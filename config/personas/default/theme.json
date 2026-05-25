@@ -1,0 +1,34 @@
+{
+  "colors": {
+    "bg_deep": "#050a15",
+    "background_deep": "#050a15",
+    "accent": "#f4a261",
+    "accent_gold": "#f4a261",
+    "accent_gold_glow": "rgba(244, 162, 97, 0.15)",
+    "accent_teal": "#2a9d8f",
+    "accent_teal_glow": "rgba(42, 157, 143, 0.2)",
+    "accent_red": "#e76f51",
+    "accent_red_glow": "rgba(231, 111, 81, 0.15)",
+    "ocean_center": "#0c1a38",
+    "ocean_mid": "#050a15",
+    "ocean_edge": "#03060d",
+    "text_main": "#f8f9fa",
+    "text_dim": "#adb5bd",
+    "text": "#f8f9fa",
+    "text_muted": "#adb5bd",
+    "glass_bg": "rgba(14, 23, 44, 0.6)",
+    "glass_border": "rgba(255, 255, 255, 0.08)",
+    "gold": "#f4a261",
+    "teal": "#2a9d8f",
+    "border": "rgba(255, 255, 255, 0.08)",
+    "nav_bg": "rgba(0, 0, 0, 0.25)",
+    "bubble_bg": "rgba(255, 255, 255, 0.06)",
+    "compass_bg": "rgba(5, 10, 21, 0.7)"
+  },
+  "styles": {
+    "avatar_shape": "freeform",
+    "background_style": "ocean",
+    "panel_style": "glass",
+    "chat_bubble_style": "quartermaster"
+  }
+}

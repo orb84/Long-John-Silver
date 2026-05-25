@@ -1,0 +1,34 @@
+# ─── Core dependencies (required to start) ────────────────────
+litellm
+pydantic
+loguru
+pyyaml
+beautifulsoup4
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+aiosqlite
+httpx
+bcrypt
+sqlite-vec
+fastembed>=0.4.0
+apscheduler
+
+# ─── Media and search ──────────────────────────────────────────
+
+# ─── Torrent — has wheels for Linux/macOS; install separately on Windows ──
+# See: https://libtorrent.org/ for platform-specific instructions
+libtorrent
+
+# ─── Browser automation for Cloudflare bypass ──────────────────
+playwright
+
+# ─── Optional bridges (auto-installed from setup wizard when selected) ───
+# Discord: pip install discord.py
+# Telegram: pip install python-telegram-bot
+# IMDb (heavy): pip install cinemagoer
+
+# ─── Development / testing ─────────────────────────────────────
+pytest
+pytest-asyncio

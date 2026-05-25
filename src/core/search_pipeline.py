@@ -1,0 +1,374 @@
+"""
+Search pipeline for LJS.
+
+UNIFIED search pipeline used by both the automated scheduler and the
+LLM agent. Single entry point (run_search) with three modes:
+  - "fast": regex-only validation, no LLM cost
+  - "auto": regex first, LLM fallback, auto-download on match
+  - "llm": regex pre-filter + LLM selection, returns candidates for agent
+
+Categories define query patterns, validation rules, and LLM prompt structure.
+"""
+
+from typing import TYPE_CHECKING, Optional
+from types import SimpleNamespace
+from loguru import logger
+from src.core.models import CategoryItem, DownloadPriority, SearchResult, QualityProfile
+
+if TYPE_CHECKING:
+    from src.search.aggregator import SearchAggregator
+    from src.core.downloader import DownloadManager
+    from src.core.database import Database
+    from src.core.librarian import Librarian
+    from src.core.categories.registry import CategoryRegistry
+    from src.core.config import SettingsManager
+
+
+def _build_query(item: CategoryItem, episode_label: str | None,
+                 language: str, category) -> str:
+    """Build a search query by delegating to the owning category.
+
+    ``episode_label`` is a historical parameter name.  The search pipeline now
+    treats it as an opaque category unit label; only the category may interpret
+    whether it means an episode, version, volume, edition, or something else.
+    """
+    if category and hasattr(category, 'build_search_query'):
+        query = category.build_search_query(item, episode_label, language)
+        if query:
+            return query
+    return _inline_query(item.key, episode_label, language)
+
+
+def _inline_query(name: str, episode_label: str | None, language: str) -> str:
+    """Fallback inline query builder when category patterns are unavailable."""
+    query = f'{name} {episode_label}' if episode_label else name
+    if language and language.lower() != 'english':
+        query += f' {language}'
+    return query.strip()
+
+
+class SearchPipeline:
+    """Unified search pipeline for both automated and LLM-triggered flows."""
+
+    def __init__(
+        self,
+        aggregator: "SearchAggregator",
+        downloader: "DownloadManager",
+        db: "Database",
+        librarian: "Librarian",
+        category_registry: "CategoryRegistry",
+        torrent_selection: object | None = None,
+        settings_manager: "SettingsManager | None" = None,
+    ) -> None:
+        self._aggregator = aggregator
+        self._downloader = downloader
+        self._db = db
+        self._librarian = librarian
+        self._categories = category_registry
+        self._torrent_selection = torrent_selection
+        self._settings_manager = settings_manager
+        self._scheduler = None
+
+    def set_scheduler(self, scheduler: object) -> None:
+        """Inject the scheduler coordinator."""
+        self._scheduler = scheduler
+
+    def _category_search_context(self) -> SimpleNamespace:
+        """Return generic collaborators categories may use for search decisions."""
+        return SimpleNamespace(
+            db=self._db,
+            pipeline=self,
+            scheduler=self._scheduler,
+            settings=self._settings_manager.settings if self._settings_manager else None,
+            settings_manager=self._settings_manager,
+            category_registry=self._categories,
+        )
+
+    async def run_search(
+        self, item: CategoryItem, episode_label: str | None = None,
+        mode: str = 'auto', language: str | None = None,
+    ) -> SearchResult | list[SearchResult] | None:
+        """Single entry point for all torrent searches.
+
+        Args:
+            item: The tracked item to search for.
+            episode_label: Historical name for an opaque category unit label.
+            mode: 'fast' (regex only), 'auto' (regex + LLM fallback + download),
+                  'llm' (regex pre-filter + LLM rank, return candidates).
+            language: Override language. Defaults to item.language.
+
+        Returns:
+            mode='fast'/'auto': SearchResult | None
+            mode='llm': list[SearchResult] | None
+        """
+        settings = self._settings_manager.settings
+        category_id = item.item_type
+        category = self._categories.get(category_id)
+        category_context = self._category_search_context()
+        target_lang = language or getattr(item, 'language', '') or settings.language
+
+        if category and hasattr(category, "prepare_search_item"):
+            # Search preparation can be category-specific (for example size
+            # limits derived from local library statistics).  The pipeline only
+            # offers context; it must not branch on concrete category IDs.
+            item = await category.prepare_search_item(
+                item,
+                settings=settings,
+                scan_result=self._scheduler.get_last_scan_result() if getattr(self, '_scheduler', None) else None,
+            )
+
+        logger.info(f'Search: {item.key} {episode_label or ""} ({mode} mode, lang={target_lang})')
+
+        # Build query from category patterns
+        query = _build_query(item, episode_label, target_lang, category)
+
+        results = await self._aggregator.search(
+            query, category=category_id, quality_profile=getattr(item, 'quality', None),
+            preferred_language=target_lang,
+        )
+
+        if not results:
+            logger.info(f'Search: no results for {query}')
+            return None
+
+        # Step 1: category-owned pre-filter. The pipeline does not parse the
+        # opaque unit label; it asks the category whether the candidate matches.
+        validated: list[SearchResult] = []
+        for r in results:
+            if r.magnet and r.quality_score >= 0.5:
+                if category and not category.validate_search_result_for_request(r, item, episode_label):
+                    continue
+                validated.append(r)
+
+        # Step 2: Route to LLM or return based on mode
+        if mode == 'fast':
+            return validated[0] if validated else None
+
+        if mode == 'llm':
+            # Return validated candidates for LLM agent to review
+            # If LLM selection service is available, use it to rank
+            if self._torrent_selection and validated:
+                ranked = await self._safe_llm_rank(validated, item, episode_label or '', target_lang)
+                return ranked or validated
+            return validated if validated else None
+
+        # mode == 'auto': return best match, with LLM fallback
+        if validated:
+            return validated[0]
+
+        # LLM fallback when regex found nothing
+        if self._torrent_selection and results:
+            logger.info(f'Search: regex found no match for {query}, trying LLM selection')
+            ranked = await self._safe_llm_rank(results, item, episode_label or '', target_lang)
+            if ranked:
+                return ranked[0]
+
+        # Try alternative queries if primary search failed
+        if category and episode_label:
+            alt_queries = category.build_alternative_search_queries(item, episode_label, target_lang)
+            for alt_query in alt_queries:
+                logger.info(f'Search: trying alternative query: {alt_query}')
+                alt_results = await self._aggregator.search(
+                    alt_query, category=category_id,
+                    quality_profile=getattr(item, 'quality', None),
+                    preferred_language=target_lang,
+                )
+                if not alt_results:
+                    continue
+
+                # Regex pre-filter on alternative results
+                for r in alt_results:
+                    if r.magnet and r.quality_score >= 0.5:
+                        if category and not category.validate_search_result_for_request(r, item, episode_label):
+                            continue
+                        logger.info(f'Search: alternative query found match: {r.title}')
+                        return r
+
+                # LLM fallback for alternative results
+                if self._torrent_selection:
+                    ranked = await self._safe_llm_rank(alt_results, item, episode_label or '', target_lang)
+                    if ranked:
+                        return ranked[0]
+
+        logger.info(f'Search: no suitable results found for {query}')
+        return None
+
+    def _build_alternative_queries(self, item, episode_label, language, category):
+        """Compatibility wrapper for category-owned alternative queries."""
+        if category and hasattr(category, 'build_alternative_search_queries'):
+            return category.build_alternative_search_queries(item, episode_label, language)
+        return []
+
+    def _effective_quality_profile(self, item: CategoryItem) -> QualityProfile | None:
+        """Return the item's quality profile with a safe global resolution floor.
+
+        Round 5/6 accidentally made this helper call itself, which caused
+        ``maximum recursion depth exceeded`` whenever the LLM torrent ranker was
+        invoked.  Keep this method deliberately simple and side-effect-free:
+        start from the item profile, fall back to the global default profile,
+        then copy before applying the global preferred-resolution floor.
+        """
+        settings = self._settings_manager.settings if self._settings_manager else None
+        profile = getattr(item, 'quality', None) or (getattr(settings, 'default_quality', None) if settings else None)
+        if not profile:
+            return None
+
+        global_profile = getattr(settings, 'default_quality', None) if settings else None
+        global_resolution = getattr(global_profile, 'preferred_resolution', None)
+        current_resolution = getattr(profile, 'preferred_resolution', None)
+        if not global_resolution:
+            return profile
+
+        try:
+            from src.utils.quality import QualityAnalyzer
+            if (not current_resolution) or QualityAnalyzer.rank_resolution(global_resolution) > QualityAnalyzer.rank_resolution(current_resolution):
+                if hasattr(profile, 'model_copy'):
+                    profile = profile.model_copy(deep=True)
+                else:
+                    from copy import deepcopy
+                    profile = deepcopy(profile)
+                profile.preferred_resolution = global_resolution
+        except Exception as exc:
+            logger.debug(f"Quality profile resolution-floor merge failed for {item.key}: {exc}")
+        return profile
+
+
+    async def _safe_llm_rank(
+        self, candidates: list[SearchResult], item: CategoryItem,
+        episode_label: str, language: str,
+    ) -> list[SearchResult] | None:
+        """LLM-rank candidates without letting ranker failures kill search.
+
+        Search already found provider results at this point.  If the optional
+        LLM ranking layer fails, the caller should still receive deterministic
+        candidates instead of an empty assistant reply or a failed plan.
+        """
+        try:
+            return await self._llm_rank(candidates, item, episode_label, language)
+        except RecursionError as exc:
+            logger.error(f"Torrent LLM ranker recursed for {item.key} {episode_label}: {exc}; using unranked candidates")
+            return None
+        except Exception as exc:
+            logger.warning(f"Torrent LLM ranker failed for {item.key} {episode_label}: {exc}; using unranked candidates")
+            return None
+
+
+    def quality_reference_for_item(self, item: CategoryItem, episode_label: str | None = None) -> str:
+        """Return category-owned library quality context for rankers/LLMs.
+
+        This method remains as the public pipeline accessor used by older
+        ranking helpers, but it now delegates to the category.  Do not add
+        domain-specific size/bitrate heuristics here.
+        """
+        category = self._categories.get(getattr(item, 'item_type', '')) if self._categories else None
+        if category and hasattr(category, 'quality_reference_for_search'):
+            return category.quality_reference_for_search(item, episode_label, self._category_search_context())
+        return ""
+
+    async def _llm_rank(
+        self, candidates: list[SearchResult], item: CategoryItem,
+        episode_label: str, language: str,
+    ) -> list[SearchResult] | None:
+        """Use TorrentSelectionService to LLM-rank candidates."""
+        if not self._torrent_selection or not candidates:
+            return None
+
+        profile = self._effective_quality_profile(item)
+        quality_context = self.quality_reference_for_item(item, episode_label)
+
+        result = await self._torrent_selection.select_best_for_category(
+            category_id=item.item_type,
+            item_id=item.key,
+            item_display_name=item.key,
+            unit_key=episode_label,
+            unit_request={"label": episode_label} if episode_label else {},
+            results=candidates,
+            preferred_language=language,
+            quality_context=quality_context,
+            require_magnet=True,
+            quality_profile=profile,
+        )
+        if result:
+            result_title = result.get('title', '')
+            for c in candidates:
+                if c.title == result_title:
+                    return [c] + [x for x in candidates if x.title != result_title]
+        return None
+
+
+    async def run_discovery(self, item: CategoryItem, episode_label: str | None = None,
+                            force: bool = False, language: str | None = None) -> bool:
+        """Auto-download wrapper. Finds best match and downloads it.
+
+        Used by the scheduler and batch download endpoints.
+        """
+        settings = self._settings_manager.settings
+        item_auto = getattr(item, 'auto_download', None)
+        can_download = item_auto if item_auto is not None else settings.auto_download
+
+        if not can_download and not force:
+            logger.trace(f'Discovery: skipping {item.key} (auto_download disabled)')
+            return False
+
+        category_id = item.item_type
+        category = self._categories.get(category_id)
+
+        if category and await category.discovery_already_satisfied(item, episode_label, self._category_search_context()):
+            logger.debug(f'Discovery: skipping {item.key} {episode_label or ""} (already satisfied by category library state)')
+            return False
+        if not category and getattr(item, "discovered", False) and not episode_label:
+            logger.debug(f'Discovery: skipping already-discovered item {item.key}')
+            return False
+
+        # Use provided language, then item language, then settings default
+        lang = language or getattr(item, 'language', None) or settings.language
+        best = await self.run_search(item, episode_label, mode='auto', language=lang)
+
+        if not best:
+            logger.info(f'Discovery: no suitable results for {item.key} {episode_label or ""}')
+            return False
+
+        logger.info(f'Discovery: triggering download for {best.title}')
+
+        descriptor = category.unit_descriptor_from_search_result(best, item, episode_label) if category and hasattr(category, "unit_descriptor_from_search_result") else {}
+        bundle_context = category.torrent_bundle_candidate_context(best, item=item, unit_label=episode_label) if category and hasattr(category, "torrent_bundle_candidate_context") else None
+        coordinates = descriptor.get("coordinates") if isinstance(descriptor.get("coordinates"), dict) else {}
+        if not coordinates and category:
+            coordinates = category.download_coordinates_from_search_result(best, item, episode_label)
+        season = coordinates.get("season")
+        episode = coordinates.get("episode")
+
+        query = _build_query(item, episode_label, getattr(item, 'language', ''), category)
+
+        reason = f"Manual discovery for {query}" if force else f"Auto-discovery for {query}"
+        priority = DownloadPriority.HIGH if force else DownloadPriority.NORMAL
+        await self._downloader.add_magnet(
+            magnet_link=best.magnet,
+            item_name=item.key,
+            torrent_title=best.title,
+            item_id=item.key,
+            priority=priority,
+            reason=reason,
+            season=season,
+            episode=episode,
+            language=getattr(item, 'language', ''),
+            category_id=category_id,
+            import_context={
+                "category_id": category_id,
+                "item_id": getattr(item, "key", ""),
+                "display_title": getattr(item, "display_name", None) or getattr(item, "key", ""),
+                "canonical_title": getattr(item, "key", ""),
+                "season": season,
+                "episode": episode,
+                "unit_descriptor": descriptor,
+                "release_title": best.title,
+                "candidate_snapshot": {
+                    "title": best.title,
+                    "source": best.source,
+                    "size_bytes": best.size_bytes,
+                    "bundle_context": bundle_context or {},
+                },
+            },
+            selective_descriptors=[descriptor] if bundle_context and descriptor else None,
+        )
+        return True

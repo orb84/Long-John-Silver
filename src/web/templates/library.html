@@ -1,0 +1,315 @@
+{% extends "base.html" %}
+{% block title %}Library — LJS{% endblock %}
+{% block nav_library %}active{% endblock %}
+{% block page_title %}Library Inspection{% endblock %}
+{% block page_subtitle %}Browse your collection, configure languages, see what's missing{% endblock %}
+
+{% block content %}
+<div id="library-root">
+    <div class="lib-toolbar">
+        <span id="lib-stats" class="card-badge">Loading...</span>
+        <label class="lib-filter">
+            <input type="text" id="lib-search" placeholder="Filter library..." oninput="libraryInspector.filter(this.value)">
+        </label>
+        <button onclick="libraryInspector.load()" class="btn btn-secondary btn-sm"><i class="fas fa-sync-alt"></i> Refresh</button>
+    </div>
+    <div id="lib-grid" class="lib-grid"><p class="empty-msg">Loading library...</p></div>
+</div>
+{% endblock %}
+
+{% block modals %}
+<!-- Category Item Detail Modal Overlay -->
+<div id="category-item-detail-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content lib-modal-content">
+        <div class="modal-header">
+            <h2 id="detail-title">Item Details</h2>
+            <button class="modal-close" onclick="detailModal.close()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div id="detail-header" class="detail-header-info">
+                <div id="detail-meta"></div>
+                <div class="detail-settings">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Language</label>
+                            <select id="detail-lang" class="lib-select"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>Interval (days)</label>
+                            <input type="number" id="detail-interval" class="lib-input" style="width: 60px;">
+                        </div>
+                        <button onclick="detailModal.saveSettings()" class="btn btn-gold btn-sm" style="margin-top: 1.4rem;">Save</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="detail-action-bar" class="action-bar"></div>
+            
+            <div class="detail-tabs">
+                <button class="detail-tab active" data-target="episodes-tab">Episodes</button>
+                <button class="detail-tab" data-target="upgrades-tab">Upgrades</button>
+            </div>
+            
+            <div id="episodes-tab" class="detail-tab-pane">
+                <div id="detail-episodes"></div>
+            </div>
+            <div id="upgrades-tab" class="detail-tab-pane" style="display: none;">
+                <div id="detail-upgrades"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.lib-modal-content {
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    max-width: 850px;
+}
+.detail-header-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 2rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border);
+}
+.detail-tabs {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+}
+.detail-tab {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.9rem;
+    border-bottom: 2px solid transparent;
+}
+.detail-tab.active {
+    color: var(--gold);
+    border-bottom-color: var(--gold);
+}
+.detail-tab:hover {
+    color: var(--text);
+}
+.ep-tag-missing {
+    background: var(--bg-card);
+    border-color: var(--orange-dim);
+    color: var(--orange);
+}
+.missing-list {
+    background: rgba(255, 140, 0, 0.05);
+    border: 1px solid var(--orange-dim);
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 1.5rem;
+}
+.batch-btns {
+    margin-top: 1rem;
+    display: flex;
+    gap: 0.5rem;
+}
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+class LibraryInspector {
+    constructor() {
+        this.grid = document.getElementById('lib-grid');
+        this.stats = document.getElementById('lib-stats');
+        this.allItems = [];
+        this.filterText = '';
+        this.collapsedCategories = new Set();
+        
+        this.LANG_OPTIONS = ["English", "Italian", "French", "German", "Spanish", "Japanese", "Korean", "Portuguese", "Russian", "Hindi", "Chinese", "Arabic", "Dutch", "Swedish", "Norwegian", "Danish", "Finnish", "Polish", "Turkish", "Other"];
+        this.SUB_OPTIONS = ["en", "it", "fr", "de", "es", "ja", "ko", "pt", "ru", "hi", "zh", "ar", "nl", "sv", "no", "da", "fi", "pl", "tr"];
+    }
+
+    async load() {
+        try {
+            const data = await APIClient.get('/api/library/inspect');
+            this.allItems = data.items || [];
+            this.stats.textContent = `${data.total_items} items · ${data.total_units || data.total_episodes || 0} total units`;
+            this.render();
+        } catch (e) {
+            this.grid.innerHTML = `<p class="empty-msg">Failed to load library: ${e.message}</p>`;
+        }
+    }
+
+    filter(text) {
+        this.filterText = text.toLowerCase();
+        this.render();
+    }
+
+    render() {
+        if (!this.grid) return;
+        this.grid.innerHTML = '';
+        
+        const filtered = this.allItems.filter(s => s.name.toLowerCase().includes(this.filterText));
+        if (!filtered.length) {
+            this.grid.appendChild(this._el('p', 'empty-msg', 'No items match your filter.'));
+            return;
+        }
+
+        // Group by category
+        const byCategory = {};
+        filtered.forEach(item => {
+            const cat = item.category || 'media';
+            if (!byCategory[cat]) byCategory[cat] = [];
+            byCategory[cat].push(item);
+        });
+
+        Object.keys(byCategory).sort().forEach(cat => {
+            const section = this._el('div', 'lib-category-section');
+            section.style.background = 'var(--card)';
+            section.style.borderRadius = '12px';
+            section.style.padding = '1.5rem';
+            section.style.marginBottom = '3rem';
+            section.style.border = '1px solid var(--border)';
+            
+            const isCollapsed = this.collapsedCategories.has(cat);
+            const chevron = this._el('i', `fa-solid fa-chevron-down category-chevron ${isCollapsed ? 'collapsed' : ''}`);
+            chevron.style.marginLeft = 'auto';
+            chevron.style.marginRight = '16px';
+            chevron.style.transition = 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1)';
+            chevron.style.cursor = 'pointer';
+            
+            if (isCollapsed) {
+                chevron.style.transform = 'rotate(-90deg)';
+            } else {
+                chevron.style.transform = 'rotate(0deg)';
+            }
+            
+            const innerGrid = this._el('div', 'media-grid');
+            innerGrid.style.display = isCollapsed ? 'none' : 'grid';
+            innerGrid.style.transition = 'all 0.3s ease';
+
+            const header = this._el('h2', 'lib-category-header', ((cat || 'media').toUpperCase()));
+            header.style.margin = '0';
+            header.style.color = 'var(--gold)';
+            header.style.fontSize = '1.4rem';
+            header.style.letterSpacing = '1px';
+            header.style.display = 'flex';
+            header.style.alignItems = 'center';
+            header.style.gap = '0.75rem';
+            header.style.cursor = 'pointer';
+            header.style.userSelect = 'none';
+            header.style.borderLeft = '4px solid var(--gold)';
+            header.style.paddingLeft = '10px';
+            
+            header.onclick = () => {
+                if (this.collapsedCategories.has(cat)) {
+                    this.collapsedCategories.delete(cat);
+                    innerGrid.style.display = 'grid';
+                    chevron.style.transform = 'rotate(0deg)';
+                    chevron.classList.remove('collapsed');
+                } else {
+                    this.collapsedCategories.add(cat);
+                    innerGrid.style.display = 'none';
+                    chevron.style.transform = 'rotate(-90deg)';
+                    chevron.classList.add('collapsed');
+                }
+            };
+            
+            const icon = '📦';
+            header.prepend(this._el('span', '', icon));
+            header.appendChild(chevron);
+            
+            const headerContainer = this._el('div', 'category-header-wrap');
+            headerContainer.style.marginBottom = '1.5rem';
+            headerContainer.appendChild(header);
+            
+            section.appendChild(headerContainer);
+            
+            byCategory[cat].forEach(item => innerGrid.appendChild(this._buildCard(item, cat)));
+            section.appendChild(innerGrid);
+            
+            this.grid.appendChild(section);
+        });
+    }
+
+    _buildCard(s, cat) {
+        const isPaused = s.paused;
+        let statusLabel = 'Tracked';
+        const localUnits = s.total_units || s.total_episodes || 0;
+        if (localUnits > 0) statusLabel = `${localUnits} local units`;
+
+        // Prepare TMDB poster URL if available
+        const posterUrl = s.poster_url || (s.poster_path ? `https://image.tmdb.org/t/p/w500${s.poster_path}` : null);
+        const placeholder = DOM.el('div', { className: 'poster-placeholder' }, [
+            DOM.el('i', { className: 'fa-solid fa-folder-open' })
+        ]);
+        
+        if (posterUrl) {
+            placeholder.style.backgroundImage = `url(${posterUrl})`;
+            placeholder.style.backgroundSize = 'cover';
+            placeholder.style.backgroundPosition = 'center';
+            const icon = placeholder.querySelector('i');
+            if (icon) icon.style.display = 'none';
+        }
+
+        // Translucent visible card banner title
+        const cardTitleBanner = DOM.el('div', { className: 'card-title-banner' }, [
+            DOM.el('span', { className: 'banner-title' }, [s.name]),
+            DOM.el('span', { className: 'banner-badge' }, [statusLabel])
+        ]);
+
+        // Card container
+        const card = DOM.el('div', { className: `media-card ${s.paused ? 'media-card-paused' : ''}`, dataset: { show: s.name, type: cat } }, [
+            placeholder,
+            cardTitleBanner,
+            DOM.el('div', { className: 'card-overlay' }, [
+                DOM.el('div', { className: 'quality-badge' }, [statusLabel]),
+                DOM.el('div', { className: 'card-content' }, [
+                    DOM.el('h3', {}, [s.name]),
+                    DOM.el('p', {}, [`Language: ${s.language} · ${(s.total_units || s.total_episodes || 0)} units`]),
+                    DOM.el('div', { style: { display: 'flex', gap: '8px' } }, [
+                        DOM.btn('', 'play-btn category-detail-btn', () => window.detailModal.open(s.category_id || s.category || 'media', s.name), {
+                            content: '<i class="fa-solid fa-circle-info"></i> Details'
+                        }),
+                        DOM.btn('', 'play-btn pause-toggle-btn', () => this._togglePause(s.category_id || s.category || cat || 'media', s.name, isPaused), {
+                            style: { background: 'rgba(255,255,255,0.05)' },
+                            content: `<i class="fa-solid ${isPaused ? 'fa-play' : 'fa-pause'}"></i>`
+                        })
+                    ])
+                ])
+            ])
+        ]);
+
+        return card;
+    }
+
+    async _updateConfig(categoryId, name, body) {
+        try {
+            await CategoryApiClient.updateItem(categoryId, name, body);
+            toast.show(`Updated ${name}`);
+        } catch (e) { toast.error(e.message); }
+    }
+
+    async _togglePause(categoryId, name, currentPaused) {
+        try {
+            await (currentPaused ? CategoryApiClient.resumeItem(categoryId, name) : CategoryApiClient.pauseItem(categoryId, name));
+            this.load(); // Refresh
+        } catch (e) { toast.error(e.message); }
+    }
+
+    _el(tag, className, text) {
+        const el = document.createElement(tag);
+        if (className) el.className = className;
+        if (text !== undefined) el.textContent = text;
+        return el;
+    }
+}
+
+const libraryInspector = new LibraryInspector();
+libraryInspector.load();
+</script>
+{% endblock %}

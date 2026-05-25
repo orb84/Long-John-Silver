@@ -1,0 +1,67 @@
+# Public fresh-install settings template for Long John Silver.
+#
+# Do not put real API keys, bridge tokens, passwords, private paths, or other
+# machine-specific values in this file. On first launch LJS copies this template
+# to config/settings.local.yaml, which is ignored by git and receives live edits.
+# Category runtime settings are created from config/category-templates/*.yaml into
+# ignored config/categories/*.yaml files.
+setup_complete: false
+
+# Local paths. Users normally edit these from the setup wizard / Compass UI.
+download_dir: ./downloads
+library_root: ./library
+
+language: English
+active_persona: default
+web_port: 8088
+
+llm:
+  active_provider: openrouter
+  model: gpt-3.5-turbo
+  api_base: null
+  api_key: null
+  max_context_tokens: null
+  context_budget_percent: 85
+
+web_search:
+  enabled: true
+  provider: brave
+  api_key: ''
+  api_base: ''
+  max_results: 5
+  allow_duckduckgo_fallback: false
+
+embeddings:
+  enabled: true
+  provider: builtin
+  builtin_model: sentence-transformers/all-MiniLM-L6-v2
+  dimension: 384
+  cache_dir: ./data/embedding_models
+  auto_download: true
+  warmup_on_startup: true
+  max_model_size_mb: 150
+
+sharing:
+  enabled: false
+  mode: disabled
+
+storage:
+  enabled: true
+  include_in_llm_context: true
+  warning_free_percent: 15.0
+  critical_free_percent: 5.0
+  warning_free_gb: 50.0
+  critical_free_gb: 10.0
+  minimum_free_after_download_gb: 5.0
+  context_max_volumes: 5
+  ui_refresh_seconds: 60
+
+security:
+  enabled: true
+  require_confirmation_for_destructive_actions: true
+  use_trash_for_deletes: true
+  trash_folder_name: .ljs-trash
+  max_files_per_destructive_action: 100
+  max_gb_per_destructive_action: 50.0
+  allow_package_install_actions: true
+  audit_log_path: ./data/security_audit.jsonl

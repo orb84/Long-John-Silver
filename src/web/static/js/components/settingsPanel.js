@@ -1,0 +1,1621 @@
+/**
+ * SettingsPanel component for LJS.
+ *
+ * Owns the Compass view.  The layout groups settings by operational domain so
+ * download/queue controls live together, media-selection preferences live
+ * together, and integrations/AI credentials are clearly separated.
+ */
+class SettingsPanel extends Component {
+    /**
+     * Construct the Compass settings panel.
+     *
+     * @param {string} elementId - ID of the container element, normally
+     *   ``settings``.
+     * @param {EventBus} eventBus - Shared UI event bus for future settings
+     *   refresh events.
+     */
+    constructor(elementId, eventBus) {
+        super(elementId);
+        this._eventBus = eventBus;
+        this._settings = null;
+        this._categories = [];
+        this._personas = [];
+        this._activePersona = null;
+
+        if (this.container) {
+            this.render();
+            this._init();
+        }
+    }
+
+    /**
+     * Render the Compass section using cohesive domain panels.
+     *
+     * Extension guidance: add new settings to the panel that owns the runtime
+     * concept rather than appending another unrelated top-level card.  If a new
+     * domain is truly needed, add one panel and one save method for that domain.
+     */
+    render() {
+        this._clear();
+        if (!this.container) return;
+
+        const grid = DOM.el('div', { className: 'settings-grid compass-settings-grid' }, [
+            this._buildAppPanel(),
+            this._buildPersonaPanel(),
+            this._buildDownloadsPanel(),
+            this._buildSharingPanel(),
+            this._buildContentPanel(),
+            this._buildCategoryPanel(),
+            this._buildStoragePanel(),
+            this._buildServicesPanel(),
+            this._buildLlmPanel(),
+            this._buildSemanticMemoryPanel(),
+            this._buildBridgesPanel(),
+            this._buildManifestPanel()
+        ]);
+
+        Array.from(grid.querySelectorAll('.settings-panel')).forEach(panel => this._makeCollapsible(panel));
+        this.container.appendChild(grid);
+    }
+
+    /**
+     * Populate rendered controls from the most recent settings snapshot.
+     */
+    populateForm() {
+        if (!this._settings) return;
+        const defaultQuality = this._settings.default_quality || {};
+        const llm = this._settings.llm || {};
+
+        this._setVal('pref-download-dir', this._settings.download_dir || '');
+        this._setVal('pref-max-concurrent', this._settings.max_concurrent_downloads || '3');
+        this._setVal('pref-max-dl-speed', defaultQuality.max_download_speed_kbps || '');
+        this._setVal('pref-max-ul-speed', defaultQuality.max_upload_speed_kbps || '');
+        this._setCheck('pref-auto-start', !!this._settings.auto_start_at_login);
+        this._setCheck('pref-auto-download', !!this._settings.auto_download);
+        this._setCheck('pref-auto-discover', !!this._settings.auto_discover);
+        this._setVal('pref-stall-interval', this._settings.stall_check_interval_minutes || '30');
+        this._setVal('pref-stall-alt', this._settings.stall_alternative_hours || '1.0');
+        this._setVal('pref-stall-cancel', this._settings.stall_cancel_hours || '5.0');
+
+        const sharing = this._settings.sharing || {};
+        this._setCheck('pref-sharing-enabled', !!sharing.enabled);
+        this._setVal('pref-sharing-mode', sharing.mode || 'disabled');
+        this._setVal('pref-sharing-upload-speed', sharing.library_upload_speed_kbps || '');
+        this._setVal('pref-sharing-seed-slots', sharing.active_seed_slots || '2');
+        this._setVal('pref-sharing-ratio', sharing.seed_ratio_target || '2.0');
+        this._setVal('pref-sharing-duration', sharing.seed_duration_hours || '168');
+        this._setCheck('pref-sharing-pause-when-downloading', !!sharing.pause_when_downloading);
+
+        this._setVal('pref-size-limit-mode', defaultQuality.size_limit_mode || 'smart');
+        this._setVal('pref-max-bitrate', defaultQuality.max_bitrate_kbps || '');
+        this._setVal('pref-max-file-size', defaultQuality.max_file_size_mb || '');
+        this._setVal('pref-resolution', defaultQuality.preferred_resolution || '1080p');
+        this._setVal('pref-language', this._settings.language || 'English');
+
+        this._setVal('pref-llm-provider', llm.active_provider || 'openrouter');
+        this._setVal('pref-llm-model', llm.model || '');
+        this._setVal('pref-llm-api-base', llm.api_base || '');
+        this._setVal('pref-llm-api-key', llm.api_key || '');
+        this._setVal('pref-llm-lw-model', (llm.lightweight || {}).model || '');
+        this._setVal('pref-llm-lw-provider', (llm.lightweight || {}).provider || '');
+        this._setVal('pref-llm-std-model', (llm.standard || {}).model || '');
+        this._setVal('pref-llm-std-provider', (llm.standard || {}).provider || '');
+        this._setVal('pref-llm-hv-model', (llm.heavy || {}).model || '');
+        this._setVal('pref-llm-hv-provider', (llm.heavy || {}).provider || '');
+        this._setVal('pref-llm-max-context', llm.max_context_tokens === null || llm.max_context_tokens === undefined ? '' : llm.max_context_tokens);
+        this._setVal('pref-llm-context-budget-percent', llm.context_budget_percent || 85);
+        this._setVal('pref-llm-raw-recent-percent', llm.raw_recent_context_percent === null || llm.raw_recent_context_percent === undefined ? 30 : llm.raw_recent_context_percent);
+        this._setVal('pref-llm-reserved-output', llm.reserved_output_tokens === null || llm.reserved_output_tokens === undefined ? '' : llm.reserved_output_tokens);
+        this._syncLlmContextWindowControl(false);
+
+        const embeddings = this._settings.embeddings || {};
+        this._setCheck('pref-embeddings-enabled', embeddings.enabled !== false);
+        this._setVal('pref-embeddings-provider', embeddings.provider || 'builtin');
+        this._setVal('pref-embeddings-model', embeddings.builtin_model || 'sentence-transformers/all-MiniLM-L6-v2');
+        this._setVal('pref-embeddings-cache', embeddings.cache_dir || './data/embedding_models');
+        this._setCheck('pref-embeddings-auto-download', embeddings.auto_download !== false);
+        this._setCheck('pref-embeddings-warmup', embeddings.warmup_on_startup !== false);
+
+        this._setVal('pref-jackett-url', this._settings.jackett_url || '');
+        this._setVal('pref-jackett-key', this._settings.jackett_api_key || '');
+        this._setCheck('pref-direct-scraper-fallback', !!this._settings.direct_scraper_fallback);
+        this._setVal('pref-tmdb-key', this._settings.tmdb_api_key || '');
+        this._setVal('pref-opensubtitles-key', this._settings.opensubtitles_api_key || '');
+        this._setVal('pref-plex-url', this._settings.plex_url || '');
+        this._setVal('pref-plex-token', this._settings.plex_token || '');
+        this._setVal('pref-trakt-custom-id', this._settings.trakt_client_id || '');
+        const traktIdEl = document.getElementById('pref-trakt-id');
+        if (traktIdEl) traktIdEl.value = this._settings.trakt_client_id || this._defaultTraktClientId();
+        this._renderTraktStatus();
+
+        this._setVal('pref-discord-token', this._settings.discord_token || '');
+        this._setVal('pref-discord-channel', this._settings.discord_channel_id || '');
+        this._setVal('pref-telegram-token', this._settings.telegram_token || '');
+        this._setVal('pref-whatsapp-token', this._settings.whatsapp_token || '');
+        this._setVal('pref-whatsapp-phone', this._settings.whatsapp_phone_number_id || '');
+        this._setVal('pref-whatsapp-verify', this._settings.whatsapp_verify_token || '');
+
+        this._setVal('pref-active-persona', (this._activePersona || {}).id || this._settings.active_persona || 'default');
+        this._renderPersonaPreview((this._activePersona || {}).id || this._settings.active_persona || 'default');
+
+        this._populateCategoryControls();
+        this._populateCategoryProviderControls();
+        this._populateCategoryNestedControls();
+        this._populateCategoryServiceControls();
+    }
+
+    /**
+     * Save the launch-at-login preference.
+     */
+    async saveStartup() {
+        const enabled = !!(document.getElementById('pref-auto-start') || {}).checked;
+        try {
+            const result = await APIClient.post('/api/settings/startup', { enabled });
+            const status = result.autostart || {};
+            if (result.status === 'warning') {
+                toast.show(status.message || 'Auto-start could not be changed on this system.', 'err');
+            } else {
+                toast.show(enabled ? 'LJS will start automatically at login.' : 'LJS will no longer start automatically at login.');
+            }
+            this._setCheck('pref-auto-start', !!result.auto_start_at_login);
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Save the active persona package and refresh the visible app chrome.
+     */
+    async savePersona() {
+        const personaId = this._valueById('pref-active-persona', 'default');
+        try {
+            const result = await APIClient.post('/api/personas/active', { persona_id: personaId });
+            this._activePersona = result.active || this._personas.find(p => p.id === result.active_persona) || { id: result.active_persona };
+            toast.show(`Persona switched to ${(this._activePersona || {}).display_name || result.active_persona}.`);
+            this._renderPersonaPreview((this._activePersona || {}).id || result.active_persona);
+            if (window.appDeck && typeof window.appDeck._applyPersonaChrome === 'function') {
+                window.appDeck._applyPersonaChrome(this._activePersona);
+            }
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Save global download, queue, speed, automation, and stall controls.
+     */
+    async saveDownloadQueue() {
+        const downloadDir = this._input('pref-download-dir');
+        const maxConcurrent = this._input('pref-max-concurrent');
+        const autoDownload = document.getElementById('pref-auto-download');
+        const autoDiscover = document.getElementById('pref-auto-discover');
+
+        try {
+            await APIClient.post('/api/settings/library', {
+                download_dir: downloadDir ? downloadDir.value : '',
+                max_concurrent: this._intValue(maxConcurrent, 3),
+                stall_check_interval_minutes: this._intById('pref-stall-interval', 30),
+                stall_alternative_hours: this._floatById('pref-stall-alt', 1.0),
+                stall_cancel_hours: this._floatById('pref-stall-cancel', 5.0)
+            });
+            await APIClient.post('/api/settings/auto_download', {
+                auto_download: autoDownload ? autoDownload.checked : false,
+                auto_discover: autoDiscover ? autoDiscover.checked : false
+            });
+            await APIClient.post('/api/settings', {
+                default_quality: {
+                    max_download_speed_kbps: this._intOrNullById('pref-max-dl-speed'),
+                    max_upload_speed_kbps: this._intOrNullById('pref-max-ul-speed')
+                }
+            });
+            toast.show('Download, queue, and bandwidth controls saved.');
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Save seed-in-place library sharing preferences.
+     */
+    async saveSharing() {
+        const enabled = document.getElementById('pref-sharing-enabled');
+        const sharingEnabled = enabled ? enabled.checked : false;
+        try {
+            await APIClient.post('/api/settings/sharing', {
+                enabled: sharingEnabled,
+                mode: sharingEnabled ? this._valueById('pref-sharing-mode', 'seed_in_place') : 'disabled',
+                library_upload_speed_kbps: this._intOrZeroById('pref-sharing-upload-speed'),
+                active_seed_slots: this._intById('pref-sharing-seed-slots', 2),
+                seed_ratio_target: this._floatById('pref-sharing-ratio', 2.0),
+                seed_duration_hours: this._intById('pref-sharing-duration', 168),
+                pause_when_downloading: !!(document.getElementById('pref-sharing-pause-when-downloading') || {}).checked
+            });
+            toast.show('Library sharing policy saved.');
+            if (window.sharingPanel) window.sharingPanel.load();
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Save media quality and torrent-selection preferences.
+     */
+    async saveContentPreferences() {
+        try {
+            await APIClient.post('/api/settings', {
+                default_quality: {
+                    size_limit_mode: this._valueById('pref-size-limit-mode', 'smart'),
+                    max_bitrate_kbps: this._intOrNullById('pref-max-bitrate'),
+                    max_file_size_mb: this._intOrNullById('pref-max-file-size'),
+                    preferred_resolution: this._valueById('pref-resolution', '1080p'),
+                    language: this._valueById('pref-language', 'English')
+                }
+            });
+            toast.show('Content selection preferences saved.');
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Save category-owned library and workflow configuration values.
+     */
+    async saveCategorySettings() {
+        const categorySettings = {};
+        document.querySelectorAll('.pref-category-prop-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const propName = input.dataset.propertyName;
+            const type = input.dataset.valueType;
+            if (!catId || !propName) return;
+            if (!categorySettings[catId]) categorySettings[catId] = {};
+            categorySettings[catId][propName] = this._coerceCategoryValue(input, type);
+        });
+        document.querySelectorAll('.pref-category-provider-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const provider = input.dataset.providerName;
+            if (!catId || !provider) return;
+            if (!categorySettings[catId]) categorySettings[catId] = {};
+            if (!categorySettings[catId].metadata) categorySettings[catId].metadata = { providers: {} };
+            if (!categorySettings[catId].metadata.providers) categorySettings[catId].metadata.providers = {};
+            categorySettings[catId].metadata.providers[provider] = { enabled: !!input.checked };
+        });
+        document.querySelectorAll('.pref-category-nested-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const section = input.dataset.sectionName;
+            const prop = input.dataset.propertyName;
+            const type = input.dataset.valueType;
+            if (!catId || !section || !prop) return;
+            if (!categorySettings[catId]) categorySettings[catId] = {};
+            if (!categorySettings[catId][section]) categorySettings[catId][section] = {};
+            categorySettings[catId][section][prop] = this._coerceCategoryValue(input, type);
+        });
+
+        try {
+            await APIClient.post('/api/settings/library', { category_settings: categorySettings });
+            const integrationPayload = this._categoryIntegrationPayload();
+            if (Object.keys(integrationPayload).length) {
+                await APIClient.post('/api/settings/integrations', integrationPayload);
+            }
+            toast.show('Category configuration and category services saved.');
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Save AI provider and tier routing parameters.
+     */
+    async saveLLM() {
+        try {
+            await APIClient.post('/api/settings/llm', {
+                provider: this._valueById('pref-llm-provider', 'openrouter'),
+                model: this._valueById('pref-llm-model', ''),
+                api_base: this._nullableValueById('pref-llm-api-base'),
+                api_key: this._nullableValueById('pref-llm-api-key'),
+                max_context_tokens: this._llmContextCapPayload(),
+                context_budget_percent: this._intById('pref-llm-context-budget-percent', 85),
+                raw_recent_context_percent: this._intById('pref-llm-raw-recent-percent', 30),
+                reserved_output_tokens: this._nonNegativeIntOrNullById('pref-llm-reserved-output')
+            });
+            await APIClient.post('/api/settings/tiers', {
+                lightweight: {
+                    model: this._nullableValueById('pref-llm-lw-model'),
+                    provider: this._nullableValueById('pref-llm-lw-provider')
+                },
+                standard: {
+                    model: this._nullableValueById('pref-llm-std-model'),
+                    provider: this._nullableValueById('pref-llm-std-provider')
+                },
+                heavy: {
+                    model: this._nullableValueById('pref-llm-hv-model'),
+                    provider: this._nullableValueById('pref-llm-hv-provider')
+                }
+            });
+            toast.show('AI Gateway configuration saved.');
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+
+    /**
+     * Save semantic-memory embedding runtime preferences.
+     */
+    async saveSemanticMemory() {
+        try {
+            await APIClient.post('/api/settings/embeddings', {
+                enabled: !!(document.getElementById('pref-embeddings-enabled') || {}).checked,
+                provider: this._valueById('pref-embeddings-provider', 'builtin'),
+                builtin_model: this._valueById('pref-embeddings-model', 'sentence-transformers/all-MiniLM-L6-v2'),
+                cache_dir: this._valueById('pref-embeddings-cache', './data/embedding_models'),
+                dimension: 384,
+                auto_download: !!(document.getElementById('pref-embeddings-auto-download') || {}).checked,
+                warmup_on_startup: !!(document.getElementById('pref-embeddings-warmup') || {}).checked,
+                max_model_size_mb: 150
+            });
+            toast.show('Semantic memory settings saved. Restart LJS to swap embedding runtime cleanly.');
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+
+    /**
+     * Load semantic-memory health into the Compass diagnostics row.
+     */
+    async loadSemanticMemoryHealth() {
+        const container = document.getElementById('semantic-memory-health');
+        if (!container) return;
+        try {
+            const data = await APIClient.get('/api/settings/embeddings/status');
+            const health = data.health || {};
+            const semantic = health.semantic === true;
+            const status = health.status || data.status || 'unknown';
+            const namespace = health.namespace || health.vector_namespace || 'not initialized';
+            const provider = health.provider || health.provider_label || 'unknown';
+            const dimension = health.dimension || health.vector_dimension || '—';
+            const lastError = health.last_error || health.error || '';
+            container.innerHTML = '';
+            container.appendChild(DOM.el('div', { className: 'semantic-health-grid' }, [
+                DOM.el('span', { className: `badge ${semantic ? 'success' : 'highlight'}` }, [semantic ? 'Semantic' : 'Fallback / degraded']),
+                DOM.el('span', {}, [`Status: ${status}`]),
+                DOM.el('span', {}, [`Provider: ${provider}`]),
+                DOM.el('span', {}, [`Dimension: ${dimension}`]),
+                DOM.el('span', {}, [`Namespace: ${namespace}`])
+            ]));
+            if (lastError) {
+                container.appendChild(DOM.el('p', { className: 'empty-msg' }, [`Last error: ${lastError}`]));
+            }
+        } catch (err) {
+            container.innerHTML = '';
+            container.appendChild(DOM.el('p', { className: 'empty-msg' }, [`Semantic memory status unavailable: ${err.message}`]));
+        }
+    }
+
+    /**
+     * Request a conversation-vector rebuild for the active namespace.
+     */
+    async reindexSemanticMemory() {
+        try {
+            const result = await APIClient.post('/api/settings/embeddings/reindex', { limit: 10000, mode: 'all' });
+            const count = (result.result || {}).reindexed || (result.result || {}).count || 0;
+            toast.show(`Semantic memory reindex requested. Rebuilt ${count} vector(s) across conversations and taste signals.`);
+            await this.loadSemanticMemoryHealth();
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Load Jackett indexer coverage diagnostics into the services panel.
+     */
+    async loadJackettIndexers() {
+        const container = document.getElementById('jackett-indexer-health');
+        if (!container) return;
+        try {
+            const data = await APIClient.get('/api/jackett/indexers');
+            const summary = data.summary || {};
+            const configured = summary.configured_indexers || 0;
+            const total = summary.total_indexers || 0;
+            const openPublic = summary.public_like_count || (data.open_public_recommended || []).length || 0;
+            const bookConfigured = summary.book_or_audio_like_configured || 0;
+            const bookTotal = summary.book_or_audio_like_count || 0;
+            container.innerHTML = '';
+            container.appendChild(DOM.el('div', { className: 'semantic-health-grid' }, [
+                DOM.el('span', { className: 'badge success' }, [`${configured}/${total} configured`]),
+                DOM.el('span', {}, [`Open/public available: ${openPublic}`]),
+                DOM.el('span', {}, [`Book/audio coverage: ${bookConfigured}/${bookTotal}`]),
+                DOM.el('span', {}, [`Dynamic profile: all_open_public`])
+            ]));
+            container.appendChild(DOM.el('p', { className: 'empty-msg' }, [summary.note || 'Jackett /all searches every configured indexer.']));
+        } catch (err) {
+            container.innerHTML = '';
+            container.appendChild(DOM.el('p', { className: 'empty-msg' }, [`Jackett diagnostics unavailable: ${err.message}`]));
+        }
+    }
+
+    /**
+     * Configure a Jackett indexer profile and refresh diagnostics.
+     */
+    async configureJackettProfile(profile) {
+        try {
+            const result = await APIClient.post('/api/jackett/configure-indexers', { profile });
+            toast.show(`Jackett profile ${profile}: added ${result.added || 0}, skipped ${result.skipped || 0}, failed ${result.failed || 0}.`);
+            await this.loadJackettIndexers();
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Open the native Jackett dashboard for full tracker-specific controls.
+     */
+    openJackettUi() {
+        const url = this._valueById('pref-jackett-url', 'http://localhost:9117') || 'http://localhost:9117';
+        window.open(url.replace(/\/$/, '') + '/UI/Dashboard', '_blank', 'noopener,noreferrer');
+    }
+
+    /**
+     * Load Jackett's native config schema for a private/closed indexer.
+     */
+    async loadJackettCustomIndexerSchema() {
+        const id = this._valueById('jackett-custom-indexer-id', '').trim();
+        const container = document.getElementById('jackett-custom-indexer-fields');
+        if (!id || !container) return;
+        try {
+            const data = await APIClient.get(`/api/jackett/indexers/${encodeURIComponent(id)}/config`);
+            container.innerHTML = '';
+            (data.fields || []).forEach(field => {
+                const inputType = field.secret ? 'text' : (field.type === 'checkbox' ? 'checkbox' : 'text');
+                const input = DOM.el('input', {
+                    type: inputType,
+                    className: field.secret ? 'ljs-secret-input jackett-custom-field' : 'jackett-custom-field',
+                    autocomplete: 'off',
+                    'data-lpignore': 'true',
+                    'data-1p-ignore': 'true',
+                    'data-bwignore': 'true',
+                    dataset: { fieldId: field.id },
+                    placeholder: field.name || field.id,
+                    value: field.value || ''
+                });
+                container.appendChild(this._createSettingItem(field.name || field.id, field.help || `Jackett field: ${field.id}`, input));
+            });
+            if (!(data.fields || []).length) container.appendChild(DOM.el('p', { className: 'empty-msg' }, ['No configurable fields returned by Jackett.']));
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Configure a user-selected Jackett indexer from the rendered schema fields.
+     */
+    async configureJackettCustomIndexer() {
+        const id = this._valueById('jackett-custom-indexer-id', '').trim();
+        if (!id) return toast.error('Enter a Jackett indexer ID first.');
+        const values = {};
+        document.querySelectorAll('#jackett-custom-indexer-fields .jackett-custom-field').forEach(input => {
+            const key = input.dataset.fieldId;
+            if (!key) return;
+            values[key] = input.type === 'checkbox' ? input.checked : input.value;
+        });
+        try {
+            const result = await APIClient.post(`/api/jackett/indexers/${encodeURIComponent(id)}/configure`, { values });
+            if (result.status === 'ok' || result.configured) toast.show(`Configured Jackett indexer ${id}.`);
+            else toast.error(result.error || `Jackett could not configure ${id}.`);
+            await this.loadJackettIndexers();
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Save search provider and metadata integration credentials.
+     */
+    async saveServices() {
+        try {
+            await APIClient.post('/api/settings/search', {
+                jackett_url: this._nullableValueById('pref-jackett-url'),
+                jackett_api_key: this._nullableValueById('pref-jackett-key'),
+                direct_scraper_fallback: !!(document.getElementById('pref-direct-scraper-fallback') || {}).checked
+            });
+            toast.show('Shared torrent search services saved. Category metadata/watch credentials live inside each category block.');
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Load and render category-aware storage status.
+     */
+    async loadStorageStatus() {
+        const container = document.getElementById('storage-volume-list');
+        if (!container) return;
+        try {
+            const data = await APIClient.get('/api/storage/status');
+            const volumes = data.volumes || [];
+            container.innerHTML = '';
+            if (!volumes.length) {
+                container.appendChild(DOM.el('p', { className: 'empty-msg' }, ['No monitored storage roots are configured.']));
+                return;
+            }
+            volumes.forEach(v => container.appendChild(this._renderStorageVolume(v)));
+        } catch (err) {
+            container.innerHTML = '';
+            container.appendChild(DOM.el('p', { className: 'empty-msg' }, [`Storage status unavailable: ${err.message}`]));
+        }
+    }
+
+    /**
+     * Save chat bridge credentials.
+     */
+    async saveBridges() {
+        try {
+            await APIClient.post('/api/settings/bridges', {
+                discord_token: this._nullableValueById('pref-discord-token'),
+                discord_channel_id: this._nullableValueById('pref-discord-channel'),
+                telegram_token: this._nullableValueById('pref-telegram-token'),
+                whatsapp_token: this._nullableValueById('pref-whatsapp-token'),
+                whatsapp_phone_number_id: this._nullableValueById('pref-whatsapp-phone'),
+                whatsapp_verify_token: this._nullableValueById('pref-whatsapp-verify')
+            });
+            toast.show('Bridge and chatbot credentials saved.');
+        } catch (err) {
+            toast.error(err.message);
+        }
+    }
+
+    /**
+     * Backwards-compatible alias for older templates/tests.
+     */
+    async savePreferences() {
+        await this.saveContentPreferences();
+    }
+
+    /**
+     * Backwards-compatible alias for older templates/tests.
+     */
+    async saveLibrary() {
+        await this.saveCategorySettings();
+    }
+
+    /**
+     * Load settings from the backend and hydrate all panels.
+     * @private
+     */
+    async _init() {
+        try {
+            const data = await APIClient.get('/api/settings');
+            const personaData = await APIClient.get('/api/personas');
+            this._settings = data.settings || {};
+            this._categories = (data.categories || []).map(cat => ({ ...cat, id: cat.id || cat.category_id }));
+            this._personas = personaData.personas || [];
+            this._activePersona = personaData.active || null;
+            this.render();
+            this.populateForm();
+            await this.loadStorageStatus();
+            await this.loadSemanticMemoryHealth();
+            await this.loadJackettIndexers();
+            if (window.CategoryManifestPanel) window.categoryManifestPanel = new CategoryManifestPanel();
+        } catch (err) {
+            console.error('[SettingsPanel] Failed to retrieve system preferences:', err);
+        }
+    }
+
+    /**
+     * Build application-level startup controls.
+     * @private
+     */
+    _buildAppPanel() {
+        return this._panel('fa-solid fa-power-off', 'Application Startup', 'One simple boot option for always-on media boxes and home servers.', [
+            this._createSettingItem(
+                'Start LJS when I log in',
+                'Creates a normal user-level startup entry on macOS, Windows, or Linux. Disable it here to remove that entry; no administrator permissions are required.',
+                this._toggle('pref-auto-start')
+            ),
+            this._saveButton('Save Startup Option', 'fa-solid fa-circle-check', () => this.saveStartup())
+        ], 'settings-startup-panel');
+    }
+
+    /**
+     * Build persona package controls.
+     * @private
+     */
+    _buildPersonaPanel() {
+        const options = (this._personas || []).map(persona => DOM.el('option', { value: persona.id }, [persona.display_name || persona.id]));
+        if (!options.length) options.push(DOM.el('option', { value: 'default' }, ['Long John Silver']));
+        return this._panel('fa-solid fa-user-astronaut', 'Assistant Persona', 'Prompt, avatar, display name, and bounded theme colors are loaded from config/personas/<persona_id>/.', [
+            this._createSettingItem('Active persona', 'Switches the assistant prompt package and applies its local avatar and theme.json colors to the interface.', DOM.el('select', { id: 'pref-active-persona', onchange: e => this._renderPersonaPreview(e.target.value) }, options)),
+            DOM.el('div', { id: 'persona-package-preview', className: 'setting-item persona-package-preview' }, [
+                DOM.el('p', { className: 'empty-msg' }, ['Persona package metadata will appear here.'])
+            ]),
+            this._saveButton('Save Persona', 'fa-solid fa-circle-check', () => this.savePersona())
+        ], 'settings-persona-panel');
+    }
+
+    /**
+     * Render selected persona metadata without reading raw prompt text into UI.
+     * @private
+     */
+    _renderPersonaPreview(personaId) {
+        const container = document.getElementById('persona-package-preview');
+        if (!container) return;
+        const persona = (this._personas || []).find(p => p.id === personaId) || this._activePersona || {};
+        container.innerHTML = '';
+        const avatar = DOM.el('div', { className: 'persona-preview-avatar' });
+        if (persona.avatar_url) avatar.style.backgroundImage = `url('${persona.avatar_url}')`;
+        const theme = persona.theme || {};
+        const styles = theme.styles || theme;
+        container.appendChild(DOM.el('div', { className: 'persona-preview-card' }, [
+            avatar,
+            DOM.el('div', { className: 'persona-preview-copy' }, [
+                DOM.el('h4', {}, [persona.display_name || persona.id || 'Unknown persona']),
+                DOM.el('p', {}, [persona.description || 'No description provided.']),
+                DOM.el('p', { className: 'empty-msg' }, [
+                    `Package: config/personas/${persona.id || personaId}/ · avatar: ${persona.avatar_filename || 'fallback'} · avatar shape: ${styles.avatar_shape || 'freeform'}`
+                ])
+            ])
+        ]));
+    }
+
+    /**
+     * Build the Downloads & Queue operational control panel.
+     * @private
+     */
+    _buildDownloadsPanel() {
+        return this._panel('fa-solid fa-download', 'Downloads & Queue', 'Active torrent behavior, queue concurrency, aggregate speed caps, and stall automation live together here.', [
+            this._sectionTitle('Storage & active slots'),
+            this._createSettingItem('Download staging folder', 'Temporary path where active torrent payloads are written before library filing.', DOM.el('input', { type: 'text', id: 'pref-download-dir', placeholder: '/home/downloads' })),
+            this._createSettingItem('Max active downloads', 'Number of torrents allowed to actively transfer at once.', DOM.el('input', { type: 'number', id: 'pref-max-concurrent', min: '1', placeholder: '3' })),
+            this._sectionTitle('Aggregate bandwidth caps'),
+            this._createSettingItem('Download cap (kB/s)', 'Global session cap shared across all active torrents. Empty or 0 means unlimited.', DOM.el('input', { type: 'number', id: 'pref-max-dl-speed', min: '0', placeholder: '0 = unlimited' })),
+            this._createSettingItem('Upload cap (kB/s)', 'Global upload cap shared across all torrents. A value of 50 means about 50 kB/s total, not per torrent.', DOM.el('input', { type: 'number', id: 'pref-max-ul-speed', min: '0', placeholder: '0 = unlimited' })),
+            this._sectionTitle('Automation mode'),
+            this._createSettingItem('Captain mode', 'Automatically start approved/newly discovered releases instead of only suggesting them.', this._toggle('pref-auto-download')),
+            this._createSettingItem('Auto-discover library items', 'Let scans register discovered category items automatically.', this._toggle('pref-auto-discover')),
+            this._sectionTitle('Stall handling'),
+            this._createSettingItem('Stall check interval (min)', 'How often LJS evaluates stalled or unhealthy transfers.', DOM.el('input', { type: 'number', id: 'pref-stall-interval', min: '5', placeholder: '30' })),
+            this._createSettingItem('Find alternative after (hrs)', 'How long a torrent may be stalled before LJS searches for a replacement candidate.', DOM.el('input', { type: 'number', id: 'pref-stall-alt', step: '0.5', min: '0.5', placeholder: '1.0' })),
+            this._createSettingItem('Cancel warning after (hrs)', 'How long a torrent may remain stalled before LJS asks whether to cancel it.', DOM.el('input', { type: 'number', id: 'pref-stall-cancel', step: '0.5', min: '1.0', placeholder: '5.0' })),
+            this._saveButton('Save Download & Queue Controls', 'fa-solid fa-circle-check', () => this.saveDownloadQueue())
+        ], 'settings-downloads-panel');
+    }
+
+    /**
+     * Build seed-in-place library sharing controls.
+     * @private
+     */
+    _buildSharingPanel() {
+        return this._panel('fa-solid fa-seedling', 'Sharing & Seeding', 'Opt-in seeding for completed torrent downloads that are already part of your library, with its own upload budget.', [
+            this._sectionTitle('Library sharing mode'),
+            this._createSettingItem('Keep completed library torrents available to others', 'When this is on, new torrent downloads can keep seeding after they appear in your library. Turn it off for a private consume-only library.', this._toggle('pref-sharing-enabled')),
+            this._createSettingItem('How files are stored', 'Seed in place means LJS keeps the original torrent folder as the library copy. The file may keep its release-group name, but Plex/Jellyfin usually still recognize it from metadata.', DOM.el('select', { id: 'pref-sharing-mode' }, [
+                DOM.el('option', { value: 'seed_in_place' }, ['Seed in place: share the library copy']),
+                DOM.el('option', { value: 'disabled' }, ['Disabled'])
+            ])),
+            this._sectionTitle('Dedicated sharing quota'),
+            this._createSettingItem('Library sharing upload cap (kB/s)', 'Total upload speed reserved for completed library items. This is separate from the upload cap used by torrents that are still downloading.', DOM.el('input', { type: 'number', id: 'pref-sharing-upload-speed', min: '0', placeholder: '0 = unlimited' })),
+            this._createSettingItem('Active shared library items', 'Maximum number of completed library torrents allowed to upload at the same time.', DOM.el('input', { type: 'number', id: 'pref-sharing-seed-slots', min: '0', placeholder: '2' })),
+            this._sectionTitle('Stop conditions'),
+            this._createSettingItem('Share until ratio', 'Example: 2.0 means upload about twice as much as was downloaded before LJS may stop sharing the item.', DOM.el('input', { type: 'number', id: 'pref-sharing-ratio', step: '0.1', min: '0', placeholder: '2.0' })),
+            this._createSettingItem('Minimum share time (hours)', 'Keep the item available for at least this long, even if the ratio target is reached earlier.', DOM.el('input', { type: 'number', id: 'pref-sharing-duration', min: '0', placeholder: '168' })),
+            this._createSettingItem('Pause library sharing while downloads are active', 'Use this when your connection is small: completed library items will stop uploading while active downloads need upload bandwidth to trade pieces.', this._toggle('pref-sharing-pause-when-downloading')),
+            this._saveButton('Save Sharing & Seeding', 'fa-solid fa-circle-check', () => this.saveSharing())
+        ], 'settings-sharing-panel');
+    }
+
+    /**
+     * Build media-quality and candidate-selection controls.
+     * @private
+     */
+    _buildContentPanel() {
+        return this._panel('fa-solid fa-filter', 'Content Selection', 'Quality, size, resolution, and language preferences used when choosing media candidates.', [
+            this._createSettingItem('Size limit mode', 'How LJS constrains torrent size during candidate selection.', DOM.el('select', { id: 'pref-size-limit-mode' }, [
+                DOM.el('option', { value: 'smart' }, ['Smart (LLM decides)']),
+                DOM.el('option', { value: 'bitrate' }, ['Max bitrate']),
+                DOM.el('option', { value: 'file_size' }, ['Max file size'])
+            ])),
+            this._createSettingItem('Max bitrate (kbps)', 'Optional video bitrate ceiling.', DOM.el('input', { type: 'number', id: 'pref-max-bitrate', min: '0', placeholder: 'e.g. 8000' })),
+            this._createSettingItem('Max file size (MB)', 'Optional per-release size ceiling.', DOM.el('input', { type: 'number', id: 'pref-max-file-size', min: '0', placeholder: 'e.g. 4000' })),
+            this._createSettingItem('Preferred resolution', 'Default target resolution for search and ranking.', DOM.el('select', { id: 'pref-resolution' }, [
+                DOM.el('option', { value: '2160p' }, ['4K / 2160p']),
+                DOM.el('option', { value: '1080p' }, ['1080p']),
+                DOM.el('option', { value: '720p' }, ['720p'])
+            ])),
+            this._createSettingItem('Preferred language', 'Default audio language for discovery and ranking.', DOM.el('select', { id: 'pref-language' }, LANG_OPTIONS.map(lang => DOM.el('option', { value: lang }, [lang])))),
+            this._saveButton('Save Content Preferences', 'fa-solid fa-circle-check', () => this.saveContentPreferences())
+        ], 'settings-content-panel');
+    }
+
+    /**
+     * Build category-specific library/workflow controls.
+     * @private
+     */
+    _buildCategoryPanel() {
+        const controls = [];
+        const categories = this._categories || [];
+        if (!categories.length) {
+            controls.push(DOM.el('p', { className: 'empty-msg' }, ['Category settings will appear here after the registry loads.']));
+        }
+        if (categories.some(cat => (cat.setup_requirements || []).some(req => req.setting_key === 'trakt_client_id'))) {
+            controls.push(DOM.el('input', { type: 'hidden', id: 'pref-trakt-id', value: this._settings?.trakt_client_id || this._defaultTraktClientId() }));
+        }
+        categories.forEach(cat => controls.push(this._categorySettingsBlock(cat)));
+        controls.push(this._saveButton('Save Category Settings & Services', 'fa-solid fa-folder-tree', () => this.saveCategorySettings()));
+        return this._panel('fa-solid fa-folder-open', 'Library Categories', 'Per-category paths, provider toggles, service credentials, naming, lifecycle cadence, and workflow options declared by each category manifest.', controls, 'settings-category-panel');
+    }
+
+
+    /**
+     * Return manifest-driven setup notices for a category.
+     * @private
+     */
+    _categorySetupNotices(cat) {
+        const notices = [];
+        const requirements = cat.setup_requirements || [];
+        const missing = requirements.filter(req => req.required && !req.configured);
+        missing.forEach(req => {
+            notices.push(DOM.el('div', { className: 'setting-item category-setup-notice category-setup-warning' }, [
+                DOM.el('label', {}, [`Configuration needed: ${req.label || req.id}`]),
+                DOM.el('p', {}, [req.why_it_matters || req.description || 'This category needs a required setting before it can operate safely.'])
+            ]));
+        });
+        if (cat.id === 'general') {
+            notices.push(DOM.el('div', { className: 'setting-item category-setup-notice category-general-notice' }, [
+                DOM.el('label', {}, ['General Files category']),
+                DOM.el('p', {}, [
+                    'Use this for exact one-off torrent targets such as documents, archives, datasets, manuals, or audio files. ',
+                    'Review the library path below; richer categories such as TV and Movies still win when they match.'
+                ])
+            ]));
+        }
+        return notices;
+    }
+
+
+
+    /**
+     * Build one manifest-driven category settings block.
+     * @private
+     */
+    _categorySettingsBlock(cat) {
+        const title = `${cat.display_name || cat.id} · local config/categories/${cat.id}.yaml`;
+        const children = [];
+        this._categorySetupNotices(cat).forEach(node => children.push(node));
+
+        const properties = cat.properties || [];
+        if (properties.length) {
+            children.push(this._sectionTitle('Category-owned config'));
+            properties.forEach(prop => {
+                const desc = prop.description || `Category property: ${prop.name}`;
+                children.push(this._createSettingItem(prop.label || prop.name, desc, this._categoryInput(cat, prop)));
+            });
+        }
+
+        const providerRows = this._categoryProviderRows(cat);
+        if (providerRows.length) {
+            children.push(this._sectionTitle('Metadata and discovery providers'));
+            providerRows.forEach(row => children.push(row));
+        }
+
+        const nestedRows = this._categoryNestedConfigRows(cat);
+        if (nestedRows.length) {
+            children.push(this._sectionTitle('Automation, storage, and lifecycle'));
+            nestedRows.forEach(row => children.push(row));
+        }
+
+        const serviceRows = this._categoryServiceRows(cat);
+        if (serviceRows.length) {
+            children.push(this._sectionTitle('Category services'));
+            serviceRows.forEach(row => children.push(row));
+        }
+
+        if (!children.length) {
+            children.push(DOM.el('p', { className: 'empty-msg' }, ['This category has no user-editable settings yet.']));
+        }
+
+        return DOM.el('details', { className: 'settings-details category-settings-details', open: true }, [
+            DOM.el('summary', {}, [title]),
+            DOM.el('div', { className: 'category-settings-body' }, children)
+        ]);
+    }
+
+    /**
+     * Render category-owned provider enable/disable switches.
+     * @private
+     */
+    _categoryProviderRows(cat) {
+        const providers = cat.metadata_providers || [];
+        return providers.map(providerName => {
+            const provider = String(providerName || '').trim();
+            const dataset = { categoryId: cat.id, providerName: provider };
+            const toggle = DOM.el('label', { className: 'toggle-switch' }, [
+                DOM.el('input', { type: 'checkbox', className: 'pref-category-provider-input', dataset }),
+                DOM.el('span', { className: 'slider' })
+            ]);
+            return this._createSettingItem(
+                this._humanizeProviderName(provider),
+                `Enable ${provider} for ${cat.display_name || cat.id}. Saved as metadata.providers.${provider}.enabled in this category config.`,
+                toggle
+            );
+        });
+    }
+
+
+    /**
+     * Render small editable controls for nested category config sections.
+     * @private
+     */
+    _categoryNestedConfigRows(cat) {
+        const rows = [];
+        const catSettings = (((this._settings || {}).category_settings || {})[cat.id]) || {};
+        const scheduler = catSettings.scheduler || null;
+        if (scheduler && typeof scheduler === 'object') {
+            rows.push(this._createSettingItem(
+                'Scheduled category checks',
+                'Enables this category in the background scheduler. Saved as scheduler.enabled in the category YAML.',
+                this._categoryNestedToggle(cat, 'scheduler', 'enabled', 'bool')
+            ));
+        }
+        const storage = catSettings.storage || null;
+        if (storage && typeof storage === 'object' && Object.prototype.hasOwnProperty.call(storage, 'inherit_global_thresholds')) {
+            rows.push(this._createSettingItem(
+                'Inherit global storage thresholds',
+                'Uses the shared disk-space thresholds for this category root. Saved as storage.inherit_global_thresholds.',
+                this._categoryNestedToggle(cat, 'storage', 'inherit_global_thresholds', 'bool')
+            ));
+        }
+        const lifecycle = catSettings.lifecycle_policy || null;
+        if (lifecycle && typeof lifecycle === 'object') {
+            const version = lifecycle.policy_version ? `Policy v${lifecycle.policy_version}` : 'Policy declared';
+            rows.push(this._createSettingItem(
+                'Lifecycle / suggestion policy',
+                'Read-only summary from lifecycle_policy. Edit config/categories YAML directly when changing policy semantics.',
+                DOM.el('span', { className: 'badge' }, [version])
+            ));
+        }
+        return rows;
+    }
+
+    /**
+     * Build a nested category config toggle.
+     * @private
+     */
+    _categoryNestedToggle(cat, sectionName, propertyName, valueType) {
+        const dataset = { categoryId: cat.id, sectionName, propertyName, valueType };
+        const id = `pref-cat-nested-${cat.id}-${sectionName}-${propertyName}`;
+        return DOM.el('label', { className: 'toggle-switch' }, [
+            DOM.el('input', { type: 'checkbox', id, className: 'pref-category-nested-input', dataset }),
+            DOM.el('span', { className: 'slider' })
+        ]);
+    }
+
+    /**
+     * Render service credentials/toggles declared by a category manifest.
+     * @private
+     */
+    _categoryServiceRows(cat) {
+        const rows = [];
+        const seen = new Set();
+        (cat.setup_requirements || []).forEach(req => {
+            const key = req.setting_key || req.id;
+            if (!key) return;
+            if (key === 'library_path') return;
+            const meta = this._serviceSettingMeta(key);
+            if (meta) {
+                const unique = `${cat.id}:${key}`;
+                if (seen.has(unique)) return;
+                seen.add(unique);
+                rows.push(this._createSettingItem(
+                    req.label || meta.label,
+                    req.why_it_matters || req.description || meta.description,
+                    this._categoryServiceControl(cat, req, meta)
+                ));
+                return;
+            }
+            rows.push(this._createSettingItem(
+                req.label || key,
+                req.why_it_matters || req.description || 'Declared by this category manifest.',
+                this._requirementStatusBadge(req)
+            ));
+        });
+        return rows;
+    }
+
+    /**
+     * Known shared integration settings surfaced inside the categories that use them.
+     * @private
+     */
+    _serviceSettingMeta(settingKey) {
+        const meta = {
+            tmdb_api_key: { label: 'TMDB API key', description: 'Used by categories that declare TMDB metadata enrichment.', secret: true, placeholder: '••••••••' },
+            opensubtitles_api_key: { label: 'OpenSubtitles API key', description: 'Used by categories that declare subtitle discovery or matching.', secret: true, placeholder: '••••••••' },
+            plex_url: { label: 'Plex server URL', description: 'Used by categories that can read watch state or library presence from Plex.', secret: false, placeholder: 'http://localhost:32400' },
+            plex_token: { label: 'Plex token', description: 'Used by categories that can read Plex state.', secret: true, placeholder: '••••••••' },
+            trakt_client_id: { label: 'Trakt connection', description: 'Used by categories that can sync watch state through Trakt.', secret: false, placeholder: 'Trakt Client ID', trakt: true }
+        };
+        return meta[settingKey] || null;
+    }
+
+    /**
+     * Create a category service control.
+     * @private
+     */
+    _categoryServiceControl(cat, req, meta) {
+        const settingKey = req.setting_key || req.id;
+        const id = `pref-cat-service-${cat.id}-${settingKey}`;
+        if (meta.trakt) {
+            return DOM.el('div', { className: 'trakt-control category-service-control' }, [
+                DOM.el('div', { className: 'trakt-status-row' }, [
+                    DOM.el('span', { className: 'badge pref-trakt-status' }, ['Not Connected']),
+                    DOM.el('button', { className: 'btn btn-sm btn-secondary', type: 'button', onclick: () => this._startTraktAuth() }, ['Link Account'])
+                ]),
+                DOM.el('input', {
+                    type: 'text',
+                    id,
+                    className: 'pref-category-service-input',
+                    dataset: { settingKey },
+                    placeholder: meta.placeholder,
+                    autocomplete: 'off',
+                    oninput: e => this._syncSharedServiceInputs(settingKey, e.target.value)
+                })
+            ]);
+        }
+        return DOM.el('input', {
+            type: 'text',
+            id,
+            className: `pref-category-service-input${meta.secret ? ' ljs-secret-input' : ''}`,
+            dataset: { settingKey },
+            placeholder: meta.placeholder || '',
+            autocomplete: 'off',
+            'data-lpignore': meta.secret ? 'true' : undefined,
+            'data-1p-ignore': meta.secret ? 'true' : undefined,
+            'data-bwignore': meta.secret ? 'true' : undefined,
+            oninput: e => this._syncSharedServiceInputs(settingKey, e.target.value)
+        });
+    }
+
+    /**
+     * Render a read-only setup requirement status.
+     * @private
+     */
+    _requirementStatusBadge(req) {
+        const configured = req.configured === true || req.required === false;
+        const label = configured ? (req.required === false ? 'Optional' : 'Configured') : 'Needs attention';
+        const cls = configured ? 'success' : 'danger';
+        return DOM.el('span', { className: `badge ${cls}` }, [label]);
+    }
+
+    /**
+     * Build integration payload from category service controls.
+     * @private
+     */
+    _categoryIntegrationPayload() {
+        const payload = {};
+        const seen = new Set();
+        document.querySelectorAll('.pref-category-service-input').forEach(input => {
+            const key = input.dataset.settingKey;
+            if (!key || seen.has(key)) return;
+            const value = String(input.value || '').trim();
+            payload[key] = value || null;
+            seen.add(key);
+        });
+        return payload;
+    }
+
+    /**
+     * Populate category provider toggles from category_settings.
+     * @private
+     */
+    _populateCategoryProviderControls() {
+        document.querySelectorAll('.pref-category-provider-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const provider = input.dataset.providerName;
+            const catSettings = ((this._settings || {}).category_settings || {})[catId] || {};
+            const providerConfig = (((catSettings.metadata || {}).providers || {})[provider]) || null;
+            input.checked = !(providerConfig && providerConfig.enabled === false);
+        });
+    }
+
+
+    /**
+     * Populate nested category config controls.
+     * @private
+     */
+    _populateCategoryNestedControls() {
+        document.querySelectorAll('.pref-category-nested-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const section = input.dataset.sectionName;
+            const prop = input.dataset.propertyName;
+            const catSettings = ((this._settings || {}).category_settings || {})[catId] || {};
+            const sectionConfig = catSettings[section] || {};
+            if (input.type === 'checkbox') input.checked = !!sectionConfig[prop];
+            else input.value = sectionConfig[prop] !== undefined && sectionConfig[prop] !== null ? sectionConfig[prop] : '';
+        });
+    }
+
+    /**
+     * Populate category service credentials from shared integration settings.
+     * @private
+     */
+    _populateCategoryServiceControls() {
+        const defaults = { trakt_client_id: this._defaultTraktClientId() };
+        document.querySelectorAll('.pref-category-service-input').forEach(input => {
+            const key = input.dataset.settingKey;
+            if (!key) return;
+            const value = (this._settings && this._settings[key]) || defaults[key] || '';
+            input.value = value;
+        });
+        const hidden = document.getElementById('pref-trakt-id');
+        if (hidden) hidden.value = (this._settings && this._settings.trakt_client_id) || this._defaultTraktClientId();
+        this._renderTraktStatus();
+    }
+
+    /**
+     * Keep duplicate shared service controls synchronized across categories.
+     * @private
+     */
+    _syncSharedServiceInputs(settingKey, value) {
+        document.querySelectorAll('.pref-category-service-input').forEach(input => {
+            if (input.dataset.settingKey !== settingKey) return;
+            if (input.value !== value) input.value = value;
+        });
+        if (settingKey === 'trakt_client_id') {
+            const hidden = document.getElementById('pref-trakt-id');
+            if (hidden) hidden.value = String(value || '').trim() || this._defaultTraktClientId();
+        }
+    }
+
+    /**
+     * Humanize provider identifiers for labels.
+     * @private
+     */
+    _humanizeProviderName(provider) {
+        const known = { tmdb: 'TMDB', tvmaze: 'TVMaze', opensubtitles: 'OpenSubtitles', trakt: 'Trakt', plex: 'Plex' };
+        return known[provider] || String(provider || '').replace(/[_-]+/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
+    }
+
+    /**
+     * Build storage monitoring panel.
+     * @private
+     */
+    _buildStoragePanel() {
+        return this._panel('fa-solid fa-hard-drive', 'Storage Watch', 'Disk-space status is grouped by physical drive and sent to the assistant before download planning.', [
+            DOM.el('div', { id: 'storage-volume-list', className: 'storage-volume-list' }, [DOM.el('p', { className: 'empty-msg' }, ['Checking storage...'])]),
+            this._saveButton('Refresh Storage Status', 'fa-solid fa-rotate', () => this.loadStorageStatus(), 'quick-btn btn-secondary')
+        ], 'storage-monitor-panel');
+    }
+
+    /**
+     * Build torrent search and metadata services panel.
+     * @private
+     */
+    _buildServicesPanel() {
+        return this._panel('fa-solid fa-plug', 'Shared Torrent Search & Indexers', 'Category-agnostic torrent search infrastructure. Metadata, subtitle, Plex, and Trakt settings are now shown inside the categories that use them.', [
+            this._sectionTitle('Torrent search backend'),
+            this._createSettingItem('Jackett URL', 'Primary torrent indexer endpoint shared by downloadable categories.', DOM.el('input', { type: 'text', id: 'pref-jackett-url', placeholder: 'http://localhost:9117' })),
+            this._createSettingItem('Jackett API key', 'API key for the configured Jackett server.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-jackett-key', placeholder: '••••••••' })),
+            this._createSettingItem('Direct scraper fallback', 'Use slower direct scrapers only when Jackett returns no usable candidates.', this._toggle('pref-direct-scraper-fallback')),
+            this._sectionTitle('Jackett indexers'),
+            DOM.el('div', { id: 'jackett-indexer-health', className: 'setting-item jackett-indexer-health' }, [
+                DOM.el('p', { className: 'empty-msg' }, ['Indexer diagnostics not loaded yet.'])
+            ]),
+            DOM.el('div', { className: 'settings-button-row' }, [
+                this._saveButton('Configure all open/public indexers', 'fa-solid fa-compass', () => this.configureJackettProfile('all_open_public'), 'quick-btn btn-secondary'),
+                this._saveButton('Refresh indexers', 'fa-solid fa-rotate', () => this.loadJackettIndexers(), 'quick-btn btn-secondary'),
+                this._saveButton('Open Jackett UI', 'fa-solid fa-arrow-up-right-from-square', () => this.openJackettUi(), 'quick-btn btn-secondary')
+            ]),
+            DOM.el('details', { className: 'settings-details' }, [
+                DOM.el('summary', {}, ['Advanced: add private/closed tracker indexer']),
+                DOM.el('p', { className: 'empty-msg' }, ['Use this when you have access to a closed tracker. Enter its Jackett indexer ID, load the schema, fill credentials/cookies/passkeys, then configure.']),
+                DOM.el('div', { className: 'tier-control' }, [
+                    DOM.el('input', { type: 'text', id: 'jackett-custom-indexer-id', autocomplete: 'off', placeholder: 'indexer id, e.g. mytracker' }),
+                    DOM.el('button', { className: 'btn btn-sm btn-secondary', type: 'button', onclick: () => this.loadJackettCustomIndexerSchema() }, ['Load fields'])
+                ]),
+                DOM.el('div', { id: 'jackett-custom-indexer-fields', className: 'jackett-custom-indexer-fields' }, []),
+                DOM.el('button', { className: 'btn btn-sm btn-gold', type: 'button', onclick: () => this.configureJackettCustomIndexer() }, ['Configure indexer'])
+            ]),
+            this._saveButton('Save Shared Search Services', 'fa-solid fa-circle-check', () => this.saveServices())
+        ], 'settings-services-panel');
+    }
+
+    /**
+     * Build LLM provider and tier-routing controls.
+     * @private
+     */
+    _buildLlmPanel() {
+        return this._panel('fa-solid fa-brain', 'AI & LLM Gateway', 'Provider, base model, and tier overrides for routing cheap vs. heavy reasoning tasks.', [
+            this._createSettingItem('Active provider', 'Primary inference backend.', DOM.el('select', { id: 'pref-llm-provider', onchange: () => this._syncLlmContextWindowControl(false) }, [
+                DOM.el('option', { value: 'openrouter' }, ['OpenRouter']),
+                DOM.el('option', { value: 'nvidia_nim' }, ['NVIDIA NIM']),
+                DOM.el('option', { value: 'ollama_cloud' }, ['Ollama Cloud']),
+                DOM.el('option', { value: 'ollama_local' }, ['Ollama Local']),
+                DOM.el('option', { value: 'lm_studio' }, ['LM Studio']),
+                DOM.el('option', { value: 'custom' }, ['Custom'])
+            ])),
+            this._createSettingItem('Base model', 'Main model used when a task has no tier override.', DOM.el('input', { type: 'text', id: 'pref-llm-model', placeholder: 'e.g. openrouter/openai/gpt-4o-mini', onchange: () => this._syncLlmContextWindowControl(false) })),
+            this._createSettingItem('API base URL', 'Optional provider endpoint override.', DOM.el('input', { type: 'text', id: 'pref-llm-api-base', placeholder: 'Defaults if blank' })),
+            this._createSettingItem('API key', 'Optional active provider key.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-llm-api-key', placeholder: '••••••••' })),
+            this._sectionTitle('Context budget'),
+            this._createSettingItem('Context window cap', 'Maximum prompt context the app may assemble for the selected model. Defaults to the endpoint-reported maximum. Minimum is 10k tokens unless the endpoint itself is smaller.', this._contextWindowControl()),
+            this._createSettingItem('Context budget percent', 'Safety headroom applied inside the cap before reserving output tokens.', DOM.el('input', { type: 'number', id: 'pref-llm-context-budget-percent', min: '20', max: '100', step: '1', placeholder: '85' })),
+            this._createSettingItem('Raw recent history reserve', 'Percent of conversation-history budget kept uncompressed for the latest turns. Older conversation is compressed into the remaining history budget.', DOM.el('input', { type: 'number', id: 'pref-llm-raw-recent-percent', min: '0', max: '100', step: '1', placeholder: '30' })),
+            this._createSettingItem('Reserved output tokens', 'Optional explicit response-token reserve. Leave blank to use task defaults. The model context window includes these output tokens.', DOM.el('input', { type: 'number', id: 'pref-llm-reserved-output', min: '0', step: '1', placeholder: 'auto' })),
+            this._sectionTitle('Tier overrides'),
+            this._createSettingItem('Lightweight tier', 'Intent routing, summarization, and simple parsing.', this._tierControl('lw')),
+            this._createSettingItem('Standard tier', 'Chat, search orchestration, and normal planning.', this._tierControl('std')),
+            this._createSettingItem('Heavy tier', 'Complex research, comparison, and multi-step reasoning.', this._tierControl('hv')),
+            this._saveButton('Save AI Gateway', 'fa-solid fa-circle-check', () => this.saveLLM())
+        ], 'settings-llm-panel');
+    }
+
+
+    /**
+     * Build local semantic-memory controls and diagnostics.
+     * @private
+     */
+    _buildSemanticMemoryPanel() {
+        return this._panel('fa-solid fa-memory', 'Semantic Memory', 'Local embeddings for long-term chat/context retrieval. Model download is automatic; dependency packaging remains part of the app install.', [
+            this._createSettingItem('Enable semantic memory', 'When enabled, conversations and taste evidence are indexed for category-aware context recall.', this._toggle('pref-embeddings-enabled')),
+            this._createSettingItem('Embedding provider', 'Builtin is the recommended local ONNX/FastEmbed path. Hash fallback is only a visible degraded mode.', DOM.el('select', { id: 'pref-embeddings-provider' }, [
+                DOM.el('option', { value: 'builtin' }, ['Builtin local embeddings']),
+                DOM.el('option', { value: 'disabled' }, ['Disabled']),
+                DOM.el('option', { value: 'hash_fallback' }, ['Hash fallback / diagnostics only'])
+            ])),
+            this._createSettingItem('Builtin model', 'Default target is sentence-transformers/all-MiniLM-L6-v2, a tiny 384-dimensional model under the project size budget.', DOM.el('input', { type: 'text', id: 'pref-embeddings-model', placeholder: 'sentence-transformers/all-MiniLM-L6-v2' })),
+            this._createSettingItem('Model cache folder', 'Where downloaded embedding model files are stored inside app/user data.', DOM.el('input', { type: 'text', id: 'pref-embeddings-cache', placeholder: './data/embedding_models' })),
+            this._createSettingItem('Auto-download model files', 'Fetch missing model files silently during setup/startup instead of asking users to manage them manually.', this._toggle('pref-embeddings-auto-download')),
+            this._createSettingItem('Warm up at startup', 'Initialize the embedding runtime early so first chat recall is not delayed.', this._toggle('pref-embeddings-warmup')),
+            this._sectionTitle('Health & maintenance'),
+            DOM.el('div', { id: 'semantic-memory-health', className: 'setting-item semantic-memory-health' }, [
+                DOM.el('p', { className: 'empty-msg' }, ['Checking semantic memory status...'])
+            ]),
+            DOM.el('div', { className: 'settings-button-row' }, [
+                this._saveButton('Save Semantic Memory', 'fa-solid fa-circle-check', () => this.saveSemanticMemory()),
+                this._saveButton('Refresh Health', 'fa-solid fa-rotate', () => this.loadSemanticMemoryHealth(), 'quick-btn btn-secondary'),
+                this._saveButton('Reindex Memory', 'fa-solid fa-arrows-rotate', () => this.reindexSemanticMemory(), 'quick-btn btn-secondary')
+            ])
+        ], 'settings-semantic-memory-panel');
+    }
+
+    /**
+     * Build communication bridge credentials panel.
+     * @private
+     */
+    _buildBridgesPanel() {
+        return this._panel('fa-solid fa-tower-broadcast', 'Communication Bridges', 'External chat channels for commanding LJS outside the web UI.', [
+            this._createSettingItem('Discord bot token', 'Bot credential for Discord integration.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-discord-token', placeholder: '••••••••' })),
+            this._createSettingItem('Discord channel ID', 'Target channel for notifications and commands.', DOM.el('input', { type: 'text', id: 'pref-discord-channel', placeholder: 'Channel ID number' })),
+            this._createSettingItem('Telegram bot token', 'Bot token from @BotFather.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-telegram-token', placeholder: '••••••••' })),
+            this._createSettingItem('WhatsApp API token', 'Permanent WhatsApp business developer endpoint token.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-whatsapp-token', placeholder: '••••••••' })),
+            this._createSettingItem('WhatsApp phone ID', 'Phone number ID of the sending client node.', DOM.el('input', { type: 'text', id: 'pref-whatsapp-phone', placeholder: 'WhatsApp Phone ID' })),
+            this._createSettingItem('WhatsApp verify token', 'Webhook verification token.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-whatsapp-verify', placeholder: '••••••••' })),
+            this._saveButton('Save Chat Bridges', 'fa-solid fa-circle-check', () => this.saveBridges(), 'quick-btn btn-secondary')
+        ], 'settings-bridges-panel');
+    }
+
+    /**
+     * Build the developer-facing category manifest panel.
+     * @private
+     */
+    _buildManifestPanel() {
+        return this._panel('fa-solid fa-layer-group', 'Advanced Category Contracts', 'Read-only diagnostics showing what each backend category declares: capabilities, UI sections, actions, provider contracts, setup requirements, and config ownership.', [
+            DOM.el('p', { className: 'empty-msg' }, ['This is not another settings form. It is the contract LJS exposes to the UI and LLM so generic code does not hardcode TV/movie behavior.']),
+            DOM.el('div', { id: 'category-manifest-panel' })
+        ], 'settings-manifest-panel');
+    }
+
+    /**
+     * Create a reusable settings panel.
+     * @private
+     */
+    _panel(iconClass, title, desc, children, id) {
+        return DOM.el('section', { className: 'settings-panel glass-panel', id }, [
+            DOM.el('h2', {}, [DOM.el('i', { className: iconClass }), ` ${title}`]),
+            DOM.el('p', { className: 'card-desc settings-panel-desc' }, [desc]),
+            DOM.el('div', { className: 'settings-panel-body' }, children)
+        ]);
+    }
+
+    /**
+     * Create a labelled setting row.
+     * @private
+     */
+    _createSettingItem(title, desc, controlEl) {
+        return DOM.el('div', { className: 'setting-item' }, [
+            DOM.el('div', { className: 'setting-info' }, [DOM.el('h4', {}, [title]), DOM.el('p', {}, [desc])]),
+            DOM.el('div', { className: 'setting-control' }, [controlEl])
+        ]);
+    }
+
+    /**
+     * Create a section heading inside a panel.
+     * @private
+     */
+    _sectionTitle(text) {
+        return DOM.el('h3', { className: 'settings-section-title' }, [text]);
+    }
+
+    /**
+     * Create a toggle switch control.
+     * @private
+     */
+    _toggle(id) {
+        return DOM.el('label', { className: 'toggle-switch' }, [
+            DOM.el('input', { type: 'checkbox', id }),
+            DOM.el('span', { className: 'slider' })
+        ]);
+    }
+
+    /**
+     * Create a standard save button.
+     * @private
+     */
+    _saveButton(text, icon, onClick, className = 'quick-btn') {
+        return DOM.btn('', className, onClick, {
+            type: 'button',
+            content: `<i class="${icon}"></i> ${text}`
+        });
+    }
+
+    /**
+     * Create category property input controls.
+     * @private
+     */
+    _categoryInput(cat, prop) {
+        const inputId = `pref-cat-prop-${cat.id}-${prop.name}`;
+        const dataset = { categoryId: cat.id, propertyName: prop.name, valueType: prop.value_type };
+        if (prop.value_type === 'bool') {
+            return DOM.el('label', { className: 'toggle-switch' }, [
+                DOM.el('input', { type: 'checkbox', className: 'pref-category-prop-input', dataset, id: inputId }),
+                DOM.el('span', { className: 'slider' })
+            ]);
+        }
+        if (prop.value_type === 'int') {
+            return DOM.el('input', { type: 'number', className: 'pref-category-prop-input', dataset, id: inputId });
+        }
+        if (prop.value_type === 'float') {
+            return DOM.el('input', { type: 'number', step: '0.1', className: 'pref-category-prop-input', dataset, id: inputId });
+        }
+        return DOM.el('input', { type: 'text', className: 'pref-category-prop-input', dataset, id: inputId });
+    }
+
+    /**
+     * Build the context-window cap control.
+     * @private
+     */
+    _contextWindowControl() {
+        return DOM.el('div', { className: 'context-window-control' }, [
+            DOM.el('input', {
+                type: 'number',
+                id: 'pref-llm-max-context',
+                min: '10000',
+                step: '1024',
+                placeholder: 'endpoint maximum',
+                oninput: () => this._markManualContextCap()
+            }),
+            DOM.el('div', { id: 'pref-llm-context-help', className: 'empty-msg' }, ['Endpoint context window will be loaded from the selected provider/model.']),
+            DOM.el('button', { className: 'btn btn-sm btn-secondary', type: 'button', onclick: () => this._syncLlmContextWindowControl(true) }, ['Refresh endpoint maximum'])
+        ]);
+    }
+
+    /**
+     * Mark context cap as explicitly edited by the user.
+     * @private
+     */
+    _markManualContextCap() {
+        const el = this._input('pref-llm-max-context');
+        if (el) el.dataset.ljsAutomaticContext = 'false';
+    }
+
+    /**
+     * Load endpoint-reported context-window metadata for the selected model.
+     * @private
+     */
+    async _syncLlmContextWindowControl(refresh) {
+        const provider = this._valueById('pref-llm-provider', 'openrouter');
+        const model = this._valueById('pref-llm-model', '');
+        const input = this._input('pref-llm-max-context');
+        const help = document.getElementById('pref-llm-context-help');
+        if (!input || !provider || !model) return;
+        try {
+            const data = await APIClient.get(`/api/settings/llm/context?provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}&refresh=${refresh ? 'true' : 'false'}`);
+            const maxSelectable = data.max_selectable_context_tokens || 16384;
+            const minSelectable = data.min_selectable_context_tokens || Math.min(10000, maxSelectable);
+            const defaultContext = data.default_context_tokens || 16384;
+            const endpointReported = data.endpoint_context_reported === true;
+            const saved = data.configured_context_tokens;
+            input.min = String(minSelectable);
+            input.max = String(maxSelectable);
+            input.dataset.endpointMaxContext = String(maxSelectable);
+            input.dataset.endpointContextReported = endpointReported ? 'true' : 'false';
+            input.dataset.minimumContext = String(minSelectable);
+            if (saved === null || saved === undefined || input.dataset.ljsAutomaticContext !== 'false') {
+                input.value = String(data.selected_context_tokens || defaultContext);
+                input.dataset.ljsAutomaticContext = saved === null || saved === undefined ? 'true' : 'false';
+            }
+            if (help) {
+                const source = endpointReported ? 'endpoint' : 'fallback default';
+                const loaded = data.loaded_context_tokens ? ` Loaded runtime: ${this._formatTokenCount(data.loaded_context_tokens)}.` : '';
+                const current = saved === null || saved === undefined
+                    ? (endpointReported ? 'endpoint maximum' : 'automatic fallback')
+                    : this._formatTokenCount(data.selected_context_tokens || 0);
+                const manualNote = endpointReported
+                    ? ''
+                    : ` Manual caps up to ${this._formatTokenCount(maxSelectable)} are allowed because this endpoint did not report its real maximum.`;
+                help.textContent = `Detected ${this._formatTokenCount(defaultContext)} context from ${source}.${loaded} Minimum selectable: ${this._formatTokenCount(minSelectable)}. Current saved cap: ${current}.${manualNote}`;
+            }
+        } catch (err) {
+            if (help) help.textContent = `Could not load endpoint context metadata: ${err.message}`;
+        }
+    }
+
+    /**
+     * Return the context-cap payload, preserving 0 and using null for endpoint max.
+     * @private
+     */
+    _llmContextCapPayload() {
+        const el = this._input('pref-llm-max-context');
+        if (!el || el.value === '') return null;
+        const parsed = parseInt(el.value, 10);
+        if (!Number.isFinite(parsed)) return null;
+        const min = parseInt(el.dataset.minimumContext || el.min || '10000', 10);
+        const boundedMin = Number.isFinite(min) && min > 0 ? Math.max(min, parsed) : Math.max(10000, parsed);
+        const max = parseInt(el.dataset.endpointMaxContext || el.max || '0', 10);
+        const bounded = Number.isFinite(max) && max > 0 ? Math.min(boundedMin, max) : boundedMin;
+        const endpointReported = el.dataset.endpointContextReported === 'true';
+        if (endpointReported && Number.isFinite(max) && max > 0 && bounded >= max) return null;
+        return bounded;
+    }
+
+    /**
+     * Render token counts compactly for settings labels.
+     * @private
+     */
+    _formatTokenCount(value) {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n)) return 'unknown';
+        if (n >= 1000000) return `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M tokens`;
+        if (n >= 1000) return `${Math.round(n / 1000)}k tokens`;
+        return `${n} tokens`;
+    }
+
+    /**
+     * Create the pair of model/provider controls for a tier.
+     * @private
+     */
+    _tierControl(prefix) {
+        return DOM.el('div', { className: 'tier-control' }, [
+            DOM.el('input', { type: 'text', id: `pref-llm-${prefix}-model`, placeholder: 'Model override' }),
+            DOM.el('input', { type: 'text', id: `pref-llm-${prefix}-provider`, placeholder: 'Provider' })
+        ]);
+    }
+
+    /**
+     * Create Trakt connection controls.
+     * @private
+     */
+    _traktControl() {
+        return DOM.el('div', { className: 'trakt-control' }, [
+            DOM.el('input', { type: 'hidden', id: 'pref-trakt-id', value: this._defaultTraktClientId() }),
+            DOM.el('div', { className: 'trakt-status-row' }, [
+                DOM.el('span', { id: 'pref-trakt-status', className: 'badge' }, ['Not Connected']),
+                DOM.el('button', { className: 'btn btn-sm btn-secondary', type: 'button', onclick: () => this._startTraktAuth() }, ['Link Account'])
+            ]),
+            DOM.el('details', { className: 'settings-details' }, [
+                DOM.el('summary', {}, ['Remote setup / custom Trakt app']),
+                DOM.el('input', { type: 'text', id: 'pref-trakt-custom-id', placeholder: 'Custom Trakt Client ID', oninput: e => {
+                    const hidden = document.getElementById('pref-trakt-id');
+                    if (hidden) hidden.value = e.target.value.trim() || this._defaultTraktClientId();
+                }})
+            ])
+        ]);
+    }
+
+    /**
+     * Render a storage status row.
+     * @private
+     */
+    _renderStorageVolume(v) {
+        const freeGb = (v.free_bytes / (1024 ** 3)).toFixed(1);
+        const totalGb = (v.total_bytes / (1024 ** 3)).toFixed(1);
+        const usedPct = v.total_bytes ? Math.min(100, Math.max(0, 100 - v.free_percent)).toFixed(1) : '0.0';
+        const categories = (v.category_ids && v.category_ids.length) ? v.category_ids.join(', ') : 'download staging';
+        const statusClass = v.status === 'critical' ? 'danger' : (v.status === 'warning' ? 'highlight' : '');
+        const paths = (v.paths || []).map(p => `${p.category_id || p.purpose}: ${p.path}`).join('\n');
+        return DOM.el('div', { className: 'setting-item', title: paths }, [
+            DOM.el('div', { className: 'setting-info' }, [
+                DOM.el('h4', {}, [`${v.mount_point} · ${categories}`]),
+                DOM.el('p', {}, [v.message || `${freeGb} GB free`]),
+                DOM.el('div', { className: 'storage-meter' }, [DOM.el('div', { style: { width: `${usedPct}%` } })])
+            ]),
+            DOM.el('span', { className: `stat-value ${statusClass}` }, [`${freeGb}/${totalGb} GB`])
+        ]);
+    }
+
+    /**
+     * Populate category property controls.
+     * @private
+     */
+    _populateCategoryControls() {
+        const categories = this._categories || [];
+        categories.forEach(cat => {
+            const catSettings = (this._settings.category_settings || {})[cat.id] || {};
+            (cat.properties || []).forEach(prop => {
+                const inputId = `pref-cat-prop-${cat.id}-${prop.name}`;
+                const val = catSettings[prop.name] !== undefined ? catSettings[prop.name] : prop.default_value;
+                if (prop.value_type === 'bool') this._setCheck(inputId, !!val);
+                else this._setVal(inputId, val !== null && val !== undefined ? val : '');
+            });
+        });
+    }
+
+    /**
+     * Render current Trakt connection state.
+     * @private
+     */
+    _renderTraktStatus() {
+        const statuses = document.querySelectorAll('#pref-trakt-status, .pref-trakt-status');
+        if (!statuses.length) return;
+        const connected = !!(this._settings && this._settings.trakt_access_token);
+        statuses.forEach(status => {
+            status.textContent = connected ? 'Connected' : 'Not Connected';
+            status.classList.toggle('success', connected);
+            status.classList.toggle('danger', !connected);
+        });
+    }
+
+    /**
+     * Start the Trakt auth flow when the optional helper is loaded.
+     * @private
+     */
+    _startTraktAuth() {
+        if (typeof window.startTraktAuth === 'function') window.startTraktAuth();
+        else ljsAlert('Trakt Auth script not loaded.', { title: 'Trakt Setup' });
+    }
+
+    /**
+     * Make a settings panel collapsible while preserving form contents.
+     * @private
+     */
+    _makeCollapsible(panelEl) {
+        const header = panelEl.querySelector('h2');
+        if (!header) return;
+        const chevron = DOM.el('i', { className: 'fa-solid fa-chevron-up toggle-chevron' });
+        header.appendChild(chevron);
+        const cardId = panelEl.id || header.innerText.trim().toLowerCase().replace(/[^a-z0-9]/g, '-');
+        const isCollapsed = localStorage.getItem(`settings-collapsed-${cardId}`) === 'true';
+        panelEl.classList.toggle('collapsed', isCollapsed);
+        chevron.className = isCollapsed ? 'fa-solid fa-chevron-down toggle-chevron' : 'fa-solid fa-chevron-up toggle-chevron';
+        header.addEventListener('click', () => {
+            const collapsed = panelEl.classList.toggle('collapsed');
+            localStorage.setItem(`settings-collapsed-${cardId}`, collapsed);
+            chevron.className = collapsed ? 'fa-solid fa-chevron-down toggle-chevron' : 'fa-solid fa-chevron-up toggle-chevron';
+        });
+    }
+
+    /**
+     * Return a DOM input by ID.
+     * @private
+     */
+    _input(id) {
+        return document.getElementById(id);
+    }
+
+    /**
+     * Set an input value when it exists.
+     * @private
+     */
+    _setVal(id, val) {
+        const el = this._input(id);
+        if (el) el.value = val;
+    }
+
+    /**
+     * Set a checkbox value when it exists.
+     * @private
+     */
+    _setCheck(id, checked) {
+        const el = this._input(id);
+        if (el) el.checked = checked;
+    }
+
+    /**
+     * Read a raw string value with a fallback.
+     * @private
+     */
+    _valueById(id, fallback) {
+        const el = this._input(id);
+        return el ? el.value : fallback;
+    }
+
+    /**
+     * Read a nullable string value.
+     * @private
+     */
+    _nullableValueById(id) {
+        const el = this._input(id);
+        const value = el ? String(el.value || '').trim() : '';
+        return value || null;
+    }
+
+    /**
+     * Read an integer value with a fallback.
+     * @private
+     */
+    _intValue(el, fallback) {
+        const parsed = el && el.value !== '' ? parseInt(el.value, 10) : NaN;
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    /**
+     * Read a non-negative integer by ID, preserving zero.
+     * @private
+     */
+    _intOrZeroById(id) {
+        const el = this._input(id);
+        if (!el || el.value === '') return 0;
+        const parsed = parseInt(el.value, 10);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    }
+
+    /**
+     * Read a nullable non-negative integer by ID, preserving zero.
+     * @private
+     */
+    _nonNegativeIntOrNullById(id) {
+        const el = this._input(id);
+        if (!el || el.value === '') return null;
+        const parsed = parseInt(el.value, 10);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    }
+
+    /**
+     * Read a nullable integer by ID.
+     * @private
+     */
+    _intOrNullById(id) {
+        const el = this._input(id);
+        if (!el || el.value === '') return null;
+        const parsed = parseInt(el.value, 10);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    }
+
+    /**
+     * Read an integer by ID with a fallback.
+     * @private
+     */
+    _intById(id, fallback) {
+        return this._intValue(this._input(id), fallback);
+    }
+
+    /**
+     * Read a float by ID with a fallback.
+     * @private
+     */
+    _floatById(id, fallback) {
+        const el = this._input(id);
+        const parsed = el && el.value !== '' ? parseFloat(el.value) : NaN;
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    /**
+     * Coerce category input values using manifest type metadata.
+     * @private
+     */
+    _coerceCategoryValue(input, type) {
+        if (type === 'bool') return input.checked;
+        if (type === 'int') return parseInt(input.value, 10) || 0;
+        if (type === 'float') return parseFloat(input.value) || 0.0;
+        return input.value.trim();
+    }
+
+    /**
+     * Return the bundled Trakt client ID fallback.
+     * @private
+     */
+    _defaultTraktClientId() {
+        return '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac';
+    }
+}
+
+window.SettingsPanel = SettingsPanel;

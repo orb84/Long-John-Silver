@@ -1,0 +1,25 @@
+# Category-specific configuration for standalone movie media.
+category_id: movie
+enabled: true
+paths:
+  library_path: ./library/Movies
+properties:
+  naming_template: "{title} ({year})/{title} ({year}) {quality}"
+metadata:
+  providers:
+    tmdb:
+      enabled: true
+lifecycle_policy:
+  policy_version: 2
+  identity_fields: [provider, external_id, title, year, edition]
+  lifecycle_fields: [library_presence, quality, language, edition, release_age, metadata_complete]
+  suggestion_types: [quality_upgrade, better_release, metadata_repair, related_media]
+  invalidation_triggers: [library_changed, metadata_changed, taste_changed, download_completed, download_failed, user_quality_or_language_changed, manual_refresh, policy_version_changed]
+  llm_policy_description: >-
+    Movie suggestions normally concern metadata repair, better releases, quality upgrades,
+    language/subtitle preferences, and related recommendations. A finished movie should
+    not be refreshed frequently unless library quality, metadata, or user preferences change.
+scheduler:
+  enabled: true
+storage:
+  inherit_global_thresholds: true

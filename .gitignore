@@ -1,0 +1,58 @@
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+config/settings.yaml
+config/settings.local.yaml
+config/settings.*.local.yaml
+config/categories/*.yaml
+config/categories/*.yml
+config/local*.yaml
+config/*secret*.yaml
+!config/settings.template.yaml
+!config/category-templates/
+!config/category-templates/*.yaml
+
+# Runtime key stores, local databases, caches, and diagnostics
+data/api_keys.json
+data/*.db
+data/*.sqlite*
+data/*.jsonl
+data/jackett/
+data/logs/
+data/cache/
+data/categories/*/metadata/
+data/embedding_models/
+diagnostics/
+*.log
+
+# Local download/library directories
+downloads/
+library/
+
+# Python runtime/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Node/Electron/frontend artifacts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+.DS_Store
+._*
+
+# Working-session history, generated reliability notes, and review scratchpads
+/docs/project-history/

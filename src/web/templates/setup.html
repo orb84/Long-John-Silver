@@ -1,0 +1,1389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LJS — Set Sail</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="icon" href="data:,">
+    <style>
+        :root {
+            --text: var(--text-main);
+        }
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: #06090e;
+            overflow-x: hidden;
+            overflow-y: auto;
+            margin: 0;
+            padding: 2rem 0;
+            box-sizing: border-box;
+            font-family: 'Inter', sans-serif;
+            color: var(--text);
+        }
+
+        .setup-wrapper {
+            position: relative;
+            z-index: 10;
+            width: min(760px, calc(100vw - 32px));
+            max-width: 760px;
+            padding: 2rem 1.5rem;
+            box-sizing: border-box;
+        }
+
+        .setup-brand {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .setup-brand h1 {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--accent-gold), #fff 60%, var(--accent-teal));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-size: 2.2rem;
+            margin: 0 0 0.4rem 0;
+            letter-spacing: -0.5px;
+        }
+
+        .setup-brand p {
+            color: var(--text-dim);
+            font-size: 0.88rem;
+            margin: 0;
+        }
+
+        /* ─── Stepper ──────────────────────────────────── */
+        .stepper {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2.5rem;
+            padding: 0 10px;
+        }
+
+        .stepper-step {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
+        }
+
+        .stepper-dot {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+            font-weight: 700;
+            background: rgba(255, 255, 255, 0.04);
+            border: 2px solid var(--glass-border);
+            color: var(--text-dim);
+            transition: all 0.4s cubic-bezier(0.165, 0.84, 0.44, 1);
+            z-index: 2;
+        }
+
+        .stepper-dot.active {
+            background: var(--accent-gold);
+            border-color: var(--accent-gold);
+            color: #0b0e14;
+            box-shadow: 0 0 20px rgba(244, 162, 97, 0.4);
+        }
+
+        .stepper-dot.completed {
+            background: var(--accent-teal);
+            border-color: var(--accent-teal);
+            color: #0b0e14;
+            box-shadow: 0 0 15px rgba(42, 157, 143, 0.3);
+        }
+
+        .stepper-label {
+            font-size: 0.72rem;
+            font-weight: 500;
+            color: var(--text-dim);
+            margin-top: 0.5rem;
+            text-align: center;
+            white-space: nowrap;
+            transition: color 0.3s;
+        }
+
+        .stepper-step.active .stepper-label {
+            color: var(--accent-gold);
+            font-weight: 600;
+        }
+
+        .stepper-step.completed .stepper-label {
+            color: var(--accent-teal);
+        }
+
+        .stepper-line {
+            flex-grow: 1;
+            height: 2px;
+            background: var(--glass-border);
+            margin: 0 8px;
+            margin-top: -16px;
+            transition: background-color 0.4s;
+            z-index: 1;
+        }
+
+        .stepper-line.completed {
+            background: var(--accent-teal);
+        }
+
+        /* ─── Step panels ──────────────────────────────── */
+        .step-panel {
+            display: none;
+            animation: slideUp 0.5s cubic-bezier(0.165, 0.84, 0.44, 1) forwards;
+        }
+
+        .step-panel.active {
+            display: block;
+        }
+
+        .step-panel .glass-panel {
+            max-height: 70vh;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+        }
+
+        .step-panel .glass-panel::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .step-panel .glass-panel::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .step-panel .glass-panel::-webkit-scrollbar-thumb {
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .step-title {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 700;
+            color: var(--accent-gold);
+            font-size: 1.35rem;
+            margin: 0 0 0.5rem 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .step-desc {
+            color: var(--text-dim);
+            font-size: 0.88rem;
+            margin: 0 0 1.8rem 0;
+            line-height: 1.6;
+        }
+
+
+
+        /* ─── Setup action buttons ───────────────────────── */
+        .setup-actions,
+        .step-actions {
+            position: sticky;
+            bottom: 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.9rem;
+            margin-top: 2rem;
+            padding: 0.9rem;
+            border: 1px solid rgba(255, 255, 255, 0.09);
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(10, 16, 29, 0.72), rgba(6, 9, 14, 0.95));
+            backdrop-filter: blur(12px);
+            box-shadow: 0 -16px 36px rgba(0,0,0,0.20);
+        }
+
+        .step-actions .btn {
+            min-height: 44px;
+            min-width: 132px;
+            padding: 0.78rem 1.15rem;
+            border-radius: 999px;
+            border: 1px solid var(--glass-border);
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.88rem;
+            font-weight: 700;
+            letter-spacing: 0.01em;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            cursor: pointer;
+            transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+            appearance: none;
+            -webkit-appearance: none;
+        }
+
+        .step-actions .btn:hover {
+            transform: translateY(-1px);
+        }
+
+        .step-actions .btn:active {
+            transform: translateY(0);
+        }
+
+        .step-actions .btn-gold {
+            background: linear-gradient(135deg, var(--accent-gold), #ffd8a8);
+            border-color: rgba(244, 162, 97, 0.65);
+            color: #10141c;
+            box-shadow: 0 12px 30px rgba(244, 162, 97, 0.18);
+        }
+
+        .step-actions .btn-skip {
+            background: rgba(255, 255, 255, 0.045);
+            color: var(--text);
+            border-color: rgba(255, 255, 255, 0.12);
+        }
+
+        .step-actions .btn-skip:hover {
+            border-color: rgba(42, 157, 143, 0.45);
+            background: rgba(42, 157, 143, 0.08);
+            color: var(--accent-teal);
+        }
+
+        .step-actions .btn-gold:hover {
+            box-shadow: 0 16px 36px rgba(244, 162, 97, 0.26);
+        }
+
+        @media (max-width: 520px) {
+            .step-actions {
+                flex-direction: column-reverse;
+                align-items: stretch;
+            }
+
+            .step-actions .btn {
+                width: 100%;
+            }
+        }
+
+        .setup-preferences-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 16px;
+            align-items: start;
+        }
+        .setup-preferences-grid .form-group { min-width: 0; }
+        .setup-preferences-grid label { min-height: 2.2em; display: flex; align-items: flex-end; }
+        .setup-preferences-grid select { width: 100%; }
+        .setup-final-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            text-decoration: none;
+            padding: 14px 34px;
+            border-radius: 999px;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+            color: #10141c !important;
+            background: linear-gradient(135deg, var(--accent-gold), #ffe0b6);
+            border: 1px solid rgba(244, 162, 97, 0.75);
+            box-shadow: 0 18px 40px rgba(244,162,97,.28), 0 0 0 1px rgba(255,255,255,.12) inset;
+        }
+        .setup-final-link:hover { transform: translateY(-1px); box-shadow: 0 24px 50px rgba(244,162,97,.36); }
+
+        .setup-path-grid {
+            display: grid;
+            gap: 0.9rem;
+        }
+
+        .setup-path-picker {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 10px;
+            align-items: stretch;
+            width: 100%;
+        }
+
+        .setup-path-picker input {
+            width: 100%;
+            min-width: 0;
+            box-sizing: border-box;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        }
+
+        .setup-browse-btn,
+        .path-browser-btn {
+            border: 1px solid rgba(244, 162, 97, 0.38);
+            border-radius: 10px;
+            background: rgba(244, 162, 97, 0.08);
+            color: var(--accent-gold);
+            font-family: 'Outfit', sans-serif;
+            font-weight: 700;
+            cursor: pointer;
+            padding: 0 14px;
+            min-height: 42px;
+            white-space: nowrap;
+        }
+
+        .setup-browse-btn:hover,
+        .path-browser-btn:hover {
+            border-color: rgba(244, 162, 97, 0.7);
+            background: rgba(244, 162, 97, 0.14);
+        }
+
+        .path-browser-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 20000;
+            background: rgba(3, 6, 13, 0.74);
+            backdrop-filter: blur(10px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            box-sizing: border-box;
+        }
+
+        .path-browser-modal {
+            width: min(1060px, 100%);
+            max-height: min(760px, calc(100vh - 48px));
+            background: linear-gradient(180deg, rgba(14, 23, 44, 0.96), rgba(8, 14, 27, 0.98));
+            border: 1px solid var(--glass-border);
+            border-radius: 22px;
+            box-shadow: 0 30px 80px rgba(0,0,0,.55);
+            display: grid;
+            grid-template-rows: auto auto minmax(220px, 1fr) auto;
+            overflow: hidden;
+        }
+
+        .path-browser-head,
+        .path-browser-footer {
+            padding: 16px 18px;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .path-browser-footer {
+            border-top: 1px solid rgba(255,255,255,.08);
+            border-bottom: none;
+            flex-wrap: wrap;
+        }
+
+        .path-browser-title {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 800;
+            color: var(--accent-gold);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .path-browser-subtitle {
+            color: var(--text-dim);
+            font-size: .78rem;
+            margin-top: 3px;
+        }
+
+        .path-browser-toolbar {
+            padding: 12px 18px;
+            display: grid;
+            grid-template-columns: auto auto minmax(0, 1fr) auto;
+            gap: 8px;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+        }
+
+        .path-browser-toolbar input,
+        .path-browser-new-folder input {
+            width: 100%;
+            min-width: 0;
+            box-sizing: border-box;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        }
+
+        .path-browser-body {
+            display: grid;
+            grid-template-columns: 280px minmax(0, 1fr);
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .path-browser-sidebar {
+            border-right: 1px solid rgba(255,255,255,.08);
+            background: rgba(255,255,255,.025);
+            padding: 12px;
+            overflow-y: auto;
+        }
+
+        .path-browser-main {
+            padding: 12px 18px;
+            overflow-y: auto;
+            min-width: 0;
+        }
+
+        .path-browser-sidebar-title {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 800;
+            color: var(--text-bright);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+
+        .path-browser-sidebar-hint {
+            color: var(--text-dim);
+            font-size: .72rem;
+            line-height: 1.35;
+            margin-bottom: 12px;
+        }
+
+        .path-browser-roots {
+            display: grid;
+            gap: 7px;
+        }
+
+        .path-browser-root-group-label {
+            margin: 12px 4px 2px;
+            color: var(--accent-teal);
+            font-family: 'Outfit', sans-serif;
+            font-weight: 800;
+            font-size: .72rem;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+        }
+
+        .path-browser-root-item {
+            border: 1px solid rgba(255,255,255,.07);
+            border-radius: 12px;
+            background: rgba(255,255,255,.035);
+            color: var(--text-main);
+            padding: 10px;
+            cursor: pointer;
+            display: grid;
+            grid-template-columns: 22px minmax(0, 1fr);
+            gap: 10px;
+            align-items: center;
+            text-align: left;
+            width: 100%;
+        }
+
+        .path-browser-root-item:hover,
+        .path-browser-root-item.active {
+            border-color: rgba(244, 162, 97, .4);
+            background: rgba(244, 162, 97, .08);
+        }
+
+        .path-browser-root-item i {
+            color: var(--accent-gold);
+            text-align: center;
+        }
+
+        .path-browser-root-item strong,
+        .path-browser-root-item small {
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .path-browser-root-item strong {
+            font-size: .84rem;
+        }
+
+        .path-browser-root-item small {
+            margin-top: 2px;
+            color: var(--text-dim);
+            font-size: .68rem;
+        }
+
+        .path-browser-row {
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr) auto;
+            gap: 12px;
+            align-items: center;
+            padding: 11px 10px;
+            border: 1px solid rgba(255,255,255,.06);
+            background: rgba(255,255,255,.025);
+            border-radius: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+        }
+
+        .path-browser-row:hover {
+            border-color: rgba(244, 162, 97, .32);
+            background: rgba(244, 162, 97, .06);
+        }
+
+        .path-browser-name {
+            font-weight: 700;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .path-browser-meta {
+            color: var(--text-dim);
+            font-size: .72rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .path-browser-status {
+            color: var(--text-dim);
+            font-size: .82rem;
+            min-height: 20px;
+        }
+
+        .path-browser-new-folder {
+            display: grid;
+            grid-template-columns: minmax(180px, 1fr) auto;
+            gap: 8px;
+            flex: 1 1 360px;
+        }
+
+        @media (max-width: 680px) {
+            .setup-path-picker,
+            .path-browser-toolbar,
+            .path-browser-new-folder {
+                grid-template-columns: 1fr;
+            }
+            .path-browser-body {
+                grid-template-columns: 1fr;
+            }
+            .path-browser-sidebar {
+                border-right: none;
+                border-bottom: 1px solid rgba(255,255,255,.08);
+                max-height: 220px;
+            }
+            .path-browser-head,
+            .path-browser-footer {
+                align-items: stretch;
+                flex-direction: column;
+            }
+        }
+        @media (max-width: 680px) {
+            .setup-preferences-grid { grid-template-columns: 1fr; }
+        }
+
+        /* ─── Guide Sections ───────────────────────────── */
+        .guide-box {
+            background: rgba(42, 157, 143, 0.08);
+            border: 1px solid rgba(42, 157, 143, 0.2);
+            border-radius: 12px;
+            padding: 14px;
+            margin-bottom: 1.5rem;
+            font-size: 0.82rem;
+            line-height: 1.5;
+            color: var(--text-dim);
+        }
+
+        .guide-box strong {
+            color: var(--accent-teal);
+        }
+
+        .api-link {
+            color: var(--accent-teal);
+            text-decoration: none;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            transition: color 0.2s;
+        }
+
+        .api-link:hover {
+            color: var(--accent-gold);
+            text-decoration: underline;
+        }
+
+        /* ─── Channel cards ────────────────────────────── */
+        .channel-cards {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .channel-card {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--glass-border);
+            border-radius: 14px;
+            padding: 1.2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.165, 0.84, 0.44, 1);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .channel-card:hover {
+            border-color: rgba(255, 255, 255, 0.2);
+            transform: translateY(-2px);
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .channel-card.selected {
+            border-color: var(--accent-gold);
+            background: rgba(244, 162, 97, 0.08);
+            box-shadow: 0 0 15px rgba(244, 162, 97, 0.1);
+        }
+
+        .channel-card .card-icon {
+            font-size: 1.8rem;
+            color: var(--accent-gold);
+            margin-bottom: 4px;
+        }
+
+        .channel-card .card-label {
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--text);
+        }
+
+        .channel-card .card-sub {
+            font-size: 0.76rem;
+            color: var(--text-dim);
+            line-height: 1.4;
+        }
+
+        .channel-config {
+            display: none;
+            margin-top: 1.2rem;
+            padding: 1.2rem;
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .channel-config.visible {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .success-box {
+            text-align: center;
+            padding: 2.5rem 0;
+        }
+
+        .success-box .ship-wheel {
+            font-size: 4rem;
+            color: var(--accent-gold);
+            margin-bottom: 1.5rem;
+            animation: spinWheel 20s linear infinite;
+            display: inline-block;
+        }
+
+        @keyframes spinWheel {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .success-box h2 {
+            font-family: 'Outfit', sans-serif;
+            color: var(--accent-gold);
+            font-size: 1.8rem;
+            margin: 0 0 0.6rem 0;
+        }
+
+        .success-box p {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+            margin-bottom: 2rem;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Ambient ocean background and bubble effects -->
+    <div class="ocean-bg"></div>
+    <div class="bubbles-container" id="bubbles"></div>
+
+    <div class="setup-wrapper">
+        <div class="setup-brand">
+            <h1>LONG JOHN SILVER</h1>
+            <p>Vessel Configuration Quartermaster</p>
+        </div>
+
+        {# ─── Stepper Progress Bar ───────────────────── #}
+        <div class="stepper">
+            <div class="stepper-step active" id="step-dot-1">
+                <div class="stepper-dot active" id="dot-1">1</div>
+                <div class="stepper-label">Access</div>
+            </div>
+            <div class="stepper-line" id="line-1"></div>
+            <div class="stepper-step" id="step-dot-2">
+                <div class="stepper-dot" id="dot-2">2</div>
+                <div class="stepper-label">Cargo Paths</div>
+            </div>
+            <div class="stepper-line" id="line-2"></div>
+            <div class="stepper-step" id="step-dot-3">
+                <div class="stepper-dot" id="dot-3">3</div>
+                <div class="stepper-label">AI Brain</div>
+            </div>
+            <div class="stepper-line" id="line-3"></div>
+            <div class="stepper-step" id="step-dot-4">
+                <div class="stepper-dot" id="dot-4">4</div>
+                <div class="stepper-label">Towers</div>
+            </div>
+            <div class="stepper-line" id="line-4"></div>
+            <div class="stepper-step" id="step-dot-5">
+                <div class="stepper-dot" id="dot-5">5</div>
+                <div class="stepper-label">Automation</div>
+            </div>
+        </div>
+
+        {# ─── Step 1: Password Lock ────────────────────── #}
+        <div class="step-panel active" id="step-1">
+            <div class="glass-panel" style="padding: 2rem;">
+                <h2 class="step-title"><i class="fa-solid fa-key"></i> Lock the Captain's Cabin</h2>
+                <p class="step-desc">Protect your control dashboard with a master password. Leave blank if you are running this locally and do not need credential gates.</p>
+                
+                <div class="form-group">
+                    <label>Master Password <span style="font-weight: normal; color: var(--text-dim);">(Leave empty for open access)</span></label>
+                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-password" placeholder="Choose your password...">
+                </div>
+                
+                <div class="form-group">
+                    <label>Confirm Password</label>
+                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-password-confirm" placeholder="Re-type password to verify...">
+                </div>
+                
+                <div class="step-actions">
+                    <button class="btn btn-skip" onclick="skipPassword()"><i class="fa-solid fa-unlock"></i> Open Access</button>
+                    <button class="btn btn-gold" onclick="savePassword()">Next <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </div>
+        </div>
+
+        {# ─── Step 2: Directories & Libraries ──────────── #}
+        <div class="step-panel" id="step-2">
+            <div class="glass-panel" style="padding: 2rem;">
+                <h2 class="step-title"><i class="fa-solid fa-folder-open"></i> Define the Cargo Holds</h2>
+                <p class="step-desc">Set the global download directory, then configure each category's own library folder. Category folders are saved to ignored <code>config/categories/&lt;category_id&gt;.yaml</code> files. Global setup writes ignored <code>config/settings.local.yaml</code>, created from <code>config/settings.template.yaml</code>.</p>
+                
+                <div class="guide-box">
+                    <i class="fa-solid fa-circle-info"></i> <strong>How it works:</strong> LJS downloads torrent chunks into the <strong>Download Directory</strong>. Once finished, it verifies the video file and organizes it into the category folder declared by that category config file.
+                </div>
+
+                <div class="form-group setup-path-grid">
+                    <label>Download Directory</label>
+                    <div class="setup-path-picker">
+                        <input type="text" id="setup-download-dir" class="setup-path-input" value="{{ settings.download_dir or './downloads' }}" placeholder="e.g. /home/user/downloads">
+                        <button type="button" class="setup-browse-btn" onclick="openServerPathBrowser('setup-download-dir', 'Download Directory')"><i class="fa-solid fa-folder-tree"></i> Browse server</button>
+                    </div>
+                </div>
+
+                <h3 style="font-family: 'Outfit', sans-serif; font-size: 0.95rem; color: var(--accent-teal); margin: 1.5rem 0 0.8rem 0; border-bottom: 1px solid var(--glass-border); padding-bottom: 6px;">Category-Owned Library Destinations</h3>
+                
+                {% for category in categories %}
+                <div class="form-group setup-path-grid">
+                    <label>{{ category.display_name }} Target Folder</label>
+                    {% for p in category.properties %}
+                        {% if p.name == 'library_path' %}
+                            <div class="setup-path-picker">
+                                <input type="text" class="setup-category-path setup-path-input" data-category-id="{{ category.id }}" data-category-name="{{ category.display_name }}" value="{{ p.value or '' }}" placeholder="{{ p.default_value or './library/' ~ category.default_folder }}">
+                                <button type="button" class="setup-browse-btn" onclick="openServerPathBrowserForInput(this.previousElementSibling)"><i class="fa-solid fa-folder-tree"></i> Browse server</button>
+                            </div>
+                        {% endif %}
+                    {% endfor %}
+                    {% if category.setup_requirements %}
+                    <div class="guide-box" style="margin-top: 10px; margin-bottom: 0;">
+                        <strong>{{ category.display_name }} needs:</strong>
+                        <ul style="margin: 8px 0 0 18px; padding: 0;">
+                            {% for req in category.setup_requirements %}
+                            <li style="margin-bottom: 6px;">
+                                <span style="color: {{ 'var(--accent-teal)' if req.configured else 'var(--accent-gold)' }};">{{ '✓' if req.configured else '•' }}</span>
+                                <strong>{{ req.label }}</strong> — {{ req.description }}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+
+                <div id="setup-requirements-summary" class="guide-box" style="display: none;"></div>
+                
+                <div class="step-actions">
+                    <button class="btn btn-skip" onclick="goStep(1)"><i class="fa-solid fa-arrow-left"></i> Back</button>
+                    <button class="btn btn-gold" onclick="savePaths()">Next <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </div>
+        </div>
+
+        {# ─── Step 3: AI Brain & Metadata APIs ─────────── #}
+        <div class="step-panel" id="step-3">
+            <div class="glass-panel" style="padding: 2rem;">
+                <h2 class="step-title"><i class="fa-solid fa-brain"></i> Commission the AI Assistant</h2>
+                <p class="step-desc">Pick an LLM provider presets to act as the ship's brain. Ollama and LM Studio can run locally on your system for free without any web keys!</p>
+                
+                <div class="form-group">
+                    <label>Inference Provider</label>
+                    <select id="setup-provider" onchange="onSetupProviderChange(this)">
+                        {% for preset in presets %}
+                        <option value="{{ preset.id }}" {{ 'selected' if preset.id == default_provider }}>{{ preset.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div id="setup-provider-info" class="guide-box" style="margin-bottom: 1.2rem; display: none;"></div>
+
+                <div class="form-group">
+                    <label>API Base Endpoint URL</label>
+                    <input type="text" id="setup-api-base" value="{{ default_api_base }}" placeholder="https://openrouter.ai/api/v1">
+                </div>
+
+                <div class="form-group" id="setup-api-key-group">
+                    <label>Provider API Key</label>
+                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-api-key" placeholder="Your API key...">
+                    <div style="font-size: 0.76rem; color: var(--text-dim); margin-top: 4px;" id="key-help-link">
+                        <i class="fa-solid fa-key"></i> Generate your key here: <a href="https://openrouter.ai/keys" target="_blank" class="api-link" id="provider-signup-link">OpenRouter Keys <i class="fa-solid fa-up-right-from-square"></i></a>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Search and Select Model</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="setup-model-search" placeholder="Filter model catalog..." oninput="filterSetupModels(this.value)" style="flex: 1;">
+                        <select id="setup-model-select" onchange="onSetupModelSelect(this)" style="width: 180px;">
+                            <option value="">— Choose model —</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Model ID Identifier</label>
+                    <input type="text" id="setup-model" value="{{ default_model }}" placeholder="e.g. openrouter/openai/gpt-4o-mini">
+                </div>
+
+                {# ─── Media Metadata Integrations ─── #}
+                <h3 style="font-family: 'Outfit', sans-serif; font-size: 0.95rem; color: var(--accent-teal); margin: 2rem 0 0.8rem 0; border-bottom: 1px solid var(--glass-border); padding-bottom: 6px;">
+                    <i class="fa-solid fa-circle-nodes"></i> Media Intelligence APIs
+                </h3>
+                <p class="step-desc" style="font-size: 0.8rem; margin-bottom: 1rem;">Provide metadata keys so the Quartermaster can look up titles, years, artwork, cast details, air dates for episodic categories, and metadata-backed suggestions.</p>
+
+                <!-- TMDB (Highly Recommended) -->
+                <div style="background: rgba(255,255,255,0.01); border: 1px solid var(--glass-border); padding: 12px; border-radius: 10px; margin-bottom: 1rem;">
+                    <strong style="color: var(--accent-gold); font-size: 0.85rem;">TMDB — The Movie Database (Highly Recommended)</strong>
+                    <p style="font-size: 0.76rem; color: var(--text-dim); margin: 4px 0 8px 0; line-height: 1.4;">
+                        Provides genres, cast, ratings, and posters. LJS cannot scan or make smart recommendations without this.
+                        <br><i class="fa-solid fa-circle-arrow-right"></i> <a href="https://www.themoviedb.org/signup" target="_blank" class="api-link">Register TMDB Account <i class="fa-solid fa-up-right-from-square"></i></a> then get API key from Settings.
+                    </p>
+                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-tmdb-key" placeholder="Paste your TMDB API Key..." style="font-size: 0.8rem;">
+                </div>
+
+                <!-- Trakt -->
+                <div style="background: rgba(255,255,255,0.01); border: 1px solid var(--glass-border); padding: 12px; border-radius: 10px; margin-bottom: 1rem;">
+                    <strong style="color: var(--accent-gold); font-size: 0.85rem;">Trakt.tv — Personalized Discovery</strong>
+                    <p style="font-size: 0.76rem; color: var(--text-dim); margin: 4px 0 8px 0; line-height: 1.4;">
+                        Links your account for personalized recommendations and watch-state aware automation. It uses the bundled LJS Trakt client ID by default; advanced users can supply their own app client ID.
+                        <br><i class="fa-solid fa-circle-arrow-right"></i> <a href="https://trakt.tv/signup" target="_blank" class="api-link">Create Trakt Account <i class="fa-solid fa-up-right-from-square"></i></a>
+                    </p>
+                    <input type="hidden" id="setup-trakt-id" value="42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac">
+                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                        <span id="setup-trakt-status" class="badge" style="background: rgba(231, 111, 81, 0.15); color: var(--accent-red); border-color: rgba(231, 111, 81, 0.3); font-size: 0.7rem; padding: 3px 8px; border-radius: 4px; border: 1px solid;" title="Not authenticated yet">Not Connected</span>
+                        <button onclick="startTraktAuth()" class="btn btn-skip" style="font-size: 0.7rem; padding: 6px 12px; margin: 0;"><i class="fa-solid fa-link"></i> Link Account</button>
+                    </div>
+                    
+                    <!-- Trakt Code / PIN input -->
+                    <div style="margin-top: 10px; padding: 10px; background: rgba(0,0,0,0.15); border: 1px dashed var(--glass-border); border-radius: 8px;">
+                        <span style="font-size: 0.72rem; color: var(--text-dim); display: block; margin-bottom: 6px;">
+                            <i class="fa-solid fa-circle-info"></i> Copy the <strong>PIN / Authorization Code</strong> shown on the Trakt popup screen and paste it below:
+                        </span>
+                        <div style="display: flex; gap: 8px;">
+                            <input type="text" id="setup-trakt-pasted-url" placeholder="Paste Trakt PIN or callback URL here..." style="font-size: 0.75rem; padding: 4px 8px; flex: 1; margin: 0; box-sizing: border-box; background: rgba(0,0,0,0.2); border: 1px solid var(--glass-border); color: var(--text);">
+                            <button onclick="submitSetupTraktPastedUrl()" class="btn btn-save" style="font-size: 0.7rem; padding: 4px 10px; margin: 0;"><i class="fa-solid fa-check"></i> Submit</button>
+                        </div>
+                    </div>
+                    
+                    <div id="setup-trakt-advanced-container" style="display:none; margin-top:12px; background: rgba(255,255,255,0.02); padding: 10px; border-radius: 8px; border: 1px solid var(--glass-border);">
+                        <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:4px;">Custom Trakt Client ID:</label>
+                        <input type="text" id="setup-trakt-custom-id" placeholder="Paste custom Trakt Client ID" style="font-size:0.8rem; margin-bottom:4px; width: 100%; box-sizing: border-box;" oninput="updateSetupTraktId(this.value)">
+                        <p style="font-size:0.7rem; color:var(--accent-gold); line-height:1.4; margin:6px 0 0 0;">
+                            Create your own Trakt developer application at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--teal); text-decoration: underline;">trakt.tv</a>.<br>
+                            Use the exact Redirect URI: <code id="trakt-setup-callback-preview" style="color: var(--accent-teal); font-family: monospace; background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 3px;"></code>
+                        </p>
+                    </div>
+                    <div style="margin-top: 8px; text-align: right;">
+                        <a href="javascript:void(0)" onclick="toggleSetupTraktAdvanced()" style="font-size:0.7rem; color:var(--teal); text-decoration:none;"><i class="fa-solid fa-gears"></i> Remote Setup / Custom Trakt App</a>
+                    </div>
+
+                    <script>
+                        function toggleSetupTraktAdvanced() {
+                            var container = document.getElementById('setup-trakt-advanced-container');
+                            if (container.style.display === 'none') {
+                                container.style.display = 'block';
+                                var preview = document.getElementById('trakt-setup-callback-preview');
+                                if (preview) {
+                                    preview.textContent = window.location.origin + '/api/trakt/callback';
+                                }
+                            } else {
+                                container.style.display = 'none';
+                            }
+                        }
+                        function updateSetupTraktId(val) {
+                            var mainInput = document.getElementById('setup-trakt-id');
+                            if (mainInput) {
+                                mainInput.value = val.trim() || '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac';
+                            }
+                        }
+                        async function submitSetupTraktPastedUrl() {
+                            var pastedVal = document.getElementById('setup-trakt-pasted-url').value.trim();
+                            if (!pastedVal) {
+                                ljsAlert('Please paste the URL or PIN first.');
+                                return;
+                            }
+                            var code = '';
+                            var state = '';
+                            try {
+                                if (pastedVal.includes('?')) {
+                                    var urlObj = new URL(pastedVal);
+                                    code = urlObj.searchParams.get('code') || '';
+                                    state = urlObj.searchParams.get('state') || '';
+                                } else {
+                                    code = pastedVal;
+                                }
+                            } catch (e) {
+                                var matchCode = pastedVal.match(/[?&]code=([^&]+)/);
+                                var matchState = pastedVal.match(/[?&]state=([^&]+)/);
+                                code = matchCode ? matchCode[1] : '';
+                                state = matchState ? matchState[1] : '';
+                            }
+                            if (!code) {
+                                ljsAlert('Could not find the authorization "code" or "PIN" in the pasted text.\n\nHere is how to do it:\n1. Click "Link Account" to open the Trakt login window.\n2. Sign in and click "Approve" inside that window.\n3. Copy the PIN code shown on the screen (or copy the URL from the popup address bar) and paste it here!');
+                                return;
+                            }
+                            try {
+                                var fetchUrl = '/api/trakt/callback?code=' + encodeURIComponent(code);
+                                if (state) {
+                                    fetchUrl += '&state=' + encodeURIComponent(state);
+                                }
+                                var response = await fetch(fetchUrl);
+                                var text = await response.text();
+                                if (response.ok && text.includes('Connected')) {
+                                    toast.show('Trakt connected successfully!');
+                                    var setupStatus = document.getElementById('setup-trakt-status');
+                                    if (setupStatus) {
+                                        setupStatus.textContent = 'Connected';
+                                        setupStatus.style.background = 'rgba(42, 157, 143, 0.2)';
+                                        setupStatus.style.color = 'var(--accent-teal)';
+                                        setupStatus.style.borderColor = 'rgba(42, 157, 143, 0.4)';
+                                    } else {
+                                        window.location.reload();
+                                    }
+                                } else {
+                                    ljsAlert('Failed to connect Trakt. Check logs for details.');
+                                }
+                            } catch (error) {
+                                console.error('Remote Trakt connection error:', error);
+                                ljsAlert('An error occurred while connecting Trakt.');
+                            }
+                        }
+                    </script>
+                </div>
+
+                <!-- General Web Search Provider -->
+                <div style="background: rgba(255,255,255,0.01); border: 1px solid var(--glass-border); padding: 12px; border-radius: 10px; margin-bottom: 1rem;">
+                    <strong style="color: var(--accent-gold); font-size: 0.85rem;">General Web Search — Assistant Research</strong>
+                    <p style="font-size: 0.76rem; color: var(--text-dim); margin: 4px 0 8px 0; line-height: 1.4;">
+                        Used for fresh release news, reviews, troubleshooting, and recommendation context. Prefer a real provider such as Brave, Tavily, Kagi, or SearXNG. DuckDuckGo HTML is disabled unless explicitly allowed as degraded fallback.
+                    </p>
+                    <div style="display: grid; grid-template-columns: 130px 1fr; gap: 8px; align-items: center;">
+                        <label for="setup-web-search-provider" style="font-size: 0.76rem; color: var(--text-dim);">Provider</label>
+                        <select id="setup-web-search-provider" style="font-size: 0.8rem;">
+                            <option value="brave">Brave Search API</option>
+                            <option value="tavily">Tavily</option>
+                            <option value="kagi">Kagi</option>
+                            <option value="searxng">SearXNG</option>
+                            <option value="duckduckgo_html">DuckDuckGo HTML fallback</option>
+                        </select>
+                        <label for="setup-web-search-key" style="font-size: 0.76rem; color: var(--text-dim);">API key</label>
+                        <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-web-search-key" placeholder="Optional for SearXNG; required by API providers" style="font-size: 0.8rem;">
+                        <label for="setup-web-search-base" style="font-size: 0.76rem; color: var(--text-dim);">Base URL</label>
+                        <input type="text" id="setup-web-search-base" placeholder="Required for SearXNG or custom endpoints" style="font-size: 0.8rem;">
+                    </div>
+                    <label style="display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.76rem; color: var(--text-dim);">
+                        <input type="checkbox" id="setup-web-search-fallback" style="width: 16px; height: 16px; margin: 0;">
+                        Allow DuckDuckGo HTML as a degraded fallback if the configured provider fails
+                    </label>
+                </div>
+
+
+                <div style="background: rgba(255,255,255,0.01); border: 1px solid var(--glass-border); padding: 12px; border-radius: 10px; margin-bottom: 1rem;">
+                    <strong style="color: var(--accent-teal); font-size: 0.85rem;">Semantic Memory — Local Embeddings</strong>
+                    <p style="font-size: 0.76rem; color: var(--text-dim); margin: 4px 0 8px 0; line-height: 1.4;">
+                        Powers conversation recall, category taste profiles, and contextual search. The default is a tiny built-in CPU model downloaded automatically on first use; most users can leave this alone.
+                    </p>
+                    <div style="display: grid; grid-template-columns: 150px 1fr; gap: 8px; align-items: center;">
+                        <label for="setup-embeddings-enabled" style="font-size: 0.76rem; color: var(--text-dim);">Enable memory index</label>
+                        <label style="display: flex; align-items: center; gap: 8px; font-size: 0.8rem;">
+                            <input type="checkbox" id="setup-embeddings-enabled" checked style="width: 16px; height: 16px; margin: 0;">
+                            Build semantic embeddings for chat/context memory
+                        </label>
+                        <label for="setup-embeddings-provider" style="font-size: 0.76rem; color: var(--text-dim);">Embedding provider</label>
+                        <select id="setup-embeddings-provider" style="font-size: 0.8rem;">
+                            <option value="builtin" selected>Built-in local MiniLM (~90 MB)</option>
+                            <option value="llm">Use configured LLM embedding endpoint</option>
+                            <option value="disabled">Disabled / lexical fallback only</option>
+                        </select>
+                        <label for="setup-embeddings-model" style="font-size: 0.76rem; color: var(--text-dim);">Built-in model</label>
+                        <input type="text" id="setup-embeddings-model" value="sentence-transformers/all-MiniLM-L6-v2" style="font-size: 0.8rem;">
+                    </div>
+                    <label style="display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.76rem; color: var(--text-dim);">
+                        <input type="checkbox" id="setup-embeddings-auto-download" checked style="width: 16px; height: 16px; margin: 0;">
+                        Download/install the small embedding runtime automatically when first needed
+                    </label>
+                </div>
+
+                <div class="step-actions">
+                    <button class="btn btn-skip" onclick="goStep(2)"><i class="fa-solid fa-arrow-left"></i> Back</button>
+                    <!-- BUG FIX: In setup 3, "Next" button must call saveLLM() instead of goStep(4)! -->
+                    <button class="btn btn-gold" onclick="saveLLM()">Next <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </div>
+        </div>
+
+        {# ─── Step 4: Notification Channels ───────────── #}
+        <div class="step-panel" id="step-4">
+            <div class="glass-panel" style="padding: 2rem;">
+                <h2 class="step-title"><i class="fa-solid fa-tower-cell"></i> Raise the Signal Towers</h2>
+                <p class="step-desc">Choose how you want to message the Quartermaster and receive search status notifications. Select all that apply.</p>
+                
+                <div class="channel-cards">
+                    <div class="channel-card" data-channel="web" onclick="toggleChannel(this, 'web')">
+                        <div class="card-icon"><i class="fa-solid fa-globe"></i></div>
+                        <div class="card-label">Web Console</div>
+                        <div class="card-sub">Control via web chat</div>
+                    </div>
+                    <div class="channel-card" data-channel="discord" onclick="toggleChannel(this, 'discord')">
+                        <div class="card-icon"><i class="fa-brands fa-discord"></i></div>
+                        <div class="card-label">Discord</div>
+                        <div class="card-sub">Control via Discord bot</div>
+                    </div>
+                    <div class="channel-card" data-channel="telegram" onclick="toggleChannel(this, 'telegram')">
+                        <div class="card-icon"><i class="fa-brands fa-telegram"></i></div>
+                        <div class="card-label">Telegram</div>
+                        <div class="card-sub">Control via Telegram bot</div>
+                    </div>
+                    <div class="channel-card" data-channel="whatsapp" onclick="toggleChannel(this, 'whatsapp')">
+                        <div class="card-icon"><i class="fa-brands fa-whatsapp"></i></div>
+                        <div class="card-label">WhatsApp</div>
+                        <div class="card-sub">Business API chat</div>
+                    </div>
+                </div>
+
+                <!-- Web Config -->
+                <div class="channel-config visible" id="config-web">
+                    <p style="font-size: 0.8rem; color: var(--text-dim); margin: 0;"><i class="fa-solid fa-check"></i> Web dashboard control chat terminal is always enabled by default.</p>
+                </div>
+
+                <!-- Discord Config -->
+                <div class="channel-config" id="config-discord">
+                    <div class="guide-box" style="margin-bottom: 12px; font-size: 0.78rem;">
+                        <strong>Quick Discord Setup Guide:</strong>
+                        <ol style="margin: 4px 0 0 16px; padding: 0; line-height: 1.4;">
+                            <li>Visit <a href="https://discord.com/developers/applications" target="_blank" style="color:var(--accent-gold);">Discord Developers Portal</a> and click **New Application**.</li>
+                            <li>Navigate to **Bot** -> click **Reset Token** -> Copy the **Bot Token** key.</li>
+                            <li>Scroll down in Bot settings and toggle **MESSAGE CONTENT INTENT** to **ON**.</li>
+                            <li>Go to **OAuth2 -> URL Generator** -> check `bot` -> check `Send Messages` -> Copy and load generated invite link.</li>
+                            <li>In Discord, enable Developer Mode -> right-click a channel -> Copy numeric **Channel ID**.</li>
+                        </ol>
+                    </div>
+                    <div class="form-group">
+                        <label>Discord Bot Token</label>
+                        <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-discord-token" placeholder="Paste the Developer Bot Token...">
+                    </div>
+                    <div class="form-group">
+                        <label>Target Channel ID</label>
+                        <input type="text" id="setup-discord-channel" placeholder="Copy Numeric ID from Discord...">
+                    </div>
+                </div>
+
+                <!-- Telegram Config -->
+                <div class="channel-config" id="config-telegram">
+                    <div class="guide-box" style="margin-bottom: 12px; font-size: 0.78rem;">
+                        <strong>Telegram Setup Guide:</strong>
+                        Open a chat with <a href="https://t.me/BotFather" target="_blank" style="color: var(--accent-gold);">@BotFather</a> on Telegram, send `/newbot`, follow prompts, and copy the HTTP token key received.
+                    </div>
+                    <div class="form-group">
+                        <label>Telegram Bot HTTP Token</label>
+                        <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-telegram-token" placeholder="e.g. 123456789:ABCdefGhI...">
+                    </div>
+                </div>
+
+                <!-- WhatsApp Config -->
+                <div class="channel-config" id="config-whatsapp">
+                    <div class="form-group">
+                        <label>Meta permanent access token</label>
+                        <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-whatsapp-token" placeholder="Meta developer permanent token...">
+                    </div>
+                    <div class="form-group">
+                        <label>Phone number ID</label>
+                        <input type="text" id="setup-whatsapp-phone-id" placeholder="Meta phone ID...">
+                    </div>
+                    <div class="form-group">
+                        <label>Webhook Verify token</label>
+                        <input type="text" id="setup-whatsapp-verify-token" placeholder="Choose a custom verification string...">
+                    </div>
+                </div>
+
+                <!-- Playwright Browser Flag -->
+                <div class="channel-config" style="display: block; margin-top: 12px; border: 1px dashed rgba(42, 157, 143, 0.4); background: rgba(42, 157, 143, 0.04);">
+                    <label style="cursor: pointer; display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" id="setup-playwright" style="width: 18px; height: 18px; margin: 0;">
+                        <span style="font-weight: 600; font-size: 0.86rem; color: var(--accent-teal);">Install Playwright Engine (Recommended)</span>
+                    </label>
+                    <p style="margin: 4px 0 0 28px; font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;">
+                        Installs a background headless browser. Allows LJS to bypass Cloudflare gates and scraped sites blocks automatically.
+                    </p>
+                </div>
+
+                <!-- Jackett Engine Flag -->
+                <div class="channel-config" style="display: block; margin-top: 12px; border: 1px dashed rgba(244, 162, 97, 0.4); background: rgba(244, 162, 97, 0.04);">
+                    <label style="cursor: pointer; display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" id="setup-jackett" checked style="width: 18px; height: 18px; margin: 0;">
+                        <span style="font-weight: 600; font-size: 0.86rem; color: var(--accent-gold);">Install Jackett Indexer Aggregator</span>
+                    </label>
+                    <p style="margin: 4px 0 0 28px; font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;">
+                        Automatically configures Jackett with all open/public indexers it can add without credentials, then queries them in parallel as the primary torrent provider. Private/closed trackers can be added later in Settings.
+                    </p>
+                    <label style="cursor: pointer; display: flex; align-items: center; gap: 10px; margin: 10px 0 0 28px;">
+                        <input type="checkbox" id="setup-direct-scraper-fallback" checked style="width: 16px; height: 16px; margin: 0;">
+                        <span style="font-size: 0.78rem; color: var(--text-dim);">Enable slower direct scraper fallback when Jackett returns no usable torrent candidates</span>
+                    </label>
+                </div>
+
+                <div class="step-actions">
+                    <button class="btn btn-skip" onclick="goStep(3)"><i class="fa-solid fa-arrow-left"></i> Back</button>
+                    <button class="btn btn-gold" onclick="goStep(5)">Next <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </div>
+        </div>
+
+        {# ─── Step 5: Automation Philosophy ────────────────── #}
+        <div class="step-panel" id="step-5">
+            <div class="glass-panel" style="padding: 2rem;">
+                <h2 class="step-title"><i class="fa-solid fa-wand-magic-sparkles"></i> Select Automation Spirit</h2>
+                <p class="step-desc">Decide whether you want to review recommended hunts first, or let LJS download episodes immediately. You can toggle this anytime in Settings.</p>
+                <div class="card-subtitle" style="margin-top: 0.5rem; margin-bottom: 0.5rem; font-size: 0.95rem; font-weight: bold; color: var(--accent-gold);">Discovery & Quality Preferences</div>
+                <div class="channel-config" style="display: block; margin-bottom: 1.5rem; background: rgba(255,255,255,0.01);">
+                    <div class="setup-preferences-grid">
+                        <div class="form-group" style="flex: 1;">
+                            <label>Preferred Language</label>
+                            <select id="setup-language">
+                                <option value="English" selected>English</option>
+                                <option value="French">French</option>
+                                <option value="Spanish">Spanish</option>
+                                <option value="German">German</option>
+                                <option value="Italian">Italian</option>
+                                <option value="Japanese">Japanese</option>
+                                <option value="Korean">Korean</option>
+                                <option value="Chinese">Chinese</option>
+                            </select>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Sets the default language filter for searches.</p>
+                        </div>
+                        <div class="form-group" style="flex: 1;">
+                            <label>Preferred Resolution</label>
+                            <select id="setup-resolution">
+                                <option value="2160p">4K / 2160p</option>
+                                <option value="1080p" selected>1080p</option>
+                                <option value="720p">720p</option>
+                            </select>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Target resolution for auto-downloads.</p>
+                        </div>
+                        <div class="form-group" style="flex: 1;">
+                            <label>Size Limit Mode</label>
+                            <select id="setup-size-mode">
+                                <option value="smart" selected>Smart (LLM decides)</option>
+                                <option value="bitrate">Max Bitrate Limit</option>
+                                <option value="file_size">Max File Size Limit</option>
+                            </select>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">How to avoid bloated releases.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card-subtitle" style="margin-bottom: 0.5rem; font-size: 0.95rem; font-weight: bold; color: var(--accent-gold);">Automation Strategy</div>
+                <div class="automation-options" style="display: flex; flex-direction: column; gap: 1rem; margin-bottom: 1.5rem;">
+                    
+                    <!-- Suggestion Review Mode -->
+                    <label class="auto-option-card" id="auto-option-suggest" style="display: flex; gap: 12px; padding: 16px; border: 1px solid var(--glass-border); border-radius: 12px; cursor: pointer; transition: all 0.3s; background: rgba(255, 255, 255, 0.01);">
+                        <input type="radio" name="automation" value="suggest" checked style="width: 18px; height: 18px; margin-top: 4px; accent-color: var(--accent-teal);" onchange="updateAutomationHighlight()">
+                        <div>
+                            <strong style="color: var(--accent-teal); font-size: 0.95rem;">Quartermaster Mode <span style="font-size: 0.7rem; color: var(--text-dim); font-weight: normal;">(Highly Recommended)</span></strong>
+                            <p style="font-size: 0.78rem; color: var(--text-dim); margin: 6px 0 0 0; line-height: 1.5;">
+                                The AI assistant scans the catalog, locates gaps/releases, and displays recommendations in the **Crow's Nest** panel. **LJS never downloads anything automatically**. You review and approve recommendations.
+                            </p>
+                        </div>
+                    </label>
+
+                    <!-- Auto-Download Mode -->
+                    <label class="auto-option-card" id="auto-option-auto" style="display: flex; gap: 12px; padding: 16px; border: 1px solid var(--glass-border); border-radius: 12px; cursor: pointer; transition: all 0.3s; background: rgba(255, 255, 255, 0.01);">
+                        <input type="radio" name="automation" value="auto" style="width: 18px; height: 18px; margin-top: 4px; accent-color: var(--accent-gold);" onchange="updateAutomationHighlight()">
+                        <div>
+                            <strong style="color: var(--accent-gold); font-size: 0.95rem;">Captain's Mode <span style="font-size: 0.7rem; color: var(--text-dim); font-weight: normal;">(Fully Automated)</span></strong>
+                            <p style="font-size: 0.78rem; color: var(--text-dim); margin: 6px 0 0 0; line-height: 1.5;">
+                                LJS behaves like an autonomous hunter: whenever a new episode airs or a higher resolution release is indexed, it **downloads immediately**. Useful for dedicated media server boxes.
+                            </p>
+                        </div>
+                    </label>
+                </div>
+
+                <div class="card-subtitle" style="margin-bottom: 0.5rem; font-size: 0.95rem; font-weight: bold; color: var(--accent-gold);">Sharing & Seeding</div>
+                <div class="automation-options" style="display: flex; flex-direction: column; gap: 1rem; margin-bottom: 1.5rem;">
+                    <label class="auto-option-card" id="sharing-option-private" style="display: flex; gap: 12px; padding: 16px; border: 1px solid var(--glass-border); border-radius: 12px; cursor: pointer; transition: all 0.3s; background: rgba(255, 255, 255, 0.01);">
+                        <input type="radio" name="sharing-mode" value="private" checked style="width: 18px; height: 18px; margin-top: 4px; accent-color: var(--accent-teal);" onchange="updateSharingHighlight()">
+                        <div>
+                            <strong style="color: var(--accent-teal); font-size: 0.95rem;">Private Library Mode <span style="font-size: 0.7rem; color: var(--text-dim); font-weight: normal;">(Default)</span></strong>
+                            <p style="font-size: 0.78rem; color: var(--text-dim); margin: 6px 0 0 0; line-height: 1.5;">
+                                LJS downloads into a temporary folder, files the completed media into your library, then stops sharing after the normal seed policy. Choose this for a clean private library with minimal torrent cleanup questions.
+                            </p>
+                        </div>
+                    </label>
+                    <label class="auto-option-card" id="sharing-option-seed" style="display: flex; gap: 12px; padding: 16px; border: 1px solid var(--glass-border); border-radius: 12px; cursor: pointer; transition: all 0.3s; background: rgba(255, 255, 255, 0.01);">
+                        <input type="radio" name="sharing-mode" value="seed_in_place" style="width: 18px; height: 18px; margin-top: 4px; accent-color: var(--accent-gold);" onchange="updateSharingHighlight()">
+                        <div>
+                            <strong style="color: var(--accent-gold); font-size: 0.95rem;">Fair Share Mode <span style="font-size: 0.7rem; color: var(--text-dim); font-weight: normal;">(Seed in place)</span></strong>
+                            <p style="font-size: 0.78rem; color: var(--text-dim); margin: 6px 0 0 0; line-height: 1.5;">
+                                New torrent downloads are saved directly in the library folder and keep seeding from that exact copy. Filenames may look like release-group names, but Plex/Jellyfin usually still recognize the movie or episode. Choose this if you want to give back to the swarm.
+                            </p>
+                        </div>
+                    </label>
+                </div>
+                <div class="channel-config" style="display: block; margin-bottom: 1.5rem; background: rgba(255,255,255,0.01);">
+                    <div class="setup-preferences-grid">
+                        <div class="form-group">
+                            <label>Library Sharing Upload Cap (kB/s)</label>
+                            <input type="number" id="setup-sharing-upload" min="0" value="0" placeholder="0 = unlimited">
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Total upload speed for completed library items only. Torrents still downloading use the separate download/upload caps in Compass.</p>
+                        </div>
+                        <div class="form-group">
+                            <label>Active Shared Library Items</label>
+                            <input type="number" id="setup-sharing-slots" min="0" value="2">
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">How many completed library torrents may upload at the same time.</p>
+                        </div>
+                        <div class="form-group">
+                            <label>Share Until Ratio</label>
+                            <input type="number" id="setup-sharing-ratio" min="0" step="0.1" value="2.0">
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Example: 2.0 means upload about twice as much as the download size before LJS may stop sharing.</p>
+                        </div>
+                    </div>
+                </div>
+
+
+                <div class="channel-config" style="display: block; margin-bottom: 1.5rem; background: rgba(255,255,255,0.01);">
+                    <label style="cursor: pointer; display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="setup-auto-start" style="width: 18px; height: 18px; margin: 0;">
+                        <span style="font-weight: 500; font-size: 0.85rem;">Start LJS automatically when I log in</span>
+                    </label>
+                    <p style="margin: 4px 0 0 26px; font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;">
+                        Creates a normal user-level startup entry on macOS, Windows, or Linux. This is useful for always-on media boxes and can be disabled later in Compass.
+                    </p>
+                </div>
+
+                <div class="channel-config" style="display: block; margin-bottom: 1.5rem; background: rgba(255,255,255,0.01);">
+                    <label style="cursor: pointer; display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="setup-auto-discover" checked style="width: 18px; height: 18px; margin: 0;">
+                        <span style="font-weight: 500; font-size: 0.85rem;">Automatically Track Discovered Media</span>
+                    </label>
+                    <p style="margin: 4px 0 0 26px; font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;">
+                        Allows the folder scanner to auto-register category items it finds in your existing Plex directory as active hunt targets.
+                    </p>
+                </div>
+
+                <div class="step-actions">
+                    <button class="btn btn-skip" onclick="goStep(4)"><i class="fa-solid fa-arrow-left"></i> Back</button>
+                    <button id="setup-finish-btn" class="btn btn-gold" onclick="finishSetup()"><i class="fa-solid fa-anchor"></i> Set Sail</button>
+                    <div id="setup-finish-status" class="setup-progress-note">Preparing the ship… saving settings, starting services, and scanning the library.</div>
+                </div>
+            </div>
+        </div>
+
+        {# ─── Step Success ────────────────────────────── #}
+        <div class="step-panel" id="step-success">
+            <div class="glass-panel" style="padding: 2rem;">
+                <div class="success-box">
+                    <div class="ship-wheel"><i class="fa-solid fa-ferry"></i></div>
+                    <h2>Fair Winds and Following Seas!</h2>
+                    <p>All configurations secured. Your vessel is fully outfitted and ready to weigh anchor.</p>
+                    <a href="/" class="setup-final-link"><i class="fa-solid fa-ship"></i> Board the Helm</a>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Core setup assets scripts -->
+    <script src="/static/js/components/dom.js"></script>
+    <script src="/static/js/core/eventBus.js"></script>
+    <script src="/static/js/core/toastManager.js"></script>
+    <script src="/static/js/components/modalManager.js"></script>
+    <script src="/static/js/api/actionClient.js"></script>
+    <script src="/static/js/components/modelCatalog.js"></script>
+    <script src="/static/js/components/traktAuth.js"></script>
+    <script src="/static/js/components/serverPathBrowser.js"></script>
+    <script src="/static/js/pages/setup.js"></script>
+
+    <!-- Visual micro-animations setup triggers -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const container = document.getElementById('bubbles');
+            if (!container) return;
+
+            const makeBubble = () => {
+                const size = Math.random() * 15 + 5; 
+                const left = Math.random() * 100;    
+                const duration = Math.random() * 10 + 6; 
+
+                const bubble = document.createElement('div');
+                bubble.className = 'bubble';
+                bubble.style.width = `${size}px`;
+                bubble.style.height = `${size}px`;
+                bubble.style.left = `${left}%`;
+                bubble.style.animationDuration = `${duration}s`;
+
+                container.appendChild(bubble);
+
+                setTimeout(() => {
+                    bubble.remove();
+                }, duration * 1000);
+            };
+
+            for (let i = 0; i < 15; i++) {
+                setTimeout(makeBubble, Math.random() * 3000);
+            }
+
+            setInterval(makeBubble, 1200);
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,670 @@
+{% extends "base.html" %}
+{% block title %}LJS Settings{% endblock %}
+{% block nav_settings %}active{% endblock %}
+{% block page_title %}Settings{% endblock %}
+{% block page_subtitle %}Configure yer vessel — API keys, models, library paths, and integrations{% endblock %}
+{% block content %}
+
+{# ─── LLM: Default Model ────────────────────────────────────────── #}
+<section id="s-llm" class="card">
+    <div class="card-header">
+        <span class="card-icon">🔭</span>
+        <div class="card-header-text">
+            <h2>Navigator — Default LLM</h2>
+            <p class="card-desc">The primary AI model and provider. All tasks use this unless overridden by a tier or per-task setting below.</p>
+        </div>
+    </div>
+    <form id="llm-form" class="settings-form" onsubmit="event.preventDefault(); saveLLM();">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Provider</label>
+                <select id="provider-select" onchange="onProviderChange(this)">
+                    <option value="">— Choose —</option>
+                    <option value="openrouter" {{ 'selected' if settings.llm.active_provider == 'openrouter' }}>OpenRouter</option>
+                    <option value="nvidia_nim" {{ 'selected' if settings.llm.active_provider == 'nvidia_nim' }}>NVIDIA NIM</option>
+                    <option value="ollama_cloud" {{ 'selected' if settings.llm.active_provider == 'ollama_cloud' }}>Ollama Cloud</option>
+                    <option value="ollama_local" {{ 'selected' if settings.llm.active_provider == 'ollama_local' }}>Ollama (Local)</option>
+                    <option value="lm_studio" {{ 'selected' if settings.llm.active_provider == 'lm_studio' }}>LM Studio (Local)</option>
+                </select>
+            </div>
+            <div id="provider-models-section" class="form-group" style="display:none">
+                <label>Model Catalog</label>
+                <div class="model-search-wrap">
+                    <input type="text" id="model-search" placeholder="Search models..." oninput="filterModels(this.value)" class="model-search-input">
+                    <select id="model-select" name="model_from_list" onchange="onModelSelect(this)">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+                <small id="model-info" class="model-info"></small>
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group flex-2">
+                <label>Model ID</label>
+                <input type="text" id="model" name="model" value="{{ settings.llm.model or '' }}" placeholder="e.g. openrouter/openai/gpt-4o-mini">
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group flex-2">
+                <label>API Base URL</label>
+                <input type="text" id="api_base" name="api_base" value="{{ settings.llm.api_base or '' }}" placeholder="https://openrouter.ai/api/v1">
+            </div>
+        </div>
+
+        {# ─── API Keys for this provider ──────────────────── #}
+        <div class="card-subtitle">API Keys</div>
+        <div id="provider-keys-section">
+            <div id="provider-keys-list" class="key-list">
+                <p class="empty-msg" id="no-keys-msg">No API keys configured for this provider.</p>
+            </div>
+            <div class="inline-form" style="margin-top:0.5rem">
+                <input type="text" id="new-key-label" placeholder="Label (e.g. 'personal')" style="max-width:160px">
+                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="new-key-value" placeholder="API key">
+                <button type="button" class="btn btn-teal btn-sm" onclick="addProviderKey()">Add Key</button>
+            </div>
+        </div>
+
+        <button type="submit" class="btn btn-gold" style="margin-top:1rem">Save Default LLM</button>
+    </form>
+</section>
+
+{# ─── LLM: Tier Routing ──────────────────────────────────────────── #}
+<section id="s-tiers" class="card">
+    <div class="card-header">
+        <span class="card-icon">🏅</span>
+        <div class="card-header-text">
+            <h2>Model Tiers</h2>
+            <p class="card-desc">Assign cheaper models to simple tasks and powerful ones to complex reasoning. Tiers override the default for their assigned tasks. Select a provider to browse its model catalog.</p>
+        </div>
+    </div>
+    <div class="tier-group">
+        <div class="tier-header">
+            <span class="tier-label tier-light">Lightweight</span>
+            <span class="tier-tasks">intent routing, summarization, download selection</span>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Provider</label>
+                <select id="tier-lightweight-provider" onchange="onTierProviderChange('lightweight', this)" class="tier-provider-select">
+                    <option value="">— Same as default —</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="nvidia_nim">NVIDIA NIM</option>
+                    <option value="ollama_cloud">Ollama Cloud</option>
+                    <option value="ollama_local">Ollama (Local)</option>
+                    <option value="lm_studio">LM Studio</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Model</label>
+                <div class="model-search-wrap">
+                    <input type="text" class="tier-model-input" id="tier-lightweight-search" placeholder="Search models..." oninput="filterTierModels('lightweight', this.value)">
+                    <select id="tier-lightweight-select" onchange="onTierModelSelect('lightweight', this)">
+                        <option value="">— Select from catalog —</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group flex-2">
+                <label>Model ID (or type custom)</label>
+                <input type="text" name="lightweight_model" id="tier-lightweight-model" value="{{ settings.llm.lightweight.model or '' }}" placeholder="e.g. openrouter/openai/gpt-3.5-turbo">
+            </div>
+        </div>
+    </div>
+    <div class="tier-group">
+        <div class="tier-header">
+            <span class="tier-label tier-standard">Standard</span>
+            <span class="tier-tasks">chat, search</span>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Provider</label>
+                <select id="tier-standard-provider" onchange="onTierProviderChange('standard', this)" class="tier-provider-select">
+                    <option value="">— Same as default —</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="nvidia_nim">NVIDIA NIM</option>
+                    <option value="ollama_cloud">Ollama Cloud</option>
+                    <option value="ollama_local">Ollama (Local)</option>
+                    <option value="lm_studio">LM Studio</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Model</label>
+                <div class="model-search-wrap">
+                    <input type="text" class="tier-model-input" id="tier-standard-search" placeholder="Search models..." oninput="filterTierModels('standard', this.value)">
+                    <select id="tier-standard-select" onchange="onTierModelSelect('standard', this)">
+                        <option value="">— Select from catalog —</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group flex-2">
+                <label>Model ID (or type custom)</label>
+                <input type="text" name="standard_model" id="tier-standard-model" value="{{ settings.llm.standard.model or '' }}" placeholder="Same as default if blank">
+            </div>
+        </div>
+    </div>
+    <div class="tier-group">
+        <div class="tier-header">
+            <span class="tier-label tier-heavy">Heavy</span>
+            <span class="tier-tasks">research, complex multi-step reasoning</span>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Provider</label>
+                <select id="tier-heavy-provider" onchange="onTierProviderChange('heavy', this)" class="tier-provider-select">
+                    <option value="">— Same as default —</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="nvidia_nim">NVIDIA NIM</option>
+                    <option value="ollama_cloud">Ollama Cloud</option>
+                    <option value="ollama_local">Ollama (Local)</option>
+                    <option value="lm_studio">LM Studio</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Model</label>
+                <div class="model-search-wrap">
+                    <input type="text" class="tier-model-input" id="tier-heavy-search" placeholder="Search models..." oninput="filterTierModels('heavy', this.value)">
+                    <select id="tier-heavy-select" onchange="onTierModelSelect('heavy', this)">
+                        <option value="">— Select from catalog —</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group flex-2">
+                <label>Model ID (or type custom)</label>
+                <input type="text" name="heavy_model" id="tier-heavy-model" value="{{ settings.llm.heavy.model or '' }}" placeholder="e.g. openrouter/anthropic/claude-sonnet-4">
+            </div>
+        </div>
+    </div>
+    <button class="btn btn-gold" onclick="saveTiers()">Save Tiers</button>
+</section>
+
+{# ─── Library Paths ─────────────────────────────────────────────── #}
+<section id="s-library" class="card">
+    <div class="card-header">
+        <span class="card-icon">📚</span>
+        <div class="card-header-text">
+            <h2>Library &amp; Downloads</h2>
+            <p class="card-desc">Where downloads land temporarily and where each category files completed media. Category-specific values are persisted in ignored local config/categories/<category_id>.yaml files bootstrapped from public templates.</p>
+        </div>
+    </div>
+    <div class="form-row">
+        <div class="form-group flex-2">
+            <label>Download Directory</label>
+            <input type="text" id="download_dir" value="{{ settings.download_dir }}" placeholder="./downloads">
+        </div>
+        <div class="form-group">
+            <label>Max Concurrent Downloads</label>
+            <input type="number" id="max_concurrent" value="{{ settings.max_concurrent_downloads }}" min="1" max="20">
+        </div>
+    </div>
+    {% for category in categories %}
+    <div class="card-subtitle" style="margin-top: 1.5rem;">{{ category.display_name }} Settings <span style="font-size:0.75rem;color:var(--muted);font-weight:400;">local config/categories/{{ category.id }}.yaml</span></div>
+    <div class="form-row">
+        {% for prop in category.properties %}
+        <div class="form-group flex-1">
+            <label>{{ prop.description }} (<code>{{ prop.name }}</code>)</label>
+            {% if prop.value_type == 'bool' %}
+            <select class="category-property-input" data-category-id="{{ category.id }}" data-property-name="{{ prop.name }}" data-value-type="bool">
+                <option value="true" {% if prop.value %}selected{% endif %}>Yes</option>
+                <option value="false" {% if not prop.value %}selected{% endif %}>No</option>
+            </select>
+            {% elif prop.value_type == 'int' %}
+            <input type="number" class="category-property-input" data-category-id="{{ category.id }}" data-property-name="{{ prop.name }}" data-value-type="int" value="{{ prop.value }}">
+            {% elif prop.value_type == 'float' %}
+            <input type="number" step="0.1" class="category-property-input" data-category-id="{{ category.id }}" data-property-name="{{ prop.name }}" data-value-type="float" value="{{ prop.value }}">
+            {% else %}
+            <input type="text" class="category-property-input" data-category-id="{{ category.id }}" data-property-name="{{ prop.name }}" data-value-type="string" value="{{ prop.value or '' }}">
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    {% endfor %}
+    
+    <div style="margin-top:1rem; padding:1rem; border:1px solid var(--gold-glow); border-radius:8px; background:rgba(212, 162, 78, 0.05);">
+        <h4 style="color:var(--gold); margin:0 0 0.5rem 0; font-size:0.85rem;"><i class="fas fa-exclamation-triangle"></i> Advanced: Consolidate Library</h4>
+        <p class="int-desc" style="margin-bottom:0.8rem;">Rename all existing files in your library to match the templates above. This will move files on disk!</p>
+        <div style="display:flex; gap:0.5rem;">
+            <button class="btn btn-secondary btn-sm" onclick="previewConsolidation()">Preview Changes</button>
+            <button id="apply-consolidate-btn" class="btn btn-danger btn-sm" onclick="applyConsolidation()" style="display:none;">Apply Changes</button>
+        </div>
+        <div id="consolidation-results" style="margin-top:1rem; display:none;">
+            <p id="consolidation-summary" style="font-size:0.75rem; margin-bottom:0.5rem;"></p>
+            <div style="max-height:200px; overflow-y:auto; border:1px solid var(--border); border-radius:4px; background:var(--bg);">
+                <table class="settings-table" style="font-size:0.7rem;">
+                    <thead>
+                        <tr><th>Status</th><th>Old Path</th><th>New Path</th></tr>
+                    </thead>
+                    <tbody id="consolidation-table-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="card-subtitle" style="margin-top: 1.5rem;">Stall Monitoring & Automation</div>
+    <div class="form-row">
+        <div class="form-group flex-1">
+            <label>Stall Check Interval (minutes)</label>
+            <input type="number" id="stall_check_interval_minutes" value="{{ settings.stall_check_interval_minutes }}" min="5">
+        </div>
+        <div class="form-group flex-1">
+            <label>Alternative Threshold (hours)</label>
+            <input type="number" step="0.5" id="stall_alternative_hours" value="{{ settings.stall_alternative_hours }}" min="0.5">
+        </div>
+        <div class="form-group flex-1">
+            <label>Cancel Threshold (hours)</label>
+            <input type="number" step="0.5" id="stall_cancel_hours" value="{{ settings.stall_cancel_hours }}" min="1.0">
+        </div>
+    </div>
+    
+    <button class="btn btn-gold" onclick="saveLibrary()" style="margin-top:1rem">Save Library Paths &amp; Templates</button>
+</section>
+
+{# ─── Bandwidth Throttling ──────────────────────────────────────── #}
+<section id="s-bandwidth" class="card">
+    <div class="card-header">
+        <span class="card-icon">🎚️</span>
+        <div class="card-header-text">
+            <h2>Bandwidth Throttling</h2>
+            <p class="card-desc">Limit download and upload speeds based on the time of day and day of the week.</p>
+        </div>
+    </div>
+    <div id="bandwidth-schedules-list">
+        {% if settings.bandwidth_schedules %}
+            <table class="settings-table">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Days</th>
+                        <th>Time</th>
+                        <th>Limit (Down/Up)</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% set day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] %}
+                    {% for s in settings.bandwidth_schedules %}
+                    <tr>
+                        <td>{{ s.name }}</td>
+                        <td>
+                            {% if s.days|length == 7 %}
+                                Everyday
+                            {% else %}
+                                {% for d in s.days %}
+                                    {{ day_names[d] }}{% if not loop.last %}, {% endif %}
+                                {% endfor %}
+                            {% endif %}
+                        </td>
+                        <td>{{ s.start_time }} - {{ s.end_time }}</td>
+                        <td>
+                            {{ s.max_download_kbps or '∞' }} / {{ s.max_upload_kbps or '∞' }} KB/s
+                        </td>
+                        <td class="text-right">
+                            <button class="btn btn-danger btn-xs" onclick="removeBandwidthSchedule({{ loop.index0 }})">Remove</button>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p class="empty-msg">No schedules configured. Downloads will use default quality limits.</p>
+        {% endif %}
+    </div>
+
+    <div class="card-subtitle mt-3">Add New Schedule</div>
+    <div class="settings-form" style="border: 1px solid var(--border); padding: 1rem; border-radius: 8px;">
+        <div class="form-row">
+            <div class="form-group flex-2">
+                <label>Name</label>
+                <input type="text" id="bw-name" placeholder="Work Hours">
+            </div>
+            <div class="form-group">
+                <label>Start Time</label>
+                <input type="time" id="bw-start" value="09:00">
+            </div>
+            <div class="form-group">
+                <label>End Time</label>
+                <input type="time" id="bw-end" value="17:00">
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group flex-2">
+                <label>Limit Download (KB/s)</label>
+                <input type="number" id="bw-down" placeholder="Uncapped">
+            </div>
+            <div class="form-group flex-2">
+                <label>Limit Upload (KB/s)</label>
+                <input type="number" id="bw-up" placeholder="Uncapped">
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Active Days</label>
+            <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                {% for day in ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] %}
+                <label style="font-size:0.75rem; display:flex; align-items:center; gap:4px; cursor:pointer;">
+                    <input type="checkbox" name="bw-days" value="{{ loop.index0 }}" {{ 'checked' if loop.index0 < 5 }}> {{ day }}
+                </label>
+                {% endfor %}
+            </div>
+        </div>
+        <button class="btn btn-teal btn-sm" onclick="addBandwidthSchedule()">Add Schedule</button>
+    </div>
+</section>
+
+{# ─── Automation ─────────────────────────────────────────────── #}
+<section id="s-automation" class="card">
+    <div class="card-header">
+        <span class="card-icon">🤖</span>
+        <div class="card-header-text">
+            <h2>Automation Philosophy</h2>
+            <p class="card-desc">
+                Controls how LJS handles discovered content.
+                <strong>Quartermaster Mode</strong> compiles suggestions for your approval.
+                <strong>Captain's Mode</strong> downloads automatically.
+            </p>
+        </div>
+        <span class="card-badge" id="automation-badge">{{ 'Suggest' if not settings.auto_download else 'Auto' }}</span>
+    </div>
+    <div class="automation-options" style="display:flex; gap:1rem; flex-direction:column; margin-bottom:1rem;">
+        <label id="auto-suggest-card" style="display:flex; align-items:flex-start; gap:0.75rem; padding:0.8rem 1rem; background:var(--input); border:2px solid {{ 'var(--teal)' if not settings.auto_download else 'var(--border)' }}; border-radius:8px; cursor:pointer;">
+            <input type="radio" name="settings-automation" value="suggest" {{ 'checked' if not settings.auto_download }} onchange="updateSettingsAutoHighlight()" style="width:16px;height:16px;margin-top:2px;flex-shrink:0;accent-color:var(--teal);">
+            <div>
+                <strong style="color:var(--teal); font-size:0.88rem;">Quartermaster Mode</strong>
+                <p style="color:var(--text-dim); font-size:0.74rem; margin-top:0.2rem;">Suggest actions — you approve each download</p>
+            </div>
+        </label>
+        <label id="auto-auto-card" style="display:flex; align-items:flex-start; gap:0.75rem; padding:0.8rem 1rem; background:var(--input); border:2px solid {{ 'var(--gold)' if settings.auto_download else 'var(--border)' }}; border-radius:8px; cursor:pointer;">
+            <input type="radio" name="settings-automation" value="auto" {{ 'checked' if settings.auto_download }} onchange="updateSettingsAutoHighlight()" style="width:16px;height:16px;margin-top:2px;flex-shrink:0;accent-color:var(--gold);">
+            <div>
+                <strong style="color:var(--gold); font-size:0.88rem;">Captain's Mode</strong>
+                <p style="color:var(--text-dim); font-size:0.74rem; margin-top:0.2rem;">Auto-download new episodes and upgrades</p>
+            </div>
+        </label>
+    </div>
+    <div style="margin-bottom:1rem;">
+        <label style="cursor:pointer; display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="settings-auto-discover" {{ 'checked' if settings.auto_discover }}>
+            <span style="font-size:0.82rem;">Auto-discover category items from library scans</span>
+        </label>
+    </div>
+    <button class="btn btn-gold" onclick="saveAutomation()">Save Automation</button>
+</section>
+
+{# ─── Search Providers ──────────────────────────────────────────── #}
+<section id="s-search" class="card">
+    <div class="card-header">
+        <span class="card-icon">🔍</span>
+        <div class="card-header-text">
+            <h2>Search Providers</h2>
+            <p class="card-desc">Jackett is the primary torrent search backbone. Direct scrapers are secondary fallback providers and are only used when Jackett returns no usable candidates.</p>
+        </div>
+    </div>
+    <div class="form-row">
+        <div class="form-group flex-2">
+            <label>Jackett URL</label>
+            <input type="text" id="jackett_url" value="{{ settings.jackett_url or '' }}" placeholder="http://localhost:9117">
+        </div>
+        <div class="form-group">
+            <label>Jackett API Key</label>
+            <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="jackett_api_key" value="{{ settings.jackett_api_key or '' }}" placeholder="Jackett API key">
+        </div>
+    </div>
+    <label style="display:flex; align-items:center; gap:10px; margin: 0.75rem 0;">
+        <input type="checkbox" id="direct_scraper_fallback" {{ 'checked' if settings.direct_scraper_fallback }}>
+        <span>Enable direct scraper fallback if Jackett returns no usable torrent candidates</span>
+    </label>
+    <p class="card-desc">Fallback is useful when Jackett is misconfigured, empty, or temporarily blocked. It is slower and less reliable than Jackett.</p>
+    <div class="integration-block" style="margin-top: 1rem;">
+        <h3 class="int-title">Jackett Indexers</h3>
+        <p class="int-desc">First launch configures all open/public indexers Jackett can add without credentials. Add private/closed trackers here or in the native Jackett UI.</p>
+        <div id="jackett-indexer-health-old" class="card-desc">Diagnostics not loaded.</div>
+        <div class="form-row" style="margin-top: 0.5rem;">
+            <button class="btn btn-secondary" type="button" onclick="configureJackettProfile('all_open_public')">Configure all open/public indexers</button>
+            <button class="btn btn-secondary" type="button" onclick="loadJackettIndexersLegacy()">Refresh diagnostics</button>
+            <button class="btn btn-secondary" type="button" onclick="openJackettUiLegacy()">Open Jackett UI</button>
+        </div>
+        <details style="margin-top: 0.75rem;">
+            <summary>Add private/closed tracker indexer</summary>
+            <div class="form-row" style="margin-top: 0.5rem;">
+                <input type="text" id="jackett_custom_indexer_id" autocomplete="off" placeholder="Jackett indexer id">
+                <button class="btn btn-secondary" type="button" onclick="loadJackettCustomIndexerSchemaLegacy()">Load fields</button>
+            </div>
+            <div id="jackett_custom_indexer_fields"></div>
+            <button class="btn btn-gold" type="button" onclick="configureJackettCustomIndexerLegacy()">Configure indexer</button>
+        </details>
+    </div>
+    <button class="btn btn-gold" onclick="saveSearch()">Save Search Providers</button>
+</section>
+
+{# ─── Integrations ──────────────────────────────────────────────── #}
+<section id="s-integrations" class="card">
+    <div class="card-header">
+        <span class="card-icon">🔌</span>
+        <div class="card-header-text">
+            <h2>Integrations</h2>
+            <p class="card-desc">Connect external services for metadata, watch status, recommendations, and subtitles.</p>
+        </div>
+    </div>
+    <div class="settings-grid">
+        <div class="integration-block">
+            <h3 class="int-title">TMDB</h3>
+            <p class="int-desc">
+                <strong>Why:</strong> Provides rich metadata (genres, ratings, cast, poster art). Vital for the AI to learn your tastes.<br>
+                <a href="https://www.themoviedb.org/signup" target="_blank" style="color:var(--teal); font-size:0.75rem;">→ Get a TMDB API key (Free)</a>
+            </p>
+            <div class="form-group">
+                <label>API Key</label>
+                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="tmdb_api_key" value="{{ settings.tmdb_api_key or '' }}" placeholder="TMDB API key">
+            </div>
+        </div>
+        <div class="integration-block">
+            <h3 class="int-title">Trakt</h3>
+            <p class="int-desc">
+                <strong>Why:</strong> Syncs your watch history and enables high-quality personalized show suggestions.<br>
+                <a href="https://trakt.tv/signup" target="_blank" style="color:var(--teal); font-size:0.75rem;">→ Create a Trakt account (Free)</a>
+            </p>
+            <input type="hidden" id="trakt_client_id" value="{{ settings.trakt_client_id or '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac' }}">
+            
+            <div id="trakt-advanced-container" style="display:none; margin-top:12px; background: rgba(255,255,255,0.02); padding: 10px; border-radius: 8px; border: 1px solid var(--glass-border);">
+                <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:4px;">Custom Trakt Client ID:</label>
+                <input type="text" id="trakt-custom-id" placeholder="Paste custom Trakt Client ID" style="font-size:0.8rem; margin-bottom:4px; width: 100%; box-sizing: border-box;" value="{{ settings.trakt_client_id if settings.trakt_client_id != '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac' else '' }}" oninput="updateSettingsTraktId(this.value)">
+                <p style="font-size:0.7rem; color:var(--accent-gold); line-height:1.4; margin:6px 0 0 0;">
+                    Create your own Trakt developer application at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--teal); text-decoration: underline;">trakt.tv</a>.<br>
+                    Use the exact Redirect URI: <code id="trakt-settings-callback-preview" style="color: var(--accent-teal); font-family: monospace; background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 3px;"></code>
+                </p>
+            </div>
+            <div style="margin-top: 8px;">
+                <a href="javascript:void(0)" onclick="toggleSettingsTraktAdvanced()" style="font-size:0.7rem; color:var(--teal); text-decoration:none;"><i class="fa-solid fa-gears"></i> Remote Setup / Custom Trakt App</a>
+            </div>
+
+            <script>
+                function toggleSettingsTraktAdvanced() {
+                    var container = document.getElementById('trakt-advanced-container');
+                    if (container.style.display === 'none') {
+                        container.style.display = 'block';
+                        var preview = document.getElementById('trakt-settings-callback-preview');
+                        if (preview) {
+                            preview.textContent = window.location.origin + '/api/trakt/callback';
+                        }
+                    } else {
+                        container.style.display = 'none';
+                    }
+                }
+                function updateSettingsTraktId(val) {
+                    var mainInput = document.getElementById('trakt_client_id');
+                    if (mainInput) {
+                        mainInput.value = val.trim() || '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac';
+                    }
+                }
+            </script>
+            <div class="form-group mt-2">
+                <div class="form-row" style="align-items: center; gap: 12px; margin-top: 8px;">
+                    {% if settings.trakt_access_token %}
+                    <span class="badge success" style="background: rgba(42, 157, 143, 0.2); color: var(--accent-teal); border-color: rgba(42, 157, 143, 0.4);" title="Authenticated as user">Connected</span>
+                    {% else %}
+                    <span class="badge" style="background: rgba(231, 111, 81, 0.15); color: var(--accent-red); border-color: rgba(231, 111, 81, 0.3);" title="Not authenticated yet">Not Connected</span>
+                    {% endif %}
+                    <button onclick="startTraktAuth()" class="btn btn-secondary btn-sm" style="margin: 0;">
+                        <i class="fas fa-link"></i> {{ 'Reconnect' if settings.trakt_access_token else 'Connect Account' }}
+                    </button>
+                </div>
+            </div>
+
+            <!-- Trakt Code / PIN input -->
+            <div style="margin-top: 12px; padding: 10px; background: rgba(0,0,0,0.15); border: 1px dashed var(--glass-border); border-radius: 8px;">
+                <span style="font-size: 0.72rem; color: var(--text-dim); display: block; margin-bottom: 6px;">
+                    <i class="fa-solid fa-circle-info"></i> Copy the <strong>PIN / Authorization Code</strong> shown on the Trakt popup screen and paste it below:
+                </span>
+                <div style="display: flex; gap: 8px;">
+                    <input type="text" id="settings-trakt-pasted-url" placeholder="Paste Trakt PIN or callback URL here..." style="font-size: 0.75rem; padding: 4px 8px; flex: 1; margin: 0; box-sizing: border-box; background: rgba(0,0,0,0.2); border: 1px solid var(--glass-border); color: var(--text);">
+                    <button onclick="submitSettingsTraktPastedUrl()" class="btn btn-save" style="font-size: 0.7rem; padding: 4px 10px; margin: 0;"><i class="fa-solid fa-check"></i> Submit</button>
+                </div>
+            </div>
+
+            <script>
+                async function submitSettingsTraktPastedUrl() {
+                    var pastedVal = document.getElementById('settings-trakt-pasted-url').value.trim();
+                    if (!pastedVal) {
+                        ljsAlert('Please paste the URL or PIN first.');
+                        return;
+                    }
+                    var code = '';
+                    var state = '';
+                    try {
+                        if (pastedVal.includes('?')) {
+                            var urlObj = new URL(pastedVal);
+                            code = urlObj.searchParams.get('code') || '';
+                            state = urlObj.searchParams.get('state') || '';
+                        } else {
+                            code = pastedVal;
+                        }
+                    } catch (e) {
+                        var matchCode = pastedVal.match(/[?&]code=([^&]+)/);
+                        var matchState = pastedVal.match(/[?&]state=([^&]+)/);
+                        code = matchCode ? matchCode[1] : '';
+                        state = matchState ? matchState[1] : '';
+                    }
+                    if (!code) {
+                        ljsAlert('Could not find the authorization "code" or "PIN" in the pasted text.\n\nHere is how to do it:\n1. Click "Connect Account" to open the Trakt login window.\n2. Sign in and click "Approve" inside that window.\n3. Copy the PIN code shown on the screen (or copy the URL from the popup address bar) and paste it here!');
+                        return;
+                    }
+                    try {
+                        var fetchUrl = '/api/trakt/callback?code=' + encodeURIComponent(code);
+                        if (state) {
+                            fetchUrl += '&state=' + encodeURIComponent(state);
+                        }
+                        var response = await fetch(fetchUrl);
+                        var text = await response.text();
+                        if (response.ok && text.includes('Connected')) {
+                            toast.show('Trakt connected successfully!');
+                            window.location.reload();
+                        } else {
+                            ljsAlert('Failed to connect Trakt. Check logs for details.');
+                        }
+                    } catch (error) {
+                        console.error('Remote Trakt connection error:', error);
+                        ljsAlert('An error occurred while connecting Trakt.');
+                    }
+                }
+            </script>
+        </div>
+        <div class="integration-block">
+            <h3 class="int-title">TVMaze</h3>
+            <p class="int-desc">
+                <strong>Why:</strong> Accurate episode air dates for smart scheduling. Prevents blind polling.<br>
+                <span style="color:var(--teal-dim); font-size:0.72rem;">✅ Always active (No API key required)</span>
+            </p>
+        </div>
+        <div class="integration-block">
+            <h3 class="int-title">Plex</h3>
+            <p class="int-desc">Watch status tracking and auto-cleanup of watched content.</p>
+            <div class="form-row">
+                <div class="form-group flex-2">
+                    <label>URL</label>
+                    <input type="text" id="plex_url" value="{{ settings.plex_url or '' }}" placeholder="http://localhost:32400">
+                </div>
+                <div class="form-group">
+                    <label>Token</label>
+                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="plex_token" value="{{ settings.plex_token or '' }}" placeholder="X-Plex-Token">
+                </div>
+            </div>
+        </div>
+        <div class="integration-block">
+            <h3 class="int-title">OpenSubtitles</h3>
+            <p class="int-desc">
+                <strong>Why:</strong> Automatically fetches .srt subtitles for all your downloaded content.<br>
+                <a href="https://www.opensubtitles.com/en/contact" target="_blank" style="color:var(--teal); font-size:0.75rem;">→ Register on OpenSubtitles.com</a>
+            </p>
+            <div class="form-group">
+                <label>API Key</label>
+                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="opensubtitles_api_key" value="{{ settings.opensubtitles_api_key or '' }}" placeholder="OpenSubtitles API key">
+            </div>
+        </div>
+    </div>
+    <button class="btn btn-gold" onclick="saveIntegrations()">Save Integrations</button>
+</section>
+
+{# ─── Chat Bridges ──────────────────────────────────────────────── #}
+<section id="s-bridges" class="card">
+    <div class="card-header">
+        <span class="card-icon">📡</span>
+        <div class="card-header-text">
+            <h2>Signal Tower — Chat Bridges</h2>
+            <p class="card-desc">Connect Discord and Telegram so you can talk to the Quartermaster from any channel.</p>
+        </div>
+    </div>
+    <div class="settings-grid">
+        <div class="integration-block">
+            <h3 class="int-title">Discord</h3>
+            <p class="int-desc">Bot token and channel for server integration.</p>
+            <div class="form-row">
+                <div class="form-group flex-2">
+                    <label>Bot Token</label>
+                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="discord_token" value="{{ settings.discord_token or '' }}" placeholder="Discord bot token">
+                </div>
+                <div class="form-group">
+                    <label>Channel ID</label>
+                    <input type="text" id="discord_channel_id" value="{{ settings.discord_channel_id or '' }}" placeholder="123456789">
+                </div>
+            </div>
+        </div>
+        <div class="integration-block">
+            <h3 class="int-title">Telegram</h3>
+            <p class="int-desc">Bot token for Telegram direct messaging.</p>
+            <div class="form-group">
+                <label>Bot Token</label>
+                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="telegram_token" value="{{ settings.telegram_token or '' }}" placeholder="Telegram bot token from @BotFather">
+            </div>
+        </div>
+    </div>
+    <button class="btn btn-gold" onclick="saveBridges()">Save Signal Lines</button>
+</section>
+
+{# ─── Web Admin ─────────────────────────────────────────────────── #}
+<section id="s-admin" class="card">
+    <div class="card-header">
+        <span class="card-icon">🔑</span>
+        <div class="card-header-text">
+            <h2>Web Admin</h2>
+            <p class="card-desc">Change the web interface login password. Leave new password blank to keep current.</p>
+        </div>
+    </div>
+    <div class="form-row">
+        <div class="form-group">
+            <label>New Password</label>
+            <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="new_password" placeholder="New password">
+        </div>
+        <div class="form-group">
+            <label>Confirm Password</label>
+            <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="new_password_confirm" placeholder="Confirm new password">
+        </div>
+    </div>
+    <button class="btn btn-gold" onclick="savePassword()">Change Password</button>
+</section>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/components/traktAuth.js"></script>
+<script src="/static/js/components/modelCatalog.js"></script>
+<script src="/static/js/components/apiKeyManager.js"></script>
+<script src="/static/js/components/settingsSavers.js"></script>
+<script src="/static/js/components/libraryConsolidation.js"></script>
+<script src="/static/js/components/bandwidthScheduler.js"></script>
+{% endblock %}

@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}The Helm - Long John Silver{% endblock %}
+{% block content %}
+
+<!-- Main Sliding Viewports -->
+<!-- Renders via HelmPanel (AI chat terminal, logs console, fleet stats, quick shortcuts) -->
+<div id="helm" class="view active"></div>
+
+<!-- Renders via HoldPanel (Active card lists, recent plunder histories) -->
+<div id="hold" class="view"></div>
+
+<!-- Renders via BootyPanel (Categories groups, detail triggers, commission forms) -->
+<div id="booty" class="view"></div>
+
+<!-- Renders via SuggestionsPanel (category-owned recommendations and action queues) -->
+<div id="suggestions" class="view">
+    <div class="suggestions-page glass-panel" id="crows-nest">
+        <div class="suggestions-hero">
+            <div>
+                <p class="eyebrow">Crow's Nest</p>
+                <h2>Suggestions</h2>
+                <p class="muted">Grouped, user-approved actions for your tracked library. Macro actions first; episode-level controls stay tucked away until needed.</p>
+            </div>
+            <span class="badge" id="suggestion-count">0 groups</span>
+        </div>
+        <div id="suggestion-list" class="suggestion-list">
+            <p class="empty-msg">Scanning the horizon for upgrades...</p>
+        </div>
+    </div>
+</div>
+
+<!-- Renders via SharingPanel (seed-in-place library sharing status) -->
+<div id="sharing" class="view"></div>
+
+<!-- Renders via SettingsPanel (System preferences) -->
+<div id="settings" class="view"></div>
+
+{% endblock %}
+
+{% block modals %}
+<!-- Category Item Detail Modal Overlay -->
+<div id="category-item-detail-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content lib-modal-content">
+        <div class="modal-header">
+            <h2 id="detail-title">Item Details</h2>
+            <button class="modal-close" onclick="detailModal.close()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div id="detail-header" class="detail-header-info">
+                <div id="detail-meta"></div>
+                <div class="detail-settings">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Language</label>
+                            <select id="detail-lang" class="lib-select"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>Interval (days)</label>
+                            <input type="number" id="detail-interval" class="lib-input" style="width: 60px;">
+                        </div>
+                        <button onclick="detailModal.saveSettings()" class="btn btn-gold btn-sm" style="margin-top: 1.4rem;">Save</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="detail-action-bar" class="action-bar"></div>
+            
+            <div class="detail-tabs">
+                <button class="detail-tab active" data-target="episodes-tab">Units</button>
+                <button class="detail-tab" data-target="upgrades-tab">Upgrades</button>
+            </div>
+            
+            <div id="episodes-tab" class="detail-tab-pane">
+                <div id="detail-episodes"></div>
+            </div>
+            <div id="upgrades-tab" class="detail-tab-pane" style="display: none;">
+                <div id="detail-upgrades"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.lib-modal-content {
+    background: rgba(14, 23, 44, 0.85) !important;
+    border: 1px solid var(--glass-border) !important;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.5) !important;
+    backdrop-filter: var(--glass-blur) !important;
+    -webkit-backdrop-filter: var(--glass-blur) !important;
+    max-width: 850px;
+}
+.detail-header-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 2rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--glass-border);
+}
+.detail-tabs {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--glass-border);
+}
+.detail-tab {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.9rem;
+    border-bottom: 2px solid transparent;
+}
+.detail-tab.active {
+    color: var(--accent-gold);
+    border-bottom-color: var(--accent-gold);
+}
+.detail-tab:hover {
+    color: var(--text-main);
+}
+.ep-tag-missing {
+    background: var(--bg-deep);
+    border-color: var(--accent-red-glow);
+    color: var(--accent-red);
+}
+.missing-list {
+    background: rgba(231, 111, 81, 0.05);
+    border: 1px solid var(--accent-red-glow);
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 1.5rem;
+}
+.batch-btns {
+    margin-top: 1rem;
+    display: flex;
+    gap: 0.5rem;
+}
+</style>
+{% endblock %}

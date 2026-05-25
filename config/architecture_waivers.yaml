@@ -1,0 +1,95 @@
+# LJS Architecture Waiver List
+#
+# Each waiver documents a known structural violation that is tolerated
+# temporarily while the codebase is decomposed. Waivers must include:
+#   - file / symbol
+#   - violated rule
+#   - reason for waiver
+#   - target phase for removal (see ARCHITECTURE_REMEDIATION_ACTION_PLAN.md)
+#
+# Waivers expire when the target phase is completed.
+
+waivers:
+
+  # ── File-level violations ──────────────────────────────────────
+
+  - file: "src/web/app.py"
+    rule: "max_file_lines (800)"
+    reason: "FastAPI application factory with all routes, WebSocket manager, event bus, setup endpoints, and provider management. Will be split into routers (Phase 2)."
+    owner: "remediation"
+    target_phase: 2
+
+  - file: "src/core/downloader.py"
+    rule: "max_file_lines (800)"
+    reason: "Download manager with queue coordination, engine calls, metadata parsing, file renaming, progress persistence, stall detection, seeding, and callbacks. Lifecycle extraction planned in Phase 6."
+    owner: "remediation"
+    target_phase: 6
+
+  # ── Class-level violations ─────────────────────────────────────
+
+  - file: "src/web/app.py"
+    symbol: "ConnectionManager"
+    rule: "max_class_lines (200)"
+    reason: "WebSocket connection manager will be extracted to its own module during Phase 2 router split."
+    owner: "remediation"
+    target_phase: 2
+
+  - file: "src/web/app.py"
+    symbol: "ShipEventBus"
+    rule: "max_class_lines (200)"
+    reason: "Event bus will be extracted to its own module during Phase 2 router split."
+    owner: "remediation"
+    target_phase: 2
+
+  - file: "src/core/downloader.py"
+    symbol: "DownloadManager"
+    rule: "max_class_lines (200)"
+    reason: "Download manager will be decomposed into coordinator + lifecycle services in Phase 6."
+    owner: "remediation"
+    target_phase: 6
+
+  - file: "src/ai/assistant.py"
+    symbol: "AIAssistant"
+    rule: "max_class_lines (200)"
+    reason: "Assistant will become a facade over extracted collaborators in Phase 5."
+    owner: "remediation"
+    target_phase: 5
+
+  - file: "src/core/categories/base.py"
+    symbol: "MediaCategory"
+    rule: "max_class_lines (200)"
+    reason: "Base class absorbed file utilities and language detection. Utility extraction planned in Phase 7."
+    owner: "remediation"
+    target_phase: 7
+
+  - file: "src/core/taste_profiler.py"
+    symbol: "TasteProfiler"
+    rule: "max_class_lines (200)"
+    reason: "Taste profiler enriches and profiles movie and TV show library metadata."
+    owner: "remediation"
+    target_phase: 7
+
+  # ── Method-level violations ────────────────────────────────────
+
+  - file: "src/core/downloader.py"
+    symbol: "DownloadManager._monitor_download"
+    rule: "max_method_lines (30)"
+    reason: "190-line monitoring method will be replaced by DownloadLifecycleMonitor in Phase 6."
+    owner: "remediation"
+    target_phase: 6
+
+  - file: "src/ai/assistant.py"
+    symbol: "AIAssistant.run"
+    rule: "max_method_lines (30)"
+    reason: "Orchestration method coordinating plan prep, loop execution, and behavior recording. Decomposed but coordinators still add line count."
+    owner: "remediation"
+    target_phase: 5
+
+  - file: "src/ai/assistant.py"
+    symbol: "AIAssistant.run_stream"
+    rule: "max_method_lines (30)"
+    reason: "Streaming orchestration method with same coordination pattern as run()."
+    owner: "remediation"
+    target_phase: 5
+
+

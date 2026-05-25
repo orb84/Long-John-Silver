@@ -1,0 +1,263 @@
+"""Prompt-safe compaction for LLM tool results.
+
+Tool handlers often return rich machine payloads so UI, cache, and direct
+callers can inspect every field.  The chat model does not need that whole
+surface on every loop iteration.  This module keeps the LLM-facing tool message
+small while preserving stable IDs, queue arguments, and the decision evidence
+needed for the next tool call.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+class ToolResultCompactor:
+    """Build compact, loss-aware tool results for assistant prompts.
+
+    The compactor never mutates the original result.  It preserves queueable
+    identifiers (`result_set_id`, `candidate_id`, `candidate_ids`) and evidence
+    that affects download decisions: language, resolution, size/bitrate, seeders,
+    source, and category unit descriptors.  Bulky raw payloads remain available
+    in result caches and logs, but are not fed back wholesale to the model.
+    """
+
+    _DEFAULT_MAX_CHARS = 6000
+    _SEARCH_CANDIDATE_LIMIT = 8
+    _SEARCH_PICKER_LIMIT = 60
+    _SEARCH_GROUP_LIMIT = 40
+    _DOWNLOAD_LIMIT = 12
+
+    def compact_for_message(self, tool_name: str, result: Any) -> str:
+        """Return a JSON/text payload suitable for a chat tool message."""
+        compacted = self.compact(tool_name, result)
+        if isinstance(compacted, str):
+            return compacted
+        try:
+            return json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return self._truncate_middle(str(compacted), self._DEFAULT_MAX_CHARS, "tool result compressed")
+
+    def compact(self, tool_name: str, result: Any) -> Any:
+        """Return a compact Python object for a known tool result."""
+        if tool_name == "search_media_torrents" and isinstance(result, dict):
+            return self._compact_media_search(result)
+        if tool_name == "search_torrents":
+            return self._compact_generic_search(result)
+        if tool_name == "list_downloads" and isinstance(result, (dict, list)):
+            return self._compact_download_list(result)
+        if tool_name in {"read_web_page", "browse_page", "browser_read_selected"}:
+            return self._compact_textual(result, 3500, "web content compressed")
+        if isinstance(result, str):
+            return self._compact_textual(result, self._DEFAULT_MAX_CHARS, "tool result compressed")
+        return self._compact_jsonish(result, self._DEFAULT_MAX_CHARS)
+
+    def _compact_media_search(self, result: dict[str, Any]) -> dict[str, Any]:
+        if result.get("ok") is False:
+            return {
+                "ok": False,
+                "tool": result.get("tool"),
+                "error_code": result.get("error_code"),
+                "recoverable": result.get("recoverable", True),
+                "error": result.get("error"),
+                "next_actions": result.get("next_actions"),
+            }
+        candidates = list(result.get("candidates") or [])
+        batch = result.get("batch_recommendation") if isinstance(result.get("batch_recommendation"), dict) else None
+        keep_ids = self._recommended_candidate_ids(batch)
+        selected = self._select_search_candidates(candidates, keep_ids)
+        compact: dict[str, Any] = {
+            "query": result.get("query"),
+            "language": result.get("language"),
+            "category_id": result.get("category_id"),
+            "name": result.get("name"),
+            "item_id": result.get("item_id"),
+            "display_name": result.get("display_name"),
+            "season": result.get("season"),
+            "episode": result.get("episode"),
+            "result_set_id": result.get("result_set_id"),
+            "result_handle": result.get("result_handle"),
+            "search_scope": result.get("search_scope"),
+            "search_summary": result.get("search_summary"),
+            "next_actions": result.get("next_actions"),
+            "candidate_count": len(candidates),
+            "estimated_total_size_bytes": result.get("estimated_total_size_bytes"),
+            "results_total_size_gb": result.get("results_total_size_gb"),
+            "candidate_picker": self._compact_candidate_picker(result.get("candidate_picker")),
+            "candidates": [self._compact_candidate(c, fallback_result_set_id=result.get("result_set_id")) for c in selected],
+        }
+        omitted = max(0, len(candidates) - len(selected))
+        if omitted:
+            compact["omitted_candidates_count"] = omitted
+            compact["omission_note"] = "Use result_set_id/candidate_id; omitted entries remain cached for queue_download resolution."
+        if result.get("llm_next_action"):
+            compact["llm_next_action"] = result.get("llm_next_action")
+        if batch:
+            compact["batch_recommendation"] = self._compact_batch_recommendation(batch, result.get("result_set_id"))
+        return compact
+
+    def _compact_generic_search(self, result: Any) -> Any:
+        if isinstance(result, dict) and isinstance(result.get("candidates"), list):
+            compact = dict(result)
+            candidates = result.get("candidates") or []
+            compact["candidate_count"] = len(candidates)
+            compact["candidates"] = [self._compact_candidate(c, fallback_result_set_id=result.get("result_set_id")) for c in candidates[:self._SEARCH_CANDIDATE_LIMIT]]
+            if len(candidates) > self._SEARCH_CANDIDATE_LIMIT:
+                compact["omitted_candidates_count"] = len(candidates) - self._SEARCH_CANDIDATE_LIMIT
+            return self._compact_jsonish(compact, self._DEFAULT_MAX_CHARS)
+        if isinstance(result, list):
+            return [self._compact_candidate(c) if isinstance(c, dict) else c for c in result[:self._SEARCH_CANDIDATE_LIMIT]]
+        return self._compact_jsonish(result, self._DEFAULT_MAX_CHARS)
+
+    def _compact_download_list(self, result: dict[str, Any] | list[Any]) -> Any:
+        if isinstance(result, list):
+            rows = result
+            return {
+                "count": len(rows),
+                "downloads": [self._compact_download_row(row) for row in rows[:self._DOWNLOAD_LIMIT]],
+                "omitted_count": max(0, len(rows) - self._DOWNLOAD_LIMIT),
+            }
+        compact = dict(result)
+        for key in ("downloads", "items", "active", "queued"):
+            value = compact.get(key)
+            if isinstance(value, list):
+                compact[f"{key}_count"] = len(value)
+                compact[key] = [self._compact_download_row(row) for row in value[:self._DOWNLOAD_LIMIT]]
+                if len(value) > self._DOWNLOAD_LIMIT:
+                    compact[f"{key}_omitted_count"] = len(value) - self._DOWNLOAD_LIMIT
+        return self._compact_jsonish(compact, self._DEFAULT_MAX_CHARS)
+
+    def _compact_batch_recommendation(self, batch: dict[str, Any], fallback_result_set_id: Any) -> dict[str, Any]:
+        groups = list(batch.get("groups") or [])
+        compact = {
+            "intent": batch.get("intent"),
+            "reason": batch.get("reason"),
+            "result_set_id": batch.get("result_set_id") or fallback_result_set_id,
+            "candidate_ids": list(batch.get("candidate_ids") or []),
+            "queue_download_arguments": batch.get("queue_download_arguments"),
+            "group_count": len(groups),
+            "groups": [self._compact_batch_group(group) for group in groups[:self._SEARCH_GROUP_LIMIT]],
+        }
+        if len(groups) > self._SEARCH_GROUP_LIMIT:
+            compact["omitted_groups_count"] = len(groups) - self._SEARCH_GROUP_LIMIT
+        return compact
+
+    def _compact_batch_group(self, group: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "unit": group.get("unit"),
+            "recommended_candidate_id": group.get("recommended_candidate_id"),
+            "title": group.get("title"),
+            "size": group.get("size"),
+            "seeders": group.get("seeders"),
+            "candidate_count": group.get("candidate_count"),
+            "unit_descriptor": self._compact_descriptor(group.get("unit_descriptor")),
+            "coordinates": group.get("coordinates") or {},
+        }
+
+    def _recommended_candidate_ids(self, batch: dict[str, Any] | None) -> set[str]:
+        ids: set[str] = set()
+        if not batch:
+            return ids
+        for value in batch.get("candidate_ids") or []:
+            if value:
+                ids.add(str(value))
+        args = batch.get("queue_download_arguments") or {}
+        for value in args.get("candidate_ids") or [] if isinstance(args, dict) else []:
+            if value:
+                ids.add(str(value))
+        for group in batch.get("groups") or []:
+            value = group.get("recommended_candidate_id") if isinstance(group, dict) else None
+            if value:
+                ids.add(str(value))
+        return ids
+
+    def _select_search_candidates(self, candidates: list[Any], keep_ids: set[str]) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if len(selected) < self._SEARCH_CANDIDATE_LIMIT:
+                selected.append(candidate)
+                cid = candidate.get("candidate_id")
+                if cid:
+                    seen.add(str(cid))
+                continue
+            cid = candidate.get("candidate_id")
+            if cid and str(cid) in keep_ids and str(cid) not in seen:
+                selected.append(candidate)
+                seen.add(str(cid))
+        return selected
+
+    def _compact_candidate_picker(self, rows: Any) -> list[dict[str, Any]]:
+        """Keep many candidate rows in a very small ID/title/size format."""
+        if not isinstance(rows, list):
+            return []
+        compact_rows: list[dict[str, Any]] = []
+        keys = ("id", "index", "title", "size", "size_bytes", "seeders", "unit", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count")
+        for row in rows[: self._SEARCH_PICKER_LIMIT]:
+            if not isinstance(row, dict):
+                continue
+            compact_rows.append({key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})})
+        return compact_rows
+
+    def _compact_candidate(self, candidate: dict[str, Any], fallback_result_set_id: Any = None) -> dict[str, Any]:
+        keys = (
+            "index", "option_index", "candidate_id", "title", "size", "size_bytes",
+            "seeders", "source", "quality_score", "season", "episode", "languages",
+            "resolution", "codec", "per_episode_size", "per_episode_size_bytes",
+            "estimated_bitrate_kbps", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count",
+        )
+        compact = {key: candidate.get(key) for key in keys if candidate.get(key) not in (None, "", [])}
+        compact["result_set_id"] = candidate.get("result_set_id") or fallback_result_set_id
+        descriptor = self._compact_descriptor(candidate.get("unit_descriptor"))
+        if descriptor:
+            compact["unit_descriptor"] = descriptor
+        return compact
+
+    def _compact_descriptor(self, descriptor: Any) -> dict[str, Any]:
+        if not isinstance(descriptor, dict):
+            return {}
+        keys = ("stable_key", "label", "granularity", "sort_key", "coordinates")
+        return {key: descriptor.get(key) for key in keys if descriptor.get(key) not in (None, "", [], {})}
+
+    def _compact_download_row(self, row: Any) -> Any:
+        if not isinstance(row, dict):
+            return row
+        keys = (
+            "id", "download_id", "name", "item_name", "title", "torrent_title", "status",
+            "progress", "priority", "category_id", "season", "episode", "unit_label",
+            "unit_key", "save_path", "error", "health", "seeders", "peers",
+        )
+        return {key: row.get(key) for key in keys if row.get(key) not in (None, "", [])}
+
+    def _compact_jsonish(self, result: Any, max_chars: int) -> Any:
+        try:
+            text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = str(result)
+        if len(text) <= max_chars:
+            return result
+        return self._truncate_middle(text, max_chars, "tool result compressed")
+
+    def _compact_textual(self, result: Any, max_chars: int, label: str) -> str:
+        if isinstance(result, str):
+            text = result
+        else:
+            try:
+                text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                text = str(result)
+        return self._truncate_middle(text, max_chars, label) if len(text) > max_chars else text
+
+    @staticmethod
+    def _truncate_middle(text: str, max_chars: int, label: str) -> str:
+        if len(text) <= max_chars:
+            return text
+        if max_chars < 240:
+            return text[:max_chars]
+        head = int(max_chars * 0.66)
+        tail = max(100, max_chars - head - 90)
+        omitted = len(text) - head - tail
+        return f"{text[:head].rstrip()}\n...[{label}: {omitted} chars omitted]...\n{text[-tail:].lstrip()}"

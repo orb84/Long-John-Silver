@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}The Helm - Long John Silver{% endblock %}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="icon" href="data:,">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    
+    <!-- Ambient Ocean and Bubble Effects -->
+    <div class="ocean-bg"></div>
+    <div class="bubbles-container" id="bubbles"></div>
+
+    <div class="app-layout">
+        
+        <!-- Premium Glass Header -->
+        <header class="app-header glass-panel">
+            <div class="brand">
+                <div class="persona-avatar" id="brand-avatar"></div>
+                <div class="brand-text">
+                    <h1 id="persona-display-name">LONG JOHN SILVER</h1>
+                    <span class="status">
+                        <i class="fa-solid fa-circle pulse-dot"></i> 
+                        <span id="system-status-text">Systems Operational</span>
+                    </span>
+                    <span class="status bg-status">
+                        <i class="fa-solid fa-gear"></i>
+                        <span id="background-status-text">Idle</span>
+                    </span>
+                </div>
+            </div>
+            
+            <!-- Navigation Dock -->
+            <nav class="nav-dock">
+                <button class="nav-btn active" data-target="helm">
+                    <i class="fa-solid fa-ship"></i> The Helm
+                </button>
+                <button class="nav-btn" data-target="hold">
+                    <i class="fa-solid fa-anchor"></i> The Hold
+                </button>
+                <button class="nav-btn" data-target="booty">
+                    <i class="fa-solid fa-gem"></i> The Booty
+                </button>
+                <button class="nav-btn" data-target="suggestions">
+                    <i class="fa-solid fa-binoculars"></i> Suggestions
+                </button>
+                <button class="nav-btn" data-target="sharing">
+                    <i class="fa-solid fa-seedling"></i> Sharing
+                </button>
+                <button class="nav-btn" data-target="settings">
+                    <i class="fa-solid fa-compass"></i> Compass
+                </button>
+            </nav>
+
+            <div class="user-actions">
+                <button class="icon-btn" id="notification-bell" title="Notifications">
+                    <i class="fa-regular fa-bell"></i>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="view-container" id="view-container">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+
+    <!-- Snapping Interactive Fidget Compass -->
+    <div class="fidget-compass" id="fidget-compass" title="Spin me!">
+        <div class="compass-ring"></div>
+        <div class="compass-needle" id="compass-needle"></div>
+    </div>
+
+    <!-- Modals Block -->
+    {% block modals %}{% endblock %}
+
+    <!-- Core App Scripts -->
+    <script src="/static/js/components/dom.js"></script>
+    <script src="/static/js/core/eventBus.js"></script>
+    <script src="/static/js/core/toastManager.js"></script>
+    <script src="/static/js/components/modalManager.js"></script>
+    <script src="/static/js/api/actionClient.js"></script>
+    <script src="/static/js/api/categoryClient.js"></script>
+    <script src="/static/js/api/websocketClient.js"></script>
+    <script src="/static/js/components/viewManager.js"></script>
+    <script src="/static/js/components/fidgetCompass.js"></script>
+    <script src="/static/js/components/chatController.js"></script>
+    <script src="/static/js/components/downloadFileRows.js"></script>
+    <script src="/static/js/components/downloadStatsPatcher.js"></script>
+    <script src="/static/js/components/downloadManagerUI.js"></script>
+    
+    <!-- Component Scripts -->
+    <script src="/static/js/components/suggestionsPanel.js"></script>
+    <script src="/static/js/components/categoryItemDetailModal.js"></script>
+    <script src="/static/js/components/settingsSavers.js"></script>
+    
+    <!-- Panel View Renderers -->
+    <script src="/static/js/components/helmPanel.js"></script>
+    <script src="/static/js/components/holdPanel.js"></script>
+    <script src="/static/js/components/bootyPanel.js"></script>
+    <script src="/static/js/components/settingsPanel.js"></script>
+    <script src="/static/js/components/sharingPanel.js"></script>
+    <script src="/static/js/components/categoryManifestPanel.js"></script>
+    
+    <!-- Composition Root and Initialization -->
+    <script src="/static/js/app.js"></script>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

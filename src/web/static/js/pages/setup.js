@@ -1,0 +1,627 @@
+/**
+ * LJS Setup Wizard — handles multi-step first-time configuration.
+ *
+ * Steps: password -> paths -> LLM -> channels -> automation -> complete.
+ * Uses shared components: modelCatalog.js (fetchModels, updateModelSelect),
+ * core/toastManager.js (toast), api/actionClient.js (APIClient).
+ */
+
+var currentStep = 1;
+var TOTAL_STEPS = 5;
+var setupProvider = '';
+var setupModels = [];
+
+var PRESET_INFO = {
+    openrouter: 'Multi-provider gateway. Supports GPT-4, Claude, Llama, and 200+ more models. Requires an API key.',
+    nvidia_nim: 'GPU-accelerated inference microservices. Fast local models. Requires NVIDIA API key.',
+    ollama_cloud: 'Ollama managed cloud. Run open-source models without local hardware. Requires API key.',
+    ollama_local: 'Run models locally with Ollama. No API key needed. Requires Ollama installed.',
+    lm_studio: 'Run models locally with LM Studio. No API key needed. Requires LM Studio running.',
+};
+
+var PRESET_BASES = {
+    openrouter: 'https://openrouter.ai/api/v1',
+    nvidia_nim: 'https://integrate.api.nvidia.com/v1',
+    ollama_cloud: 'https://api.ollama.ai/v1',
+    ollama_local: 'http://localhost:11434/v1',
+    lm_studio: 'http://localhost:1234/v1',
+};
+
+var PRESET_NEEDS_KEY = {
+    openrouter: true,
+    nvidia_nim: true,
+    ollama_cloud: true,
+    ollama_local: false,
+    lm_studio: false,
+};
+
+var selectedChannels = new Set(['web']);
+
+/**
+ * Public UI helper for the goStep workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function goStep(step) {
+    document.getElementById('step-' + currentStep).classList.remove('active');
+    document.getElementById('step-' + step).classList.add('active');
+    currentStep = step;
+    updateStepper();
+}
+
+/**
+ * Public UI helper for the updateStepper workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function updateStepper() {
+    for (var i = 1; i <= TOTAL_STEPS; i++) {
+        var dot = document.getElementById('dot-' + i);
+        var line = document.getElementById('line-' + i);
+        dot.classList.remove('active', 'completed');
+        if (i < currentStep) {
+            dot.classList.add('completed');
+            dot.textContent = '\u2713';
+            if (line) line.classList.add('completed');
+        } else if (i === currentStep) {
+            dot.classList.add('active');
+            dot.textContent = i;
+            if (line) line.classList.remove('completed');
+        } else {
+            dot.textContent = i;
+            if (line) line.classList.remove('completed');
+        }
+    }
+}
+
+/**
+ * Public UI helper for the installBridge workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+async function installBridge(bridgeId) {
+    try {
+        var r = await fetch('/api/comms/bridges/' + bridgeId + '/install', { method: 'POST' });
+        if (r.ok) {
+            var result = await r.json();
+            if (result.status === 'installed') {
+                toast.show(bridgeId + ' package installed');
+            }
+        }
+    } catch (e) {
+        console.warn('Bridge install for ' + bridgeId + ' failed:', e);
+    }
+}
+
+/**
+ * Public UI helper for the savePassword workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function savePassword() {
+    var password = document.getElementById('setup-password').value;
+    var confirm = document.getElementById('setup-password-confirm').value;
+
+    if (password && password !== confirm) {
+        toast.show('Passwords do not match', 'err');
+        return;
+    }
+
+    APIClient.post('/api/setup/password', { password: password, confirm: confirm }).then(function() {
+        toast.show('Password saved');
+        goStep(2);
+    }).catch(function(e) {
+        toast.show(e.message, 'err');
+    });
+}
+
+/**
+ * Public UI helper for the skipPassword workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function skipPassword() {
+    APIClient.post('/api/setup/password', { password: '', confirm: '' }).then(function() {
+        toast.show('No password set — open access');
+        goStep(2);
+    }).catch(function(e) {
+        toast.show(e.message, 'err');
+    });
+}
+
+/**
+ * Public UI helper for the savePaths workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function savePaths() {
+    var data = {
+        download_dir: document.getElementById('setup-download-dir').value.trim() || './downloads',
+        library_paths: collectSetupCategoryPaths(),
+    };
+    APIClient.post('/api/setup/paths', data).then(function() {
+        toast.show('Paths saved');
+        goStep(3);
+        onSetupProviderChange(document.getElementById('setup-provider'));
+    }).catch(function(e) {
+        toast.show(e.message, 'err');
+    });
+}
+
+/**
+ * Public UI helper for the collectSetupCategoryPaths workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function collectSetupCategoryPaths() {
+    var paths = {};
+    document.querySelectorAll('.setup-category-path').forEach(function(input) {
+        paths[input.dataset.categoryId] = input.value.trim();
+    });
+    return paths;
+}
+
+/**
+ * Public UI helper for the onSetupProviderChange workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+async function onSetupProviderChange(selectEl) {
+    var providerId = selectEl.value;
+    setupProvider = providerId;
+
+    var infoEl = document.getElementById('setup-provider-info');
+    if (infoEl) {
+        if (PRESET_INFO[providerId]) {
+            infoEl.textContent = PRESET_INFO[providerId];
+            infoEl.style.display = 'block';
+        } else {
+            infoEl.style.display = 'none';
+        }
+    }
+
+    var apiBaseEl = document.getElementById('setup-api-base');
+    if (PRESET_BASES[providerId]) {
+        apiBaseEl.value = PRESET_BASES[providerId];
+    }
+
+    var keyGroup = document.getElementById('setup-api-key-group');
+    if (keyGroup) {
+        keyGroup.style.display = PRESET_NEEDS_KEY[providerId] ? '' : 'none';
+    }
+
+    // Dynamic key instructions link updates
+    var providerLinks = {
+        openrouter: { name: 'OpenRouter Keys', url: 'https://openrouter.ai/keys' },
+        openai: { name: 'OpenAI API Keys', url: 'https://platform.openai.com/api-keys' },
+        nvidia_nim: { name: 'NVIDIA NIM Catalog', url: 'https://build.nvidia.com/' },
+        ollama_cloud: { name: 'Ollama Cloud Console', url: 'https://ollama.com' }
+    };
+    var linkHelp = document.getElementById('key-help-link');
+    var signupLink = document.getElementById('provider-signup-link');
+    if (linkHelp && signupLink) {
+        if (providerLinks[providerId]) {
+            signupLink.textContent = providerLinks[providerId].name + ' \u2197';
+            signupLink.href = providerLinks[providerId].url;
+            linkHelp.style.display = 'block';
+        } else {
+            linkHelp.style.display = 'none';
+        }
+    }
+
+    var modelSelect = document.getElementById('setup-model-select');
+    var searchInput = document.getElementById('setup-model-search');
+    if (searchInput) searchInput.value = '';
+    if (modelSelect) {
+        modelSelect.innerHTML = '<option value="">Loading models...</option>';
+    }
+
+    setupModels = await fetchModels(providerId);
+    if (modelSelect) {
+        updateModelSelect(modelSelect, setupModels, '');
+    }
+}
+
+/**
+ * Public UI helper for the onSetupModelSelect workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function onSetupModelSelect(selectEl) {
+    var modelId = selectEl.value;
+    if (modelId) {
+        document.getElementById('setup-model').value = modelId;
+    }
+}
+
+/**
+ * Public UI helper for the filterSetupModels workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function filterSetupModels(query) {
+    var modelSelect = document.getElementById('setup-model-select');
+    var filtered = query
+        ? setupModels.filter(function(m) { return m.id.toLowerCase().includes(query.toLowerCase()) || m.name.toLowerCase().includes(query.toLowerCase()); })
+        : setupModels;
+    updateModelSelect(modelSelect, setupModels, query);
+}
+
+/**
+ * Public UI helper for the saveLLM workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function saveLLM() {
+    var provider = document.getElementById('setup-provider').value;
+    var model = document.getElementById('setup-model').value.trim();
+    var apiBase = document.getElementById('setup-api-base').value.trim();
+    var apiKey = document.getElementById('setup-api-key').value.trim();
+
+    if (!model) {
+        toast.show('Please select or enter a model ID', 'err');
+        return;
+    }
+
+    var data = { provider: provider, model: model, api_base: apiBase };
+    if (apiKey) data.api_key = apiKey;
+
+    var webProvider = document.getElementById('setup-web-search-provider');
+    var webKey = document.getElementById('setup-web-search-key');
+    var webBase = document.getElementById('setup-web-search-base');
+    var webFallback = document.getElementById('setup-web-search-fallback');
+    if (webProvider) {
+        data.web_search = {
+            enabled: true,
+            provider: webProvider.value,
+            api_key: webKey ? webKey.value.trim() : '',
+            api_base: webBase ? webBase.value.trim() : '',
+            max_results: 5,
+            allow_duckduckgo_fallback: webFallback ? webFallback.checked : false,
+        };
+    }
+
+    APIClient.post('/api/setup/llm', data).then(function() {
+        return APIClient.post('/api/setup/embeddings', collectSetupEmbeddings());
+    }).then(function() {
+        var tmdbKey = document.getElementById('setup-tmdb-key');
+        var traktId = document.getElementById('setup-trakt-id');
+        var intelData = {};
+        if (tmdbKey && tmdbKey.value.trim()) intelData.tmdb_api_key = tmdbKey.value.trim();
+        if (traktId && traktId.value.trim()) intelData.trakt_client_id = traktId.value.trim();
+        if (Object.keys(intelData).length) {
+            return APIClient.post('/api/settings/integrations', intelData);
+        }
+        return Promise.resolve({ status: 'skipped' });
+    }).then(function() {
+        toast.show('AI brain connected');
+        goStep(4);
+    }).catch(function(e) {
+        toast.show(e.message, 'err');
+    });
+}
+
+
+/**
+ * Collect optional semantic-memory embedding settings from setup.
+ */
+function collectSetupEmbeddings() {
+    var enabled = document.getElementById('setup-embeddings-enabled');
+    var provider = document.getElementById('setup-embeddings-provider');
+    var model = document.getElementById('setup-embeddings-model');
+    var autoDownload = document.getElementById('setup-embeddings-auto-download');
+    return {
+        enabled: enabled ? enabled.checked : true,
+        provider: provider ? provider.value : 'builtin',
+        builtin_model: model && model.value.trim() ? model.value.trim() : 'sentence-transformers/all-MiniLM-L6-v2',
+        dimension: 384,
+        auto_download: autoDownload ? autoDownload.checked : true,
+        warmup_on_startup: true,
+        max_model_size_mb: 150,
+    };
+}
+
+/**
+ * Public UI helper for the toggleChannel workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function toggleChannel(cardEl, channel) {
+    cardEl.classList.toggle('selected');
+    if (selectedChannels.has(channel)) {
+        selectedChannels.delete(channel);
+    } else {
+        selectedChannels.add(channel);
+    }
+
+    document.getElementById('config-discord').classList.toggle('visible', selectedChannels.has('discord'));
+    document.getElementById('config-telegram').classList.toggle('visible', selectedChannels.has('telegram'));
+    document.getElementById('config-whatsapp').classList.toggle('visible', selectedChannels.has('whatsapp'));
+}
+
+/**
+ * Public UI helper for the updateAutomationHighlight workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+function updateAutomationHighlight() {
+    var suggestCard = document.getElementById('auto-option-suggest');
+    var autoCard = document.getElementById('auto-option-auto');
+    var isSuggest = document.querySelector('input[name="automation"]:checked').value === 'suggest';
+    if (suggestCard) {
+        suggestCard.style.borderColor = isSuggest ? 'var(--teal)' : 'var(--border)';
+        suggestCard.style.background = isSuggest ? 'rgba(46,196,182,0.08)' : 'var(--input)';
+    }
+    if (autoCard) {
+        autoCard.style.borderColor = isSuggest ? 'var(--border)' : 'var(--gold)';
+        autoCard.style.background = isSuggest ? 'var(--input)' : 'rgba(212,162,78,0.08)';
+    }
+}
+
+/**
+ * Public UI helper for the updateSharingHighlight workflow.
+ *
+ * Keeps first-run sharing choices visually clear without saving until finish.
+ */
+function updateSharingHighlight() {
+    var privateCard = document.getElementById('sharing-option-private');
+    var seedCard = document.getElementById('sharing-option-seed');
+    var selected = document.querySelector('input[name="sharing-mode"]:checked');
+    var isSeed = selected && selected.value === 'seed_in_place';
+    if (privateCard) {
+        privateCard.style.borderColor = isSeed ? 'var(--border)' : 'var(--teal)';
+        privateCard.style.background = isSeed ? 'var(--input)' : 'rgba(46,196,182,0.08)';
+    }
+    if (seedCard) {
+        seedCard.style.borderColor = isSeed ? 'var(--gold)' : 'var(--border)';
+        seedCard.style.background = isSeed ? 'rgba(212,162,78,0.08)' : 'var(--input)';
+    }
+}
+
+/**
+ * Public UI helper for the finishSetup workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+async function finishSetup() {
+    var finishBtn = document.getElementById('setup-finish-btn');
+    var finishStatus = document.getElementById('setup-finish-status');
+    var originalBtnHtml = finishBtn ? finishBtn.innerHTML : '';
+    if (finishBtn) {
+        finishBtn.classList.add('is-loading');
+        finishBtn.disabled = true;
+        finishBtn.innerHTML = '<i class="fa-solid fa-spinner"></i> Setting sail…';
+    }
+    if (finishStatus) {
+        finishStatus.classList.add('is-visible');
+        finishStatus.textContent = 'Saving setup and starting background services…';
+    }
+    try {
+    var bridgeInstalls = [];
+    if (selectedChannels.has('discord')) {
+        bridgeInstalls.push(installBridge('discord'));
+    }
+    if (selectedChannels.has('telegram')) {
+        bridgeInstalls.push(installBridge('telegram'));
+    }
+
+    await Promise.allSettled(bridgeInstalls);
+
+    var installPlaywright = document.getElementById('setup-playwright');
+    if (installPlaywright && installPlaywright.checked) {
+        toast.show('Installing Playwright browser engine (may take a minute)...');
+        try {
+            var r = await fetch('/api/browser/install', { method: 'POST' });
+            var result = await r.json();
+            if (result.status === 'installed') {
+                toast.show('Playwright installed successfully');
+            } else {
+                toast.show('Playwright install failed — you can install manually later', 'err');
+            }
+        } catch (e) {
+            toast.show('Playwright install failed — you can install manually later', 'err');
+        }
+    }
+
+    var installJackett = document.getElementById('setup-jackett');
+    if (installJackett && installJackett.checked) {
+        toast.show('Installing Jackett torrent search engine (may take a minute)...');
+        try {
+            var r = await fetch('/api/jackett/install', { method: 'POST' });
+            var result = await r.json();
+            if (result.status === 'installed') {
+                toast.show('Jackett installed — configured open/public indexers via ' + result.url);
+            } else {
+                toast.show('Jackett install failed — you can set it up manually later', 'err');
+            }
+        } catch (e) {
+            toast.show('Jackett install failed — you can set it up manually later', 'err');
+        }
+    }
+
+
+    var directFallback = document.getElementById('setup-direct-scraper-fallback');
+    try {
+        await fetch('/api/settings/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ direct_scraper_fallback: directFallback ? directFallback.checked : true })
+        });
+    } catch (e) {
+        console.warn('Failed to save direct scraper fallback preference', e);
+    }
+
+    var automationMode = document.querySelector('input[name="automation"]:checked');
+    var autoDiscover = document.getElementById('setup-auto-discover');
+    try {
+        await APIClient.post('/api/settings/auto_download', {
+            auto_download: automationMode ? automationMode.value === 'auto' : false,
+            auto_discover: autoDiscover ? autoDiscover.checked : true,
+        });
+    } catch (e) { /* non-critical */ }
+
+    try {
+        var sharingMode = document.querySelector('input[name="sharing-mode"]:checked');
+        var sharingEnabled = sharingMode && sharingMode.value === 'seed_in_place';
+        await APIClient.post('/api/setup/sharing', {
+            enabled: sharingEnabled,
+            mode: sharingEnabled ? 'seed_in_place' : 'disabled',
+            library_upload_speed_kbps: parseInt((document.getElementById('setup-sharing-upload') || {}).value || '0', 10) || 0,
+            active_seed_slots: parseInt((document.getElementById('setup-sharing-slots') || {}).value || '2', 10) || 2,
+            seed_ratio_target: parseFloat((document.getElementById('setup-sharing-ratio') || {}).value || '2.0') || 2.0,
+            seed_duration_hours: 168
+        });
+    } catch (e) { /* non-critical */ }
+
+    try {
+        var autoStart = document.getElementById('setup-auto-start');
+        await APIClient.post('/api/setup/startup', { enabled: autoStart ? autoStart.checked : false });
+    } catch (e) { /* non-critical */ }
+
+    try {
+        var lang = document.getElementById('setup-language');
+        var res = document.getElementById('setup-resolution');
+        var mode = document.getElementById('setup-size-mode');
+        var qData = {};
+        if (lang) qData.language = lang.value;
+        if (res) qData.preferred_resolution = res.value;
+        if (mode) qData.size_limit_mode = mode.value;
+        if (Object.keys(qData).length > 0) {
+            await APIClient.post('/api/settings/quality', qData);
+        }
+    } catch (e) { /* non-critical */ }
+
+    var data = {};
+    if (selectedChannels.has('discord')) {
+        data.discord_token = (document.getElementById('setup-discord-token').value || '').trim() || null;
+        data.discord_channel_id = (document.getElementById('setup-discord-channel').value || '').trim() || null;
+    } else {
+        data.discord_token = null;
+        data.discord_channel_id = null;
+    }
+    if (selectedChannels.has('telegram')) {
+        data.telegram_token = (document.getElementById('setup-telegram-token').value || '').trim() || null;
+    } else {
+        data.telegram_token = null;
+    }
+    if (selectedChannels.has('whatsapp')) {
+        data.whatsapp_token = (document.getElementById('setup-whatsapp-token').value || '').trim() || null;
+        data.whatsapp_phone_number_id = (document.getElementById('setup-whatsapp-phone-id').value || '').trim() || null;
+        data.whatsapp_verify_token = (document.getElementById('setup-whatsapp-verify-token').value || '').trim() || null;
+    } else {
+        data.whatsapp_token = null;
+        data.whatsapp_phone_number_id = null;
+        data.whatsapp_verify_token = null;
+    }
+
+    await APIClient.post('/api/setup/channels', data);
+
+    var result = await APIClient.post('/api/setup/complete', {});
+    if (!result || result.status === 'blocked' || result.setup_complete === false) {
+        var missing = (result && result.missing_required) ? result.missing_required : [];
+        var message = missing.length
+            ? 'Setup is missing required items: ' + missing.map(function(item) { return item.label || item.id; }).join(', ')
+            : 'Setup could not be completed. Please review the highlighted requirements.';
+        toast.show(message, 'err');
+        loadSetupRequirements();
+        return;
+    }
+
+    document.getElementById('step-' + currentStep).classList.remove('active');
+    document.getElementById('step-success').classList.add('active');
+
+    for (var i = 1; i <= TOTAL_STEPS; i++) {
+        var dot = document.getElementById('dot-' + i);
+        dot.classList.remove('active');
+        dot.classList.add('completed');
+        dot.textContent = '\u2713';
+        var line = document.getElementById('line-' + i);
+        if (line) line.classList.add('completed');
+    }
+
+    toast.show('Setup complete!');
+    } catch (e) {
+        console.error('Setup completion failed:', e);
+        toast.show('Setup completion failed. Please review the console or logs.', 'err');
+    } finally {
+        if (finishBtn) {
+            finishBtn.classList.remove('is-loading');
+            finishBtn.disabled = false;
+            finishBtn.innerHTML = originalBtnHtml || '<i class="fa-solid fa-anchor"></i> Set Sail';
+        }
+        if (finishStatus) {
+            finishStatus.classList.remove('is-visible');
+        }
+    }
+}
+
+/**
+ * Public UI helper for the loadSetupRequirements workflow.
+ *
+ * Keep inputs DOM-safe, delegate server mutations through API or Action clients,
+ * and preserve the return/side-effect contract because templates may call this
+ * function directly from event handlers.
+ */
+async function loadSetupRequirements() {
+    var summary = document.getElementById('setup-requirements-summary');
+    if (!summary) return;
+    try {
+        var response = await fetch('/api/setup/requirements');
+        if (!response.ok) return;
+        var data = await response.json();
+        var required = 0;
+        var configured = 0;
+        (data.categories || []).forEach(function(category) {
+            (category.requirements || []).forEach(function(req) {
+                if (req.required) required += 1;
+                if (req.required && req.configured) configured += 1;
+            });
+        });
+        summary.style.display = 'block';
+        summary.innerHTML = '<strong>Category-first setup status:</strong> ' + configured + '/' + required + ' required items configured. ' +
+            'Use these requirements to understand why folders, Jackett, TMDB, TVMaze, and web search matter.';
+    } catch (e) {
+        console.warn('Failed to load setup requirements:', e);
+    }
+}
+
+
+document.addEventListener('DOMContentLoaded', function() {
+    var webCard = document.querySelector('[data-channel="web"]');
+    if (webCard) webCard.classList.add('selected');
+    updateAutomationHighlight();
+    updateSharingHighlight();
+    loadSetupRequirements();
+    var providerSelect = document.getElementById('setup-provider');
+    if (providerSelect) {
+        onSetupProviderChange(providerSelect);
+    }
+});
