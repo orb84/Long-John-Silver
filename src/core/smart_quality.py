@@ -40,7 +40,7 @@ class SmartQualityInferrer:
         if scanned.avg_bitrate_kbps:
             profile.max_bitrate_kbps = int(scanned.avg_bitrate_kbps * 1.2)
 
-        logger.info(
+        logger.debug(
             f"Inferred quality for '{scanned.name}': "
             f"res={profile.preferred_resolution}, "
             f"max_size={profile.max_file_size_mb}MB, "

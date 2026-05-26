@@ -526,8 +526,6 @@ class PlanExecutor:
         """
         if tool_name != "metadata_lookup":
             return False
-        if not ({"web_search", "read_web_page", "browse_page"} & self._allowed_tool_names):
-            return False
         lower = (error or "").lower()
         soft_markers = (
             "no metadata service",

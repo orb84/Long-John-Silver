@@ -61,7 +61,11 @@ class JackettSearch(SearchProvider):
         logger.info(f'[Jackett] Searching for: {query}')
         try:
             async with httpx.AsyncClient(timeout=self._timeout, verify=False) as client:
-                response = await client.get(endpoint, params=params)
+                response = await client.get(endpoint, params=params, follow_redirects=False)
+                if self._is_login_redirect(response):
+                    self.record_error_category('auth_redirect')
+                    logger.warning('[Jackett] API redirected to UI login; check saved API key/admin auth. Falling back if configured.')
+                    return []
                 response.raise_for_status()
             results = self._parse_payload(response.json())
             logger.info(f'[Jackett] Found {len(results)} results.')
@@ -85,10 +89,20 @@ class JackettSearch(SearchProvider):
                 response = await client.get(
                     f'{self._url}/api/v2.0/server/config',
                     params={'apikey': self._api_key},
+                    follow_redirects=False,
                 )
-            return response.status_code < 500
+            return response.status_code == 200 and not self._is_login_redirect(response)
         except Exception:
             return False
+
+
+    @staticmethod
+    def _is_login_redirect(response: httpx.Response) -> bool:
+        """Return whether Jackett redirected an API request to the UI login."""
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return False
+        location = str(response.headers.get('location') or '').lower()
+        return '/ui/login' in location
 
     def _parse_payload(self, payload: Any) -> list[SearchResult]:
         """Parse Jackett JSON response variants into SearchResult objects."""

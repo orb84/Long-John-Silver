@@ -402,7 +402,7 @@ async def main():
             logger.info("Jackett search provider active from saved settings")
 
         if settings.direct_scraper_fallback:
-            logger.warning(
+            logger.info(
                 "Direct scraper fallback is enabled. Jackett remains primary; "
                 "fallback providers are used only when the primary search returns no usable results."
             )

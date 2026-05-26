@@ -223,11 +223,20 @@ class MetadataClientResolver:
         return bool(self._current_tmdb_key(category_id))
 
     def _current_tmdb_key(self, category_id: str | None = None) -> str | None:
+        """Return the effective TMDB key, preserving inherited Media defaults.
+
+        Runtime ``Settings.category_settings`` is an effective view only right
+        after a fresh load.  During setup/Compass saves, however, the in-memory
+        object often contains the user-owned value only on the abstract
+        ``media`` category.  Movie/TV metadata lookups must therefore fall back
+        to ``media.services.tmdb.api_key`` instead of treating a blank concrete
+        child as an unconfigured provider.
+        """
         if self._settings_manager is None:
             return None
         settings = self._settings_manager.settings
         if category_id in {"tv", "movie"}:
-            return settings.category_service_value(category_id, "tmdb", "api_key")
+            return settings.first_category_service_value([category_id, "media"], "tmdb", "api_key")
         return settings.first_category_service_value(["tv", "movie", "media"], "tmdb", "api_key")
 
     def _log_tmdb_status(self, *, api_key: str | None, settings_ready: bool) -> None:

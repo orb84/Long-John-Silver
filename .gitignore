@@ -31,7 +31,9 @@ diagnostics/
 # Local download/library directories
 downloads/
 library/
-!library/.gitkeep
+
+# macOS resource forks
+._*
 
 # Python runtime/build artifacts
 __pycache__/
@@ -55,8 +57,9 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-store/
 .DS_Store
-._*
 
 # Working-session history, generated reliability notes, and review scratchpads
 /docs/project-history/
+
+# Temporary archives
 logs.zip

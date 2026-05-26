@@ -776,3 +776,11 @@ Definition-backed category scans now carry lightweight local object evidence:
 These reconstructed models are local evidence only. Provider metadata and LLM disambiguation remain authoritative for ambiguous identity choices such as exact release, narrator, translator, edition, or series order.
 
 Library metadata refresh now uses category-owned stable snapshot policy. When a definition-backed metadata workflow resolves a library item, it persists the best provider snapshot with `stable_id`, `external_id`, cover URL, object model, and `metadata_refresh_policy`. The scheduler interprets only the generic policy envelope (`refresh_after_days`, stable ID presence, last refresh time) so it does not learn MusicBrainz/Open Library/LibriVox semantics. Fresh stable snapshots are not re-queried on every boot.
+
+## Round 129 fallback and degraded-provider rule
+
+Recoverable provider misses are not terminal plan errors. When a tool such as `metadata_lookup` returns `ok=false` because no configured provider result is available, the executor should preserve that tool result as context and let the agent continue with web/library fallback or a graceful limitation. Terminal planned-step errors should be reserved for invalid arguments, unsafe actions, missing required dependencies, or queue/download failures that cannot safely continue.
+
+Concrete media categories inherit abstract `media` service credentials. During setup and Compass hot-saves, the in-memory settings object may contain the user-owned TMDB key only under `media.services.tmdb.api_key` while `movie` and `tv` contain only sparse private overrides. Runtime metadata client resolution must therefore check the concrete category first and then the abstract parent rather than clearing a working client.
+
+Jackett search and Jackett indexer administration are separate health surfaces. A `/UI/Login` redirect from an indexer administration endpoint means indexer auto-configuration is degraded/action-required; it does not by itself mean every torrent search path should crash. Search health must reject UI-login redirects, report degraded diagnostics, and let explicit fallback providers run when primary search returns no usable results.

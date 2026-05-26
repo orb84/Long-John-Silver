@@ -88,6 +88,7 @@ class JackettIndexerConfigurer:
         self._url = jackett_url.rstrip("/")
         self._api_key = api_key
         self._cookies: dict[str, str] = {}
+        self._last_catalogue_error: str | None = None
 
     async def configure_defaults(self, indexer_ids: list[str] | None = None) -> tuple[int, int, int]:
         """Configure first-run open/public indexers in Jackett.
@@ -112,6 +113,18 @@ class JackettIndexerConfigurer:
         """
         profile = (profile or DEFAULT_JACKETT_PROFILE).strip()
         catalogue = await self.fetch_indexer_catalogue()
+        if not catalogue and self._last_catalogue_error:
+            return {
+                "status": "degraded",
+                "profile": profile,
+                "requested": 0,
+                "missing_ids": [],
+                "added": 0,
+                "skipped": 0,
+                "failed": 0,
+                "error": self._last_catalogue_error,
+                "diagnostics": self.summarize_catalogue([]),
+            }
         available_ids = {entry.id for entry in catalogue}
         if profile in {"all_open_public", "broad_public"}:
             requested = [entry.id for entry in catalogue if self._is_public_like(entry)]
@@ -136,7 +149,7 @@ class JackettIndexerConfigurer:
         if not indexer_ids:
             return 0, 0, 0
         if not await self._authenticate():
-            logger.error("Jackett: failed to obtain admin session — indexer configuration skipped")
+            logger.info("Jackett: indexer configuration skipped because admin session is unavailable")
             return 0, 0, len(indexer_ids)
 
         configured = await self._fetch_configured_ids()
@@ -158,18 +171,43 @@ class JackettIndexerConfigurer:
         return added, skipped, failed
 
     async def fetch_indexer_catalogue(self) -> list[JackettIndexerInfo]:
-        """Fetch configured and unconfigured indexers from Jackett."""
+        """Fetch configured and unconfigured indexers from Jackett.
+
+        Jackett search endpoints use the API key, but indexer administration can
+        redirect to the UI login when Jackett has an admin password/session
+        policy.  Treat that as a degraded, actionable condition instead of
+        spamming warning logs or pretending the catalogue is healthy.
+        """
+        self._last_catalogue_error = None
         try:
-            async with httpx.AsyncClient(timeout=_CONFIG_TIMEOUT, verify=False) as client:
+            async with httpx.AsyncClient(
+                timeout=_CONFIG_TIMEOUT,
+                verify=False,
+                follow_redirects=False,
+                cookies=self._cookies or None,
+            ) as client:
                 response = await client.get(
                     f"{self._url}/api/v2.0/indexers",
                     params={"apikey": self._api_key},
                     headers={"Accept": "application/json"},
                 )
+                if self._is_login_redirect(response):
+                    self._last_catalogue_error = (
+                        "Jackett indexer administration redirected to the UI login. "
+                        "Search may still work for already configured indexers, but LJS cannot "
+                        "auto-configure indexers until Jackett admin auth is cleared or handled."
+                    )
+                    logger.info("Jackett: {}", self._last_catalogue_error)
+                    return []
                 response.raise_for_status()
             data = response.json()
         except Exception as exc:
-            logger.warning(f"Jackett: failed to fetch indexer catalogue: {exc}")
+            self._last_catalogue_error = f"Jackett indexer catalogue unavailable: {exc}"
+            logger.info("Jackett: {}", self._last_catalogue_error)
+            return []
+        if not isinstance(data, list):
+            self._last_catalogue_error = "Jackett indexer catalogue returned an unexpected payload."
+            logger.info("Jackett: {}", self._last_catalogue_error)
             return []
         return [self._normalize_indexer(raw) for raw in data if isinstance(raw, dict)]
 
@@ -204,7 +242,8 @@ class JackettIndexerConfigurer:
         """Fetch and summarize current Jackett indexer coverage."""
         catalogue = await self.fetch_indexer_catalogue()
         return {
-            "status": "ok" if catalogue else "unknown",
+            "status": "ok" if catalogue else ("degraded" if self._last_catalogue_error else "unknown"),
+            "error": self._last_catalogue_error,
             "summary": self.summarize_catalogue(catalogue),
             "configured": [entry.__dict__ for entry in catalogue if entry.configured][:500],
             "unconfigured": [entry.__dict__ for entry in catalogue if not entry.configured][:500],
@@ -260,14 +299,29 @@ class JackettIndexerConfigurer:
             async with httpx.AsyncClient(
                 timeout=_CONFIG_TIMEOUT,
                 verify=False,
-                follow_redirects=True,
+                follow_redirects=False,
             ) as client:
-                await client.get(f"{self._url}/UI/Dashboard")
+                response = await client.get(f"{self._url}/UI/Dashboard")
+                if self._is_login_redirect(response):
+                    self._last_catalogue_error = (
+                        "Jackett admin UI requires login; automatic indexer configuration is unavailable."
+                    )
+                    logger.info("Jackett: {}", self._last_catalogue_error)
+                    return False
                 self._cookies = dict(client.cookies)
-                return "Jackett" in self._cookies
+                return response.status_code < 400 and "Jackett" in self._cookies
         except Exception as e:
-            logger.error(f"Jackett auth failed: {e}")
+            self._last_catalogue_error = f"Jackett auth failed: {e}"
+            logger.info("Jackett: {}", self._last_catalogue_error)
             return False
+
+    @staticmethod
+    def _is_login_redirect(response: httpx.Response) -> bool:
+        """Return whether Jackett redirected an admin/API call to UI login."""
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return False
+        location = str(response.headers.get("location") or "").lower()
+        return "/ui/login" in location
 
     async def _fetch_configured_ids(self) -> set[str]:
         catalogue = await self.fetch_indexer_catalogue()
