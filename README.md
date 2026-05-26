@@ -104,17 +104,6 @@ LJS needs an OpenAI-compatible chat-completions endpoint for intent routing, rea
 
 Good options include:
 
-### NVIDIA NIM
-
-NVIDIA NIM is a strong place to start because NVIDIA provides hosted NIM APIs for development and testing through the NVIDIA Developer Program and API Catalog. In practice, this makes it a very good free development alternative while you are experimenting with LJS.
-
-Useful links:
-
-- NVIDIA NIM for developers: <https://developer.nvidia.com/nim>
-- NVIDIA API Catalog / Build: <https://build.nvidia.com/>
-- NIM documentation: <https://docs.nvidia.com/nim/index.html>
-
-The setup wizard supports OpenAI-compatible provider configuration, so a NIM endpoint can be configured with its base URL, API key, and model name.
 
 ### Local models
 
@@ -127,6 +116,20 @@ LJS is designed to work with local or self-hosted models too. You can run an Ope
 - self-hosted NVIDIA NIM containers on suitable NVIDIA GPUs
 
 Local models are attractive because they keep more of your assistant traffic on your own machine. They may need a larger context window and careful model selection because LJS is a tool-using assistant, not just a chatbot.
+
+
+
+### NVIDIA NIM
+
+NVIDIA NIM is a strong place to start because NVIDIA provides hosted NIM APIs for development and testing through the NVIDIA Developer Program and API Catalog. In practice, this makes it a very good free development alternative while you are experimenting with LJS.
+
+Useful links:
+
+- NVIDIA NIM for developers: <https://developer.nvidia.com/nim>
+- NVIDIA API Catalog / Build: <https://build.nvidia.com/>
+- NIM documentation: <https://docs.nvidia.com/nim/index.html>
+
+The setup wizard supports OpenAI-compatible provider configuration, so a NIM endpoint can be configured with its base URL, API key, and model name.
 
 ### Other hosted providers
 
@@ -276,6 +279,12 @@ The first-run wizard helps configure:
 - storage thresholds and safety settings.
 
 ---
+
+
+
+### WARNING ### 
+THIS PROJECT IS STILL IN DEVELOPMENT. HARD AT IT. I WOULD LOVE TO RECEIVE FEEDBACK AND BUG REPORTS TO MAKE IT BETTER, BUT DON'T EXPECT A PERFECT EXPERIENCE, ESPECIALLY NOT WITH FIRST RELEASE ! 
+
 
 ## Runtime environment variables
 
@@ -456,36 +465,5 @@ See [LICENSE](LICENSE), [NOTICE](NOTICE), and [AUTHORS.md](AUTHORS.md).
 - Repository: <https://github.com/orb84/Long-John-Silver>
 - Maintainer: <https://github.com/orb84>
 - Contact: <orblaboratories@gmail.com>
-- Support: see [SUPPORT.md](SUPPORT.md) and the repository for current ways to send a coffee my way.
+- Support: see [SUPPORT.md](SUPPORT.md) and the repository for current ways to send a coffee my way (if you really want to help paying for my Claude subscription, any paypal orblaboratories@gmail.com would be greatly appreciated !)
 
-### Music/Book category review status
-
-Music, Audiobooks, and Ebooks are definition-backed categories with category-owned metadata service declarations, setup links, and download preferences. Music/Audiobook audio conversion uses FFmpeg only when the user preference requires Apple-friendly sidecars, keeps the source file, and attempts to preserve metadata, chapters, and embedded artwork.
-
-Soulseek was researched as a possible Music/Audiobook companion source. It is intentionally not enabled yet; the safe future route is an explicit slskd-backed source provider with separate queue/share/path settings rather than pretending Soulseek is a torrent fallback.
-
-
-### Category stabilization note
-
-Music, Audiobooks, and Ebooks use category-owned download profiles. The simple Ebook selector saves `preferred_ebook_format`, while the richer `format_priority` list remains available for future ranking. Audio conversion sidecars are created by category post-import hooks and also run when seed-in-place sharing leaves the torrent payload directly in the library.
-
-
-## Round 122/123/124 music/search stabilization
-
-- Round 122 fixed music-search leakage from TV/movie defaults: music searches no longer append global language or video-quality rules, storage preflight now checks candidate size deterministically, and chat cover art is constrained.
-- Round 123 corrected the architecture so Music does not declare video terms; cross-category candidate filtering now derives foreign release signatures from the categories that own them.
-- Round 124 cleaned the remaining boundary smells: Music-specific `discography`, `OST`/`Original Soundtrack`, and `bootleg` rules now live only in the Music category profile, generic prompt code no longer hardcodes Music behavior, non-video definition-backed parsers do not emit base video traits, and category-config saves no longer persist definition-only fields into ignored private config.
-- Round 125 continued the cleanup by extracting candidate validation and audio conversion out of `DefinitionBackedCategory`, replacing substring category routing with boundary-aware token matching, routing soundtrack/OST requests to Music, and turning the music/book metadata-provider matrix into declarative resolver profiles.
-
-### Metadata cache and stable IDs
-
-Music, Audiobooks, and Ebooks now normalize provider results into category object models and persistent cache entries. Public provider lookups are cached with TTLs, rate limits are tracked, and every metadata candidate carries a stable ID plus LLM-facing disambiguation facets. The assistant should use those facets for hard-to-code selection work such as choosing between album editions, translators, narrators, abridged/unabridged audiobook releases, or conflicting provider candidates.
-
-
-### Round 127 metadata disambiguation cleanup
-
-Metadata lookups now use a dedicated disambiguation boundary for cross-provider grouping, conflict reporting, and LLM selection packets. The persistent cache can explicitly reuse stale rows after provider failures, marked as `stale_on_error`, and provider `Retry-After` parsing handles numeric and HTTP-date forms. Music/book/audiobook object models gained small but important selection facets such as disc/track counts, series/volume, source level, narrator/reader, and abridgement.
-
-### Round 128 metadata/library cleanup note
-
-Metadata provider adapters for Music/Books now live behind a small provider registry, while the resolver handles cache, rate-limit, stale reuse, and LLM disambiguation packets. Local scans for Music, Audiobooks, and Ebooks now produce category-owned local object evidence and richer units (`track`, `chapter`, `ebook_file`, `comic_archive`) instead of flattening everything into generic files.
