@@ -102,14 +102,15 @@ if "%ACTION%"=="update" (
     exit /b 0
 )
 
-REM ─── Ensure data directories exist ─────────────────────────────
+REM ─── Ensure runtime directories exist ───────────────────────────
 if not exist "data" mkdir data
 if not exist "config" mkdir config
+if not exist "config\categories" mkdir config\categories
 if not exist "downloads" mkdir downloads
 
-REM ─── Check for config ──────────────────────────────────────────
-if not exist "config\settings.yaml" (
-    echo [LJS] No config found - first run will launch setup wizard.
+REM ─── Check for local config ─────────────────────────────────────
+if not exist "config\settings.local.yaml" (
+    echo [LJS] No local config found - LJS will create config/settings.local.yaml from the template and launch setup.
 )
 
 REM ─── Launch ────────────────────────────────────────────────────

@@ -439,7 +439,7 @@ class PlanCategoryCreationTool:
             questions.append(self._question(
                 "services",
                 "Are there known metadata/discovery services you trust for this domain, or should I research options?",
-                "A new category should not hard-code guesses. The agent should web-research services comparable to TMDB for that domain.",
+                "A new category declares service contracts in config/category-definitions/<id>.yaml under services.<service_id>, stores private values in ignored config/categories/<id>.yaml bootstrapped from config/category-config-templates/<id>.yaml, then its subclass consumes those values and exposes service behavior through category workflows/actions.",
                 examples=["IGDB/RAWG/Steam for games", "MusicBrainz/Discogs for music", "OpenLibrary/Google Books for books"],
             ))
         if "taste" not in answers and not any("taste" in str(k).lower() for k in answers.keys()):
@@ -463,7 +463,9 @@ class PlanCategoryCreationTool:
             "recommended_next_step": (
                 "Ask the required questions before previewing a scaffold. After the answers are known, call "
                 "research_category_services for metadata providers. If the category is downloadable, also call "
-                "research_category_download_profile so torrent/search conventions come from the category's own domain."
+                "research_category_download_profile so torrent/search conventions come from the category's own domain. "
+                "The scaffold must put paths, services, tools, download_profile, and llm_guidance in category YAML; "
+                "new executable LLM tools must be category workflows/actions, not global tool hacks."
             ),
             "minimum_spec_outline": {
                 "category_id": CategoryDesignHelpers.snake_case(category_name),
@@ -968,9 +970,11 @@ class CategoryToolProvider:
 
         Dynamic category tools need the same runtime collaborators that UI
         category endpoints receive: database, search pipeline, aggregator,
-        downloader, settings, and metadata/artwork services.  Without this
-        context, LLM calls to dynamic category workflow tools would reach
-        the category with only an audit shell and fail before discovery.
+        downloader, settings, and metadata/artwork services. Category subclasses
+        then read their own services/download/tool/LLM settings from
+        ``settings.category_settings[category_id]``. Without this context, LLM
+        calls to dynamic category workflow tools would reach the category with
+        only an audit shell and fail before discovery.
         """
         from src.core.categories.base import CategoryWorkflowContext
 

@@ -1,0 +1,271 @@
+category_id: ebooks
+extends: book
+definition_version: 1
+services:
+  gutendex:
+    label: Gutendex
+    purpose: Keyless Project Gutenberg ebook metadata, subjects, languages, authors,
+      and download format links.
+    llm_usage: Use for public-domain ebook metadata and format availability checks.
+    help_url: https://gutendex.com/
+    fields:
+      enabled: bool
+  comic_vine:
+    label: Comic Vine
+    purpose: Optional keyed metadata source for comics/graphic novels when CBZ/CBR
+      library items need issue, volume, publisher, and cover metadata.
+    llm_usage: Suggest only for comics/manga/graphic-novel workflows; not needed for
+      normal prose EPUB/PDF books.
+    help_url: https://comicvine.gamespot.com/api/
+    severity: info
+    enabled: false
+    fields:
+      enabled: bool
+      api_key: secret
+metadata:
+  providers:
+    open_library:
+      enabled: true
+    internet_archive:
+      enabled: true
+    gutendex:
+      enabled: true
+    google_books:
+      enabled: false
+    comic_vine:
+      enabled: false
+formats:
+  accepted_file_patterns:
+  - '*.epub'
+  - '*.pdf'
+  - '*.azw3'
+  - '*.mobi'
+  - '*.djvu'
+  - '*.cbz'
+  - '*.cbr'
+  ebook_formats:
+  - EPUB
+  - PDF
+  - AZW3
+  - MOBI
+  - DJVU
+  - CBZ
+  - CBR
+  release_terms:
+  - retail
+  - epub
+  - pdf
+  - azw3
+  - mobi
+  - kindle
+  - kobo
+  - scan
+  - OCR
+  - illustrated
+  - annotated
+download_profile:
+  preferred_ebook_format: epub
+  preferred_ebook_formats:
+  - epub
+  - azw3
+  - pdf
+  format_priority:
+  - epub
+  - azw3
+  - mobi
+  - pdf
+  - djvu
+  - cbz
+  - cbr
+  preferred_language: English
+  edition_preference: retail_or_clean_epub
+  reader_device: generic_epub_reader
+  avoid_format_conversion: true
+tools:
+  category_workflows:
+  - ebooks.resolve_metadata
+  - ebooks.search_download_candidates
+  - ebooks.search_upgrade
+  llm_usage_notes:
+  - A file extension matters: EPUB/AZW3/PDF/DJVU/CBZ/CBR are not interchangeable for
+      every reader device.
+  - Prefer EPUB for reflowable text, PDF/DJVU for fixed-layout scans, and CBZ/CBR
+    only for comics/manga/art books.
+llm_guidance:
+  behavior:
+  - Ebooks are edition-sensitive. Author, title, translator, ISBN, language, publisher,
+    edition, and device format can all be necessary.
+  - Do not route audiobooks, music albums, or video courses into Ebooks just because
+    the title matches a book.
+  search_examples:
+  - Ursula K Le Guin The Left Hand of Darkness epub
+  - Dune Frank Herbert retail epub
+  - House of Leaves PDF
+lifecycle_policy:
+  policy_version: 1
+  identity_fields:
+  - author
+  - title
+  - isbn
+  - edition
+  - language
+  lifecycle_fields:
+  - library_presence
+  - format
+  - edition
+  - language
+  - metadata_complete
+  - cover_present
+  suggestion_types:
+  - format_upgrade
+  - metadata_repair
+  - cover_repair
+  - better_edition
+  invalidation_triggers:
+  - library_changed
+  - metadata_changed
+  - download_completed
+  - download_failed
+  - user_format_or_language_changed
+  - manual_refresh
+  - policy_version_changed
+  default_check_interval_days: 180
+  llm_policy_description: 'Ebook suggestions are mostly stable: better format, cleaner
+    edition, metadata/cover repair, and language/edition corrections. Finished books
+    should not be reprocessed often.'
+display_name: Ebooks
+default_folder: Ebooks
+icon: book-open
+media_kind: ebook
+capabilities:
+- metadata
+- downloadable
+- file_organization
+- cover_art
+supported_operations:
+- search
+- download
+- scan
+- organize
+- refresh_metadata
+- search_upgrade
+llm_profile:
+  short_description: Digital books with author/title/ISBN/edition/language and EPUB/PDF/AZW3/MOBI/DJVU/CBZ
+    format awareness.
+  user_facing_description: Ebooks manages digital book files such as EPUB, PDF, AZW3,
+    MOBI, DJVU, CBZ, and CBR, with edition, language, ISBN, cover, and device-format
+    awareness.
+  router_description: 'Ebooks: EPUB/PDF/AZW3/MOBI/DJVU/CBZ/CBR digital book releases
+    and edition/ISBN-aware requests.'
+  domain_vocabulary:
+  - ebook
+  - e-book
+  - epub
+  - pdf
+  - azw3
+  - mobi
+  - kindle
+  - kobo
+  - djvu
+  - cbz
+  - cbr
+  - isbn
+  - open library
+  - gutenberg
+  - gutendex
+  item_types:
+  - ebook
+  - digital_book
+  - epub
+  - pdf
+  - kindle_book
+  - comic_archive
+  identifiers:
+  - author
+  - title
+  - isbn
+  - edition
+  - publisher
+  - translator
+  - language
+  - format
+  - work
+  - edition_key
+  common_user_requests:
+  - Find an EPUB/AZW3/PDF for a book.
+  - Find a specific edition or translation.
+  - Repair metadata or cover art.
+  - Prefer reader/device-compatible formats.
+  ambiguity_rules:
+  - Do not satisfy ebook requests with audiobooks, music, or video courses.
+  - PDF scans, EPUB retail files, and comic archives are not interchangeable; honor
+    the requested format/device.
+  - Classics have many editions/translations, so author/translator/language can be
+    binding.
+  search_rules:
+  - Preserve author, title, ISBN, language, edition, translator, EPUB/PDF/AZW3/MOBI/DJVU/CBZ/CBR
+    constraints.
+  - Prefer EPUB/AZW3 for reflowable reading and PDF/DJVU for fixed-layout scans unless
+    the user says otherwise.
+  download_rules:
+  - Reject audiobook/music/video/software results for ebook requests.
+  - Prefer retail/clean EPUB or device-requested formats when available.
+  organization_rules:
+  - Organize by author/title or series/title where metadata is known; preserve edition/format
+    evidence.
+  safety_rules:
+  - Do not execute scripts or installers bundled with ebook archives.
+  tool_usage_notes:
+  - Use Open Library for broad book metadata and covers; Gutendex/Gutenberg is public-domain
+    only; Google Books is an optional fallback.
+  examples:
+  - user: Find The Left Hand of Darkness epub
+    expected_intent: download
+    expected_behavior: Route to Ebooks, preserve EPUB format and title constraints,
+      and avoid audiobook or video results.
+    tool_plan:
+    - ebooks.resolve_metadata
+    - ebooks.search_download_candidates
+  - user: Find Watchmen cbz or cbr
+    expected_intent: download
+    expected_behavior: Route to Ebooks because comic archive formats are declared
+      for this category.
+    tool_plan:
+    - ebooks.search_download_candidates
+search_policy:
+  language_relevant: true
+  use_global_quality_profile: false
+object_model:
+  canonical_types:
+  - work
+  - edition
+  - author
+  - translation
+  - format_file
+  stable_identifiers:
+  - openlibrary_work_key
+  - openlibrary_edition_key
+  - isbn_10
+  - isbn_13
+  - google_books_id
+  - gutenberg_id
+  - internet_archive_identifier
+  disambiguation_facets:
+  - author
+  - title
+  - translator
+  - language
+  - publisher
+  - edition_name
+  - published_date
+  - format
+  - isbn
+  llm_notes:
+  - 'Treat work and edition as different layers: work identifies the book concept;
+    edition/ISBN/translator/language identifies the specific file the user may want.'
+  - For classics and translated books, let the LLM compare edition/language/translator
+    constraints before selecting a candidate.
+local_scan:
+  grouping_strategy: file_or_edition_folder
+  description: Treat each ebook/comic file as an edition item, grouping same-title
+    multi-format files or edition folders when present.

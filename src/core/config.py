@@ -4,8 +4,9 @@ Configuration module for LJS.
 Loads live global settings from the untracked ``config/settings.local.yaml``
 file and bootstraps that file from ``config/settings.template.yaml`` on first
 launch. Category-owned live settings are loaded from ignored
-``config/categories/<category_id>.yaml`` files and bootstrapped from tracked
-``config/category-templates/<category_id>.yaml`` files.
+``config/categories/<category_id>.yaml`` files. Category definitions live in
+``config/category-definitions``; blank local config templates live in
+``config/category-config-templates``.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from src.core.security.path_policy import SafePathResolver
 
 
 class SettingsManager:
-    """Manages loading, saving, migration, and hot-reloading of settings.
+    """Manages loading, saving, bootstrap, and hot-reloading of settings.
 
     The public repository tracks only templates. Runtime settings live in
     ignored local files so API keys, bridge tokens, private paths, and password
@@ -46,7 +47,6 @@ class SettingsManager:
 
     DEFAULT_LIVE_SETTINGS_PATH = Path('config/settings.local.yaml')
     DEFAULT_TEMPLATE_SETTINGS_PATH = Path('config/settings.template.yaml')
-    DEFAULT_LEGACY_SETTINGS_PATH = Path('config/settings.yaml')
 
     def __init__(
         self,
@@ -55,7 +55,7 @@ class SettingsManager:
         category_config_dir: str | None = None,
         template_path: str | None = None,
         category_template_dir: str | None = None,
-        legacy_yaml_path: str | None = None,
+        category_definition_dir: str | None = None,
     ) -> None:
         """Create a settings manager.
 
@@ -68,11 +68,9 @@ class SettingsManager:
                 Defaults to ``config/categories`` next to the settings file.
             template_path: Public template copied to ``yaml_path`` on first
                 launch. Defaults to ``config/settings.template.yaml``.
-            category_template_dir: Public category templates copied into the
+            category_template_dir: Public blank config templates copied into the
                 live category config directory when missing.
-            legacy_yaml_path: Previous live settings path. Defaults to
-                ``config/settings.yaml`` only for the standard local settings
-                layout, so existing installs are migrated without reset.
+            category_definition_dir: Public shareable category definition directory.
         """
         env_yaml = os.getenv('LJS_SETTINGS_PATH')
         self._yaml_path = Path(yaml_path or env_yaml or self.DEFAULT_LIVE_SETTINGS_PATH)
@@ -81,15 +79,11 @@ class SettingsManager:
             or os.getenv('LJS_SETTINGS_TEMPLATE')
             or self._default_template_path(self._yaml_path)
         )
-        self._legacy_yaml_path = (
-            Path(legacy_yaml_path)
-            if legacy_yaml_path is not None
-            else self._default_legacy_path(self._yaml_path)
-        )
         self._env_file = env_file
         category_dir = Path(category_config_dir) if category_config_dir else self._yaml_path.parent / 'categories'
-        template_dir = Path(category_template_dir) if category_template_dir else self._yaml_path.parent / 'category-templates'
-        self._category_store = CategoryConfigStore(category_dir, template_directory=template_dir)
+        template_dir = Path(category_template_dir) if category_template_dir else self._yaml_path.parent / 'category-config-templates'
+        definition_dir = Path(category_definition_dir) if category_definition_dir else self._yaml_path.parent / 'category-definitions'
+        self._category_store = CategoryConfigStore(category_dir, template_directory=template_dir, definition_directory=definition_dir)
         self._settings: Optional[Settings] = None
 
     @property
@@ -116,25 +110,28 @@ class SettingsManager:
 
     @property
     def category_template_dir(self) -> Path:
-        """Return the tracked directory used for category config templates."""
+        """Return the tracked directory used for blank category config templates."""
         return self._category_store.template_directory
+
+    @property
+    def category_definition_dir(self) -> Path:
+        """Return the tracked directory used for shareable category definitions."""
+        return self._category_store.definition_directory
 
     def load(self) -> Settings:
         """Load local YAML settings and merge category YAML settings.
 
-        Existing installs are migrated from the old tracked-looking
-        ``config/settings.yaml`` path into ``config/settings.local.yaml`` before
-        parsing. Missing local files are created from public templates.
+        Missing local files are created from public templates. Fresh installs use
+        ignored local settings only; the removed tracked settings path is not a
+        runtime source.
         """
         self._ensure_live_settings_file()
         settings = Settings()
-        legacy_category_settings: dict[str, dict] = {}
         if self._yaml_path.exists():
             try:
                 with self._yaml_path.open('r', encoding='utf-8') as handle:
                     data = yaml.safe_load(handle)
                 if isinstance(data, dict):
-                    legacy_category_settings = self._legacy_category_settings(data)
                     settings = self._apply_yaml(settings, data)
                 logger.info('Settings loaded successfully from {}.', self._yaml_path)
             except Exception as exc:
@@ -146,11 +143,8 @@ class SettingsManager:
                     return self._settings
 
         category_file_settings = self._category_store.load_all()
-        merged_category_settings = dict(legacy_category_settings)
-        for category_id, values in category_file_settings.items():
-            merged_category_settings[category_id] = values
-        if merged_category_settings:
-            settings.category_settings = merged_category_settings
+        if category_file_settings:
+            settings.category_settings = category_file_settings
         return settings
 
     def save(self, settings: Settings) -> None:
@@ -182,19 +176,10 @@ class SettingsManager:
         return self._settings
 
     def _ensure_live_settings_file(self) -> None:
-        """Create or migrate the ignored live settings file before reading it."""
+        """Create the ignored live settings file before reading it."""
         if self._yaml_path.exists():
             return
         self._yaml_path.parent.mkdir(parents=True, exist_ok=True)
-        legacy = self._legacy_yaml_path
-        if legacy and legacy.exists() and legacy.resolve() != self._yaml_path.resolve():
-            legacy.replace(self._yaml_path)
-            logger.warning(
-                'Migrated legacy live settings file from {} to ignored local path {}.',
-                legacy,
-                self._yaml_path,
-            )
-            return
         if self._template_path.exists():
             shutil.copyfile(self._template_path, self._yaml_path)
             logger.info('Created local settings file {} from template {}.', self._yaml_path, self._template_path)
@@ -207,27 +192,6 @@ class SettingsManager:
         if live_path == cls.DEFAULT_LIVE_SETTINGS_PATH or live_path.name == 'settings.local.yaml':
             return live_path.with_name('settings.template.yaml')
         return live_path.with_suffix('.template.yaml')
-
-    @classmethod
-    def _default_legacy_path(cls, live_path: Path) -> Path | None:
-        """Return the old live path that should be migrated, if applicable."""
-        if live_path == cls.DEFAULT_LIVE_SETTINGS_PATH or live_path.name == 'settings.local.yaml':
-            return live_path.with_name('settings.yaml')
-        return None
-
-    def _legacy_category_settings(self, data: dict) -> dict[str, dict]:
-        """Extract old inline category settings for one-time effective loading."""
-        category_settings: dict[str, dict] = {}
-        inline = data.get('category_settings')
-        if isinstance(inline, dict):
-            for category_id, values in inline.items():
-                if isinstance(values, dict):
-                    category_settings[str(category_id)] = dict(values)
-        library_paths = data.get('library_paths')
-        if isinstance(library_paths, dict):
-            for category_id, path in library_paths.items():
-                category_settings.setdefault(str(category_id), {})['library_path'] = path
-        return category_settings
 
     def _apply_yaml(self, settings: Settings, data: dict) -> Settings:
         """Apply global YAML data to a Settings instance, preserving types."""

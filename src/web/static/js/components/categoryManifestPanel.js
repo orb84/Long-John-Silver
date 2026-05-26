@@ -82,7 +82,7 @@ class CategoryManifestPanel extends Component {
                 ` ${cat.display_name || categoryId}`
             ]),
             DOM.el('p', { className: 'muted' }, [cat.description || cat.llm_summary || 'Category contract']),
-            DOM.el('p', { className: 'empty-msg' }, [`Live config: config/categories/${categoryId}.yaml`]),
+            DOM.el('p', { className: 'empty-msg' }, [`Private config: config/categories/${categoryId}.yaml · Definition: config/category-definitions/${categoryId}.yaml`]),
             DOM.el('div', { className: 'chip-row' }, (cat.capabilities || []).map(cap => DOM.el('span', { className: 'chip' }, [cap]))),
             DOM.el('h4', {}, ['Editable properties declared by manifest']),
             DOM.el('ul', {}, properties.length ? properties : [DOM.el('li', {}, ['No editable properties declared'])]),

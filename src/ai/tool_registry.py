@@ -108,7 +108,9 @@ class ToolRegistry:
             return
 
         async def _handler(**kwargs: Any) -> Any:
-            ctx = ToolExecutionContext()
+            ctx = kwargs.pop("__tool_context", None)
+            if not isinstance(ctx, ToolExecutionContext):
+                ctx = ToolExecutionContext()
             return await tool.execute(kwargs, ctx)
 
         self._tools[tool.name] = ToolDefinition(
@@ -194,14 +196,17 @@ class ToolRegistry:
         """Return whether a tool name is registered."""
         return name in self._tools
 
-    async def execute(self, name: str, arguments: dict) -> Any:
+    async def execute(self, name: str, arguments: dict, context: ToolExecutionContext | None = None) -> Any:
         """Execute a tool by name with the given arguments."""
         tool = self._tools.get(name)
         if not tool:
             return {"error": f"Tool '{name}' not found."}
 
         try:
-            result = await tool.handler(**arguments)
+            payload = dict(arguments or {})
+            if context is not None:
+                payload["__tool_context"] = context
+            result = await tool.handler(**payload)
             return result
         except Exception as e:
             logger.error(f"Tool '{name}' execution error: {e}")

@@ -1,0 +1,9 @@
+# Local user config for Movies. Copied to ignored config/categories/movie.yaml.
+category_id: movie
+enabled: true
+properties:
+  naming_template: '{title} ({year})/{title} ({year}) {quality}'
+scheduler:
+  enabled: true
+storage:
+  inherit_global_thresholds: true

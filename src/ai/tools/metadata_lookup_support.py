@@ -56,6 +56,7 @@ class MetadataLookupRequest:
     episode: int | None = None
     question: str | None = None
     include_episodes: bool = False
+    category_id: str | None = None
 
     @classmethod
     def from_arguments(cls, arguments: dict[str, Any]) -> "MetadataLookupRequest | dict[str, Any]":
@@ -79,6 +80,11 @@ class MetadataLookupRequest:
         season = _safe_int(arguments.get("season")) or MetadataLookupRequest.infer_season_number(coordinate_text)
         episode = _safe_int(arguments.get("episode")) or MetadataLookupRequest.infer_episode_number(coordinate_text)
         include_episodes = bool(arguments.get("include_episodes", season is not None or episode is not None))
+        category_id = str(arguments.get("category_id") or "").strip().lower() or None
+        if category_id not in {None, "tv", "movie", "general"}:
+            category_id = None
+        if category_id is None and media_type in {"tv", "movie"}:
+            category_id = media_type
         return cls(
             query=query,
             media_type=media_type,
@@ -89,6 +95,7 @@ class MetadataLookupRequest:
             episode=episode,
             question=question,
             include_episodes=include_episodes,
+            category_id=category_id,
         )
 
 
@@ -160,9 +167,9 @@ class MetadataClientResolver:
         self._owns_tmdb_client = False
         self._last_tmdb_status: tuple[bool, bool, bool] | None = None
 
-    async def get_tmdb_client(self) -> Optional["TMDBClient"]:
-        """Return a TMDB client built from the same live settings used elsewhere."""
-        api_key = self._current_tmdb_key()
+    async def get_tmdb_client(self, category_id: str | None = None) -> Optional["TMDBClient"]:
+        """Return a TMDB client built from category-local settings."""
+        api_key = self._current_tmdb_key(category_id)
         settings_ready = self._settings_manager is not None
         self._log_tmdb_status(api_key=api_key, settings_ready=settings_ready)
 
@@ -209,16 +216,19 @@ class MetadataClientResolver:
             "settings_manager_ready": self._settings_manager is not None,
         }
 
-    def tmdb_configured(self) -> bool:
+    def tmdb_configured(self, category_id: str | None = None) -> bool:
         """Return whether current settings expose a TMDB API key."""
         if self._settings_manager is None:
             return self._tmdb_client is not None
-        return bool(self._current_tmdb_key())
+        return bool(self._current_tmdb_key(category_id))
 
-    def _current_tmdb_key(self) -> str | None:
+    def _current_tmdb_key(self, category_id: str | None = None) -> str | None:
         if self._settings_manager is None:
             return None
-        return getattr(self._settings_manager.settings, "tmdb_api_key", None)
+        settings = self._settings_manager.settings
+        if category_id in {"tv", "movie"}:
+            return settings.category_service_value(category_id, "tmdb", "api_key")
+        return settings.first_category_service_value(["tv", "movie", "media"], "tmdb", "api_key")
 
     def _log_tmdb_status(self, *, api_key: str | None, settings_ready: bool) -> None:
         status = (bool(api_key), bool(self._tmdb_client), settings_ready)
@@ -298,6 +308,11 @@ class LibraryMetadataSnapshotLookup:
                 or result.get("number_of_episodes")
                 or result.get("season_details")
             )
+        if result.get("type") == "person":
+            direction_terms = ("director", "directed", "regista", "direct", "latest", "released", "movie", "film")
+            if any(term in q for term in direction_terms):
+                return bool(result.get("directed_movies") or result.get("directed_tv"))
+            return bool(result.get("biography") or result.get("directed_movies") or result.get("acted_movies"))
         return bool(result.get("overview") or result.get("cast") or result.get("lead_cast"))
 
     async def _lookup_from_repo(
@@ -452,7 +467,7 @@ class MetadataResultNormalizer:
         """Select a TMDB search match respecting requested media type."""
         if not matches:
             return None
-        if media_type in {"tv", "movie"}:
+        if media_type in {"tv", "movie", "person"}:
             for match in matches:
                 if match.get("type") == media_type:
                     return match
@@ -467,6 +482,7 @@ class MetadataResultNormalizer:
             "provider": "tmdb",
             "type": result_type,
             "title": details.get("title") or details.get("name") or details.get("original_title"),
+            "name": details.get("name") or details.get("title"),
             "cast": cast,
             "lead_cast": cast[:3],
         })
@@ -482,7 +498,8 @@ class MetadataResultNormalizer:
             provider_score = 2 if result.get("provider") == "tmdb" else 1
             type_score = 1 if media_type in {"auto", "multi"} or result.get("type") == media_type else 0
             cast_score = 1 if result.get("cast") or result.get("lead_cast") else 0
-            return provider_score, type_score, cast_score
+            person_credit_score = 1 if result.get("directed_movies") or result.get("directed_tv") else 0
+            return provider_score, type_score, cast_score + person_credit_score
 
         return sorted(results, key=score, reverse=True)[0]
 
@@ -503,6 +520,9 @@ class MetadataResultNormalizer:
             "season_lead_cast": season_cast[:5] if isinstance(season_cast, list) else [],
             "creators_or_writers": best.get("creators") or best.get("writers") or [],
             "directors": best.get("directors") or [],
+            "directed_movies": best.get("directed_movies") or [],
+            "directed_tv": best.get("directed_tv") or [],
+            "person_name": best.get("name") if best.get("type") == "person" else None,
             "first_air_date": best.get("first_air_date"),
             "release_date": best.get("release_date"),
             "seasons": best.get("number_of_seasons"),

@@ -93,7 +93,8 @@ class SettingsRouter:
                 "global_live": str(self._deps.settings_manager.settings_path),
                 "global_template": str(self._deps.settings_manager.settings_template_path),
                 "categories_dir": str(self._deps.settings_manager.category_config_dir),
-                "category_templates_dir": str(self._deps.settings_manager.category_template_dir),
+                "category_config_templates_dir": str(self._deps.settings_manager.category_template_dir),
+                "category_definitions_dir": str(self._deps.settings_manager.category_definition_dir),
             },
         }
 
@@ -394,6 +395,8 @@ class SettingsRouter:
         args = {}
         if "download_dir" in body:
             args["download_dir"] = body["download_dir"]
+        if "library_root" in body:
+            args["library_root"] = body["library_root"]
         if "max_concurrent" in body:
             args["max_concurrent"] = int(body["max_concurrent"])
         if "library_paths" in body:
@@ -447,17 +450,8 @@ class SettingsRouter:
 
     async def _update_integrations(self, request: Request, _auth: bool = Depends(verify_auth)):
         body = await request.json()
-        args = {}
-        if "tmdb_api_key" in body:
-            args["tmdb_api_key"] = body["tmdb_api_key"] or None
-        if "trakt_client_id" in body:
-            args["trakt_client_id"] = body["trakt_client_id"] or None
-        if "plex_url" in body:
-            args["plex_url"] = body["plex_url"] or None
-        if "plex_token" in body:
-            args["plex_token"] = body["plex_token"] or None
-        if "opensubtitles_api_key" in body:
-            args["opensubtitles_api_key"] = body["opensubtitles_api_key"] or None
+        category_services = body.get("category_services") if isinstance(body, dict) else None
+        args = {"category_services": category_services if isinstance(category_services, dict) else {}}
         await self._execute_action('settings_update_integrations', args)
         return {"status": "ok"}
 

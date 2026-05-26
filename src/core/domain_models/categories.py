@@ -88,8 +88,9 @@ class CategoryLlmProfile(BaseModel):
             parts.append("Identifiers: " + ", ".join(self.identifiers))
         if self.ambiguity_rules:
             parts.append("Ambiguity rules:\n" + "\n".join(f"- {rule}" for rule in self.ambiguity_rules))
-        if intent.lower() in {"search", "chat"} and self.search_rules:
-            parts.append("Search/research rules:\n" + "\n".join(f"- {rule}" for rule in self.search_rules))
+        if intent.lower() in {"search", "chat", "download"} and self.search_rules:
+            heading = "Search/download rules" if intent.lower() == "download" else "Search/research rules"
+            parts.append(heading + ":\n" + "\n".join(f"- {rule}" for rule in self.search_rules))
         if intent.lower() == "download" and self.download_rules:
             parts.append("Download rules:\n" + "\n".join(f"- {rule}" for rule in self.download_rules))
         if self.tool_usage_notes:
@@ -411,6 +412,27 @@ class CategoryScaffoldPreview(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+
+
+class CategoryRuntimeDependency(BaseModel):
+    """Runtime binary/package dependency declared by a category or mixin.
+
+    Dependency declarations are informational contracts for setup, manifests,
+    and workflow preflight checks. They do not install software automatically
+    and they do not grant YAML the ability to execute arbitrary commands.
+    """
+
+    id: str
+    label: str
+    kind: Literal["binary", "python_package", "service", "other"] = "binary"
+    command: str = ""
+    required: bool = False
+    configured: bool = False
+    purpose: str = ""
+    install_hint: str = ""
+    validation_action: str | None = None
+    severity: Literal["info", "recommended", "warning", "required"] = "info"
+
 class CategorySetupRequirement(BaseModel):
     """One setup requirement advertised by a category manifest.
 
@@ -441,17 +463,30 @@ class CategoryManifest(BaseModel):
     display_name: str
     description: str
     default_folder: str = ""
+    default_library_path: str = ""
+    """Default path under the global library root when no category override is set."""
+    effective_library_path: str = ""
+    """Effective path currently used by the category; secret-free and safe for UI display."""
     icon: str | None = None
     media_kind: str = "media"
     capabilities: list[str] = Field(default_factory=list)
     metadata_providers: list[str] = Field(default_factory=list)
     discovery_sources: list[dict[str, Any]] = Field(default_factory=list)
     """Declarative category-owned enrichment/discovery services for setup, UI, and LLM context."""
+    service_settings: list[dict[str, Any]] = Field(default_factory=list)
+    """Sanitized effective category service settings. Secret values are never exposed here."""
+    download_profile: dict[str, Any] = Field(default_factory=dict)
+    """Category-owned quality/language/format preferences used by search and downloads."""
+    tool_policy: dict[str, Any] = Field(default_factory=dict)
+    """Category-owned LLM tool exposure hints, sanitized for UI/debug display."""
+    llm_guidance: dict[str, Any] = Field(default_factory=dict)
+    """Natural-language category guidance loaded from the live category config."""
     properties: list[dict[str, Any]] = Field(default_factory=list)
     ui_sections: list[CategoryUiSection] = Field(default_factory=list)
     actions: list[CategoryActionDeclaration] = Field(default_factory=list)
     workflows: list[CategoryWorkflowDeclaration] = Field(default_factory=list)
     setup_requirements: list[CategorySetupRequirement] = Field(default_factory=list)
+    runtime_dependencies: list[CategoryRuntimeDependency] = Field(default_factory=list)
     tool_names: list[str] = Field(default_factory=list)
     supported_operations: list[str] = Field(default_factory=list)
     router_brief: CategoryRouterBrief | None = None

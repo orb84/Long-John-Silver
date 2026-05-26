@@ -425,12 +425,20 @@ class SystemRepository(BaseRepository):
         """Insert or update a scheduled task."""
         last_run = task.last_run_at.isoformat() if task.last_run_at else None
         created = task.created_at.isoformat() if task.created_at else None
+        due_at = task.due_at.isoformat() if task.due_at else None
+        next_run = task.next_run_at.isoformat() if task.next_run_at else None
         await self._db.execute(
             """INSERT OR REPLACE INTO scheduled_tasks
-               (id, prompt, interval_minutes, user_id, channel, enabled, last_run_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (task.id, task.prompt, task.interval_minutes, task.user_id,
-             task.channel, 1 if task.enabled else 0, last_run, created),
+               (id, prompt, interval_minutes, user_id, channel, enabled, last_run_at,
+                created_at, task_type, schedule_type, title, due_at, next_run_at,
+                run_count, max_runs, session_id, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task.id, task.prompt, task.interval_minutes, task.user_id,
+                task.channel, 1 if task.enabled else 0, last_run, created,
+                task.task_type, task.schedule_type, task.title, due_at, next_run,
+                int(task.run_count or 0), task.max_runs, task.session_id, task.last_error or "",
+            ),
         )
         await self._db.commit()
 
@@ -452,6 +460,7 @@ class SystemRepository(BaseRepository):
             conditions.append("enabled = 1")
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY COALESCE(next_run_at, due_at, last_run_at, created_at) ASC"
         cursor = await self._db.execute(query, params)
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]

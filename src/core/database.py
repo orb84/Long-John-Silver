@@ -455,7 +455,16 @@ class Database:
                 channel TEXT NOT NULL DEFAULT 'web',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_run_at TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                task_type TEXT NOT NULL DEFAULT 'scheduled_prompt',
+                schedule_type TEXT NOT NULL DEFAULT 'recurring',
+                title TEXT NOT NULL DEFAULT '',
+                due_at TEXT,
+                next_run_at TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                max_runs INTEGER,
+                session_id TEXT,
+                last_error TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS deletion_log (
@@ -510,7 +519,34 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_category_items_category ON category_items(category_id, enabled);
             CREATE INDEX IF NOT EXISTS idx_category_units_status ON category_item_units(category_id, item_id, status);
+            CREATE TABLE IF NOT EXISTS category_metadata_cache (
+                category_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                query TEXT NOT NULL DEFAULT '',
+                stable_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'ok',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                provider_signature TEXT NOT NULL DEFAULT '',
+                fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_accessed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (category_id, provider, cache_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_rate_limits (
+                provider TEXT PRIMARY KEY,
+                next_allowed_at TEXT NOT NULL DEFAULT '',
+                last_status TEXT NOT NULL DEFAULT '',
+                remaining TEXT NOT NULL DEFAULT '',
+                reset_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_category_metadata_provider ON category_item_metadata(provider, external_id);
+            CREATE INDEX IF NOT EXISTS idx_category_metadata_cache_expiry ON category_metadata_cache(category_id, provider, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_category_metadata_cache_stable_id ON category_metadata_cache(category_id, stable_id);
             CREATE INDEX IF NOT EXISTS idx_property_index_lookup ON category_property_index(category_id, property_name, value_text);
 
             CREATE INDEX IF NOT EXISTS idx_processing_due ON category_item_processing_state(next_check_at, category_id, item_id);
@@ -543,6 +579,86 @@ class Database:
         row = await cursor.fetchone()
         return row[0] if row and row[0] else 1
 
+    @staticmethod
+    def _split_sql_migration_statements(sql: str) -> list[str]:
+        """Split migration SQL into executable statements.
+
+        A plain semicolon split is not safe enough for migrations because
+        semicolons may appear inside SQL comments or string literals. Round 119
+        fixed a startup crash where a semicolon in a ``--`` comment was treated
+        as a statement boundary, causing the next chunk of comment prose to be
+        executed as SQL.
+
+        The migration files are intentionally simple SQLite scripts, so this
+        lightweight scanner strips line/block comments outside quoted strings
+        and splits only on statement-terminating semicolons.
+        """
+        statements: list[str] = []
+        chars: list[str] = []
+        in_single_quote = False
+        in_double_quote = False
+        in_line_comment = False
+        in_block_comment = False
+        i = 0
+
+        while i < len(sql):
+            char = sql[i]
+            next_char = sql[i + 1] if i + 1 < len(sql) else ""
+
+            if in_line_comment:
+                if char in "\r\n":
+                    in_line_comment = False
+                    chars.append(char)
+                i += 1
+                continue
+
+            if in_block_comment:
+                if char == "*" and next_char == "/":
+                    in_block_comment = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if not in_single_quote and not in_double_quote:
+                if char == "-" and next_char == "-":
+                    in_line_comment = True
+                    i += 2
+                    continue
+                if char == "/" and next_char == "*":
+                    in_block_comment = True
+                    i += 2
+                    continue
+                if char == ";":
+                    statement = "".join(chars).strip()
+                    if statement:
+                        statements.append(statement)
+                    chars = []
+                    i += 1
+                    continue
+
+            chars.append(char)
+
+            if char == "'" and not in_double_quote:
+                if in_single_quote and next_char == "'":
+                    chars.append(next_char)
+                    i += 2
+                    continue
+                in_single_quote = not in_single_quote
+            elif char == '"' and not in_single_quote:
+                if in_double_quote and next_char == '"':
+                    chars.append(next_char)
+                    i += 2
+                    continue
+                in_double_quote = not in_double_quote
+
+            i += 1
+
+        statement = "".join(chars).strip()
+        if statement:
+            statements.append(statement)
+        return statements
+
     async def _run_migrations(self, current_version: int):
         """Apply all migration files with a version higher than current_version."""
         if not self.MIGRATIONS_DIR.exists():
@@ -566,7 +682,7 @@ class Database:
             logger.info(f"Applying migration {version}: {path.name}")
             sql = path.read_text()
 
-            statements = [s.strip() for s in sql.split(";") if s.strip()]
+            statements = self._split_sql_migration_statements(sql)
             for stmt in statements:
                 try:
                     await self._db.execute(stmt)

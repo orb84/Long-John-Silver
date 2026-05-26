@@ -16,6 +16,7 @@ from loguru import logger
 
 from src.core.models import ActionCommand, ActionSource
 from src.integrations.trakt import TraktClient
+from src.integrations.trakt_defaults import resolve_trakt_client_id, trakt_redirect_uri_for_client, is_bundled_trakt_client_id
 from src.web.dependencies import WebDependencies, verify_auth
 
 
@@ -243,27 +244,31 @@ class SystemRouter:
     async def _trakt_auth(self, request: Request, client_id: str = None, _auth: bool = Depends(verify_auth)):
         deps = self._deps
         settings = deps.settings_manager.settings
-        actual_client_id = client_id or settings.trakt_client_id
+        actual_client_id = resolve_trakt_client_id(settings, client_id)
         if not actual_client_id:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Trakt Client ID not configured or provided."},
+                content={"error": "This build does not include the bundled Trakt Client ID, and no custom Client ID was provided."},
             )
         client = TraktClient(actual_client_id)
         verifier, challenge = client.generate_pkce_pair()
         state = secrets.token_urlsafe(16)
-        deps.trakt_pkce_store[state] = {"verifier": verifier, "client_id": actual_client_id}
-        GLOBAL_TRAKT_CLIENT_ID = "42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac"
-        if actual_client_id == GLOBAL_TRAKT_CLIENT_ID:
-            redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-        else:
-            base_url = str(request.base_url).rstrip("/")
-            if "127.0.0.1" in base_url:
-                base_url = base_url.replace("127.0.0.1", "localhost")
-            redirect_uri = f"{base_url}/api/trakt/callback"
-        logger.info(f"Generating Trakt auth URL. base_url: {str(request.base_url)}, redirect_uri: {redirect_uri}")
+        base_url = str(request.base_url).rstrip("/")
+        redirect_uri = trakt_redirect_uri_for_client(actual_client_id, base_url)
+        deps.trakt_pkce_store[state] = {
+            "verifier": verifier,
+            "client_id": actual_client_id,
+            "redirect_uri": redirect_uri,
+            "flow": "oob" if is_bundled_trakt_client_id(actual_client_id) else "callback",
+        }
+        logger.info(
+            "Generating Trakt auth URL. base_url: {}, redirect_uri: {}, flow: {}",
+            str(request.base_url),
+            redirect_uri,
+            deps.trakt_pkce_store[state]["flow"],
+        )
         auth_url = client.get_auth_url(redirect_uri, state, challenge)
-        return {"auth_url": auth_url}
+        return {"auth_url": auth_url, "flow": deps.trakt_pkce_store[state]["flow"]}
 
     async def _trakt_callback(self, request: Request, code: str = None, state: str = None, error: str = None):
         deps = self._deps
@@ -285,24 +290,28 @@ class SystemRouter:
 
         verifier = pkce_record["verifier"]
         settings = deps.settings_manager.settings
-        client_id = pkce_record.get("client_id") or settings.trakt_client_id
+        client_id = resolve_trakt_client_id(settings, pkce_record.get("client_id"))
         client = TraktClient(client_id)
-        GLOBAL_TRAKT_CLIENT_ID = "42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac"
-        if client_id == GLOBAL_TRAKT_CLIENT_ID:
-            redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-        else:
-            base_url = str(request.base_url).rstrip("/")
-            if "127.0.0.1" in base_url:
-                base_url = base_url.replace("127.0.0.1", "localhost")
-            redirect_uri = f"{base_url}/api/trakt/callback"
-        logger.info(f"Exchanging Trakt code for token. base_url: {str(request.base_url)}, redirect_uri: {redirect_uri}")
+        redirect_uri = pkce_record.get("redirect_uri") or trakt_redirect_uri_for_client(client_id, str(request.base_url).rstrip("/"))
+        logger.info(
+            "Exchanging Trakt code for token. base_url: {}, redirect_uri: {}, flow: {}",
+            str(request.base_url),
+            redirect_uri,
+            pkce_record.get("flow") or ("oob" if is_bundled_trakt_client_id(client_id) else "callback"),
+        )
         tokens = await client.exchange_code_for_token(code, redirect_uri, verifier)
         if not tokens:
             logger.error("Trakt exchange failed (no tokens returned).")
             return HTMLResponse("<h1>Error</h1><p>Failed to exchange code for token.</p>")
-        settings.trakt_client_id = client_id
-        settings.trakt_access_token = tokens.get("access_token")
-        settings.trakt_refresh_token = tokens.get("refresh_token")
+        media = settings.category_settings.setdefault("media", {})
+        services = media.setdefault("services", {})
+        trakt = services.setdefault("trakt", {})
+        if not isinstance(trakt, dict):
+            trakt = {}
+            services["trakt"] = trakt
+        trakt["client_id"] = client_id
+        trakt["access_token"] = tokens.get("access_token")
+        trakt["refresh_token"] = tokens.get("refresh_token")
         deps.settings_manager.save(settings)
         return HTMLResponse(self._TRAKT_CONNECTED_HTML)
 

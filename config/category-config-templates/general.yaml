@@ -1,0 +1,7 @@
+# Local user config for General Files. Copied to ignored config/categories/general.yaml.
+category_id: general
+enabled: true
+scheduler:
+  enabled: false
+storage:
+  inherit_global_thresholds: true

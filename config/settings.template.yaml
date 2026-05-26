@@ -3,7 +3,8 @@
 # Do not put real API keys, bridge tokens, passwords, private paths, or other
 # machine-specific values in this file. On first launch LJS copies this template
 # to config/settings.local.yaml, which is ignored by git and receives live edits.
-# Category runtime settings are created from config/category-templates/*.yaml into
+# Category definitions live in config/category-definitions/*.yaml. Blank local
+# category settings are copied from config/category-config-templates/*.yaml into
 # ignored config/categories/*.yaml files.
 setup_complete: false
 

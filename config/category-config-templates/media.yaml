@@ -1,0 +1,26 @@
+# Local user config for the abstract Media defaults.
+# Copied to ignored config/categories/media.yaml on first launch.
+category_id: media
+enabled: true
+services:
+  tmdb:
+    enabled: true
+    api_key: ""
+  trakt:
+    enabled: true
+    client_id: ""
+    access_token: ""
+    refresh_token: ""
+  plex:
+    enabled: false
+    url: ""
+    token: ""
+  opensubtitles:
+    enabled: false
+    api_key: ""
+download_profile:
+  language: English
+  preferred_resolution: 1080p
+  size_limit_mode: smart
+  subtitle_languages: [en]
+  preferred_formats: [WEB-DL, BluRay, Remux]

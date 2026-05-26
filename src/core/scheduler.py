@@ -11,9 +11,9 @@ import hashlib
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from loguru import logger
-from typing import Optional, Callable, TYPE_CHECKING
+from typing import Any, Optional, Callable, TYPE_CHECKING
 from src.utils.scheduler import IntervalScheduler
 
 from src.core.categories.identity import canonical_item_key, clean_category_item_name, clean_display_title
@@ -176,6 +176,13 @@ class MediaScheduler:
         
         self._scheduler = IntervalScheduler()
         self._last_scan_result = None
+        self._library_scan_status: dict[str, object] = {
+            "state": "idle",
+            "message": "Library scanner idle",
+            "phase": "idle",
+            "scan_in_progress": False,
+            "reason": None,
+        }
         self._last_library_fs_signature: str | None = None
         self._library_scan_lock = asyncio.Lock()
         self._library_scan_task: asyncio.Task | None = None
@@ -198,6 +205,25 @@ class MediaScheduler:
             self._event_bus.emit_system("background_status", {"message": message, "phase": phase, "item": item})
         except Exception:
             pass
+
+    def _set_library_scan_status(self, *, state: str, message: str, phase: str, reason: str | None = None) -> None:
+        """Store and broadcast the user-visible library scan state."""
+        self._library_scan_status = {
+            "state": state,
+            "message": message,
+            "phase": phase,
+            "scan_in_progress": state in {"queued", "running"},
+            "reason": reason,
+        }
+        self._emit_status(message, phase=phase)
+
+    def get_library_scan_status(self) -> dict[str, object]:
+        """Return current scanner state for initial UI hydration."""
+        running = self._library_scan_lock.locked() or (self._library_scan_task is not None and not self._library_scan_task.done())
+        status = dict(getattr(self, "_library_scan_status", {}) or {})
+        if running and not status.get("scan_in_progress"):
+            status.update({"state": "running", "phase": "running", "scan_in_progress": True, "message": "Library scan running"})
+        return status
 
     @property
     def settings_manager(self) -> SettingsManager:
@@ -266,9 +292,9 @@ class MediaScheduler:
         
         if self._prompt_scheduler:
             self._scheduler.add_job(
-                self._run_scheduled_prompts, interval_seconds=3600,
+                self._run_scheduled_prompts, interval_seconds=60,
                 id="prompt_scheduler",
-                initial_delay_seconds=3600,
+                initial_delay_seconds=60,
             )
 
         settings = self._settings_manager.settings
@@ -314,7 +340,7 @@ class MediaScheduler:
                     pass
 
             logger.info("Starting library scan...")
-            self._emit_status("Scanning library", phase="running")
+            self._set_library_scan_status(state="running", message="Scanning library", phase="running", reason="scheduled" if not force else "requested")
             result = await self._scanner.full_scan(settings)
             self._last_scan_result = result
 
@@ -332,7 +358,7 @@ class MediaScheduler:
             await self._invalidate_scanned_lifecycle_state(result)
             self._last_library_fs_signature = await self._library_roots_signature_async(settings)
             await self._downloader.apply_speed_limits(settings.default_quality)
-            self._emit_status("Library scan complete", phase="done")
+            self._set_library_scan_status(state="complete", message="Library scan complete", phase="done")
             if self._event_bus:
                 try:
                     self._event_bus.emit_system("library_scan_completed", {
@@ -375,7 +401,7 @@ class MediaScheduler:
                 self._library_scan_task = None
 
         task.add_done_callback(_clear_scan_task)
-        self._emit_status("Library scan queued", phase="running")
+        self._set_library_scan_status(state="queued", message="Library scan queued", phase="running", reason=reason)
         return {
             "status": "queued",
             "scan_in_progress": True,
@@ -809,13 +835,12 @@ class MediaScheduler:
             try:
                 rows = await self._db.media.get_category_metadata(category_id, item_id)
                 metadata = (rows[0].get("metadata") if rows else {}) or {}
-                if metadata.get("local_poster_url") or metadata.get("poster_url"):
-                    continue
-                from src.core.categories.metadata.cache_policy import metadata_row_is_fresh
-                if rows and metadata_row_is_fresh(rows[0]):
-                    # A fresh provider snapshot without local artwork should not
-                    # cause TMDB or other providers to be searched again on every boot.
-                    if metadata.get("poster_path") and hasattr(category, "cache_metadata_artwork"):
+                refresh_policy = self._category_metadata_refresh_policy(category, rows[0] if rows else None)
+                if rows and not refresh_policy.get("due"):
+                    # A stable library metadata snapshot should not be re-queried on
+                    # every boot. If it contains provider artwork paths, the category
+                    # may still cache local artwork without performing a live search.
+                    if not (metadata.get("local_poster_url") or metadata.get("poster_url")) and metadata.get("poster_path") and hasattr(category, "cache_metadata_artwork"):
                         cached = await category.cache_metadata_artwork(
                             category.create_item(item_id), metadata, context, provider=metadata.get("provider", "metadata"),
                         )
@@ -825,6 +850,8 @@ class MediaScheduler:
                                 str(cached.get("external_id") or cached.get("tmdb_id") or rows[0].get("external_id") or ""),
                             )
                             refreshed += 1
+                    continue
+                if metadata.get("local_poster_url") or metadata.get("poster_url"):
                     continue
                 workflows = {workflow.name for workflow in category.declare_workflows()}
                 workflow_name = "refresh_metadata" if "refresh_metadata" in workflows else "resolve_metadata" if "resolve_metadata" in workflows else "resolve_show" if "resolve_show" in workflows else None
@@ -838,6 +865,60 @@ class MediaScheduler:
         if refreshed:
             self._emit_status(f"Updated artwork for {refreshed} library items", phase="done")
         return refreshed
+
+    def _category_metadata_refresh_policy(self, category: object, row: dict[str, Any] | None) -> dict[str, Any]:
+        """Return whether one library metadata row is due for live refresh.
+
+        Category-owned metadata workflows can persist ``metadata_refresh_policy``
+        alongside stable provider IDs. The scheduler only interprets that generic
+        policy envelope; it does not know that MusicBrainz, Open Library, or
+        LibriVox have category-specific semantics.
+        """
+        if not row:
+            return {"due": True, "reason": "missing_metadata"}
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        policy = metadata.get("metadata_refresh_policy") if isinstance(metadata.get("metadata_refresh_policy"), dict) else {}
+        if not policy and hasattr(category, "metadata_refresh_policy"):
+            try:
+                policy = category.metadata_refresh_policy(provider=str(row.get("provider") or metadata.get("provider") or ""))
+            except Exception:
+                policy = {}
+        try:
+            refresh_days = int(policy.get("refresh_after_days") or policy.get("default_check_interval_days") or 90)
+        except (TypeError, ValueError):
+            refresh_days = 90
+        refresh_days = max(1, min(refresh_days, 3650))
+        refreshed_at = self._parse_refresh_timestamp(str(row.get("refreshed_at") or ""))
+        if refreshed_at is None:
+            return {"due": True, "reason": "unknown_last_refresh", "refresh_after_days": refresh_days}
+        due_at = refreshed_at + timedelta(days=refresh_days)
+        due = datetime.now(timezone.utc) >= due_at
+        return {
+            "due": due,
+            "reason": "due" if due else "fresh_stable_snapshot",
+            "refresh_after_days": refresh_days,
+            "last_refreshed_at": refreshed_at.isoformat(),
+            "next_refresh_at": due_at.isoformat(),
+            "stable_id": metadata.get("stable_id") or row.get("external_id") or "",
+        }
+
+    @staticmethod
+    def _parse_refresh_timestamp(value: str) -> datetime | None:
+        """Parse SQLite/ISO metadata timestamps as timezone-aware UTC datetimes."""
+        text = str(value or "").strip()
+        if not text:
+            return None
+        for candidate in (text, text.replace("Z", "+00:00")):
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            return parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
 
     async def _ensure_scanned_items_exist(self, result: LibraryScanResult) -> int:
         """Ensure scanned category items exist before inserting scanned units.

@@ -1,0 +1,34 @@
+# Movies category definition. Safe to commit/share.
+category_id: movie
+extends: media
+definition_version: 1
+download_profile:
+  format_examples:
+    - Movie.Title.2024.ITA.1080p.WEB-DL.x265
+    - Movie Title 2024 2160p BluRay REMUX
+tools:
+  category_workflows:
+    - movie.resolve_metadata
+    - movie.search_download_candidates
+    - movie.download_movie
+    - movie.search_upgrade
+  llm_usage_notes:
+    - Resolve movie title/year before searching when the title is ambiguous or has remakes.
+    - Treat released/already-out constraints as binding and do not recommend future releases unless asked.
+llm_guidance:
+  behavior:
+    - Movie identity is normally title plus year. Ask or resolve metadata when remakes, shorts, or foreign-title ambiguity matters.
+    - For recommendations, prefer evidence from user taste profiles and category metadata over broad popularity.
+  search_examples:
+    - Dune Part Two 2024 ITA 1080p
+    - Blade Runner 1982 Final Cut 1080p
+lifecycle_policy:
+  policy_version: 2
+  identity_fields: [provider, external_id, title, year, edition]
+  lifecycle_fields: [library_presence, quality, language, edition, release_age, metadata_complete]
+  suggestion_types: [quality_upgrade, better_release, metadata_repair, related_media]
+  invalidation_triggers: [library_changed, metadata_changed, taste_changed, download_completed, download_failed, user_quality_or_language_changed, manual_refresh, policy_version_changed]
+  llm_policy_description: >-
+    Movie suggestions normally concern metadata repair, better releases, quality upgrades,
+    language/subtitle preferences, and related recommendations. Finished movies should not
+    be refreshed frequently unless library quality, metadata, or user preferences change.

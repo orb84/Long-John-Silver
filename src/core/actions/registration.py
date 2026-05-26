@@ -181,6 +181,7 @@ class ActionRegistrationService:
         for action_name, method in (
             ("setup_password", handler.setup_password),
             ("setup_paths", handler.setup_paths),
+            ("setup_category_config", handler.setup_category_config),
             ("setup_llm", handler.setup_llm),
             ("setup_embeddings", handler.setup_embeddings),
             ("setup_channels", handler.setup_channels),

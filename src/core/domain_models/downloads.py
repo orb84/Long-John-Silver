@@ -466,6 +466,7 @@ class ScannedMediaFile(BaseModel):
     subtitle_languages: list[str] = Field(default_factory=list)
     subtitle_tracks: list[dict] = Field(default_factory=list)
     media_probe: dict = Field(default_factory=dict)
+    local_object: dict = Field(default_factory=dict)
 
 
 class ScannedLibraryItem(BaseModel):
@@ -486,6 +487,7 @@ class ScannedLibraryItem(BaseModel):
     detected_languages: list[str] = Field(default_factory=list)
     subtitle_languages: list[str] = Field(default_factory=list)
     year: int | None = None
+    local_object_model: dict = Field(default_factory=dict)
 
     @property
     def detailed_episodes(self) -> list[ScannedMediaFile]:

@@ -164,6 +164,11 @@ class AppDeck {
             if (window.sharingPanel && typeof window.sharingPanel.load === 'function') jobs.push(window.sharingPanel.load());
             if (window.helmPanel && typeof window.helmPanel.updateStats === 'function') jobs.push(window.helmPanel.updateStats());
             if (window.helmPanel && typeof window.helmPanel.updateStorageStatus === 'function') jobs.push(window.helmPanel.updateStorageStatus());
+            if (typeof APIClient !== 'undefined') {
+                jobs.push(APIClient.get('/api/library/status').then(data => {
+                    if (data && data.scan && data.scan.message) this._updateBackgroundStatus(data.scan);
+                }));
+            }
             const results = await Promise.allSettled(jobs);
             const failed = results.filter(r => r.status === 'rejected');
             if (failed.length) console.warn(`[AppDeck] ${failed.length} panel hydration job(s) failed after ${reason}.`, failed);

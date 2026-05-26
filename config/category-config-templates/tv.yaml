@@ -1,0 +1,18 @@
+# Local user config for TV Shows. Copied to ignored config/categories/tv.yaml.
+category_id: tv
+enabled: true
+properties:
+  naming_template: '{series_title}/Season {season:02d}/{series_title} - S{season:02d}E{episode:02d} - {episode_title}'
+  active_update_interval_days: 7
+  inactive_update_interval_days: 90
+  ended_update_interval_days: 180
+  upgrade_scan_interval_days: 30
+services:
+  tvmaze:
+    enabled: true
+download_profile:
+  pack_preference: preferred_not_required
+scheduler:
+  enabled: true
+storage:
+  inherit_global_thresholds: true

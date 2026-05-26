@@ -52,7 +52,7 @@ def test_readme_reflects_current_architecture() -> None:
     require("General Files" in readme, "README should document the bundled General Files category")
     require("Advanced Category Contracts" in readme, "README should explain the renamed manifest diagnostics panel")
     require("config/settings.template.yaml" in readme and "config/settings.local.yaml" in readme, "README should document template/live settings split")
-    require("config/category-templates/<category_id>.yaml" in readme and "config/categories/<category_id>.yaml" in readme, "README should document category template/live split")
+    require("config/category-definitions/<category_id>.yaml" in readme and "config/category-config-templates/<category_id>.yaml" in readme and "config/categories/<category_id>.yaml" in readme, "README should document category definition/template/live split")
 
 
 def test_release_license_and_public_attribution_are_set() -> None:

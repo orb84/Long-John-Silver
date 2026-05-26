@@ -160,7 +160,7 @@ class GetPlexWatchedTool:
         logger.info("Tool: Getting watched items from Plex")
         if not self._plex:
             return {
-                "error": "Plex not configured. Set plex_url and plex_token in settings."
+                "error": "Plex not configured. Set config/categories/media.yaml services.plex.url and services.plex.token."
             }
         try:
             items = await self._plex.get_watched_items()

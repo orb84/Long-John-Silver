@@ -5,6 +5,7 @@ Provides SettingsActionHandler: the single place for settings mutation
 logic invoked via ActionGateway from UI endpoints.
 """
 
+from pathlib import Path
 from typing import Any
 
 from src.ai.assistant import AIAssistant
@@ -181,21 +182,21 @@ class SettingsActionHandler:
         settings = self._sm.settings
         if "download_dir" in kwargs:
             settings.download_dir = kwargs["download_dir"]
+        if "library_root" in kwargs:
+            settings.library_root = kwargs["library_root"] or "./library"
         new_max_concurrent = None
         if "max_concurrent" in kwargs:
             new_max_concurrent = max(1, int(kwargs["max_concurrent"]))
             settings.max_concurrent_downloads = new_max_concurrent
         if "category_settings" in kwargs:
-            for cat_id, cat_props in dict(kwargs["category_settings"]).items():
-                if cat_id not in settings.category_settings:
-                    settings.category_settings[cat_id] = {}
-                for prop_name, prop_val in cat_props.items():
-                    settings.category_settings[cat_id][prop_name] = prop_val
+            self._merge_category_settings(settings, kwargs.get("category_settings"))
         if "library_paths" in kwargs:
-            for cat_id, path in dict(kwargs["library_paths"]).items():
-                if cat_id not in settings.category_settings:
-                    settings.category_settings[cat_id] = {}
-                settings.category_settings[cat_id]["library_path"] = path
+            path_payload = {
+                str(cat_id): {"library_path": path}
+                for cat_id, path in dict(kwargs["library_paths"]).items()
+                if cat_id and path is not None
+            }
+            self._merge_category_settings(settings, path_payload)
         if "stall_check_interval_minutes" in kwargs:
             settings.stall_check_interval_minutes = int(kwargs["stall_check_interval_minutes"])
         if "stall_alternative_hours" in kwargs:
@@ -213,10 +214,32 @@ class SettingsActionHandler:
             if field in kwargs:
                 current = getattr(settings, field)
                 setattr(settings, field, int(kwargs[field]) if isinstance(current, int) else float(kwargs[field]))
+        self._prepare_library_directories(settings)
         self._sm.save(settings)
         if new_max_concurrent is not None:
             await self._downloader.set_max_concurrent(new_max_concurrent)
-        return {"status": "ok", "max_concurrent_downloads": settings.max_concurrent_downloads}
+        return {"status": "ok", "max_concurrent_downloads": settings.max_concurrent_downloads, "library_root": settings.library_root}
+
+
+    def _prepare_library_directories(self, settings) -> None:
+        """Best-effort creation of global/category library roots after path edits."""
+        from loguru import logger
+
+        roots: set[Path] = {Path(getattr(settings, "library_root", "./library") or "./library")}
+        try:
+            from src.core.categories.registry import CategoryRegistry
+
+            registry = CategoryRegistry.with_defaults()
+            for category in registry.list_all():
+                if getattr(category, "category_id", ""):
+                    roots.add(Path(category.get_root_path(settings)))
+        except Exception as exc:
+            logger.warning(f"Could not enumerate category roots while saving settings: {exc}")
+        for root in sorted(roots, key=lambda item: str(item)):
+            try:
+                root.expanduser().mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning(f"Could not create library directory {root}: {exc}")
 
     async def update_sharing(self, **kwargs: Any) -> dict:
         """Update library seed-in-place sharing settings and apply quotas."""
@@ -245,6 +268,38 @@ class SettingsActionHandler:
         self._sm.save(settings)
         return {"status": "ok" if result.get("ok") else "warning", "auto_start_at_login": settings.auto_start_at_login, "autostart": result}
 
+
+    @classmethod
+    def _merge_category_settings(cls, settings: Any, payload: object) -> None:
+        """Deep-merge partial category-local settings into ``settings``.
+
+        Compass controls usually save one field at a time.  Deep merging keeps
+        sibling service credentials, paths, scheduler toggles, and inherited
+        media preferences alive in memory until ``SettingsManager.save`` writes
+        the ignored local category files.
+        """
+        if not isinstance(payload, dict):
+            return
+        for category_id, values in payload.items():
+            key = str(category_id or "").strip()
+            if not key or not isinstance(values, dict):
+                continue
+            existing = settings.category_settings.get(key)
+            if not isinstance(existing, dict):
+                existing = {}
+            settings.category_settings[key] = cls._deep_merge(existing, values)
+
+    @classmethod
+    def _deep_merge(cls, base: dict, override: dict) -> dict:
+        """Recursively merge mappings while replacing scalars/lists."""
+        merged = dict(base or {})
+        for key, value in (override or {}).items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = cls._deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
     async def update_bandwidth(self, **kwargs: Any) -> dict:
         """Update bandwidth scheduling rules and apply the active profile."""
         settings = self._sm.settings
@@ -270,38 +325,62 @@ class SettingsActionHandler:
         return {"status": "ok"}
 
     async def update_integrations(self, **kwargs: Any) -> dict:
-        """Update external API integrations (TMDB, Trakt, Plex, OpenSubtitles)."""
+        """Update category-owned service settings from a structured payload.
+
+        The settings UI sends ``category_services`` so the action layer does not
+        need to know about global TMDB/Trakt/Plex fields.  Each category entry is
+        merged into ``Settings.category_settings[category_id].services`` and is
+        persisted by ``SettingsManager`` into ignored ``config/categories`` YAML.
+        """
         settings = self._sm.settings
-        before = {
-            "tmdb": bool(settings.tmdb_api_key),
-            "trakt": bool(settings.trakt_client_id),
-            "plex": bool(settings.plex_url and settings.plex_token),
-            "opensubtitles": bool(settings.opensubtitles_api_key),
-        }
-        if "tmdb_api_key" in kwargs:
-            settings.tmdb_api_key = kwargs["tmdb_api_key"] or None
-        if "trakt_client_id" in kwargs:
-            new_id = kwargs["trakt_client_id"] or None
-            if new_id != settings.trakt_client_id:
-                settings.trakt_client_id = new_id
-                settings.trakt_access_token = None
-                settings.trakt_refresh_token = None
-        if "plex_url" in kwargs:
-            settings.plex_url = kwargs["plex_url"] or None
-        if "plex_token" in kwargs:
-            settings.plex_token = kwargs["plex_token"] or None
-        if "opensubtitles_api_key" in kwargs:
-            settings.opensubtitles_api_key = kwargs["opensubtitles_api_key"] or None
+        category_services = kwargs.get("category_services")
+        if not isinstance(category_services, dict):
+            category_services = {}
+
+        for category_id, category_payload in category_services.items():
+            if not isinstance(category_payload, dict):
+                continue
+            category_config = settings.category_settings.setdefault(str(category_id), {})
+            services = category_config.setdefault("services", {})
+            if not isinstance(services, dict):
+                services = {}
+                category_config["services"] = services
+            incoming_services = category_payload.get("services")
+            if not isinstance(incoming_services, dict):
+                continue
+            for service_id, service_payload in incoming_services.items():
+                if not isinstance(service_payload, dict):
+                    continue
+                service_config = services.setdefault(str(service_id), {})
+                if not isinstance(service_config, dict):
+                    service_config = {}
+                    services[str(service_id)] = service_config
+                previous_effective_trakt_id = None
+                if str(category_id) == "media" and str(service_id) == "trakt":
+                    from src.integrations.trakt_defaults import resolve_trakt_client_id
+                    previous_effective_trakt_id = resolve_trakt_client_id(settings)
+
+                for key, value in service_payload.items():
+                    service_config[str(key)] = value or None
+
+                if str(category_id) == "media" and str(service_id) == "trakt":
+                    from src.integrations.trakt_defaults import resolve_trakt_client_id
+                    next_effective_trakt_id = resolve_trakt_client_id(settings)
+                    if next_effective_trakt_id != previous_effective_trakt_id:
+                        service_config["access_token"] = None
+                        service_config["refresh_token"] = None
+
         self._sm.save(settings)
-        after = {
-            "tmdb": bool(settings.tmdb_api_key),
-            "trakt": bool(settings.trakt_client_id),
-            "plex": bool(settings.plex_url and settings.plex_token),
-            "opensubtitles": bool(settings.opensubtitles_api_key),
+        from src.integrations.trakt_defaults import resolve_trakt_client_id
+        configured = {
+            "tmdb": bool(settings.category_service_value("media", "tmdb", "api_key")),
+            "trakt": bool(resolve_trakt_client_id(settings)),
+            "plex": bool(settings.category_service_value("media", "plex", "url") and settings.category_service_value("media", "plex", "token")),
+            "opensubtitles": bool(settings.category_service_value("media", "opensubtitles", "api_key")),
         }
         from loguru import logger
-        logger.info("Integration settings updated: before={} after={}", before, after)
-        return {"status": "ok", "configured": after}
+        logger.info("Shared media service settings updated from category payload: {}", configured)
+        return {"status": "ok", "configured": configured}
 
     async def update_bridges(self, **kwargs: Any) -> dict:
         """Update chat bridge settings (Discord, Telegram, WhatsApp)."""

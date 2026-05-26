@@ -788,10 +788,10 @@
         <div class="step-panel" id="step-2">
             <div class="glass-panel" style="padding: 2rem;">
                 <h2 class="step-title"><i class="fa-solid fa-folder-open"></i> Define the Cargo Holds</h2>
-                <p class="step-desc">Set the global download directory, then configure each category's own library folder. Category folders are saved to ignored <code>config/categories/&lt;category_id&gt;.yaml</code> files. Global setup writes ignored <code>config/settings.local.yaml</code>, created from <code>config/settings.template.yaml</code>.</p>
+                <p class="step-desc">Set the global download directory and one main library root. Category-specific folders are optional overrides saved to ignored <code>config/categories/&lt;category_id&gt;.yaml</code> files. If a category override is blank, LJS creates and uses <code>&lt;library root&gt;/&lt;category folder&gt;</code>.</p>
                 
                 <div class="guide-box">
-                    <i class="fa-solid fa-circle-info"></i> <strong>How it works:</strong> LJS downloads torrent chunks into the <strong>Download Directory</strong>. Once finished, it verifies the video file and organizes it into the category folder declared by that category config file.
+                    <i class="fa-solid fa-circle-info"></i> <strong>How it works:</strong> LJS downloads torrent chunks into the <strong>Download Directory</strong>. Once finished, it verifies the payload and organizes it into the category's effective library folder. Most users only need the global library root; use category overrides only for different disks, shares, or existing Plex/Emby/Jellyfin libraries.
                 </div>
 
                 <div class="form-group setup-path-grid">
@@ -802,15 +802,24 @@
                     </div>
                 </div>
 
-                <h3 style="font-family: 'Outfit', sans-serif; font-size: 0.95rem; color: var(--accent-teal); margin: 1.5rem 0 0.8rem 0; border-bottom: 1px solid var(--glass-border); padding-bottom: 6px;">Category-Owned Library Destinations</h3>
+                <div class="form-group setup-path-grid">
+                    <label>Main Library Root</label>
+                    <div class="setup-path-picker">
+                        <input type="text" id="setup-library-root" class="setup-path-input" value="{{ settings.library_root or './library' }}" placeholder="e.g. /mnt/media/LJS">
+                        <button type="button" class="setup-browse-btn" onclick="openServerPathBrowser('setup-library-root', 'Main Library Root')"><i class="fa-solid fa-folder-tree"></i> Browse server</button>
+                    </div>
+                    <p style="font-size: 0.76rem; color: var(--text-dim); margin-top: 6px;">Blank category overrides use this root, for example <code>{{ settings.library_root or './library' }}/Music</code>, <code>{{ settings.library_root or './library' }}/Ebooks</code>, and <code>{{ settings.library_root or './library' }}/Audiobooks</code>.</p>
+                </div>
+
+                <h3 style="font-family: 'Outfit', sans-serif; font-size: 0.95rem; color: var(--accent-teal); margin: 1.5rem 0 0.8rem 0; border-bottom: 1px solid var(--glass-border); padding-bottom: 6px;">Optional Category Library Overrides</h3>
                 
                 {% for category in categories %}
                 <div class="form-group setup-path-grid">
-                    <label>{{ category.display_name }} Target Folder</label>
+                    <label>{{ category.display_name }} Target Folder <span style="font-weight: normal; color: var(--text-dim);">(optional)</span></label>
                     {% for p in category.properties %}
                         {% if p.name == 'library_path' %}
                             <div class="setup-path-picker">
-                                <input type="text" class="setup-category-path setup-path-input" data-category-id="{{ category.id }}" data-category-name="{{ category.display_name }}" value="{{ p.value or '' }}" placeholder="{{ p.default_value or './library/' ~ category.default_folder }}">
+                                <input type="text" class="setup-category-path setup-path-input" data-category-id="{{ category.id }}" data-category-name="{{ category.display_name }}" value="{{ p.value or '' }}" placeholder="Default: {{ category.default_library_path }}">
                                 <button type="button" class="setup-browse-btn" onclick="openServerPathBrowserForInput(this.previousElementSibling)"><i class="fa-solid fa-folder-tree"></i> Browse server</button>
                             </div>
                         {% endif %}
@@ -823,6 +832,7 @@
                             <li style="margin-bottom: 6px;">
                                 <span style="color: {{ 'var(--accent-teal)' if req.configured else 'var(--accent-gold)' }};">{{ '✓' if req.configured else '•' }}</span>
                                 <strong>{{ req.label }}</strong> — {{ req.description }}
+                                {% if req.help_url %}<br><a href="{{ req.help_url }}" target="_blank" class="api-link"><i class="fa-solid fa-up-right-from-square"></i> Service docs / signup</a>{% endif %}
                             </li>
                             {% endfor %}
                         </ul>
@@ -844,7 +854,7 @@
         <div class="step-panel" id="step-3">
             <div class="glass-panel" style="padding: 2rem;">
                 <h2 class="step-title"><i class="fa-solid fa-brain"></i> Commission the AI Assistant</h2>
-                <p class="step-desc">Pick an LLM provider presets to act as the ship's brain. Ollama and LM Studio can run locally on your system for free without any web keys!</p>
+                <p class="step-desc">Pick an LLM provider preset to act as the ship's brain. NVIDIA NIM is a strong free remote option for many users, while Ollama and LM Studio can run local models on your own machine without cloud API keys.</p>
                 
                 <div class="form-group">
                     <label>Inference Provider</label>
@@ -881,21 +891,21 @@
                 </div>
 
                 <div class="form-group">
-                    <label>Model ID Identifier</label>
-                    <input type="text" id="setup-model" value="{{ default_model }}" placeholder="e.g. openrouter/openai/gpt-4o-mini">
+                    <label>Selected model ID <span style="font-weight: normal; color: var(--text-dim);">(advanced/manual override)</span></label>
+                    <input type="text" id="setup-model" value="{{ default_model }}" placeholder="Choose from the catalog above or paste a custom model ID">
                 </div>
 
                 {# ─── Media Metadata Integrations ─── #}
                 <h3 style="font-family: 'Outfit', sans-serif; font-size: 0.95rem; color: var(--accent-teal); margin: 2rem 0 0.8rem 0; border-bottom: 1px solid var(--glass-border); padding-bottom: 6px;">
                     <i class="fa-solid fa-circle-nodes"></i> Media Intelligence APIs
                 </h3>
-                <p class="step-desc" style="font-size: 0.8rem; margin-bottom: 1rem;">Provide metadata keys so the Quartermaster can look up titles, years, artwork, cast details, air dates for episodic categories, and metadata-backed suggestions.</p>
+                <p class="step-desc" style="font-size: 0.8rem; margin-bottom: 1rem;">These service values are saved in the private abstract <code>media</code> category config and inherited by TV Shows and Movies. TMDB is highly recommended because it powers title/year disambiguation, artwork, cast/crew context, air-date reasoning, and better suggestions.</p>
 
                 <!-- TMDB (Highly Recommended) -->
                 <div style="background: rgba(255,255,255,0.01); border: 1px solid var(--glass-border); padding: 12px; border-radius: 10px; margin-bottom: 1rem;">
                     <strong style="color: var(--accent-gold); font-size: 0.85rem;">TMDB — The Movie Database (Highly Recommended)</strong>
                     <p style="font-size: 0.76rem; color: var(--text-dim); margin: 4px 0 8px 0; line-height: 1.4;">
-                        Provides genres, cast, ratings, and posters. LJS cannot scan or make smart recommendations without this.
+                        Provides canonical titles, release years, genres, cast/crew, ratings, posters, and external IDs. LJS can run without it, but media matching and recommendations are much weaker.
                         <br><i class="fa-solid fa-circle-arrow-right"></i> <a href="https://www.themoviedb.org/signup" target="_blank" class="api-link">Register TMDB Account <i class="fa-solid fa-up-right-from-square"></i></a> then get API key from Settings.
                     </p>
                     <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-tmdb-key" placeholder="Paste your TMDB API Key..." style="font-size: 0.8rem;">
@@ -905,10 +915,10 @@
                 <div style="background: rgba(255,255,255,0.01); border: 1px solid var(--glass-border); padding: 12px; border-radius: 10px; margin-bottom: 1rem;">
                     <strong style="color: var(--accent-gold); font-size: 0.85rem;">Trakt.tv — Personalized Discovery</strong>
                     <p style="font-size: 0.76rem; color: var(--text-dim); margin: 4px 0 8px 0; line-height: 1.4;">
-                        Links your account for personalized recommendations and watch-state aware automation. It uses the bundled LJS Trakt client ID by default; advanced users can supply their own app client ID.
+                        Links your account for personalized recommendations and watch-state aware automation. LJS normally uses its bundled public Trakt application Client ID, so you only need a free Trakt account.
                         <br><i class="fa-solid fa-circle-arrow-right"></i> <a href="https://trakt.tv/signup" target="_blank" class="api-link">Create Trakt Account <i class="fa-solid fa-up-right-from-square"></i></a>
                     </p>
-                    <input type="hidden" id="setup-trakt-id" value="42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac">
+                    <input type="hidden" id="setup-trakt-id" value="{{ trakt_custom_client_id or '' }}">
                     <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
                         <span id="setup-trakt-status" class="badge" style="background: rgba(231, 111, 81, 0.15); color: var(--accent-red); border-color: rgba(231, 111, 81, 0.3); font-size: 0.7rem; padding: 3px 8px; border-radius: 4px; border: 1px solid;" title="Not authenticated yet">Not Connected</span>
                         <button onclick="startTraktAuth()" class="btn btn-skip" style="font-size: 0.7rem; padding: 6px 12px; margin: 0;"><i class="fa-solid fa-link"></i> Link Account</button>
@@ -927,14 +937,14 @@
                     
                     <div id="setup-trakt-advanced-container" style="display:none; margin-top:12px; background: rgba(255,255,255,0.02); padding: 10px; border-radius: 8px; border: 1px solid var(--glass-border);">
                         <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:4px;">Custom Trakt Client ID:</label>
-                        <input type="text" id="setup-trakt-custom-id" placeholder="Paste custom Trakt Client ID" style="font-size:0.8rem; margin-bottom:4px; width: 100%; box-sizing: border-box;" oninput="updateSetupTraktId(this.value)">
+                        <input type="text" id="setup-trakt-custom-id" placeholder="Paste custom Trakt Client ID" style="font-size:0.8rem; margin-bottom:4px; width: 100%; box-sizing: border-box;" value="{{ trakt_custom_client_id or '' }}" oninput="updateSetupTraktId(this.value)">
                         <p style="font-size:0.7rem; color:var(--accent-gold); line-height:1.4; margin:6px 0 0 0;">
                             Create your own Trakt developer application at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--teal); text-decoration: underline;">trakt.tv</a>.<br>
                             Use the exact Redirect URI: <code id="trakt-setup-callback-preview" style="color: var(--accent-teal); font-family: monospace; background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 3px;"></code>
                         </p>
                     </div>
                     <div style="margin-top: 8px; text-align: right;">
-                        <a href="javascript:void(0)" onclick="toggleSetupTraktAdvanced()" style="font-size:0.7rem; color:var(--teal); text-decoration:none;"><i class="fa-solid fa-gears"></i> Remote Setup / Custom Trakt App</a>
+                        <a href="javascript:void(0)" onclick="toggleSetupTraktAdvanced()" style="font-size:0.7rem; color:var(--teal); text-decoration:none;"><i class="fa-solid fa-gears"></i> Use a custom Trakt developer app</a>
                     </div>
 
                     <script>
@@ -953,7 +963,7 @@
                         function updateSetupTraktId(val) {
                             var mainInput = document.getElementById('setup-trakt-id');
                             if (mainInput) {
-                                mainInput.value = val.trim() || '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac';
+                                mainInput.value = val.trim();
                             }
                         }
                         async function submitSetupTraktPastedUrl() {
@@ -1209,7 +1219,7 @@
                                 <option value="Korean">Korean</option>
                                 <option value="Chinese">Chinese</option>
                             </select>
-                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Sets the default language filter for searches.</p>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Saved as a shared Media category download preference inherited by TV Shows and Movies. It does not change the chat UI language.</p>
                         </div>
                         <div class="form-group" style="flex: 1;">
                             <label>Preferred Resolution</label>
@@ -1218,7 +1228,7 @@
                                 <option value="1080p" selected>1080p</option>
                                 <option value="720p">720p</option>
                             </select>
-                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Target resolution for auto-downloads.</p>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Saved as a shared Media category download preference used by TV/Movie searches and automation.</p>
                         </div>
                         <div class="form-group" style="flex: 1;">
                             <label>Size Limit Mode</label>
@@ -1227,7 +1237,48 @@
                                 <option value="bitrate">Max Bitrate Limit</option>
                                 <option value="file_size">Max File Size Limit</option>
                             </select>
-                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">How to avoid bloated releases.</p>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Saved as a shared Media category download preference used when ranking torrent candidates.</p>
+                        </div>
+                    </div>
+                </div>
+
+
+                <div class="card-subtitle" style="margin-bottom: 0.5rem; font-size: 0.95rem; font-weight: bold; color: var(--accent-gold);">Music, Audiobook & Ebook Preferences</div>
+                <div class="channel-config" style="display: block; margin-bottom: 1.5rem; background: rgba(255,255,255,0.01);">
+                    <div class="setup-preferences-grid">
+                        <div class="form-group" style="flex: 1;">
+                            <label>Music Lossless Preference</label>
+                            <select id="setup-music-lossless-format">
+                                <option value="flac" selected>FLAC / keep original lossless files</option>
+                                <option value="alac_m4a">ALAC .m4a / Apple-friendly lossless sidecar</option>
+                            </select>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">When ALAC is preferred, imported FLAC/WAV/AIFF music can produce an Apple-friendly .m4a sidecar while preserving the source.</p>
+                            <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.78rem; color: var(--text-dim);">
+                                <input type="checkbox" id="setup-music-auto-convert" style="width: 16px; height: 16px; margin: 0;">
+                                Also allow lossless-to-AAC sidecars when portable AAC is preferred
+                            </label>
+                        </div>
+                        <div class="form-group" style="flex: 1;">
+                            <label>Audiobook Format Preference</label>
+                            <select id="setup-audiobook-format">
+                                <option value="m4b" selected>M4B / Apple-friendly chapters</option>
+                                <option value="mp3">MP3 / broad compatibility</option>
+                                <option value="flac">FLAC / archival lossless</option>
+                            </select>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">M4B is usually the nicest Apple audiobook container. LJS only auto-converts lossless sources by default, not MP3-to-AAC.</p>
+                            <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.78rem; color: var(--text-dim);">
+                                <input type="checkbox" id="setup-audiobook-auto-convert" checked style="width: 16px; height: 16px; margin: 0;">
+                                Create M4B/M4A sidecars from lossless audiobook sources
+                            </label>
+                        </div>
+                        <div class="form-group" style="flex: 1;">
+                            <label>Ebook Format Preference</label>
+                            <select id="setup-ebook-format">
+                                <option value="epub" selected>EPUB / reflowable text</option>
+                                <option value="azw3">AZW3 / Kindle-oriented</option>
+                                <option value="pdf">PDF / fixed-layout scans</option>
+                            </select>
+                            <p style="font-size: 0.72rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4;">Used as search/ranking guidance. LJS does not auto-convert ebooks yet because editions, scans, DRM, and layout can be damaged.</p>
                         </div>
                     </div>
                 </div>
@@ -1306,7 +1357,7 @@
                         <span style="font-weight: 500; font-size: 0.85rem;">Start LJS automatically when I log in</span>
                     </label>
                     <p style="margin: 4px 0 0 26px; font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;">
-                        Creates a normal user-level startup entry on macOS, Windows, or Linux. This is useful for always-on media boxes and can be disabled later in Compass.
+                        Creates a normal user-level login entry on macOS, Windows, or Linux desktop sessions. It uses the current Python/executable and project folder, can be disabled later in Compass, and is not a privileged system daemon.
                     </p>
                 </div>
 

@@ -1,0 +1,98 @@
+category_id: book
+abstract: true
+definition_version: 1
+services:
+  open_library:
+    label: Open Library
+    purpose: Keyless book/work/edition metadata, authors, identifiers, subjects, and
+      cover IDs.
+    llm_usage: Use for ISBN, title/author, edition disambiguation, public metadata,
+      and cover lookup.
+    help_url: https://openlibrary.org/developers/api
+    fields:
+      enabled: bool
+  internet_archive:
+    label: Internet Archive
+    purpose: Public item metadata, files, covers, collection context, and archive
+      identifiers for books and public-domain audio.
+    llm_usage: Use as a metadata/catalog fallback and to inspect item files when a
+      result points to archive.org.
+    help_url: https://archive.org/developers/metadata.html
+    fields:
+      enabled: bool
+  google_books:
+    label: Google Books
+    purpose: Optional broad commercial/public book metadata fallback for title, authors,
+      publisher, publication date, ISBNs, categories, thumbnails, and preview links.
+    llm_usage: Use as a fallback when Open Library or Internet Archive cannot disambiguate
+      a non-public-domain commercial title.
+    help_url: https://developers.google.com/books/docs/v1/using
+    severity: info
+    fields:
+      enabled: bool
+      api_key: secret
+  apple_itunes_search:
+    label: Apple iTunes / Apple Books Search API
+    purpose: Keyless catalog search across Apple/iTunes media, including books and
+      audiobooks, useful as a commercial/public catalog fallback.
+    llm_usage: Use as an optional fallback for Apple Books/iTunes metadata, audiobook
+      presence, cover thumbnails, and store-facing disambiguation.
+    help_url: https://performance-partners.apple.com/search-api
+    severity: info
+    enabled: false
+    fields:
+      enabled: bool
+metadata:
+  providers:
+    open_library:
+      enabled: true
+    internet_archive:
+      enabled: true
+    google_books:
+      enabled: false
+    apple_itunes_search:
+      enabled: false
+formats:
+  edition_terms:
+  - unabridged
+  - abridged
+  - annotated
+  - illustrated
+  - revised
+  - expanded
+  - omnibus
+  - complete
+  - retail
+  - scan
+  - OCR
+download_profile:
+  preferred_language: English
+  edition_preference: complete
+tools:
+  allowed_generic:
+  - metadata_lookup
+  - search_media_torrents
+  - inspect_torrent_candidate
+  - queue_download
+  - list_library_files
+  llm_usage_notes:
+  - Resolve title, author, ISBN, edition, and language before download when the user
+    request is ambiguous.
+  - Do not let an ebook satisfy an audiobook request or an audiobook satisfy an ebook
+    request unless the user explicitly switches format.
+llm_guidance:
+  behavior:
+  - Books have work-level identity and edition-level identity. Edition, translator,
+    narrator, abridgement, language, ISBN, and format can all matter.
+  - Use free metadata services for discovery/metadata only; torrent search remains
+    the download mechanism.
+  search_rules:
+  - Include author and edition/format constraints when they are known, especially
+    for common titles or classics with many editions.
+display_name: Book Metadata
+default_folder: Books
+icon: book
+media_kind: book_capability
+search_policy:
+  language_relevant: true
+  use_global_quality_profile: false

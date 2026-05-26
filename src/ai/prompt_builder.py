@@ -48,7 +48,8 @@ class PromptBuilder:
 
     def build_system_prompt(self, intent: Intent, preferences_summary: str = "",
                             behavior_context: str = "", category_guidance: str = "",
-                            platform_guidance: str = "", user_language_hint: str | None = None) -> str:
+                            platform_guidance: str = "", user_language_hint: str | None = None,
+                            active_category_id: str | None = None) -> str:
         """Build the system prompt representation.
 
         Keep construction deterministic and side-effect free.  Future
@@ -89,10 +90,10 @@ class PromptBuilder:
         if platform_guidance:
             parts.append(platform_guidance)
 
-        parts.append(self._task_guidance(intent))
+        parts.append(self._task_guidance(intent, active_category_id=active_category_id))
         return "\n\n".join(parts)
 
-    def _task_guidance(self, intent: Intent) -> str:
+    def _task_guidance(self, intent: Intent, active_category_id: str | None = None) -> str:
         """Return persona-neutral task guidance for an intent."""
 
         if intent == Intent.SEARCH:
@@ -110,7 +111,8 @@ class PromptBuilder:
                 "5. If the user has preferences, compare the media's attributes against those preferences and give an opinionated recommendation.\n"
                 "6. If tools return no results, say so honestly. Do not invent facts.\n"
                 "7. For episode/air-date answers, cite only tool/source facts actually returned in this turn or already present in conversation context. If metadata_lookup returns only season-level data, do not infer a specific episode date from it. "
-                "8. For upcoming/future episode dates, prefer official network/streamer pages over community calendars when they disagree. If sources disagree by one day, say so and use the official regional source for the user's locale when available."
+                "8. For upcoming/future episode dates, prefer official network/streamer pages over community calendars when they disagree. If sources disagree by one day, say so and use the official regional source for the user's locale when available. "
+                "9. Follow-up corrections are binding constraints. If the user says a variant of 'released', 'already out', or 'not future' after a latest/newest media answer, exclude future/scheduled titles and answer with the latest title whose release date is not in the future; use compare_date_to_now on candidate dates when needed."
             )
 
         if intent == Intent.DOWNLOAD:
@@ -120,26 +122,27 @@ class PromptBuilder:
                 "CRITICAL DOWNLOAD-CONTROL RULE: If the user asks for a download report, queue status, priority change, pause, resume, cancel, stop, or move/reorder operation, do not search torrents. First call `list_downloads` to inspect current state, then call `manage_downloads` for the requested existing-download mutation. If the user asks what library files are being shared/seeding under Fair Share mode, call `list_library_shares`. For cancellation or any confirmation_required result, ask the user to confirm before retrying with confirmed=true.\n"
                 "CRITICAL: If the media is already verified (via category metadata or research evidence in the preceding conversation history), "
                 "DO NOT call the verification tools again. Only execute search_torrents if you need to perform a new search.\n"
-                "1. TOOL PHILOSOPHY: Use a small generic chain. Read the CATEGORY LIBRARY CONTEXT PACKET first; call `enquire_about_media` only if local/category state is absent or stale; call `search_media_torrents` for candidates; call `inspect_torrent_candidate` when a bundle/full-series candidate needs file-list or coverage clarification; call `queue_download` only after the candidate choice is clear. If the current turn already contains a search_media_torrents result with result_set_id/candidate_id values, do not repeat the same search; evaluate that result and either queue by ID, inspect a specific candidate, or ask the user. Do not call or invent category-specific download/read micro-tools for ordinary download decisions.\n"
-                "2. The category owns the meaning of local units, metadata, release state, bundle/pack rules, and language policy. The LLM decides what to search/queue from that context; generic code must not hardcode TV/movie/book/game decision trees.\n"
+                "1. TOOL PHILOSOPHY: Use a small generic chain. Read the CATEGORY LIBRARY CONTEXT PACKET first; call `enquire_about_media` only if local/category state is absent or stale; call `search_media_torrents` for candidates; call `inspect_torrent_candidate` when a bundle/full-series candidate needs file-list or coverage clarification; call `queue_download` only after choosing a safe candidate.\n"
+                "2. CATEGORY OWNERSHIP: The active category owns the meaning of local units, metadata, release state, bundle/pack rules, language relevance, format facets, and special search terms. Generic prompt code must not hardcode TV/movie/book/music/game decision trees. Follow the active category profile for catalogue/bundle wording, soundtrack naming, language use, source type, narrator/edition/translation, format, bitrate, and quality rules.\n"
                 "3. If a matched tracked item is present, use its exact key/name and configured language unless the user explicitly overrides them. Also inspect existing local unit languages/audio_languages: prefer continuity with the configured/existing language and never silently queue a different-language release.\n"
                 "4. If the requested item is not tracked, use metadata_lookup/enquire_about_media/research before acting; do not invent metadata from memory.\n"
                 "5. For category units (season/episode/chapter/disc/track), put numbers in dedicated tool arguments; do not hide localized unit phrases inside a free-form name field.\n"
                 "6. For episodic categories, use category context/provider metadata to avoid future unaired units. For missing/multiple units, search exact units as well as safe bundles/packs returned by the category search hook. If the user asks to prefer a full season/pack, pass search_scope=season_pack_preferred to search_media_torrents; this means pack-first, then category-owned fallback to individual units if no acceptable pack exists. The search tool returns a compact candidate_picker workspace, result_handle, next_actions, and cached candidate IDs; choose by candidate_id/result_set_id and do not ask the model to ingest raw torrent payloads or invent JSON paths into a result.\n"
-                "7. Evaluate results against the user's hard preferences: language or acceptable multi-audio, exact unit/pack coverage, magnet availability, resolution, per-unit size/bitrate, seeders, codecs, and release groups.\n"
+                "7. Evaluate results against the user's hard preferences: category-owned language relevance, exact unit/pack coverage, magnet availability, format/bitrate/quality facets that actually belong to the category, seeders, codecs, and release groups. If storage context says WARNING or CRITICAL, call check_storage_capacity with the candidate's estimated size before claiming it cannot fit; do not do free-space arithmetic in prose.\n"
                 "8. DECISION RULE: Evaluate the search results returned by search_media_torrents or search_torrents:\n"
                 "   - Clear Choice: If there is a single, clear-cut best candidate (exact media unit or safe bundle containing the target units, required/preferred language or acceptable multi-audio, acceptable resolution/size, queueable magnet, good seeders), call `queue_download` with `candidate_id`/`candidate_ids` and `result_set_id`. Confirm success only if the tool result says status=`queued` or returns queued receipts with download IDs; otherwise report the error.\n"
-                "   - Ambiguity / Multiple Options: If there are multiple suitable candidates with different tradeoffs (e.g., a fast 1080p, a high-quality Bluray, or different dual-audio / language options), or if a pack/full-series candidate may not contain the requested units and has not been inspected, call `inspect_torrent_candidate` or ask; DO NOT call `queue_download`. Instead, halt tool execution, present the top 2-3 candidates in a clean markdown list or table (showing index, title, size, and seeders), and conversationally ask the user to select which option they would prefer.\n"
+                "   - Ambiguity / Multiple Options: If there are multiple suitable candidates with category-relevant tradeoffs (for example format, edition, bitrate, narrator, translation, coverage, size, or seeders), or if a bundle/pack candidate may not contain the requested units and has not been inspected, call `inspect_torrent_candidate` or ask; DO NOT call `queue_download`. Instead, halt tool execution, present the top 2-3 candidates in a clean markdown list or table (showing index, title, size, and seeders), and conversationally ask the user to select which option they would prefer.\n"
                 "   - No Matches: If no acceptable pack was found for a pack-preferred request, say that clearly and then present/queue the category-owned individual-unit fallback only if those candidates are acceptable. If neither path works, report honestly and ask the user how to proceed.\n"
                 "   - No Matches: If no acceptable candidates were found, report this honestly and ask the user how they would like to proceed.\n\n"
-                + get_compact_quality_guide()
+                + self._download_quality_guide(active_category_id)
             )
 
         if intent == Intent.CONFIG:
             return (
                 "TASK: Modify the user's configuration.\n"
                 "Available actions: configure category properties, add/remove/pause/resume category items, "
-                "manage scheduled tasks, list library files, check library status, and create new category scaffolds.\n"
+                "create/list/remove scheduled reminders and assistant checks, list library files, check library status, and create new category scaffolds.\n"
+                "For reminders or future checks, call create_scheduled_task: use task_type=reminder for simple reminders, task_type=condition_check for future torrent/search existence checks, schedule_type=one_off for 'in 7 days' or 'in 3 weeks', and delay_minutes or due_at to set the first run time. Do not pretend a reminder was scheduled unless the tool returns ok=true. "
                 "For new categories, first call get_category_creation_guide and plan_category_creation. "
                 "Ask targeted questions when scope, item types, downloads, units, metadata, or taste dimensions are unclear; do not rush to scaffolding from a vague category name. "
                 "Before previewing a metadata-capable category, call research_category_services to look for current provider/API/database options comparable to TMDB for that domain, then discuss credible provider tradeoffs with the user. "
@@ -180,3 +183,17 @@ class PromptBuilder:
             )
 
         return "TASK: Help the user with their request."
+
+    @staticmethod
+    def _download_quality_guide(active_category_id: str | None) -> str:
+        """Return a compact quality guide only where it is semantically safe."""
+        category = str(active_category_id or "").strip().lower()
+        if category in {"music", "audio", "audiobooks", "ebooks", "book", "general"}:
+            return (
+                "## Category Quality Guide\n\n"
+                "Use the active category profile above as the authority for formats, language relevance, "
+                "bundle terms, and rejection rules. Do not import quality, language, or release "
+                "vocabulary from another category unless the user explicitly asked for that kind of "
+                "companion item.\n"
+            )
+        return get_compact_quality_guide()

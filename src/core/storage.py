@@ -109,7 +109,7 @@ class StorageMonitor:
                 f"of {total_gb:.1f} GB ({volume.free_percent:.1f}%) for {categories}."
             )
             if volume.status in {"warning", "critical"}:
-                lines.append("  Before queueing large downloads on this disk, warn the user or choose a smaller release.")
+                lines.append("  Use check_storage_capacity with the candidate's estimated size before deciding whether a download fits; low percentage alone is not a size calculation.")
         if len(report.volumes) > max_volumes:
             lines.append(f"- ... {len(report.volumes) - max_volumes} additional volume(s) omitted from prompt context.")
         return "\n".join(lines)
@@ -145,24 +145,43 @@ class StorageMonitor:
             projected_free = max(0, target_usage.free_bytes - max(0, estimated_bytes))
         free_gb = target_usage.free_bytes / _BYTES_PER_GB
         projected_gb = projected_free / _BYTES_PER_GB if projected_free is not None else None
-        min_after_gb = self._settings.storage.minimum_free_after_download_gb
-        ok = target_usage.status != "critical"
+        config = self._settings.storage
+        min_after_gb = config.minimum_free_after_download_gb
         reason = target_usage.message or "Storage target has acceptable free space."
-        if projected_gb is not None and projected_gb < min_after_gb:
+
+        # ``critical`` in the status summary can mean low percentage on a large
+        # disk.  Queue preflight must answer the concrete question: will this
+        # download fit while preserving the configured absolute reserve?
+        # Therefore an estimated 2 GiB album should be allowed on a disk with
+        # 23 GiB free even if that happens to be only 5% of the volume.
+        ok = True
+        decision_status = target_usage.status
+        if projected_gb is not None:
+            if projected_gb < min_after_gb:
+                ok = False
+                decision_status = "critical"
+                reason = (
+                    f"Estimated download would leave only {projected_gb:.1f} GB free on {target_usage.mount_point}; "
+                    f"minimum configured reserve is {min_after_gb:.1f} GB."
+                )
+            elif target_usage.status in {"warning", "critical"}:
+                decision_status = "warning"
+                reason = (
+                    f"Estimated download would fit and leave about {projected_gb:.1f} GB free on "
+                    f"{target_usage.mount_point}; the disk is still low overall ({free_gb:.1f} GB free, "
+                    f"{target_usage.free_percent:.1f}%)."
+                )
+        elif target_usage.status == "critical" and free_gb <= config.critical_free_gb:
             ok = False
-            reason = (
-                f"Estimated download would leave only {projected_gb:.1f} GB free on {target_usage.mount_point}; "
-                f"minimum configured reserve is {min_after_gb:.1f} GB."
-            )
-        elif projected_gb is not None and target_usage.status == "warning":
-            reason = (
-                f"Estimated download would leave about {projected_gb:.1f} GB free on warning-level disk "
-                f"{target_usage.mount_point}."
-            )
+            decision_status = "critical"
+        elif target_usage.status == "critical":
+            # Unknown download size on a low-percent disk: proceed as warning so
+            # the LLM can ask/check size instead of claiming impossible storage.
+            decision_status = "warning"
 
         return StorageCapacityDecision(
             ok=ok,
-            status="critical" if not ok else target_usage.status,
+            status=decision_status,
             category_id=category_id,
             estimated_bytes=estimated_bytes,
             target_path=target_usage.path,

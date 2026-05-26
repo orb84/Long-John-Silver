@@ -115,6 +115,38 @@ def _format_access_urls(host: str, port: int) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+def _category_service_value(settings: object, service_id: str, key: str, category_ids: tuple[str, ...] = ("media",)) -> str | None:
+    """Return one category-owned service value without using legacy globals.
+
+    Shared media integrations are configured in the abstract ``media`` category
+    and inherited by TV/Movie. A small fallback category list is accepted so
+    custom deployments can intentionally override a service in a child category
+    without reintroducing application-wide TMDB/Trakt/Plex fields.
+    """
+    getter = getattr(settings, "first_category_service_value", None)
+    if callable(getter):
+        value = getter(list(category_ids), service_id, key)
+    else:
+        value = None
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _category_service_enabled(
+    settings: object,
+    category_id: str,
+    service_id: str,
+    *,
+    default: bool = True,
+) -> bool:
+    """Return a category-local enable flag with a conservative fallback."""
+    enabled = getattr(settings, "category_service_enabled", None)
+    if callable(enabled):
+        return bool(enabled(category_id, service_id, default=default))
+    return bool(default)
+
+
 async def _probe_http_live(host: str, port: int, *, timeout: float = 0.75) -> str:
     """Return the raw response prefix from LJS's lightweight live endpoint."""
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
@@ -398,24 +430,35 @@ async def main():
             search_logger=detailed_logger.search_logger,
         )
 
-        # --- Initialize external clients ---
-        if settings.plex_url and settings.plex_token:
-            from src.integrations.plex import PlexClient
-            plex_client = PlexClient(settings.plex_url, settings.plex_token)
+        # --- Initialize category-owned external clients ---
+        # Media integrations are no longer global settings.  The abstract
+        # ``media`` category owns shared audiovisual services (TMDB, Trakt,
+        # Plex, OpenSubtitles); TV/Movie inherit them and may override locally.
+        if _category_service_enabled(settings, "media", "plex", default=False):
+            plex_url = _category_service_value(settings, "plex", "url")
+            plex_token = _category_service_value(settings, "plex", "token")
+            if plex_url and plex_token:
+                from src.integrations.plex import PlexClient
+                plex_client = PlexClient(plex_url, plex_token)
 
-        if settings.tmdb_api_key:
-            try:
-                from src.integrations.tmdb import TMDBClient
-                tmdb_client = TMDBClient(settings.tmdb_api_key)
-                logger.info("TMDB integration configured at startup; client initialized for library and agent metadata.")
-            except Exception as exc:
-                logger.warning(f"TMDB integration is configured, but startup client initialization failed: {exc}")
+        if _category_service_enabled(settings, "media", "tmdb", default=True):
+            tmdb_api_key = _category_service_value(settings, "tmdb", "api_key", ("media", "movie", "tv"))
+            if tmdb_api_key:
+                try:
+                    from src.integrations.tmdb import TMDBClient
+                    tmdb_client = TMDBClient(tmdb_api_key)
+                    logger.info("TMDB integration configured from category settings; client initialized.")
+                except Exception as exc:
+                    logger.warning(f"TMDB integration is configured, but startup client initialization failed: {exc}")
+            else:
+                logger.info("TMDB integration not configured; add the API key under Media defaults in Compass/setup.")
+
+        if _category_service_enabled(settings, "tv", "tvmaze", default=True):
+            from src.integrations.tvmaze import TVMazeClient
+            tvmaze_client = TVMazeClient()
+            logger.info("TVMaze metadata client initialized from TV category settings.")
         else:
-            logger.info("TMDB integration not configured at startup; settings-aware services can hydrate it after setup.")
-
-        from src.integrations.tvmaze import TVMazeClient
-        tvmaze_client = TVMazeClient()
-        logger.info("TVMaze fallback metadata client initialized.")
+            logger.info("TVMaze metadata client disabled by TV category settings.")
 
         # --- Initialize notifications ---
         notifications = NotificationService()
@@ -498,9 +541,13 @@ async def main():
 
         # --- Initialize recommendation engine ---
         trakt_client = None
-        if settings.trakt_client_id:
-            from src.integrations.trakt import TraktClient
-            trakt_client = TraktClient(settings.trakt_client_id, access_token=settings.trakt_access_token)
+        if _category_service_enabled(settings, "media", "trakt", default=True):
+            from src.integrations.trakt_defaults import resolve_trakt_client_id
+            trakt_client_id = resolve_trakt_client_id(settings)
+            trakt_access_token = _category_service_value(settings, "trakt", "access_token")
+            if trakt_client_id:
+                from src.integrations.trakt import TraktClient
+                trakt_client = TraktClient(trakt_client_id, access_token=trakt_access_token)
 
         metadata_enricher = TMDBMetadataEnricher(tmdb_client, settings_manager=settings_manager)
         recommender = RecommendationEngine(

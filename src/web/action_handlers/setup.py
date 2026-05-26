@@ -5,7 +5,10 @@ Provides SetupActionHandler: the single place for setup wizard
 mutation logic invoked via ActionGateway from UI endpoints.
 """
 
+from pathlib import Path
 from typing import Any
+
+from loguru import logger
 
 from src.ai.assistant import AIAssistant
 from src.core.config import SettingsManager
@@ -45,23 +48,72 @@ class SetupActionHandler:
         return {"status": "ok"}
 
     async def setup_paths(self, **kwargs: Any) -> dict:
-        """Configure download directory and library paths."""
+        """Configure download directory and category-owned library paths.
+
+        The setup wizard uses the same ignored category config files as Compass.
+        It may receive the older flat ``library_paths`` shape from the UI, but
+        save-time inflation writes those paths to ``paths.library_path`` inside
+        ``config/categories/<category_id>.yaml``.
+        """
         settings = self._sm.settings
         if "download_dir" in kwargs and kwargs["download_dir"]:
             settings.download_dir = kwargs["download_dir"]
-        if "category_settings" in kwargs:
-            for cat_id, cat_props in dict(kwargs["category_settings"]).items():
-                if cat_id not in settings.category_settings:
-                    settings.category_settings[cat_id] = {}
-                for prop_name, prop_val in cat_props.items():
-                    settings.category_settings[cat_id][prop_name] = prop_val
+        if "library_root" in kwargs and kwargs["library_root"]:
+            settings.library_root = kwargs["library_root"]
+        self._merge_category_settings(kwargs.get("category_settings"))
         if "library_paths" in kwargs:
-            for cat_id, path in dict(kwargs["library_paths"]).items():
-                if cat_id not in settings.category_settings:
-                    settings.category_settings[cat_id] = {}
-                settings.category_settings[cat_id]["library_path"] = path
+            path_payload = {
+                str(cat_id): {"library_path": path}
+                for cat_id, path in dict(kwargs["library_paths"]).items()
+                if cat_id and path is not None
+            }
+            self._merge_category_settings(path_payload)
+        self._prepare_library_directories(settings)
         self._sm.save(settings)
-        return {"status": "ok"}
+        return {"status": "ok", "library_root": settings.library_root}
+
+    async def setup_category_config(self, **kwargs: Any) -> dict:
+        """Save first-run category-local services and preferences.
+
+        Initial setup must not write media API keys, library paths, or download
+        preferences into global settings.  This action accepts the same
+        ``category_settings`` payload shape as Compass and deep-merges it into
+        ``Settings.category_settings`` so partial updates such as "only the TMDB
+        key" do not erase inherited media defaults or other services.
+        """
+        category_payload = kwargs.get("category_settings")
+        if not isinstance(category_payload, dict):
+            return {"status": "ok", "updated": []}
+        self._merge_category_settings(category_payload)
+        self._sm.save(self._sm.settings)
+        return {"status": "ok", "updated": sorted(str(key) for key in category_payload.keys())}
+
+
+    def _prepare_library_directories(self, settings) -> None:
+        """Best-effort creation of the global and category library roots.
+
+        Setup is the right place to create user-facing folders: read-only code
+        paths can still call ``get_root_path`` without side effects, while write
+        flows start from directories that normally exist.  Failures are logged
+        instead of aborting setup because users may point to temporarily offline
+        mounts and fix permissions later.
+        """
+        roots: set[Path] = {Path(getattr(settings, "library_root", "./library") or "./library")}
+        try:
+            from src.core.categories.registry import CategoryRegistry
+
+            registry = CategoryRegistry.with_defaults()
+            for category in registry.list_all():
+                if getattr(category, "category_id", ""):
+                    roots.add(Path(category.get_root_path(settings)))
+        except Exception as exc:
+            logger.warning(f"Could not enumerate category roots during setup: {exc}")
+
+        for root in sorted(roots, key=lambda item: str(item)):
+            try:
+                root.expanduser().mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning(f"Could not create library directory {root}: {exc}")
 
     async def setup_llm(self, **kwargs: Any) -> dict:
         """Configure LLM provider, model, API base, API key, and web search."""
@@ -145,6 +197,40 @@ class SetupActionHandler:
         settings.language = language
         self._sm.save(settings)
         return {"status": "ok", "language": language}
+
+
+    def _merge_category_settings(self, payload: object) -> None:
+        """Deep-merge category settings into the current in-memory settings.
+
+        Category payloads are partial by design: setup may save only a TMDB key,
+        later save only a media language preference, and Compass may toggle one
+        provider.  A shallow assignment would silently drop sibling services or
+        inherited defaults until the next reload, so all category writes go
+        through this small merge helper before ``SettingsManager.save`` filters
+        and persists the private YAML.
+        """
+        if not isinstance(payload, dict):
+            return
+        settings = self._sm.settings
+        for category_id, values in payload.items():
+            key = str(category_id or "").strip()
+            if not key or not isinstance(values, dict):
+                continue
+            existing = settings.category_settings.get(key)
+            if not isinstance(existing, dict):
+                existing = {}
+            settings.category_settings[key] = self._deep_merge(existing, values)
+
+    @classmethod
+    def _deep_merge(cls, base: dict, override: dict) -> dict:
+        """Recursively merge setup category config without losing siblings."""
+        merged = dict(base or {})
+        for key, value in (override or {}).items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = cls._deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
 
     async def setup_complete(self) -> dict:
         """Mark the setup wizard as complete."""

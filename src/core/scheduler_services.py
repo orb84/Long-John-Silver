@@ -264,9 +264,20 @@ class SchedulerTorrentSearchService:
         requested_category = explicit_category_id or self._category_for_units(season, episode)
         if not requested_category:
             requested_category = self._category_for_search_scope(normalized_scope)
-        media = await self._media_for_request(name, normalized_name, requested_category, language or settings.language)
-        target_lang = language or getattr(media, "language", None) or settings.language
+        initial_category = self._context.categories.get(requested_category) if requested_category and self._context.categories else None
+        initial_lang = self._normalize_category_search_language(
+            initial_category,
+            language or settings.language,
+            explicit=language is not None,
+        )
+        media = await self._media_for_request(name, normalized_name, requested_category, initial_lang or "")
         category_id = getattr(media, "category_id", None) or getattr(media, "item_type", "")
+        category = self._context.categories.get(category_id) if self._context.categories else None
+        target_lang = self._normalize_category_search_language(
+            category,
+            language or getattr(media, "language", None) or settings.language,
+            explicit=language is not None,
+        )
         season = await self._resolve_category_default_season(
             media, category_id, season, episode, normalized_scope, settings,
         )
@@ -306,6 +317,20 @@ class SchedulerTorrentSearchService:
         if media:
             return media
         return await self._temporary_media(normalized_name, category_id, language)
+
+    @staticmethod
+    def _normalize_category_search_language(category: object | None, language: str | None, *, explicit: bool = False) -> str | None:
+        """Return the category-approved language facet for a search."""
+        value = str(language or "").strip()
+        if not value:
+            return None
+        normalizer = getattr(category, "normalize_search_language", None)
+        if callable(normalizer):
+            try:
+                return normalizer(value, explicit=explicit)
+            except TypeError:
+                return normalizer(value)
+        return value
 
     async def _temporary_media(self, normalized_name: str, category_id: str | None, language: str) -> CategoryItem:
         """Create an in-memory item using category-aware classification when possible."""

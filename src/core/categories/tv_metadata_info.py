@@ -121,8 +121,8 @@ class TvMetadataInfoMixin:
         if should_refresh:
             logger.info(f"[TvShowCategory] Provider snapshot stale/missing. Querying TMDB for '{name}'...")
             from src.integrations.tmdb import TMDBClient
-            api_key = settings.tmdb_api_key
-            if api_key:
+            api_key = settings.category_service_value(self.category_id, "tmdb", "api_key")
+            if api_key and self.metadata_provider_enabled(settings, "tmdb", True):
                 try:
                     client = TMDBClient(api_key)
                     enricher = TMDBMetadataEnricher(tmdb_client=client)
@@ -151,8 +151,8 @@ class TvMetadataInfoMixin:
         
         if cached_meta and cached_meta.tmdb_id:
             from src.integrations.tmdb import TMDBClient
-            api_key = settings.tmdb_api_key
-            if api_key:
+            api_key = settings.category_service_value(self.category_id, "tmdb", "api_key")
+            if api_key and self.metadata_provider_enabled(settings, "tmdb", True):
                 try:
                     client = TMDBClient(api_key)
                     tv_details = await client.get_tv_details(cached_meta.tmdb_id)

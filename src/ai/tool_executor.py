@@ -17,6 +17,7 @@ from loguru import logger
 from src.ai.tool_registry import ToolRegistry
 from src.ai.tool_result_compactor import ToolResultCompactor
 from src.ai.tool_contracts import ToolContractValidator
+from src.core.models import ToolExecutionContext
 
 
 _TOOL_NAME_ALIASES = {
@@ -71,6 +72,7 @@ class ToolCallExecutor:
         arguments_raw: str | dict,
         tool_call_id: str,
         allowed_tool_names: set[str],
+        tool_context: ToolExecutionContext | None = None,
     ) -> tuple[dict, str]:
         """Validate, parse, execute a tool call and return result artifacts.
 
@@ -126,7 +128,9 @@ class ToolCallExecutor:
                 result = validation.error_payload(executable_name)
             else:
                 # Step 3: Execute via registry using schema-normalized arguments.
-                result = await self._tool_registry.execute(executable_name, validation.arguments)
+                result = await self._tool_registry.execute(
+                    executable_name, validation.arguments, context=tool_context,
+                )
 
         # Step 4: Build a compact tool result message for LLM context.
         # Raw tool results can contain dozens of torrent candidates, full web

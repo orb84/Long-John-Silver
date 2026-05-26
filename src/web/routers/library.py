@@ -57,9 +57,16 @@ class LibraryRouter:
     async def _get_library_status(self):
         deps = self._deps
         result = deps.scheduler.get_last_scan_result()
+        scan_status = deps.scheduler.get_library_scan_status() if hasattr(deps.scheduler, "get_library_scan_status") else {"state": "unknown", "scan_in_progress": False}
+        payload = {"scan": scan_status, "items": []}
         if not result:
-            return {"items": []}
-        return {"items": [item.model_dump() for item in result.items]}
+            return payload
+        payload.update({
+            "items": [item.model_dump() for item in result.items],
+            "items_found": len(result.items),
+            "total_files": result.total_files,
+        })
+        return payload
 
     async def _inspect_library(self):
         return await self._inspection_builder.build()

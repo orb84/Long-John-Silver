@@ -1,0 +1,340 @@
+category_id: music
+extends: audio
+definition_version: 1
+services:
+  musicbrainz:
+    label: MusicBrainz
+    purpose: Keyless canonical music metadata for artists, releases, recordings, release
+      groups, labels, dates, tracklists, and identifiers.
+    llm_usage: Use before broad web search for artist/album/track identity, release
+      disambiguation, editions, and canonical tracklists.
+    help_url: https://musicbrainz.org/doc/MusicBrainz_API
+    fields:
+      enabled: bool
+  cover_art_archive:
+    label: Cover Art Archive
+    purpose: Keyless album/release cover art linked to MusicBrainz release and release-group
+      IDs.
+    llm_usage: Use after resolving a MusicBrainz release or release group when cover
+      art is needed.
+    help_url: https://musicbrainz.org/doc/Cover_Art_Archive/API
+    fields:
+      enabled: bool
+  discogs:
+    label: Discogs
+    purpose: Optional commercial/community music metadata fallback for releases, labels,
+      catalog numbers, formats, and physical/digital editions.
+    llm_usage: Use as a fallback when MusicBrainz cannot disambiguate an exact album/release
+      edition or when catalog/label/vinyl/CD edition facts matter.
+    help_url: https://www.discogs.com/developers
+    severity: info
+    enabled: false
+    fields:
+      enabled: bool
+      token: secret
+  acoustid:
+    label: AcoustID
+    purpose: Optional audio fingerprint lookup that can map unknown local tracks to
+      MusicBrainz identifiers when a future scanner supplies Chromaprint fingerprints.
+    llm_usage: Suggest when the user wants to repair poorly tagged local music files
+      from fingerprints rather than filenames.
+    help_url: https://acoustid.org/webservice
+    severity: info
+    enabled: false
+    fields:
+      enabled: bool
+      api_key: secret
+metadata:
+  providers:
+    musicbrainz:
+      enabled: true
+    cover_art_archive:
+      enabled: true
+    discogs:
+      enabled: false
+    acoustid:
+      enabled: false
+formats:
+  accepted_file_patterns:
+  - '*.flac'
+  - '*.alac'
+  - '*.m4a'
+  - '*.mp3'
+  - '*.aac'
+  - '*.ogg'
+  - '*.opus'
+  - '*.wav'
+  - '*.aiff'
+  - '*.ape'
+  - '*.cue'
+  - '*.log'
+  release_terms:
+  - album
+  - single
+  - EP
+  - discography
+  - deluxe
+  - remaster
+  - expanded
+  - explicit
+  - clean
+  - vinyl
+  - CD
+  - WEB
+  - FLAC
+  - ALAC
+  - AAC
+  - MP3
+  - 320kbps
+  - V0
+  - 24bit
+  - OST
+  - Original Soundtrack
+  - soundtrack
+  - bootleg
+  - live bootleg
+  - complete discography
+download_profile:
+  preferred_lossless_format: flac
+  preferred_container: folder_per_album
+  preferred_bitrate_kbps: 320
+  apple_compatibility: convert_flac_to_alac_m4a_when_requested
+  transcode_policy: keep_source_and_write_sidecar
+  preferred_lossy_format: aac_m4a
+  auto_convert_lossless_to_preferred: false
+  conversion_policy: Only auto-convert lossless sources when preferred_lossless_format
+    is alac_m4a/apple_lossless_m4a, or when preferred_lossy_format is aac_m4a and
+    auto_convert_lossless_to_preferred is true. Always keep the source file.
+tools:
+  category_workflows:
+  - music.resolve_metadata
+  - music.search_download_candidates
+  - music.convert_audio_for_apple
+  - music.search_upgrade
+  llm_usage_notes:
+  - Resolve artist/album/release identity before searching when a title is ambiguous
+    or has many editions.
+  - Treat album, single, track, discography, format, bitrate, and lossless/lossy constraints
+    as binding.
+  - Discogs and AcoustID are optional fallback/future-repair services; do not imply
+    they are required for normal torrent download selection.
+llm_guidance:
+  behavior:
+  - Music identity can be artist, album/release group, exact release, track, or discography.
+    Do not flatten everything into one title string when edition or tracklist matters.
+  - For maximum quality, prefer lossless sources such as FLAC unless the user asks
+    for Apple-friendly files, where ALAC in .m4a is the lossless target.
+  - Preserve cue/log/artwork/metadata companion files when they are relevant to an
+    album release.
+  search_examples:
+  - Miles Davis Kind of Blue FLAC 24bit
+  - Radiohead OK Computer OKNOTOK FLAC
+  - Daft Punk Random Access Memories ALAC
+lifecycle_policy:
+  policy_version: 1
+  identity_fields:
+  - artist
+  - release_group
+  - release
+  - year
+  - edition
+  lifecycle_fields:
+  - library_presence
+  - format
+  - bitrate
+  - sample_rate
+  - bit_depth
+  - edition
+  - metadata_complete
+  - artwork_present
+  suggestion_types:
+  - quality_upgrade
+  - better_release
+  - format_conversion
+  - artwork_repair
+  - metadata_repair
+  invalidation_triggers:
+  - library_changed
+  - metadata_changed
+  - taste_changed
+  - download_completed
+  - download_failed
+  - user_quality_or_format_changed
+  - manual_refresh
+  - policy_version_changed
+  default_check_interval_days: 120
+  llm_policy_description: Music suggestions normally concern metadata/artwork repair,
+    better master/edition selection, quality upgrades, and optional Apple-friendly
+    sidecar conversions. Stable albums should not be rechecked frequently unless preferences,
+    metadata, or local files change.
+display_name: Music
+default_folder: Music
+icon: music
+media_kind: music_release
+capabilities:
+- metadata
+- downloadable
+- file_organization
+- artwork
+- audio_conversion
+supported_operations:
+- search
+- download
+- scan
+- organize
+- refresh_metadata
+- search_upgrade
+- convert_audio
+llm_profile:
+  short_description: Music albums, singles, tracks, and discographies with format,
+    bitrate, edition, and artwork awareness.
+  user_facing_description: Music manages artists, albums, tracks, singles, discographies,
+    lossless/lossy formats, cover art, and optional Apple-friendly audio conversion.
+  router_description: 'Music: albums, artists, singles, tracks, discographies, FLAC/ALAC/AAC/MP3
+    audio releases.'
+  domain_vocabulary:
+  - music
+  - album
+  - artist
+  - track
+  - single
+  - ep
+  - discography
+  - song
+  - flac
+  - alac
+  - aac
+  - mp3
+  - lossless
+  - bitrate
+  - cover art
+  - soundtrack
+  - ost
+  - original soundtrack
+  - bootleg
+  - musicbrainz
+  item_types:
+  - album
+  - artist
+  - track
+  - single
+  - ep
+  - discography
+  - music_release
+  identifiers:
+  - artist
+  - release_group
+  - release
+  - recording
+  - tracklist
+  - year
+  - edition
+  - format
+  - bitrate
+  - sample_rate
+  - bit_depth
+  common_user_requests:
+  - Find/download a lossless album.
+  - Find a specific remaster or deluxe edition.
+  - Convert FLAC files to Apple Lossless .m4a sidecars.
+  - Repair album metadata or cover art.
+  ambiguity_rules:
+  - A bare title can be an album, song, movie, book, or TV show; use artist/format/context
+    before routing.
+  - Music requests should not fall back to General Files when album/artist/release
+    vocabulary is present.
+  - Discography requests are bundles and may contain many albums/discs.
+  search_rules:
+  - Preserve artist, album, edition, year, medium, FLAC/ALAC/AAC/MP3, bitrate, sample-rate,
+    and bit-depth constraints.
+  - For maximum quality prefer lossless FLAC/ALAC unless the user asked for portable
+    lossy files.
+  - For whole-catalogue artist requests, include the term 'discography' in the torrent
+    search query.
+  - For movie/game/show soundtrack requests, also try OST and Original Soundtrack
+    wording.
+  - Use bootleg only when the user asks for unofficial, live, rare, demo, or bootleg
+    material; do not add it to ordinary album searches.
+  - Language is normally irrelevant for music torrent searches; do not append global
+    movie/TV language preferences such as English or Italian unless the user explicitly
+    requested language-specific music.
+  download_rules:
+  - Do not accept ebooks, audiobooks, music videos, software, or unrelated archives
+    as music.
+  - Prefer complete album folders with track numbering, cue/log/artwork when relevant.
+  organization_rules:
+  - Organize by artist and album/release when metadata is known; preserve disc/track
+    order and companion artwork/log/cue files.
+  safety_rules:
+  - Do not execute scripts or installers bundled with music releases.
+  tool_usage_notes:
+  - Use MusicBrainz for canonical metadata and Cover Art Archive for artwork when
+    adapters are available.
+  - Use music.convert_audio_for_apple only for local audio files inside allowed roots.
+  examples:
+  - user: Find Kind of Blue by Miles Davis in FLAC
+    expected_intent: download
+    expected_behavior: Route to Music, preserve artist/album/lossless constraints,
+      and search music torrents rather than General Files.
+    tool_plan:
+    - music.resolve_metadata
+    - music.search_download_candidates
+  - user: Convert this FLAC album to Apple Lossless m4a
+    expected_intent: download
+    expected_behavior: Use the audio conversion workflow after validating source paths
+      and FFmpeg availability; keep source FLAC files.
+    tool_plan:
+    - music.convert_audio_for_apple
+search_policy:
+  language_relevant: false
+  use_global_quality_profile: false
+  bundle_request_terms:
+  - discography
+  - catalogue
+  - catalog
+  - whole catalogue
+  - complete catalogue
+  - complete catalog
+  - complete collection
+  bundle_candidate_terms:
+  - discography
+  - complete
+  - collection
+  - anthology
+  - box set
+  - albums
+  - studio albums
+object_model:
+  canonical_types:
+  - artist
+  - release_group
+  - release
+  - medium
+  - track
+  - recording
+  stable_identifiers:
+  - musicbrainz_release_id
+  - musicbrainz_release_group_id
+  - musicbrainz_recording_id
+  - barcode
+  - discogs_id
+  disambiguation_facets:
+  - artist_credit
+  - release_type
+  - release_status
+  - country
+  - date
+  - label
+  - barcode
+  - catalog_number
+  - track_count
+  - medium_format
+  llm_notes:
+  - Use release_group when the user wants the album concept, exact release when edition/master/country/year
+    matters, and recording/track only for individual songs.
+  - When candidates have close scores or conflicting release dates/types, ask the
+    LLM to apply user constraints instead of taking the first provider result blindly.
+local_scan:
+  grouping_strategy: top_level_catalog
+  description: Treat a top-level artist/catalog folder as one item and reconstruct
+    albums/tracks underneath it.

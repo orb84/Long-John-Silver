@@ -349,7 +349,7 @@ class DownloadCompletionHandler:
     ) -> tuple[Path, bool] | None:
         """Validate a ready-time target, retrying the category fallback on block.
 
-        The security resolver is the final authority.  When a category template
+        The security resolver is the final authority.  When private category naming config
         accidentally produces a target outside its root, do not give up with a
         stranded completed torrent. Re-plan once through the category fallback,
         which preserves the source filename and category unit hierarchy.
@@ -417,7 +417,7 @@ class DownloadCompletionHandler:
             logger.error(f"Ready callback blocked unsafe file operation {source} -> {safe_target}: {exc}")
             return None
 
-    async def _reconcile_imported_library_item(self, item: DownloadItem, target: Path) -> None:
+    async def _reconcile_imported_library_item(self, item: DownloadItem, target: Path, *, reason: str = "download_import") -> None:
         """Refresh the affected canonical item after a ready-time import."""
         reconciler = self._library_reconciler
         if reconciler is None or not hasattr(reconciler, "reconcile_library_item_from_path"):
@@ -430,10 +430,46 @@ class DownloadCompletionHandler:
                 category_id=category_id,
                 item_id=item_id,
                 changed_path=str(target),
-                reason="download_import",
+                reason=reason,
             )
         except Exception as exc:
             logger.warning(f"Item-scoped library reconciliation failed for {category_id}/{item_id}: {exc}")
+
+    async def _run_category_post_import_hooks(
+        self,
+        *,
+        category: object,
+        item: DownloadItem,
+        settings: Settings,
+        source: Path,
+        imported: Path,
+        file_info: object | None,
+    ) -> list[Path]:
+        """Run category-owned post-import hooks and reconcile created sidecars."""
+        hook = getattr(category, "after_library_file_imported", None)
+        if not callable(hook):
+            return []
+        try:
+            extra_paths = await hook(
+                imported_path=imported,
+                source_path=source,
+                item=item,
+                settings=settings,
+                file_info=file_info,
+            )
+        except Exception as exc:
+            logger.warning(f"Post-import category hook failed for {getattr(category, 'category_id', 'unknown')}: {exc}")
+            return []
+        created: list[Path] = []
+        for path in extra_paths or []:
+            try:
+                candidate = Path(path)
+                if candidate.exists():
+                    created.append(candidate)
+                    await self._reconcile_imported_library_item(item, candidate, reason="download_import_sidecar")
+            except Exception as exc:
+                logger.warning(f"Failed to reconcile post-import sidecar {path}: {exc}")
+        return created
 
     async def _link_completed_file_to_library(
         self,
@@ -492,6 +528,14 @@ class DownloadCompletionHandler:
             if already_present:
                 logger.info(f"Library target already present for '{item.item_name}': {safe_target}")
                 await self._reconcile_imported_library_item(item, safe_target)
+                await self._run_category_post_import_hooks(
+                    category=category,
+                    item=item,
+                    settings=settings,
+                    source=source,
+                    imported=safe_target,
+                    file_info=file_info,
+                )
                 return safe_target
 
             result = await asyncio.to_thread(
@@ -503,6 +547,14 @@ class DownloadCompletionHandler:
             )
             if result is not None:
                 await self._reconcile_imported_library_item(item, result)
+                await self._run_category_post_import_hooks(
+                    category=category,
+                    item=item,
+                    settings=settings,
+                    source=source,
+                    imported=result,
+                    file_info=file_info,
+                )
             return result
         finally:
             if mutation_marked and reconciler is not None and hasattr(reconciler, "end_managed_library_mutation"):
@@ -542,9 +594,28 @@ class DownloadCompletionHandler:
                     df.organized_path = str(source)
                     df.status = "organized"
                     changed = True
+                    if category:
+                        await self._run_category_post_import_hooks(
+                            category=category,
+                            item=item,
+                            settings=settings,
+                            source=source,
+                            imported=source,
+                            file_info=df,
+                        )
             if not item.files and item.file_path:
-                item.file_path = str(Path(item.file_path).resolve())
+                source = Path(item.file_path).resolve()
+                item.file_path = str(source)
                 changed = True
+                if category and source.exists() and self._path_allowed_for_item(source, item):
+                    await self._run_category_post_import_hooks(
+                        category=category,
+                        item=item,
+                        settings=settings,
+                        source=source,
+                        imported=source,
+                        file_info=None,
+                    )
             if changed:
                 await self._downloader.update_download(item)
             logger.info(f"Seed-in-place ready: leaving '{item.item_name}' torrent payload in library for sharing")

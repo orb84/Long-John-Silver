@@ -1,0 +1,254 @@
+category_id: audiobooks
+extends: book
+mixins:
+- audio
+definition_version: 1
+services:
+  librivox:
+    label: LibriVox
+    purpose: Keyless public-domain audiobook catalog metadata, authors, readers/narrators,
+      languages, durations, and Internet Archive links.
+    llm_usage: Use for public-domain audiobook metadata, narrator/reader names, language,
+      and edition checks.
+    help_url: https://librivox.org/api/info
+    fields:
+      enabled: bool
+metadata:
+  providers:
+    open_library:
+      enabled: true
+    internet_archive:
+      enabled: true
+    librivox:
+      enabled: true
+    google_books:
+      enabled: false
+formats:
+  accepted_file_patterns:
+  - '*.m4b'
+  - '*.m4a'
+  - '*.mp3'
+  - '*.flac'
+  - '*.aac'
+  - '*.ogg'
+  - '*.opus'
+  - '*.cue'
+  audiobook_formats:
+  - M4B
+  - M4A
+  - MP3
+  - FLAC
+  - AAC
+  - Opus
+  - OGG
+  release_terms:
+  - audiobook
+  - unabridged
+  - abridged
+  - m4b
+  - m4a
+  - mp3
+  - chaptered
+  - narrated
+  - narrator
+  - complete
+download_profile:
+  preferred_audio_format: m4b
+  preferred_lossless_format: flac
+  preferred_lossy_format: m4b_aac
+  preferred_bitrate_kbps: 128
+  preserve_chapters: true
+  chapter_strategy: prefer_m4b_chapters_or_companion_cue
+  auto_convert_lossless_to_preferred: true
+  conversion_policy: Auto-convert lossless audiobook sources to the preferred M4B/M4A
+    sidecar when requested by format preferences; do not lossy-transcode MP3 to AAC
+    automatically.
+tools:
+  category_workflows:
+  - audiobooks.resolve_metadata
+  - audiobooks.search_download_candidates
+  - audiobooks.convert_audio_for_apple
+  - audiobooks.search_upgrade
+  llm_usage_notes:
+  - Audiobook identity includes author, title, narrator/reader, abridged/unabridged
+    status, language, duration, and chaptering.
+  - Prefer M4B for Apple-friendly audiobook playback with chapters; preserve chapter
+    metadata when converting.
+llm_guidance:
+  behavior:
+  - Do not satisfy audiobook requests with ebooks, PDFs, or music albums. Narrator,
+    abridgement, and chapter support matter.
+  - For Apple-friendly audiobooks, M4B/M4A containers are preferred. Preserve chapters
+    and metadata when converting.
+  - A FLAC audiobook may be high quality but is often inconvenient on Apple devices;
+    offer ALAC/AAC sidecar conversion only when the user wants Apple playback.
+  search_examples:
+  - Project Hail Mary audiobook unabridged m4b
+  - The Hobbit audiobook Rob Inglis m4b
+  - Pride and Prejudice Librivox mp3
+lifecycle_policy:
+  policy_version: 1
+  identity_fields:
+  - author
+  - title
+  - narrator
+  - edition
+  - language
+  - abridgement
+  lifecycle_fields:
+  - library_presence
+  - format
+  - narrator
+  - duration
+  - chapters
+  - language
+  - metadata_complete
+  - cover_present
+  suggestion_types:
+  - format_upgrade
+  - chapter_repair
+  - metadata_repair
+  - cover_repair
+  - better_edition
+  invalidation_triggers:
+  - library_changed
+  - metadata_changed
+  - download_completed
+  - download_failed
+  - user_format_or_language_changed
+  - manual_refresh
+  - policy_version_changed
+  default_check_interval_days: 180
+  llm_policy_description: Audiobook suggestions are stable unless a better format/chaptered
+    edition, narrator correction, metadata repair, or user format preference changes.
+display_name: Audiobooks
+default_folder: Audiobooks
+icon: headphones
+media_kind: audiobook
+capabilities:
+- metadata
+- downloadable
+- file_organization
+- audio_conversion
+- chapters
+supported_operations:
+- search
+- download
+- scan
+- organize
+- refresh_metadata
+- search_upgrade
+- convert_audio
+llm_profile:
+  short_description: Narrated books with narrator, abridgement, language, chaptering,
+    duration, and audio-format awareness.
+  user_facing_description: Audiobooks manages narrated book releases such as M4B/M4A/MP3/FLAC,
+    including narrator, abridged/unabridged status, language, chapters, and duration.
+  router_description: 'Audiobooks: narrated books, M4B/M4A/MP3/FLAC audiobook releases,
+    narrator/chapter-aware requests.'
+  domain_vocabulary:
+  - audiobook
+  - audio book
+  - narrated
+  - narrator
+  - reader
+  - m4b
+  - m4a
+  - mp3
+  - unabridged
+  - abridged
+  - chapters
+  - librivox
+  item_types:
+  - audiobook
+  - narrated_book
+  - m4b
+  - audio_release
+  identifiers:
+  - author
+  - title
+  - narrator
+  - reader
+  - abridgement
+  - language
+  - duration
+  - chapters
+  - edition
+  - isbn
+  common_user_requests:
+  - Find an unabridged audiobook.
+  - Find a specific narrator/reader edition.
+  - Convert or repair chaptered M4B/M4A playback files.
+  ambiguity_rules:
+  - Do not satisfy audiobook requests with EPUB/PDF ebooks or music albums.
+  - Classic titles often have many narrators; narrator and abridgement are identity
+    fields, not minor metadata.
+  - LibriVox is useful for public-domain readings but not a complete commercial audiobook
+    catalog.
+  search_rules:
+  - Preserve author, title, narrator, language, abridgement, M4B/M4A/MP3, and chapter
+    constraints.
+  - Prefer M4B for Apple-friendly chaptered playback when the user has not asked for
+    another format.
+  download_rules:
+  - Reject ebooks, PDFs, and music albums when the user asked for an audiobook.
+  - Prefer complete unabridged/chaptered releases when requested.
+  organization_rules:
+  - Organize by author/title and preserve narrator/edition metadata where possible.
+  safety_rules:
+  - Do not execute scripts or installers bundled with audiobook releases.
+  tool_usage_notes:
+  - Use LibriVox for public-domain audiobook metadata and Open Library/Internet Archive
+    for book identity when adapters are available.
+  - Use audiobooks.convert_audio_for_apple only after validating safe local paths.
+  examples:
+  - user: Find Project Hail Mary audiobook unabridged m4b
+    expected_intent: download
+    expected_behavior: Route to Audiobooks, preserve unabridged and M4B constraints,
+      and avoid ebook results.
+    tool_plan:
+    - audiobooks.resolve_metadata
+    - audiobooks.search_download_candidates
+  - user: Find the Stephen Fry Harry Potter audiobooks
+    expected_intent: download
+    expected_behavior: Treat narrator as a binding identity constraint and search
+      audiobook candidates, not ebooks or music.
+    tool_plan:
+    - audiobooks.search_download_candidates
+search_policy:
+  language_relevant: true
+  use_global_quality_profile: false
+object_model:
+  canonical_types:
+  - work
+  - audiobook_edition
+  - narrator
+  - reader
+  - chapter
+  - audio_file
+  stable_identifiers:
+  - librivox_id
+  - openlibrary_work_key
+  - openlibrary_edition_key
+  - google_books_id
+  - internet_archive_identifier
+  - apple_track_id
+  disambiguation_facets:
+  - author
+  - title
+  - narrator
+  - reader
+  - abridgement
+  - language
+  - duration
+  - chapter_count
+  - audio_format
+  llm_notes:
+  - Narrator/reader, abridged vs unabridged, and chaptering are identity-level facets
+    for audiobooks, not cosmetic metadata.
+  - When several audiobook candidates have the same book title, let the LLM select
+    by narrator, duration, language, completeness, and requested playback format.
+local_scan:
+  grouping_strategy: leaf_folder_or_file
+  description: Treat the deepest folder containing audiobook audio files as a narrated
+    book item, or a single M4B/M4A/MP3 file as one item.

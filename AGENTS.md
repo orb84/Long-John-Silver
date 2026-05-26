@@ -63,6 +63,7 @@ as category semantics. Legacy `season`/`episode` fields exist only for old rows
 and old assistant schemas; do not add new logic that depends on them.
 
 
+
 ### 0.5.2 LLM Tool Philosophy: Few Generic Tools, Category-Owned Context
 
 Do not add category-specific LLM micro-tools for ordinary download decisions.
@@ -113,6 +114,29 @@ structured pending-action context (`result_set_id`, `candidate_id`,
 `queue_download_arguments`) and let the LLM route/plan from that context.
 Generic code may validate stable IDs and queueability, but it must not parse
 user intent from English keyword lists.
+
+
+### 0.5.3 Definition-Backed Category Rule
+
+When adding a new category, prefer the definition-backed path first: put the
+shareable contract in `config/category-definitions/<category_id>.yaml`, private
+blank defaults in `config/category-config-templates/<category_id>.yaml`, and let
+`DefinitionBackedCategory` register concrete non-abstract definitions. Use
+`extends` for is-a inheritance and `mixins` for additive capabilities such as
+book + audio. Do not add global routing/scanning branches for a new domain just
+because it has a new file extension.
+
+Provider declarations and runtime dependencies are contracts, not adapters. A
+YAML `services` entry tells setup/LLM what a provider is for; a YAML
+`runtime_dependencies` entry tells setup/preflight what local binary/package is
+needed. Real API clients, metadata ingestion, conversion execution, and rich
+canonical object builders still belong in category-owned Python code.
+
+When deterministic category routing uses router vocabulary, match tokens with
+category-router helpers rather than raw substring checks. Short tokens such as
+`EP` or `TV` must match only as bounded tokens; they must not match prose such
+as `please`.
+
 
 ### 0.6 Suggestion Actions Are Declared by Suggestions
 
@@ -356,7 +380,7 @@ Maintain durable work notes under `docs/project-history/` and keep `architecture
 src/
   ai/          — Agent logic: assistant, intent router, prompt builder, tool registry, reasoning
   core/        — Domain logic: config, database, scheduler, preferences, behavior tracker, conversation, vector store, downloader, recommender, smart quality, notifications
-    categories/— Media categories subclasses (base.py, tv.py, movie.py, path_planner.py)
+    categories/— Category bases and concrete categories (abstract Media/CategoryMedia base, TV/Movie/General subclasses, path planners)
   integrations/— External APIs: tmdb, tvmaze, trakt
   llm_providers/— LLM abstraction: client, registry, catalog, key store, presets
   search/      — Search providers: base class, torznab, jackett_manager, fallback providers, aggregator, rss_monitor
@@ -368,7 +392,8 @@ config/
   personas/              — AI persona packages (`persona.md`, `persona.json`, `avatar.png`, `theme.json`)
   settings.template.yaml — Tracked fresh-install global template; no secrets
   settings.local.yaml    — Ignored live global settings created on first launch
-  category-templates/    — Tracked category defaults (`tv.yaml`, `movie.yaml`, custom templates)
+  category-definitions/  — Tracked shareable category contracts (`media.yaml`, `tv.yaml`, custom definitions)
+  category-config-templates/ — Tracked blank templates for ignored private category settings
   categories/            — Ignored live category settings edited by setup/Compass
 migrations/    — Database migration SQL files
 tests/         — Mirror src/ structure
@@ -379,7 +404,7 @@ docs/          — Current architecture map and working-practices guide
 
 ### New File Rules
 
-- A new media category subclass → `src/core/categories/category_name.py`, inherits `MediaCategory` and defines custom `CategoryProperty` descriptors.
+- A new media category subclass → `src/core/categories/category_name.py`, inherits the appropriate base (`CategoryMedia` or a domain-specific parent), uses `extends: <parent>` in its tracked category definition when sharing services/tools, keeps private values in ignored category config, and defines custom `CategoryProperty` descriptors only for child-specific settings.
 - A new search provider → `src/search/provider_name.py`, inherits `SearchProvider`
 - A new tool → add handler method to `AgentTools` or a new tool class, register in `tool_registry.py`
 - A new integration → `src/integrations/provider.py`, standalone client class
@@ -408,7 +433,7 @@ Before changing architecture, security, storage, setup, category behavior, or us
 | `docs/PROJECT_WORKING_PRACTICES.md` | You change development conventions, review checklists, category-first rules, test expectations, setup rules, or extension patterns. |
 | `SECURITY.md` | You change safe-path policy, command policy, destructive confirmations, audit logging, filesystem operations, subprocess usage, or action risk handling. |
 | `STORAGE.md` | You change storage monitoring, volume grouping, capacity checks, category-root storage mapping, download preflight rules, or LLM storage context. |
-| `skills/category_creation_guide.md` | You change the category manifest contract, category scaffold format, custom-category validation, or generated category templates. |
+| `skills/category_creation_guide.md` | You change the category manifest contract, category scaffold format, custom-category validation, or generated category definitions/config templates. |
 | `README.md` | You change fresh-install setup, user-visible configuration, service requirements, or common operating instructions. |
 | `PROGRESS.md` | Every meaningful code or documentation change. |
 
@@ -470,8 +495,7 @@ The repository tracks templates only:
 
 - `config/settings.template.yaml` is the public fresh-install global template.
 - `config/settings.local.yaml` is the ignored live settings file created on first launch.
-- `config/settings.yaml` is the legacy live path and must stay ignored; startup migrates it to `config/settings.local.yaml` when present.
-- `config/category-templates/<category_id>.yaml` stores public category defaults.
+- `config/category-definitions/<category_id>.yaml` stores public category behavior/contracts; `config/category-config-templates/<category_id>.yaml` stores blank safe defaults for private category config.
 - `config/categories/<category_id>.yaml` stores ignored live category settings edited by setup/Compass.
 
 Tracked templates may contain harmless defaults and public category policy, but they must not contain:
@@ -483,7 +507,7 @@ Tracked templates may contain harmless defaults and public category policy, but 
 - password hashes or signed-session secrets
 - absolute personal library paths
 
-The Trakt client ID is different from an API secret. LJS can ship a public app client ID for PKCE/OOB login; user tokens are created only after authorization and must remain local.
+The Trakt client ID is different from an API secret, but it is still category configuration. It belongs under the abstract `media` category service config; user access/refresh tokens are created only after authorization and must remain local.
 
 When changing configuration ownership, update all affected docs in the same patch:
 
@@ -524,6 +548,7 @@ If you add a new startup service, verify it receives a fully initialized `Databa
 - Generic services must not choose a built-in category as a default. Missing category identity should become `media`, a failed validation, or a category-registry lookup, not an implicit TV/movie assumption.
 - Download completion must call `category.download_target_for_item()` for normal path planning. The category extracts any structured unit fields it understands.
 - Search preparation must go through `category.prepare_search_item()`. Do not add category-id branches to `SearchPipeline` for quality caps, provider quirks, or candidate shaping.
+- Generic prompt code may tell the model to follow the active category profile, but it must not hardcode a category's release vocabulary. Put terms such as `discography`, `OST`, narrator, edition, platform, codec, or pack naming rules in the owning category definition/profile.
 - Prefer `compute_target_path_from_fields()` for new path work. The legacy `compute_target_path(..., season, episode, ...)` wrapper exists only to avoid breaking older category code while it is migrated.
 
 ### 0.9 Round 74 Search and Cleanup Boundary Rules
@@ -605,6 +630,11 @@ When changing any communication surface:
 - Do not add bridge-specific context trimming, bridge-specific recent-history rules, or bridge-specific tool filtering.
 - Do not add whole-turn bridge timeouts. Timeouts belong around individual external services, not the full user conversation turn.
 - Verify the shared contract with `scripts/round93_unified_chat_bridge_tests.py` after changing `src/web/app.py`, `src/web/*_bridge.py`, `src/web/comms.py`, or `src/ai/chat_session_runner.py`.
+
+
+### Category inheritance rule
+
+Do not duplicate shared media services or tools in each concrete category. Shared audiovisual behavior belongs in the abstract `media` config/template and the shared media base class. TV Shows and Movies use `extends: media` and add only their own services, workflows, filename examples, lifecycle rules, and LLM guidance. Fresh installs do not read old global media service settings.
 
 ## Round 94 Agent Rule — Media Facts Need Episode-Level Grounding
 

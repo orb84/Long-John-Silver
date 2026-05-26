@@ -107,12 +107,12 @@ if [ "$ACTION" = "update" ]; then
     exit 0
 fi
 
-# ─── Ensure data directories exist ─────────────────────────────
-mkdir -p data config downloads
+# ─── Ensure runtime directories exist ───────────────────────────
+mkdir -p data config config/categories downloads
 
-# ─── Check for config ──────────────────────────────────────────
-if [ ! -f "config/settings.yaml" ]; then
-    info "No config found — first run will launch setup wizard."
+# ─── Check for local config ─────────────────────────────────────
+if [ ! -f "config/settings.local.yaml" ]; then
+    info "No local config found — LJS will create config/settings.local.yaml from the template and launch setup."
 fi
 
 # ─── Launch ────────────────────────────────────────────────────

@@ -1,0 +1,61 @@
+# Shared audiovisual media category definition.
+# Safe to commit/share. Do not put personal paths or real credentials here.
+category_id: media
+abstract: true
+definition_version: 1
+services:
+  tmdb:
+    label: TMDB
+    purpose: Canonical movie/TV metadata, release dates, artwork, cast, crew, genres, ratings, and external IDs.
+    llm_usage: Use before broad web search for audiovisual media identity, disambiguation, artwork, credits, ratings, and provider IDs.
+    fields:
+      api_key: secret
+      enabled: bool
+  trakt:
+    label: Trakt
+    purpose: Optional watched-state, history, and taste synchronization shared by media categories.
+    llm_usage: Use only when watch-state, user-history, or taste context is relevant.
+    fields:
+      client_id: string
+      access_token: secret
+      refresh_token: secret
+      enabled: bool
+  plex:
+    label: Plex
+    purpose: Optional local library presence, refresh, and watched-state reconciliation shared by media categories.
+    llm_usage: Use to reconcile local library state or watched status, not as a metadata authority.
+    fields:
+      url: string
+      token: secret
+      enabled: bool
+  opensubtitles:
+    label: OpenSubtitles
+    purpose: Optional subtitle discovery/matching shared by audiovisual media categories.
+    llm_usage: Use when subtitle language or missing subtitle requirements matter.
+    fields:
+      api_key: secret
+      enabled: bool
+metadata:
+  providers:
+    tmdb:
+      enabled: true
+formats:
+  accepted_file_patterns: ['*.mkv', '*.mp4', '*.avi', '*.webm']
+  release_terms: [WEB-DL, WEBRip, HDTV, BluRay, REMUX, x264, x265, HEVC, AV1, 720p, 1080p, 2160p]
+download_profile:
+  preferred_formats: [WEB-DL, BluRay, Remux]
+tools:
+  allowed_generic:
+    - metadata_lookup
+    - search_media_torrents
+    - inspect_torrent_candidate
+    - queue_download
+    - list_library_files
+  llm_usage_notes:
+    - Resolve audiovisual media identity through category metadata services before broad web search when title/year/season ambiguity matters.
+    - Treat user language, resolution, format, and released/already-out constraints as binding search constraints.
+llm_guidance:
+  behavior:
+    - Media categories share TMDB, Trakt, Plex, and subtitle service definitions through this abstract media layer.
+    - Prefer category workflows over generic browsing when a media provider can answer the question more directly.
+    - Do not mix TV episode/season rules into movie requests, or movie year-only rules into TV requests.

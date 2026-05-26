@@ -105,7 +105,12 @@ class SearchPipeline:
         category_id = item.item_type
         category = self._categories.get(category_id)
         category_context = self._category_search_context()
-        target_lang = language or getattr(item, 'language', '') or settings.language
+        category_profile = category.category_download_profile(settings) if category and hasattr(category, "category_download_profile") else {}
+        target_lang = self._normalize_category_search_language(
+            category,
+            language or getattr(item, 'language', '') or category_profile.get('language') or settings.language,
+            explicit=language is not None,
+        )
 
         if category and hasattr(category, "prepare_search_item"):
             # Search preparation can be category-specific (for example size
@@ -116,14 +121,19 @@ class SearchPipeline:
                 settings=settings,
                 scan_result=self._scheduler.get_last_scan_result() if getattr(self, '_scheduler', None) else None,
             )
+            target_lang = self._normalize_category_search_language(
+                category,
+                language or getattr(item, 'language', '') or category_profile.get('language') or settings.language,
+                explicit=language is not None,
+            )
 
-        logger.info(f'Search: {item.key} {episode_label or ""} ({mode} mode, lang={target_lang})')
+        logger.info(f'Search: {item.key} {episode_label or ""} ({mode} mode, lang={target_lang or "none"})')
 
         # Build query from category patterns
         query = _build_query(item, episode_label, target_lang, category)
 
         results = await self._aggregator.search(
-            query, category=category_id, quality_profile=getattr(item, 'quality', None),
+            query, category=category_id, quality_profile=self._search_quality_profile(category, item),
             preferred_language=target_lang,
         )
 
@@ -170,7 +180,7 @@ class SearchPipeline:
                 logger.info(f'Search: trying alternative query: {alt_query}')
                 alt_results = await self._aggregator.search(
                     alt_query, category=category_id,
-                    quality_profile=getattr(item, 'quality', None),
+                    quality_profile=self._search_quality_profile(category, item),
                     preferred_language=target_lang,
                 )
                 if not alt_results:
@@ -193,6 +203,32 @@ class SearchPipeline:
         logger.info(f'Search: no suitable results found for {query}')
         return None
 
+    @staticmethod
+    def _normalize_category_search_language(category: object | None, language: str | None, *, explicit: bool = False) -> str | None:
+        """Return the category-approved search language, if any."""
+        value = str(language or "").strip()
+        if not value:
+            return None
+        normalizer = getattr(category, "normalize_search_language", None)
+        if callable(normalizer):
+            try:
+                return normalizer(value, explicit=explicit)
+            except TypeError:
+                return normalizer(value)
+        return value
+
+    @staticmethod
+    def _search_quality_profile(category: object | None, item: CategoryItem) -> QualityProfile | None:
+        """Return the category-owned quality profile for provider ranking."""
+        uses_global = getattr(category, "uses_global_quality_profile", None)
+        if callable(uses_global):
+            try:
+                if not uses_global():
+                    return QualityProfile(preferred_resolution="", preferred_codecs=[])
+            except Exception:
+                pass
+        return getattr(item, 'quality', None)
+
     def _build_alternative_queries(self, item, episode_label, language, category):
         """Compatibility wrapper for category-owned alternative queries."""
         if category and hasattr(category, 'build_alternative_search_queries'):
@@ -209,6 +245,14 @@ class SearchPipeline:
         then copy before applying the global preferred-resolution floor.
         """
         settings = self._settings_manager.settings if self._settings_manager else None
+        category = self._categories.get(getattr(item, 'item_type', '')) if self._categories else None
+        uses_global = getattr(category, "uses_global_quality_profile", None)
+        if callable(uses_global):
+            try:
+                if not uses_global():
+                    return None
+            except Exception:
+                pass
         profile = getattr(item, 'quality', None) or (getattr(settings, 'default_quality', None) if settings else None)
         if not profile:
             return None

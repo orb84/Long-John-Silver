@@ -520,7 +520,7 @@ src/core/category_config.py CategoryConfigStore
 src/core/models.py          Settings and nested config models
 config/settings.template.yaml       tracked global fresh-install template
 config/settings.local.yaml          ignored live global config
-config/category-templates/*.yaml    tracked category defaults
+config/category-definitions/*.yaml and config/category-config-templates/*.yaml    tracked category defaults
 config/categories/*.yaml            ignored live category config
 .env.example                env var reference
 ```
@@ -532,7 +532,7 @@ Checklist:
 ```text
 [ ] Add typed field to the appropriate model in src/core/models.py for global settings, or a category property/manifest declaration for category settings.
 [ ] For global settings, update SettingsManager YAML loading if nested.
-[ ] For category settings, update the category manifest/property list and the default `config/category-templates/<category_id>.yaml`; never commit live `config/categories/<category_id>.yaml` edits.
+[ ] For category settings, update the category manifest/property list and the default `config/category-definitions/<category_id>.yaml plus config/category-config-templates/<category_id>.yaml`; never commit live `config/categories/<category_id>.yaml` edits.
 [ ] Update .env.example if environment-backed.
 [ ] Update setup/settings UI if user-facing.
 [ ] Update CODEBASE_ARCHITECTURE_MAP.md when configuration ownership changes.

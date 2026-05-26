@@ -149,6 +149,7 @@ function skipPassword() {
 function savePaths() {
     var data = {
         download_dir: document.getElementById('setup-download-dir').value.trim() || './downloads',
+        library_root: document.getElementById('setup-library-root').value.trim() || './library',
         library_paths: collectSetupCategoryPaths(),
     };
     APIClient.post('/api/setup/paths', data).then(function() {
@@ -170,7 +171,8 @@ function savePaths() {
 function collectSetupCategoryPaths() {
     var paths = {};
     document.querySelectorAll('.setup-category-path').forEach(function(input) {
-        paths[input.dataset.categoryId] = input.value.trim();
+        var value = input.value.trim();
+        if (value) paths[input.dataset.categoryId] = value;
     });
     return paths;
 }
@@ -306,15 +308,7 @@ function saveLLM() {
     APIClient.post('/api/setup/llm', data).then(function() {
         return APIClient.post('/api/setup/embeddings', collectSetupEmbeddings());
     }).then(function() {
-        var tmdbKey = document.getElementById('setup-tmdb-key');
-        var traktId = document.getElementById('setup-trakt-id');
-        var intelData = {};
-        if (tmdbKey && tmdbKey.value.trim()) intelData.tmdb_api_key = tmdbKey.value.trim();
-        if (traktId && traktId.value.trim()) intelData.trakt_client_id = traktId.value.trim();
-        if (Object.keys(intelData).length) {
-            return APIClient.post('/api/settings/integrations', intelData);
-        }
-        return Promise.resolve({ status: 'skipped' });
+        return saveSetupMediaServices();
     }).then(function() {
         toast.show('AI brain connected');
         goStep(4);
@@ -323,6 +317,81 @@ function saveLLM() {
     });
 }
 
+
+
+/**
+ * Save shared Media service credentials into the private media category config.
+ *
+ * The setup wizard collects TMDB/Trakt beside the LLM controls because users
+ * think of them as "make the assistant smarter" keys, but the values belong to
+ * the abstract media category, not to global settings.
+ */
+function saveSetupMediaServices() {
+    var tmdbKey = document.getElementById('setup-tmdb-key');
+    var traktId = document.getElementById('setup-trakt-id');
+    var mediaServices = {};
+    if (tmdbKey && tmdbKey.value.trim()) mediaServices.tmdb = { enabled: true, api_key: tmdbKey.value.trim() };
+    if (traktId && traktId.value.trim()) mediaServices.trakt = { enabled: true, client_id: traktId.value.trim() };
+    if (!Object.keys(mediaServices).length) {
+        return Promise.resolve({ status: 'skipped' });
+    }
+    return APIClient.post('/api/setup/category-config', {
+        category_settings: { media: { services: mediaServices } }
+    });
+}
+
+/**
+ * Save first-run shared Media search preferences into category config.
+ *
+ * These defaults are inherited by TV and Movies through the media category
+ * definition; global language remains the chat/UI language, not a torrent
+ * search preference.
+ */
+function saveSetupMediaPreferences() {
+    var lang = document.getElementById('setup-language');
+    var res = document.getElementById('setup-resolution');
+    var mode = document.getElementById('setup-size-mode');
+    var profile = {};
+    if (lang) profile.language = lang.value;
+    if (res) profile.preferred_resolution = res.value;
+    if (mode) profile.size_limit_mode = mode.value;
+    if (!Object.keys(profile).length) {
+        return Promise.resolve({ status: 'skipped' });
+    }
+    return APIClient.post('/api/setup/category-config', {
+        category_settings: { media: { download_profile: profile } }
+    });
+}
+
+
+/**
+ * Save first-run Music/Audiobook/Ebook format preferences into category config.
+ */
+function saveSetupBookAudioPreferences() {
+    var musicLossless = document.getElementById('setup-music-lossless-format');
+    var musicAutoConvert = document.getElementById('setup-music-auto-convert');
+    var audiobookFormat = document.getElementById('setup-audiobook-format');
+    var audiobookAutoConvert = document.getElementById('setup-audiobook-auto-convert');
+    var ebookFormat = document.getElementById('setup-ebook-format');
+    var payload = { category_settings: {} };
+    if (musicLossless || musicAutoConvert) {
+        payload.category_settings.music = { download_profile: {} };
+        if (musicLossless) payload.category_settings.music.download_profile.preferred_lossless_format = musicLossless.value;
+        if (musicAutoConvert) payload.category_settings.music.download_profile.auto_convert_lossless_to_preferred = !!musicAutoConvert.checked;
+    }
+    if (audiobookFormat || audiobookAutoConvert) {
+        payload.category_settings.audiobooks = { download_profile: {} };
+        if (audiobookFormat) payload.category_settings.audiobooks.download_profile.preferred_audio_format = audiobookFormat.value;
+        if (audiobookAutoConvert) payload.category_settings.audiobooks.download_profile.auto_convert_lossless_to_preferred = !!audiobookAutoConvert.checked;
+    }
+    if (ebookFormat) {
+        payload.category_settings.ebooks = { download_profile: { preferred_ebook_format: ebookFormat.value } };
+    }
+    if (!Object.keys(payload.category_settings).length) {
+        return Promise.resolve({ status: 'skipped' });
+    }
+    return APIClient.post('/api/setup/category-config', payload);
+}
 
 /**
  * Collect optional semantic-memory embedding settings from setup.
@@ -507,17 +576,11 @@ async function finishSetup() {
     } catch (e) { /* non-critical */ }
 
     try {
-        var lang = document.getElementById('setup-language');
-        var res = document.getElementById('setup-resolution');
-        var mode = document.getElementById('setup-size-mode');
-        var qData = {};
-        if (lang) qData.language = lang.value;
-        if (res) qData.preferred_resolution = res.value;
-        if (mode) qData.size_limit_mode = mode.value;
-        if (Object.keys(qData).length > 0) {
-            await APIClient.post('/api/settings/quality', qData);
-        }
-    } catch (e) { /* non-critical */ }
+        await saveSetupMediaPreferences();
+        await saveSetupBookAudioPreferences();
+    } catch (e) {
+        console.warn('Failed to save category preferences during setup', e);
+    }
 
     var data = {};
     if (selectedChannels.has('discord')) {

@@ -13,3 +13,14 @@ starting at version 101.
 - `104_evidence_based_taste_profiles.sql` — persisted evidence-derived taste snapshots.
 - `105_download_import_context.sql` — download/import context preservation.
 - `106_item_lifecycle_policy_ledger.sql` — item-scoped lifecycle processing, events, and suggestion validity ledgers.
+- `107_scheduled_task_timing.sql` — one-off reminders, recurring assistant prompts, condition checks, and due-time bookkeeping.
+
+## Migration authoring notes
+
+Round 119 hardened the migration runner after startup failed on a semicolon inside a SQL `--` comment in migration 107. The runner now strips SQL comments and splits only on statement-terminating semicolons outside quoted strings before calling `sqlite.execute`.
+
+Keep migrations additive and simple. Comments are allowed, including comments with semicolons, but prose must never be relied on as part of executable SQL. Prefer one DDL statement per semicolon-terminated block so duplicate-column recovery can continue to work during partially upgraded installs.
+
+## 108 — Metadata cache and provider rate limits
+
+Adds `category_metadata_cache` for provider result caching and `provider_rate_limits` for persisted upstream backoff/rate-limit state. Fresh installs also create these tables in the base schema.

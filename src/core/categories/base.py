@@ -75,6 +75,7 @@ class CategoryWorkflowContext:
     web_search: object | None = None
     user_id: str | None = None
     session_id: str | None = None
+    category_registry: object | None = None
 
 
 class MediaCategory(CategoryContractMixin, ABC):
@@ -97,6 +98,8 @@ class MediaCategory(CategoryContractMixin, ABC):
     supported_operations: list[str] = []
     category_tool_names: list[str] = []
     prompt_file: str | None = None
+    router_priority: int = 0
+    """Tie-breaker for deterministic routing; fallback categories should be lower."""
 
     # ── Collaborators ────────────────────────────────────────────
 
@@ -201,15 +204,44 @@ class MediaCategory(CategoryContractMixin, ABC):
 
     # ── Path resolution ───────────────────────────────────────────
 
+    def default_root_path(self, settings: "Settings") -> str:
+        """Return this category's default path under the global library root.
+
+        The global root is the normal user-facing setting.  Category-specific
+        ``library_path`` values are optional overrides for users who want Movies,
+        TV, Music, Books, or any custom category on different disks.
+        """
+        root = getattr(settings, "library_root", "./library") if settings is not None else "./library"
+        return str(Path(root) / (self.default_folder or self.category_id))
+
     def get_root_path(self, settings: "Settings") -> str:
-        """Return the root filesystem path for this category."""
-        custom_path = self.get_property_value("library_path", settings)
+        """Return the effective root filesystem path for this category.
+
+        Prefer an explicit category ``library_path`` override.  If absent or
+        blank, fall back to ``settings.library_root/<default_folder>``.  The
+        legacy ``settings.library_paths`` map is still honored as a migration
+        fallback, but category config remains the save-time authority.
+        """
+        custom_path = ""
+        if settings is not None:
+            try:
+                custom_path = self.get_property_value("library_path", settings)
+            except KeyError:
+                custom_path = ""
         if custom_path:
-            return custom_path
-        legacy_paths = getattr(settings, "library_paths", {}) or {}
-        if isinstance(legacy_paths, dict) and legacy_paths.get(self.category_id):
-            return str(legacy_paths[self.category_id])
-        return str(Path(settings.library_root) / self.default_folder)
+            return str(custom_path)
+        legacy_paths = getattr(settings, "library_paths", {}) if settings is not None else {}
+        if isinstance(legacy_paths, dict):
+            legacy_path = str(legacy_paths.get(self.category_id) or "").strip()
+            if legacy_path:
+                return legacy_path
+        return self.default_root_path(settings)
+
+    def ensure_root_path(self, settings: "Settings") -> str:
+        """Create and return the effective root path for write-time workflows."""
+        root = Path(self.get_root_path(settings)).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        return str(root)
 
     # ── Name parsing ───────────────────────────────────────────────
 
@@ -627,3 +659,13 @@ class CategoryMedia(MediaCategory):
         profile.download_rules.append("Reject unrelated content types and archive/software/document releases unless the category explicitly allows them.")
         profile.organization_rules.append("Use the category naming template and library root when organizing files.")
         return profile
+
+    def provider_setup_requirements(self, settings: "Settings") -> list[CategorySetupRequirement]:
+        """Return setup requirements from declarative service definitions.
+
+        Earlier rounds hardcoded TMDB/Trakt/Plex/OpenSubtitles here, which made
+        every subclass of CategoryMedia look audiovisual. New categories such as
+        Music, Audiobooks, and Ebooks prove that service requirements must come
+        from the effective category YAML instead.
+        """
+        return super().provider_setup_requirements(settings)

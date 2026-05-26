@@ -111,6 +111,77 @@ class TMDBClient:
 
         return results
 
+
+    async def get_person_details(self, person_id: int) -> Optional[dict]:
+        """Get person details and compact movie/TV credits by TMDB person ID.
+
+        The assistant uses this for questions such as a director's latest
+        released movie. Returning credits through the normal metadata tool is
+        safer than letting the model treat a TMDB person search result as a TV
+        or movie ID.
+        """
+        data = await self._get(
+            f"{self.BASE_URL}/person/{person_id}",
+            params={"api_key": self._api_key, "append_to_response": "movie_credits,tv_credits"},
+        )
+        if not data:
+            return None
+
+        def _compact_credit(item: dict, *, media_type: str, role_key: str) -> dict:
+            date = item.get("release_date") or item.get("first_air_date") or ""
+            return {
+                "id": item.get("id"),
+                "title": item.get("title") or item.get("name"),
+                "media_type": media_type,
+                "date": date,
+                "year": date[:4] if date else None,
+                "job": item.get("job") or role_key,
+                "character": item.get("character"),
+                "rating": item.get("vote_average"),
+                "vote_count": item.get("vote_count"),
+            }
+
+        movie_credits = data.get("movie_credits") or {}
+        tv_credits = data.get("tv_credits") or {}
+        directed_movies = [
+            _compact_credit(item, media_type="movie", role_key="Director")
+            for item in movie_credits.get("crew", [])
+            if item.get("job") == "Director"
+        ]
+        directed_tv = [
+            _compact_credit(item, media_type="tv", role_key="Director")
+            for item in tv_credits.get("crew", [])
+            if item.get("job") == "Director"
+        ]
+        acted_movies = [
+            _compact_credit(item, media_type="movie", role_key="Cast")
+            for item in movie_credits.get("cast", [])[:20]
+        ]
+        acted_tv = [
+            _compact_credit(item, media_type="tv", role_key="Cast")
+            for item in tv_credits.get("cast", [])[:20]
+        ]
+
+        def _sort_key(credit: dict) -> str:
+            return str(credit.get("date") or "")
+
+        directed_movies.sort(key=_sort_key, reverse=True)
+        directed_tv.sort(key=_sort_key, reverse=True)
+        return {
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "known_for_department": data.get("known_for_department"),
+            "biography": data.get("biography"),
+            "birthday": data.get("birthday"),
+            "deathday": data.get("deathday"),
+            "imdb_id": data.get("imdb_id"),
+            "profile_path": data.get("profile_path"),
+            "directed_movies": directed_movies[:40],
+            "directed_tv": directed_tv[:30],
+            "acted_movies": acted_movies,
+            "acted_tv": acted_tv,
+        }
+
     async def get_movie_details(self, movie_id: int) -> Optional[dict]:
         """Get detailed info for a movie by TMDB ID.
 

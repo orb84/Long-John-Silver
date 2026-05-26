@@ -74,7 +74,7 @@ class TMDBMetadataEnricher(MetadataEnricher):
     def client(self) -> "TMDBClient | None":
         """Get or lazily construct/update the TMDB client."""
         if hasattr(self, "_sm") and self._sm:
-            api_key = self._sm.settings.tmdb_api_key
+            api_key = self._sm.settings.first_category_service_value(["tv", "movie", "media"], "tmdb", "api_key")
             if api_key:
                 if not self._client or getattr(self._client, "_api_key", None) != api_key:
                     from src.integrations.tmdb import TMDBClient

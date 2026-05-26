@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import re
 from typing import Any, Literal, Optional
@@ -171,6 +171,65 @@ class Settings(BaseModel):
     library_paths: dict[str, str] = Field(default_factory=dict)
     category_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     """Effective category settings loaded from ignored config/categories/<category_id>.yaml."""
+
+    def category_config(self, category_id: str | None) -> dict[str, Any]:
+        """Return the effective local configuration for one category.
+
+        Category configuration is the authority for category-owned paths,
+        external services, tool policy, LLM guidance, and download preferences.
+        Concrete category configs may inherit values from abstract configs such
+        as ``media`` during settings load.
+        """
+        if not category_id:
+            return {}
+        value = self.category_settings.get(str(category_id), {})
+        return value if isinstance(value, dict) else {}
+
+    def category_service_config(self, category_id: str | None, service_id: str | None) -> dict[str, Any]:
+        """Return ``services.<service_id>`` for a category config."""
+        if not category_id or not service_id:
+            return {}
+        services = self.category_config(category_id).get("services")
+        if not isinstance(services, dict):
+            return {}
+        value = services.get(str(service_id), {})
+        return value if isinstance(value, dict) else {}
+
+    def category_service_value(
+        self,
+        category_id: str | None,
+        service_id: str | None,
+        key: str,
+    ) -> Any:
+        """Return one service value from effective category config."""
+        value = self.category_service_config(category_id, service_id).get(key)
+        if value not in (None, ""):
+            return value
+        return None
+
+    def category_service_enabled(self, category_id: str | None, service_id: str | None, default: bool = True) -> bool:
+        """Return whether a category-local service is enabled."""
+        value = self.category_service_config(category_id, service_id).get("enabled")
+        if value is None:
+            metadata = self.category_config(category_id).get("metadata")
+            providers = metadata.get("providers") if isinstance(metadata, dict) else {}
+            provider_cfg = providers.get(str(service_id)) if isinstance(providers, dict) else None
+            if isinstance(provider_cfg, dict) and "enabled" in provider_cfg:
+                value = provider_cfg.get("enabled")
+        return bool(default if value is None else value)
+
+    def first_category_service_value(
+        self,
+        category_ids: list[str],
+        service_id: str,
+        key: str,
+    ) -> Any:
+        """Return the first configured service value among category configs."""
+        for category_id in category_ids:
+            value = self.category_service_value(category_id, service_id, key)
+            if value not in (None, ""):
+                return value
+        return None
     language: str = "English"
     discord_token: Optional[str] = None
     discord_channel_id: Optional[int] = None
@@ -181,14 +240,6 @@ class Settings(BaseModel):
     active_persona: str = "default"
     jackett_url: Optional[str] = None
     jackett_api_key: Optional[str] = None
-    opensubtitles_api_key: Optional[str] = None
-    trakt_client_id: Optional[str] = "42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac"
-    """The default hardcoded Trakt Client ID for LJS integration, so the user does not need to configure it."""
-    trakt_access_token: Optional[str] = None
-    trakt_refresh_token: Optional[str] = None
-    tmdb_api_key: Optional[str] = None
-    plex_url: Optional[str] = None
-    plex_token: Optional[str] = None
     web_username: str = "admin"
     web_password_hash: Optional[str] = None
     setup_complete: bool = False
@@ -226,10 +277,15 @@ class Settings(BaseModel):
 
 
 class ScheduledTask(BaseModel):
-    """A recurring natural-language task processed by the AI assistant.
+    """A persisted assistant automation or reminder.
 
-    Examples: 'weekly TV show report', 'daily download check',
-    'notify me when new episodes of X air'.
+    The scheduler supports three user-facing shapes while keeping one storage
+    model: lightweight reminders that simply notify the user, one-off scheduled
+    prompts that run through the assistant at a future time, and recurring
+    checks/reports that re-run on an interval.  Category-specific recurring
+    media jobs stay in category lifecycle hooks; this model is for user-created
+    assistant tasks such as "remind me in 7 days" or "check this torrent
+    again in 3 weeks and tell me what you find".
     """
     id: str
     prompt: str
@@ -238,7 +294,16 @@ class ScheduledTask(BaseModel):
     channel: str = "web"
     enabled: bool = True
     last_run_at: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    task_type: str = "scheduled_prompt"
+    schedule_type: str = "recurring"
+    title: str = ""
+    due_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+    run_count: int = 0
+    max_runs: Optional[int] = None
+    session_id: Optional[str] = None
+    last_error: str = ""
 
 
 class WatchedItem(BaseModel):

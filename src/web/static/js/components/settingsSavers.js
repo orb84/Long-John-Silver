@@ -46,6 +46,7 @@ async function saveTiers() {
 async function saveLibrary() {
     const data = {
         download_dir: (document.getElementById('download_dir') || {}).value || './downloads',
+        library_root: (document.getElementById('library_root') || {}).value || './library',
         max_concurrent: parseInt((document.getElementById('max_concurrent') || {}).value || '3'),
         category_settings: collectCategorySettings(),
         stall_check_interval_minutes: parseInt((document.getElementById('stall_check_interval_minutes') || {}).value || '30'),
@@ -111,11 +112,25 @@ async function saveSearch() {
  */
 async function saveIntegrations() {
     const data = {
-        tmdb_api_key: (document.getElementById('tmdb_api_key') || {}).value || '',
-        trakt_client_id: (document.getElementById('trakt_client_id') || {}).value || '',
-        plex_url: (document.getElementById('plex_url') || {}).value || '',
-        plex_token: (document.getElementById('plex_token') || {}).value || '',
-        opensubtitles_api_key: (document.getElementById('opensubtitles_api_key') || {}).value || '',
+        category_services: {
+            media: {
+                services: {
+                    tmdb: {
+                        api_key: (document.getElementById('tmdb_api_key') || {}).value || '',
+                    },
+                    trakt: {
+                        client_id: (document.getElementById('trakt_client_id') || {}).value || '',
+                    },
+                    plex: {
+                        url: (document.getElementById('plex_url') || {}).value || '',
+                        token: (document.getElementById('plex_token') || {}).value || '',
+                    },
+                    opensubtitles: {
+                        api_key: (document.getElementById('opensubtitles_api_key') || {}).value || '',
+                    },
+                },
+            },
+        },
     };
     await APIClient.post('/api/settings/integrations', data);
     toast.show('Integrations saved');

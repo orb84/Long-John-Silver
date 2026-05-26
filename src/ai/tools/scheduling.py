@@ -34,12 +34,14 @@ def _format_size(size_bytes: int | None) -> str | None:
 
 
 class CreateScheduledTaskTool:
-    """Create a recurring task that the AI will execute periodically."""
+    """Create a reminder, scheduled prompt, or recurring assistant check."""
 
     name = "create_scheduled_task"
     description = (
-        "Create a recurring task that the AI will run automatically "
-        "at a set interval."
+        "Create a user reminder, one-off scheduled assistant task, or recurring "
+        "condition check. Use for requests such as 'remind me in 7 days', "
+        "'check whether this torrent exists in 3 weeks and report back', or "
+        "'send me a weekly report'."
     )
     intents = {Intent.CONFIG}
     allow_direct = True
@@ -53,9 +55,9 @@ class CreateScheduledTaskTool:
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
 
-        The schema is consumed by the LLM runtime and should remain
-        backward-compatible.  Add optional fields for extensions whenever
-        possible, and keep validation rules mirrored in execute().
+        The model should prefer ``delay_minutes`` for relative requests and
+        ``due_at`` for absolute calendar requests.  One-off tasks must provide
+        one of them; recurring tasks may also provide one as the first run time.
         """
         return {
             "type": "object",
@@ -63,46 +65,99 @@ class CreateScheduledTaskTool:
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "The natural-language instruction for the recurring task."
+                        "The instruction/reminder text. For condition checks, include the exact "
+                        "thing to check and what to report. Do not include secrets."
                     ),
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Short notification title shown when the task fires.",
+                },
+                "task_type": {
+                    "type": "string",
+                    "enum": ["reminder", "scheduled_prompt", "condition_check"],
+                    "description": (
+                        "reminder sends the prompt as a notification without an LLM call; "
+                        "scheduled_prompt runs the assistant at the due time; condition_check "
+                        "runs the assistant/tools to check whether something changed or exists."
+                    ),
+                },
+                "schedule_type": {
+                    "type": "string",
+                    "enum": ["one_off", "recurring"],
+                    "description": "Use one_off for 'in 7 days' reminders/checks; recurring for repeated reports/checks.",
+                },
+                "due_at": {
+                    "type": "string",
+                    "description": "Optional absolute first run time as ISO-8601 datetime, with timezone when known.",
+                },
+                "delay_minutes": {
+                    "type": "integer",
+                    "description": "Optional relative delay from now in minutes. 7 days = 10080, 3 weeks = 30240.",
                 },
                 "interval_minutes": {
                     "type": "integer",
-                    "description": (
-                        "How often to run in minutes. "
-                        "1440=daily, 10080=weekly (default), 43200=monthly."
-                    ),
+                    "description": "Recurring interval in minutes. 1440=daily, 10080=weekly. Ignored for one_off.",
+                },
+                "max_runs": {
+                    "type": "integer",
+                    "description": "Optional run limit for recurring tasks. Omit for indefinite recurrence.",
                 },
             },
             "required": ["prompt"],
         }
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
-        """Create a recurring task."""
-        prompt = arguments["prompt"]
-        interval_minutes = arguments.get("interval_minutes", 10080)
+        """Create a reminder, one-off scheduled task, or recurring check."""
+        prompt = str(arguments["prompt"]).strip()
         logger.info(f"Tool: Creating scheduled task: {prompt[:80]}")
         if not self._prompt_scheduler:
-            return {"error": "Scheduled tasks not available."}
+            return {"ok": False, "error": "Scheduled tasks not available."}
         try:
             task = await self._prompt_scheduler.create_task(
-                prompt=prompt, interval_minutes=interval_minutes
+                prompt=prompt,
+                interval_minutes=arguments.get("interval_minutes"),
+                user_id=context.user_id,
+                channel=context.source or "web",
+                title=arguments.get("title"),
+                task_type=arguments.get("task_type", "scheduled_prompt"),
+                schedule_type=arguments.get("schedule_type", "recurring"),
+                due_at=arguments.get("due_at"),
+                delay_minutes=arguments.get("delay_minutes"),
+                max_runs=arguments.get("max_runs"),
+                session_id=context.session_id,
             )
-            hours = interval_minutes / 60
-            if interval_minutes <= 1440:
-                period = "daily"
-            elif interval_minutes <= 10080:
-                period = "weekly"
-            else:
-                period = f"every {hours:.0f}h"
             return {
-                "message": f"Created {period} task (id={task.id}): '{prompt}'",
-                "task_id": task.id,
-                "interval_minutes": interval_minutes,
+                "ok": True,
+                "message": self._success_message(task),
+                "task": {
+                    "id": task.id,
+                    "title": task.title,
+                    "prompt": task.prompt,
+                    "task_type": task.task_type,
+                    "schedule_type": task.schedule_type,
+                    "interval_minutes": task.interval_minutes,
+                    "due_at": task.due_at.isoformat() if task.due_at else None,
+                    "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+                    "max_runs": task.max_runs,
+                    "enabled": task.enabled,
+                },
+                "next_actions": ["list_scheduled_tasks", "remove_scheduled_task"],
             }
         except Exception as e:
             logger.error(f"Create scheduled task tool error: {e}")
-            return {"error": str(e)}
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def _success_message(task: Any) -> str:
+        """Return a concise LLM-facing creation receipt."""
+        when = task.next_run_at.isoformat() if task.next_run_at else "now"
+        if task.schedule_type == "one_off":
+            return f"Created one-off {task.task_type} task (id={task.id}) for {when}."
+        return (
+            f"Created recurring {task.task_type} task (id={task.id}) every "
+            f"{task.interval_minutes} minutes, next run {when}."
+        )
 
 
 class ListScheduledTasksTool:
@@ -143,12 +198,18 @@ class ListScheduledTasksTool:
                 "tasks": [
                     {
                         "id": t.id,
+                        "title": t.title,
                         "prompt": t.prompt,
+                        "task_type": t.task_type,
+                        "schedule_type": t.schedule_type,
                         "interval_minutes": t.interval_minutes,
                         "enabled": t.enabled,
-                        "last_run": t.last_run_at.isoformat()
-                        if t.last_run_at
-                        else None,
+                        "due_at": t.due_at.isoformat() if t.due_at else None,
+                        "next_run_at": t.next_run_at.isoformat() if t.next_run_at else None,
+                        "last_run": t.last_run_at.isoformat() if t.last_run_at else None,
+                        "run_count": t.run_count,
+                        "max_runs": t.max_runs,
+                        "last_error": t.last_error or None,
                     }
                     for t in tasks
                 ],
@@ -295,11 +356,12 @@ class SearchMediaTorrentsTool:
     name = "search_media_torrents"
     description = (
         "Search torrents for any media item (tracked or untracked). Returns candidates with title, size, "
-        "seeders, language, resolution, codec, magnet. Use exact tracked item keys from the "
+        "seeders, category-owned language/quality facets, codec, magnet. Use exact tracked item keys from the "
         "CATEGORY LIBRARY CONTEXT PACKET when available. For category units such as season, "
         "episode, chapter, disc, or track, use dedicated arguments rather than appending "
-        "localized phrases to the name. YOU MUST evaluate candidates for the correct language. "
-        "IF NO candidates are found for the preferred language, DO NOT download anything; "
+        "localized phrases to the name. Evaluate language only when the active category says language is relevant; "
+        "music searches must not inherit global movie/TV language preferences. "
+        "IF NO candidates are found for an explicit category-relevant language, DO NOT download anything; "
         "instead, ASK the user if they want to try another language or wait. For bundled "
         "payloads, pass category-owned unit arguments/descriptors rather than forcing a "
         "category-specific phrase into the title."
@@ -337,7 +399,7 @@ class SearchMediaTorrentsTool:
                 },
                 "language": {
                     "type": "string",
-                    "description": "Preferred language (e.g. 'English', 'Italian'). Defaults to global setting.",
+                    "description": "Preferred language only when relevant to the active category (e.g. movies, ebooks, audiobooks). For music, omit unless the user explicitly asks for language-specific music.",
                 },
                 "search_scope": {
                     "type": "string",

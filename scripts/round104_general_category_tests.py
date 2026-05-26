@@ -23,7 +23,8 @@ def read(rel: str) -> str:
 def test_general_category_is_first_class_and_conservative() -> None:
     src = read("src/core/categories/general.py")
     prompt = read("src/core/categories/prompts/general.md")
-    config = read("config/category-templates/general.yaml")
+    definition = read("config/category-definitions/general.yaml")
+    config = read("config/category-config-templates/general.yaml")
     assert "class GeneralCategory(CategoryMedia)" in src
     assert 'category_id = "general"' in src
     assert 'display_name = "General Files"' in src
@@ -35,8 +36,10 @@ def test_general_category_is_first_class_and_conservative() -> None:
     assert "Richer installed categories win" in prompt
     assert 'category_id: "general"' in prompt
     assert "Do not silently reinterpret a failed TV/movie search" in prompt
+    assert "category_id: general" in definition
+    assert "Richer categories win" in definition
     assert "category_id: general" in config
-    assert "library_path" in config
+    assert "library_path" not in config
 
 
 def test_registry_registers_general_without_dynamic_duplicate() -> None:

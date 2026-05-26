@@ -1,0 +1,37 @@
+# General Files category definition. Safe to commit/share.
+category_id: general
+definition_version: 1
+services: {}
+formats:
+  accepted_extensions: [pdf, epub, cbz, cbr, zip, rar, 7z, flac, mp3, wav, txt, csv, json]
+  blocked_extensions: [exe, msi, dmg, pkg, apk, sh, bat, ps1, jar]
+  reject_title_terms: [crack, keygen, activator, patcher, serial]
+download_profile:
+  preserve_original_filename: true
+  allowed_extensions: [pdf, epub, cbz, cbr, zip, rar, 7z, flac, mp3, wav, txt, csv, json]
+  blocked_extensions: [exe, msi, dmg, pkg, apk, sh, bat, ps1, jar]
+  reject_title_terms: [crack, keygen, activator, patcher, serial]
+tools:
+  allowed_generic: [search_media_torrents, inspect_torrent_candidate, queue_download, list_library_files]
+  category_workflows: []
+  llm_usage_notes:
+    - Use only for concrete miscellaneous file targets that do not match richer installed categories.
+    - Inspect archive/file lists when available before queueing ambiguous bundles.
+llm_guidance:
+  behavior:
+    - Richer categories win. Do not use General for obvious TV shows, movies, or future domain categories.
+    - Preserve literal filenames, quoted names, extensions, version numbers, and requested formats.
+    - Ask one clarification when the target is vague.
+  search_examples:
+    - Exact.Manual.Name.pdf
+    - Lecture title FLAC
+    - Dataset name zip
+lifecycle_policy:
+  policy_version: 1
+  identity_fields: [category_id, item_id, title, literal_filename]
+  lifecycle_fields: [library_presence, file_count, total_size_bytes]
+  suggestion_types: [manual_review]
+  invalidation_triggers: [library_changed, download_completed, download_failed, manual_refresh, policy_version_changed]
+  llm_policy_description: >-
+    General Files is intentionally conservative. It should only be used for exact,
+    user-named miscellaneous payloads that do not fit richer installed categories.

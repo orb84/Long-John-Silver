@@ -64,6 +64,7 @@ class GeneralCategory(CategoryMedia):
     supported_operations = ["search", "download", "scan", "organize"]
     category_tool_names = ["search_media_torrents", "queue_download", "list_media_items", "list_library_files"]
     prompt_file = "general.md"
+    router_priority = -20
     accepted_file_patterns = sorted(f"*{suffix}" for suffix in _SAFE_GENERAL_SUFFIXES)
     _default_naming_template = "{title}/{filename_stem}"
 

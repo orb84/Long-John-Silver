@@ -182,7 +182,7 @@
         <span class="card-icon">📚</span>
         <div class="card-header-text">
             <h2>Library &amp; Downloads</h2>
-            <p class="card-desc">Where downloads land temporarily and where each category files completed media. Category-specific values are persisted in ignored local config/categories/<category_id>.yaml files bootstrapped from public templates.</p>
+            <p class="card-desc">Where downloads land temporarily and where completed items are organized. Set one main library root, then leave category paths blank unless a category belongs on a different disk/share/existing server folder.</p>
         </div>
     </div>
     <div class="form-row">
@@ -190,13 +190,19 @@
             <label>Download Directory</label>
             <input type="text" id="download_dir" value="{{ settings.download_dir }}" placeholder="./downloads">
         </div>
+        <div class="form-group flex-2">
+            <label>Main Library Root</label>
+            <input type="text" id="library_root" value="{{ settings.library_root }}" placeholder="./library">
+            <small style="color: var(--muted);">Blank category paths use this root plus each category's default folder.</small>
+        </div>
         <div class="form-group">
             <label>Max Concurrent Downloads</label>
             <input type="number" id="max_concurrent" value="{{ settings.max_concurrent_downloads }}" min="1" max="20">
         </div>
     </div>
     {% for category in categories %}
-    <div class="card-subtitle" style="margin-top: 1.5rem;">{{ category.display_name }} Settings <span style="font-size:0.75rem;color:var(--muted);font-weight:400;">local config/categories/{{ category.id }}.yaml</span></div>
+    <div class="card-subtitle" style="margin-top: 1.5rem;">{{ category.display_name }} Settings <span style="font-size:0.75rem;color:var(--muted);font-weight:400;">optional overrides in local config/categories/{{ category.id }}.yaml</span></div>
+    <p style="font-size:0.76rem;color:var(--muted);margin:0 0 0.6rem 0;">Effective default path: <code>{{ category.default_library_path }}</code></p>
     <div class="form-row">
         {% for prop in category.properties %}
         <div class="form-group flex-1">
@@ -450,27 +456,27 @@
             </p>
             <div class="form-group">
                 <label>API Key</label>
-                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="tmdb_api_key" value="{{ settings.tmdb_api_key or '' }}" placeholder="TMDB API key">
+                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="tmdb_api_key" value="{{ settings.category_service_value('media', 'tmdb', 'api_key') or '' }}" placeholder="TMDB API key">
             </div>
         </div>
         <div class="integration-block">
             <h3 class="int-title">Trakt</h3>
             <p class="int-desc">
-                <strong>Why:</strong> Syncs your watch history and enables high-quality personalized show suggestions.<br>
+                <strong>Why:</strong> Syncs your watch history and enables high-quality personalized show suggestions. LJS normally uses its bundled public Trakt Client ID; create a custom developer app only for advanced/remote setups.<br>
                 <a href="https://trakt.tv/signup" target="_blank" style="color:var(--teal); font-size:0.75rem;">→ Create a Trakt account (Free)</a>
             </p>
-            <input type="hidden" id="trakt_client_id" value="{{ settings.trakt_client_id or '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac' }}">
+            <input type="hidden" id="trakt_client_id" value="{{ trakt_custom_client_id or '' }}">
             
             <div id="trakt-advanced-container" style="display:none; margin-top:12px; background: rgba(255,255,255,0.02); padding: 10px; border-radius: 8px; border: 1px solid var(--glass-border);">
                 <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:4px;">Custom Trakt Client ID:</label>
-                <input type="text" id="trakt-custom-id" placeholder="Paste custom Trakt Client ID" style="font-size:0.8rem; margin-bottom:4px; width: 100%; box-sizing: border-box;" value="{{ settings.trakt_client_id if settings.trakt_client_id != '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac' else '' }}" oninput="updateSettingsTraktId(this.value)">
+                <input type="text" id="trakt-custom-id" placeholder="Paste custom Trakt Client ID" style="font-size:0.8rem; margin-bottom:4px; width: 100%; box-sizing: border-box;" value="{{ trakt_custom_client_id or '' }}" oninput="updateSettingsTraktId(this.value)">
                 <p style="font-size:0.7rem; color:var(--accent-gold); line-height:1.4; margin:6px 0 0 0;">
                     Create your own Trakt developer application at <a href="https://trakt.tv/oauth/applications" target="_blank" style="color:var(--teal); text-decoration: underline;">trakt.tv</a>.<br>
                     Use the exact Redirect URI: <code id="trakt-settings-callback-preview" style="color: var(--accent-teal); font-family: monospace; background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 3px;"></code>
                 </p>
             </div>
             <div style="margin-top: 8px;">
-                <a href="javascript:void(0)" onclick="toggleSettingsTraktAdvanced()" style="font-size:0.7rem; color:var(--teal); text-decoration:none;"><i class="fa-solid fa-gears"></i> Remote Setup / Custom Trakt App</a>
+                <a href="javascript:void(0)" onclick="toggleSettingsTraktAdvanced()" style="font-size:0.7rem; color:var(--teal); text-decoration:none;"><i class="fa-solid fa-gears"></i> Use a custom Trakt developer app</a>
             </div>
 
             <script>
@@ -489,19 +495,19 @@
                 function updateSettingsTraktId(val) {
                     var mainInput = document.getElementById('trakt_client_id');
                     if (mainInput) {
-                        mainInput.value = val.trim() || '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac';
+                        mainInput.value = val.trim();
                     }
                 }
             </script>
             <div class="form-group mt-2">
                 <div class="form-row" style="align-items: center; gap: 12px; margin-top: 8px;">
-                    {% if settings.trakt_access_token %}
+                    {% if settings.category_service_value('media', 'trakt', 'access_token') %}
                     <span class="badge success" style="background: rgba(42, 157, 143, 0.2); color: var(--accent-teal); border-color: rgba(42, 157, 143, 0.4);" title="Authenticated as user">Connected</span>
                     {% else %}
                     <span class="badge" style="background: rgba(231, 111, 81, 0.15); color: var(--accent-red); border-color: rgba(231, 111, 81, 0.3);" title="Not authenticated yet">Not Connected</span>
                     {% endif %}
                     <button onclick="startTraktAuth()" class="btn btn-secondary btn-sm" style="margin: 0;">
-                        <i class="fas fa-link"></i> {{ 'Reconnect' if settings.trakt_access_token else 'Connect Account' }}
+                        <i class="fas fa-link"></i> {{ 'Reconnect' if settings.category_service_value('media', 'trakt', 'access_token') else 'Connect Account' }}
                     </button>
                 </div>
             </div>
@@ -577,11 +583,11 @@
             <div class="form-row">
                 <div class="form-group flex-2">
                     <label>URL</label>
-                    <input type="text" id="plex_url" value="{{ settings.plex_url or '' }}" placeholder="http://localhost:32400">
+                    <input type="text" id="plex_url" value="{{ settings.category_service_value('media', 'plex', 'url') or '' }}" placeholder="http://localhost:32400">
                 </div>
                 <div class="form-group">
                     <label>Token</label>
-                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="plex_token" value="{{ settings.plex_token or '' }}" placeholder="X-Plex-Token">
+                    <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="plex_token" value="{{ settings.category_service_value('media', 'plex', 'token') or '' }}" placeholder="X-Plex-Token">
                 </div>
             </div>
         </div>
@@ -593,7 +599,7 @@
             </p>
             <div class="form-group">
                 <label>API Key</label>
-                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="opensubtitles_api_key" value="{{ settings.opensubtitles_api_key or '' }}" placeholder="OpenSubtitles API key">
+                <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="opensubtitles_api_key" value="{{ settings.category_service_value('media', 'opensubtitles', 'api_key') or '' }}" placeholder="OpenSubtitles API key">
             </div>
         </div>
     </div>

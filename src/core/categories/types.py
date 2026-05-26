@@ -30,6 +30,7 @@ class ScannedFileObservation:
     subtitle_languages: list[str] = field(default_factory=list)
     subtitle_tracks: list[dict[str, Any]] = field(default_factory=list)
     media_probe: dict[str, Any] = field(default_factory=dict)
+    local_object: dict[str, Any] = field(default_factory=dict)
 
 
 # Backwards-compatible alias for older category code.  New code should use the
@@ -59,6 +60,7 @@ class ScannedItem:
     detected_languages: list[str] = field(default_factory=list)
     subtitle_languages: list[str] = field(default_factory=list)
     year: int | None = None
+    local_object_model: dict[str, Any] = field(default_factory=dict)
 
     @property
     def files(self) -> list[ScannedFileObservation]:

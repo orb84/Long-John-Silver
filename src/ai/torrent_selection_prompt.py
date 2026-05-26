@@ -86,12 +86,18 @@ class TorrentSelectionPromptBuilder:
             "  2. Contain only archives or samples when the category expects a usable payload",
             "  3. Are obviously malformed, spam, fake, or unrelated releases",
         ]
-        parts.extend([
-            "  4. Have a clearly wrong language — if lang:X shows a single language ",
-            f"     that does NOT match the preferred language '{preferred_language}', reject it.",
-            "     Example: lang:Hindi when preferred is English → REJECT.",
-            "  5. Have no magnet link — can't be downloaded",
-        ])
+        if preferred_language:
+            parts.extend([
+                "  4. Have a clearly wrong language — if lang:X shows a single language ",
+                f"     that does NOT match the preferred language '{preferred_language}', reject it.",
+                "     Example: lang:Hindi when preferred is English → REJECT.",
+                "  5. Have no magnet link — can't be downloaded",
+            ])
+        else:
+            parts.extend([
+                "  4. Have no magnet link — can't be downloaded",
+                "  5. Do not invent a language requirement when the category declares language irrelevant.",
+            ])
         return parts
 
     @staticmethod
@@ -115,18 +121,29 @@ class TorrentSelectionPromptBuilder:
     @staticmethod
     def language_and_quality_parts(preferred_language: str, quality_ref: str) -> list[str]:
         """Return candidate language rules and compact quality reference text."""
-        return [
-            "",
-            "Language rules:",
-            f"  - Preferred language: {preferred_language}",
-            "  - MULTI-language releases are acceptable (they include multiple audio tracks)",
-            f"  - Dual-audio with {preferred_language} + another language is ideal",
-            f"  - Single-language releases in {preferred_language} are preferred",
-            "  - Single-language releases in a DIFFERENT language → REJECT",
-            "  - No language tag: UNKNOWN risk; prefer confirmed language matches",
-            "  - If ALL candidates have unknown language, pick the best quality one",
-            "    but prefer higher seed counts (more likely to be legitimate)",
-            "",
+        parts = [""]
+        if preferred_language:
+            parts.extend([
+                "Language rules:",
+                f"  - Preferred language: {preferred_language}",
+                "  - MULTI-language releases are acceptable (they include multiple audio tracks)",
+                f"  - Dual-audio with {preferred_language} + another language is ideal",
+                f"  - Single-language releases in {preferred_language} are preferred",
+                "  - Single-language releases in a DIFFERENT language → REJECT",
+                "  - No language tag: UNKNOWN risk; prefer confirmed language matches",
+                "  - If ALL candidates have unknown language, pick the best quality one",
+                "    but prefer higher seed counts (more likely to be legitimate)",
+                "",
+            ])
+        else:
+            parts.extend([
+                "Language rules:",
+                "  - This category did not provide a search language constraint.",
+                "  - Do not penalize candidates merely because they lack language tags.",
+                "  - Do not introduce English/Italian/MULTI preferences unless the user explicitly asked for language-specific content.",
+                "",
+            ])
+        parts.extend([
             "Seeder / availability rules:",
             "  - Seeders are a first-class availability metric, not decoration.",
             "  - When two candidates are otherwise equivalent in unit coverage, language, resolution, codec, and size, choose the one with more seeders.",
@@ -137,4 +154,5 @@ class TorrentSelectionPromptBuilder:
             quality_ref,
             "",
             "Candidates (index, summary):",
-        ]
+        ])
+        return parts

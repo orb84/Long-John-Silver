@@ -176,6 +176,26 @@ This matters because the same canonical object contract must govern all library 
 
 The scheduler does not know what an air date, release date, patch date, chapter publication date, or DLC drop means. It calls `category.next_scheduled_unit(item, context)` and persists the category-owned `state_updates` returned by that hook.
 
+## Round 110 Context Hygiene: Routing Must See Recent Chat, Not Library Dumps
+
+Short follow-ups such as "I meant released movie", "not that one", "in Italian", or equivalent multilingual corrections must be routed with compact recent conversation context. The intent router must not see only pending torrent handles, because many obvious corrections are SEARCH or CHAT refinements rather than download actions.
+
+Prompt construction should keep category-owned packets targeted. When a user message only matches a broad category word like "movie" or "show" but no tracked item, categories expose a lean router overview and sample keys, not the whole category library. Full category/unit context is reserved for matched tracked items or explicit library-state tools.
+
+TMDB person search results must remain person results. The metadata lookup tool should return compact person credits for director/actor questions instead of treating a person ID as a movie or TV ID.
+
+## User Scheduled Assistant Tasks
+
+User-created reminders and future checks are separate from category lifecycle schedules. A request such as "remind me in 7 days" creates a one-off reminder that sends the stored reminder text through notifications. A request such as "check whether this torrent exists in 3 weeks and report back" creates a one-off scheduled assistant task with `task_type=condition_check`; when it fires, the shared assistant runtime receives the stored prompt and may use the normal category/search/download tools according to tool policy.
+
+These tasks must remain generic and contract-bound:
+
+- store absolute `next_run_at` / `due_at` timestamps instead of relying only on elapsed intervals;
+- use `task_type` (`reminder`, `scheduled_prompt`, `condition_check`) and `schedule_type` (`one_off`, `recurring`) to make behavior explicit;
+- do not hard-code torrent/media semantics into the prompt scheduler; the scheduled prompt uses the same LLM/category tools as chat;
+- one-off tasks disable themselves after a successful run; recurring tasks advance `next_run_at`;
+- failures are persisted in `last_error` and retried later rather than spinning every scheduler tick.
+
 ## Startup Discipline
 
 Startup must avoid provider storms. A startup pass may reconcile cheap local ledgers and repair missing artwork, but provider-heavy work should run only when lifecycle state says an item is due, invalidated, or manually refreshed.
@@ -526,7 +546,7 @@ Completed-download imports are app-owned, item-scoped library mutations. The dow
 
 The filesystem watcher remains a coarse fallback for external/manual library changes. It may trigger a full scan only when no managed import is active. Known item mutations should refresh canonical units, lifecycle state, and suggestions for that item only.
 
-Recovered category-template path failures are not import failures. If a template proposes an unsafe destination but the category fallback produces a safe target, the event is informational; only failure of both target plans or the actual file operation is an error.
+Recovered category-config path failures are not import failures. If a private naming config proposes an unsafe destination but the category fallback produces a safe target, the event is informational; only failure of both target plans or the actual file operation is an error.
 
 ## Round 98 — Ready Import Paths and Diagnostics
 
@@ -606,7 +626,7 @@ safety limit.
 
 `general` is now a built-in category named **General Files**. It is intentionally narrow: it handles exact, user-named miscellaneous payloads such as documents, archives, datasets, manuals, lectures, audio files, or other one-off files that do not belong to a richer installed category. It is not a generic fallback for failed TV/movie/book/game searches.
 
-General Files follows the same category contract as TV and Movies: it declares its own manifest/profile, LLM prompt, setup requirements, search query builder, candidate validator, import layout, file scanner, unit descriptors, and bundle/file-list affordances. The only normal setup field is its `library_path`; completed payloads are stored below that root in a safe title folder while preserving the original filename.
+General Files follows the same category contract as TV and Movies: it declares its own manifest/profile, LLM prompt, setup requirements, search query builder, candidate validator, import layout, file scanner, unit descriptors, and bundle/file-list affordances. The normal path control is an optional `library_path` override; when it is blank, completed payloads are stored under `settings.library_root/General` in a safe title folder while preserving the original filename.
 
 The assistant must explicitly opt into the category by passing `category_id: "general"` to `search_media_torrents`. Existing rich categories continue to win whenever their router vocabulary or tracked items apply. Generic search planning must not switch a failed TV/movie request into General unless the user clearly asks for a miscellaneous exact file target or approves the category switch.
 
@@ -616,11 +636,143 @@ Frontend onboarding remains manifest-driven. `/api/setup/requirements` exposes t
 
 Compass now follows the category-owned configuration model more strictly:
 
-- Per-category paths, naming templates, cadence values, provider toggles, scheduler participation, storage declarations, and lifecycle summaries are rendered in **Library Categories** from category manifests plus ignored live `config/categories/<category_id>.yaml` files bootstrapped from tracked `config/category-templates/<category_id>.yaml` templates.
+- One global `library_root` is the default parent for all concrete category libraries. Per-category paths are optional overrides only; blank category paths resolve to `library_root/<category default folder>` and setup/path saves create those folders on a best-effort basis. Naming templates, cadence values, provider toggles, scheduler participation, storage declarations, and lifecycle summaries are rendered in **Library Categories** from category manifests plus ignored live `config/categories/<category_id>.yaml` files bootstrapped from tracked `config/category-config-templates/<category_id>.yaml` templates, while shareable category behavior lives in `config/category-definitions/<category_id>.yaml`.
 - TMDB, TVMaze, Trakt, Plex, and OpenSubtitles are no longer presented as one generic "Metadata and watch state" block. Categories that use those services declare setup requirements, and the UI surfaces the controls under the owning category.
+- **Content Selection** writes shared TV/Movie candidate preferences to the private abstract `media.download_profile`; it is not a global UI-language or one-off torrent-quality bucket.
 - **Shared Torrent Search & Indexers** owns only category-agnostic torrent infrastructure such as Jackett and direct scraper fallback.
 - **Advanced Category Contracts** is read-only diagnostics. It shows the backend contract exposed to the UI and LLM so generic code does not hardcode TV/movie behavior; it is not an editable settings surface.
 - Runtime code must honor category YAML sections through category helpers: `metadata.providers.<provider>.enabled`, `scheduler.enabled`, `storage.*`, and `lifecycle_policy`.
 
-When adding a category, add editable user settings through `get_properties()`, service/setup needs through `provider_setup_requirements()` / `setup_requirements()`, and public non-secret defaults through `config/category-templates/<category_id>.yaml`; live user paths/keys belong only in ignored `config/categories/<category_id>.yaml`. Do not add category-specific fields to a global Compass section.
+When adding a category, add editable user settings through `get_properties()`, service/setup needs through `provider_setup_requirements()` / `setup_requirements()`, and shareable definitions through `config/category-definitions/<category_id>.yaml` and blank private defaults through `config/category-config-templates/<category_id>.yaml`; live user path overrides/keys belong only in ignored `config/categories/<category_id>.yaml`. Do not prefill category templates with `./library/<Category>` paths: that is computed from the global root at runtime. Do not add category-specific fields to a global Compass section.
 
+## Category-owned settings, inheritance, services, tools, and LLM guidance
+
+Categories are the authority for domain behavior, and category files are deliberately split by audience:
+
+- `config/category-definitions/<category_id>.yaml` is tracked and shareable. It defines the category contract: inherited base, services, executable tool/workflow declarations, LLM guidance, filename examples, accepted/rejected formats, and lifecycle semantics.
+- `config/category-config-templates/<category_id>.yaml` is tracked but intentionally boring: blank/safe first-launch defaults for private config.
+- `config/categories/<category_id>.yaml` is ignored and stores only local user values such as library paths, API keys/tokens, provider enable flags, scheduler/storage toggles, and personal download preferences.
+
+Fresh installs use ignored local files for live category values. Global settings do not own media service credentials. Runtime settings see one effective deep-merged view, but save-time filtering writes only private config fields back to `config/categories` so people can improve/share category definitions without exposing personal configuration.
+
+First-run setup must follow the same split. It may present Media services near the LLM controls because that is friendlier for new users, but TMDB/Trakt values are saved to the private abstract `media` category config; TV/Movie library folders are saved to their own private category configs; and shared TV/Movie search defaults such as language/resolution/size mode are saved to `media.download_profile`. Setup must not call generic Compass endpoints as a shortcut for category-owned values.
+
+Trakt is special inside that category-owned service model: the bundled LJS Trakt Client ID is public app configuration shipped in `src/integrations/trakt_defaults.py`, not a user secret or setup requirement. Normal users leave the Client ID blank and use the Trakt out-of-band PIN/code login flow, which exchanges the code with redirect URI `urn:ietf:wg:oauth:2.0:oob`. Only user-specific access/refresh tokens are private. A custom Client ID is an advanced override and must use a matching callback redirect for that user's own Trakt developer application.
+
+The built-in audiovisual hierarchy uses an abstract shared `media` definition and base class. `config/category-definitions/media.yaml` declares shared media services and defaults such as TMDB, Trakt, Plex, OpenSubtitles, media file-format rules, generic media tools, and common LLM guidance. Concrete categories such as TV Shows and Movies set `extends: media`, so runtime settings see inherited services/tools/guidance while their private YAML files only contain category-specific local values. TV adds TVMaze, season/episode workflows, pack-search examples, and episode-level rules. Movies add movie identity/year rules, movie workflows, and movie filename examples.
+
+A category defines external services in YAML under `services.<service_id>` and consumes those values through `category_service_config()`, `category_service_enabled()`, and `category_service_secret()`. Shared services belong in the nearest meaningful parent config, not duplicated in every child. A new media-like category should inherit from `media` when it needs TMDB/Trakt/Plex/OpenSubtitles behavior; a non-media category should declare only its own domain services.
+
+A category defines executable LLM tools through `declare_actions()` and `declare_workflows()`. `CategoryToolFactory` registers those declarations with the shared tool registry, while `AgentToolPolicy` exposes them only for the active category and only when the intent/risk gates allow them. YAML `tools` entries can narrow/document exposure but cannot invent executable tools. Shared workflows/tools should live on the closest reusable category base class; child categories add only their domain-specific workflows.
+
+Natural-language category behavior belongs in `llm_profile()`, `src/core/categories/prompts/<category_id>.md`, and live YAML `llm_guidance`. The global prompt builder injects only the active category's compact guidance and context packet, including inherited media guidance where relevant, and must not dump unrelated library/category blobs into short follow-ups.
+
+
+
+## Definition-Backed Category Extension Path
+
+Category definitions in `config/category-definitions/*.yaml` are now capable of
+creating real runtime categories when a dedicated Python subclass is not yet
+needed. The registry loads concrete, non-abstract definitions through
+`DefinitionBackedCategory`; dedicated subclasses still win when they exist.
+
+This is the baseline extension path:
+
+- use `extends` for an is-a base, such as `music extends audio` or `ebooks extends book`;
+- use `mixins` for additive shared capabilities, such as `audiobooks extends book` and `mixins: [audio]`;
+- declare `services` as metadata/setup contracts, not as working provider adapters;
+- declare `runtime_dependencies` for local binaries/packages such as FFmpeg;
+- declare `formats.accepted_file_patterns`, release terms, `download_profile`, `llm_profile`, `llm_guidance`, `tools`, and `lifecycle_policy` in the shareable definition;
+- keep user paths, toggles, credentials, and personal download preferences in ignored `config/categories/<category_id>.yaml` bootstrapped from `config/category-config-templates/<category_id>.yaml`.
+
+The generic runtime provides manifests, routing vocabulary, neutral format-based
+scanning, safe import targets, conservative torrent candidate checks, and honest
+workflow receipts. It does **not** pretend YAML has implemented rich provider
+adapters. Metadata ingestion for MusicBrainz, Open Library, LibriVox, Gutendex,
+Google Books, or other services still belongs in category-owned adapters and
+workflows.
+
+### Runtime Dependencies and Tools
+
+Runtime dependencies are preflight facts, not executable code. A dependency like
+FFmpeg can appear in setup manifests with availability and install hints, and a
+category workflow may validate it before doing work. The audio conversion
+workflow uses `CommandPolicy.create_subprocess_exec()` with an argv list and
+`SafePathResolver`; it must not build shell strings from LLM/user input.
+
+### Fallback Routing
+
+Catch-all categories such as General Files should set a lower `router_priority`
+than rich domain categories. This lets a request like `Kind of Blue FLAC` route
+to Music and `The Left Hand of Darkness EPUB` route to Ebooks instead of being
+captured by the generic file bucket. The tie-breaker is a category contract, not
+a hardcoded list of new media types.
+
+
+## Round 118 category review notes: metadata adapters, post-import hooks, and Soulseek
+
+Definition-backed categories may now implement read-only metadata workflows through category-owned provider adapters. The shared scheduler and assistant must continue to invoke them through `CategoryWorkflowContext` and `category.execute_workflow(...)`; they must not import MusicBrainz/Open Library/LibriVox/etc. directly.
+
+Completed-download orchestration may call the generic `after_library_file_imported(...)` hook and reconcile any returned sidecar paths. Category-specific side effects such as Music FLAC -> ALAC/M4A or Audiobook FLAC -> M4B conversion belong behind this hook, not inside torrent download plumbing.
+
+Audio conversion policy is preference-driven and conservative: keep source files, preserve metadata/chapter/cover streams where FFmpeg supports them, and avoid automatic lossy-to-lossy transcoding. Ebooks intentionally have no automatic conversion pipeline yet.
+
+Soulseek is not a torrent provider. A future integration should be a separate source-provider adapter, probably targeting slskd, with explicit setup for credentials, sharing roots, staging paths, queue policy, and legal notices. Do not implement the reverse-engineered Soulseek protocol directly in LJS.
+
+### Round 121 stabilization note
+
+The simple Ebook format selector persists to `download_profile.preferred_ebook_format`; richer `preferred_ebook_formats` and `format_priority` remain available for future category ranking. Download ready-time hooks must run in both hardlink/copy import mode and seed-in-place mode, because Music/Audiobook sidecars are category-owned post-import behavior rather than torrent orchestration logic.
+
+
+## Round 122/123 category search-policy note
+
+- Definition-backed categories can declare `search_policy` fields such as `language_relevant`, `use_global_quality_profile`, and bundle terms so new domains do not inherit TV/movie search semantics. Category-specific reject terms are allowed only when they truly belong to that category. Cross-category release vocabulary is handled by the generic boundary-signature index derived from other category definitions; Music must not list video tokens, Ebooks must not list audio tokens, etc.
+- Generic assistant prompt code must not duplicate category-specific search vocabulary. Terms such as Music `discography`, `OST`/`Original Soundtrack`, or `bootleg` belong in the Music category profile and are injected through `category.build_prompt_guidance()`. The generic prompt may instruct the model to obey the active category profile, but it must not contain category branches that recreate those rules.
+- Ignored live files in `config/categories/*.yaml` must remain user/machine config only. `CategoryConfigStore.save_all()` must not write tracked definition fields such as `display_name`, `llm_profile`, `search_policy`, service labels, purposes, or help URLs into private config. If old local configs contain such polluted fields, save-time filtering should clean them.
+
+## Round 125 category-runtime cleanup note
+
+Definition-backed categories now coordinate smaller collaborators for concerns that had started to make the bootstrap class change for unrelated reasons:
+
+- `DefinitionCandidateValidator` owns generic search-result safety, category reject terms, bundle/discography candidate checks, and foreign release-signature rejection.
+- `AudioConversionService` owns FFmpeg command construction/execution, safe conversion path handling, and preference-driven post-import sidecars.
+- `router_matching` provides boundary-aware router-token matching so short category vocabulary such as `EP` or `TV` cannot match arbitrary substrings inside user prose.
+- `CategoryMetadataResolver` uses declarative provider profiles instead of category-specific provider-selection branches.
+
+Keep this pattern for future cleanup: split a responsibility only when there is a real policy or execution seam, and keep the category object as the owner of category definitions, safe roots, and lifecycle contracts.
+
+## Round 126 metadata cache, stable IDs, and LLM-assisted disambiguation
+
+Music/Book metadata adapters now use a shared resolver boundary with four explicit concerns:
+
+- **Persistent provider-cache rows** in `category_metadata_cache`, keyed by category/provider/query/profile. This avoids re-querying free public services on every agent turn and gives future refresh jobs a clear TTL/expiry boundary.
+- **Provider rate-limit state** in `provider_rate_limits`, plus conservative in-process throttling. Provider adapters must call through the resolver helper so MusicBrainz, Apple Search, Discogs, and similar APIs are not hammered by loops or repeated LLM attempts.
+- **Stable external IDs** on every normalized result. Use provider-native identifiers first (`musicbrainz_release_id`, `openlibrary_work_key`, `openlibrary_edition_key`, `isbn_13`, `librivox_id`, `google_books_id`, etc.) and a deterministic fallback fingerprint only when the provider gives no durable identifier.
+- **Conflict/disambiguation reports** instead of pretending deterministic ranking is enough. The resolver returns scores, evidence, selection facets, conflict groups, and an `llm_selection_instruction`. The LLM should apply user constraints such as narrator, edition, language, release type, format, year, and track/chapter completeness before selecting/pruning candidates.
+
+Canonical Music/Book object models live in `src/core/category_object_models.py`. They are provider-neutral shapes used by adapters:
+
+- Music follows the MusicBrainz-style hierarchy of artist credit, release group, release, medium, track, and recording.
+- Ebooks distinguish work-level identity from edition/ISBN/translator/language/format identity.
+- Audiobooks extend book identity with narrator/reader, abridgement, duration, chapter count, chapter metadata, and audio format.
+
+Category YAML may declare `object_model` to document canonical types, stable identifiers, and LLM disambiguation facets, but this is definition-only contract data. It must never be persisted into ignored private category config.
+
+
+### Round 127 metadata disambiguation cleanup
+
+Metadata lookups now use a dedicated disambiguation boundary for cross-provider grouping, conflict reporting, and LLM selection packets. The persistent cache can explicitly reuse stale rows after provider failures, marked as `stale_on_error`, and provider `Retry-After` parsing handles numeric and HTTP-date forms. Music/book/audiobook object models gained small but important selection facets such as disc/track counts, series/volume, source level, narrator/reader, and abridgement.
+
+### Round 128 provider adapter, local-object, and refresh cleanup
+
+Provider-specific metadata parsing now lives outside the resolver in `src/integrations/metadata_providers/`. `CategoryMetadataResolver` should remain an orchestration boundary for cache lookup, rate-limit/backoff, adapter invocation, stale-on-error reuse, and disambiguation. Do not add provider URLs or provider JSON parsing back into the resolver.
+
+Definition-backed category scans now carry lightweight local object evidence:
+
+- Music scans reconstruct local artist/catalog → album → track evidence from path/file structure and persist track units instead of generic file units.
+- Audiobook scans reconstruct narrated book files and chapter-file evidence from leaf folders or single-file M4B/M4A/MP3 releases.
+- Ebook scans treat files/multi-format edition groups as local edition evidence and keep comics archives as explicit `comic_archive` units.
+
+These reconstructed models are local evidence only. Provider metadata and LLM disambiguation remain authoritative for ambiguous identity choices such as exact release, narrator, translator, edition, or series order.
+
+Library metadata refresh now uses category-owned stable snapshot policy. When a definition-backed metadata workflow resolves a library item, it persists the best provider snapshot with `stable_id`, `external_id`, cover URL, object model, and `metadata_refresh_policy`. The scheduler interprets only the generic policy envelope (`refresh_after_days`, stable ID presence, last refresh time) so it does not learn MusicBrainz/Open Library/LibriVox semantics. Fresh stable snapshots are not re-queried on every boot.

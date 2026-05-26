@@ -36,12 +36,13 @@ class AutoStartManager:
 
         Args:
             working_dir: Project root containing ``main.py``. Defaults to the
-                current working directory used to launch LJS.
+                source checkout root derived from this module, not the shell
+                current working directory.
             command: Optional explicit command. Packaged distributions should
                 pass their executable command here; source checkouts use
                 ``sys.executable main.py``.
         """
-        self._working_dir = Path(working_dir or os.getcwd()).resolve()
+        self._working_dir = Path(working_dir).resolve() if working_dir else self._default_project_root()
         self._command = command or [sys.executable, str(self._working_dir / "main.py")]
 
     def status(self) -> dict[str, Any]:
@@ -51,6 +52,7 @@ class AutoStartManager:
             "supported": self.is_supported(),
             "enabled": self.is_enabled(),
             "target": str(self._entry_path()) if self._entry_path() else "",
+            "working_dir": str(self._working_dir),
             "command": " ".join(self._command),
         }
 
@@ -61,12 +63,12 @@ class AutoStartManager:
     def is_enabled(self) -> bool:
         """Return whether the expected auto-start entry is already present."""
         try:
+            if self._platform_key() == "windows":
+                return self._windows_value_matches_current_target()
             path = self._entry_path()
             if not path:
                 return False
-            if self._platform_key() == "windows":
-                return self._windows_value_exists()
-            return path.exists()
+            return path.exists() and self._file_entry_matches_current_target(path)
         except Exception:
             return False
 
@@ -135,6 +137,19 @@ class AutoStartManager:
             return "linux"
         return system
 
+
+    @staticmethod
+    def _default_project_root() -> Path:
+        """Return the source-checkout root containing ``main.py``.
+
+        ``os.getcwd()`` is fragile for login items: the user may enable
+        auto-start from a shell in the project today, then a later launch or
+        packaged wrapper may have a different current directory.  Deriving the
+        root from this module keeps the generated LaunchAgent/.desktop/Run
+        value pointed at the checkout that contains the code.
+        """
+        return Path(__file__).resolve().parents[2]
+
     def _entry_path(self) -> Path | None:
         """Return the platform-specific file path, if the platform uses one."""
         key = self._platform_key()
@@ -146,6 +161,21 @@ class AutoStartManager:
         if key == "windows":
             return None
         return None
+
+
+    def _file_entry_matches_current_target(self, path: Path) -> bool:
+        """Return whether an existing launch file points at this checkout.
+
+        A stale LaunchAgent or desktop file from an older project location
+        should not make the UI report "enabled" for the current install.
+        Enabling auto-start rewrites the file, so this check is conservative
+        and intentionally tied to the expected working directory and command.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return str(self._working_dir) in text and all(str(part) in text for part in self._command)
 
     def _quote(self, value: str | Path) -> str:
         """Shell-quote one command/path component for desktop/plist files."""
@@ -220,16 +250,16 @@ X-GNOME-Autostart-enabled=true
         except FileNotFoundError:
             return
 
-    def _windows_value_exists(self) -> bool:
-        """Return whether the HKCU Run value exists on Windows."""
+    def _windows_value_matches_current_target(self) -> bool:
+        """Return whether the HKCU Run value points at this checkout."""
         if self._platform_key() != "windows":
             return False
         try:
             import winreg  # type: ignore
 
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ) as key:
-                winreg.QueryValueEx(key, self.APP_NAME)
-                return True
+                value, _ = winreg.QueryValueEx(key, self.APP_NAME)
+                return str(value) == self._windows_command()
         except Exception:
             return False
 

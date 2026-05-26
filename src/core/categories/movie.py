@@ -100,61 +100,8 @@ class MovieCategory(CategoryMedia):
     _default_naming_template = '{title} ({year})/{title} ({year}) {quality}'
 
     def provider_setup_requirements(self, settings: 'Settings') -> list[CategorySetupRequirement]:
-        """Return movie-owned provider and watch-state setup guidance."""
-        return [
-            CategorySetupRequirement(
-                id="tmdb_api_key",
-                label="TMDB movie metadata key",
-                description=(
-                    "TMDB provides canonical film titles, years, artwork, cast, genres, "
-                    "ratings, and IDs used by movie metadata refresh workflows."
-                ),
-                required=False,
-                configured=bool(settings.tmdb_api_key),
-                setting_key="tmdb_api_key",
-                help_url="https://www.themoviedb.org/settings/api",
-                severity="recommended",
-                secret=True,
-            ),
-            CategorySetupRequirement(
-                id="trakt_watch_state",
-                label="Trakt watch state",
-                description="Optional account link for watched-state aware movie automation and recommendations.",
-                required=False,
-                configured=bool(settings.trakt_access_token or settings.trakt_client_id),
-                setting_key="trakt_client_id",
-                severity="recommended",
-            ),
-            CategorySetupRequirement(
-                id="plex_url",
-                label="Plex server URL",
-                description="Optional Plex endpoint for movie library refresh and watched-state reconciliation.",
-                required=False,
-                configured=bool(settings.plex_url),
-                setting_key="plex_url",
-                severity="info",
-            ),
-            CategorySetupRequirement(
-                id="plex_token",
-                label="Plex token",
-                description="Optional Plex token paired with the Plex server URL.",
-                required=False,
-                configured=bool(settings.plex_token),
-                setting_key="plex_token",
-                severity="info",
-                secret=True,
-            ),
-            CategorySetupRequirement(
-                id="opensubtitles_api_key",
-                label="OpenSubtitles key",
-                description="Optional subtitle search/download key for movie releases.",
-                required=False,
-                configured=bool(settings.opensubtitles_api_key),
-                setting_key="opensubtitles_api_key",
-                severity="info",
-                secret=True,
-            ),
-        ]
+        """Return shared media setup requirements inherited from CategoryMedia."""
+        return super().provider_setup_requirements(settings)
 
     def lifecycle_policy(self) -> dict[str, Any]:
         """Declare movie-owned suggestion and lifecycle policy."""
@@ -899,6 +846,7 @@ class MovieCategory(CategoryMedia):
         file normally represents the feature and can compare against the local
         movie library.
         """
+        item = await super().prepare_search_item(item, settings=settings, scan_result=scan_result)
         if not hasattr(item, "quality"):
             return item
         profile = item.quality
@@ -928,9 +876,9 @@ class MovieCategory(CategoryMedia):
         return item_copy
 
 
-    def build_prompt_guidance(self, for_intent: str) -> str:
+    def build_prompt_guidance(self, for_intent: str, settings: object | None = None) -> str:
         """Return compact movie profile guidance for the active intent."""
-        return self.llm_profile().format_for_prompt(for_intent)
+        return self.llm_profile_for_settings(settings).format_for_prompt(for_intent)
 
     async def scan(self, root_path: str, existing_keys: set[str] | None = None) -> list[ScannedItem]:
         """Scan a movie directory. Movies are folders or flat files."""
@@ -1495,7 +1443,7 @@ class MovieCategory(CategoryMedia):
         if should_refresh:
             logger.info(f"[MovieCategory] Cache stale/missing. Querying TMDB for '{name}'...")
             from src.integrations.tmdb import TMDBClient
-            api_key = settings.tmdb_api_key
+            api_key = settings.category_service_value(self.category_id, "tmdb", "api_key")
             if api_key and self.metadata_provider_enabled(settings, "tmdb", True):
                 try:
                     client = TMDBClient(api_key)

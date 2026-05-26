@@ -64,7 +64,8 @@ The scaffold currently generates:
 ```text
 src/core/categories/custom/<category_id>.py
 src/core/categories/prompts/<category_id>.md
-config/category-templates/<category_id>.yaml
+config/category-definitions/<category_id>.yaml
+config/category-config-templates/<category_id>.yaml
 tests/test_category_<category_id>.py
 ```
 
@@ -193,6 +194,7 @@ The profile should answer domain questions such as:
 - Which identifiers must match? Examples: title, author, narrator, platform, album artist, issue number, language.
 - Which file/container formats are acceptable? Examples should come from user requirements or research, not from another category.
 - Which quality facets matter in this domain? Examples: bitrate/duration for spoken audio, lossless/bitrate for music, platform/version for games, scan group/volume for comics, resolution/source/codec for video.
+- Keep category vocabulary in the category. Do not add another category's release terms as negative rules; generic boundary checks compare declarations across categories.
 - Which unit conventions exist? Examples: chapters, tracks, issues, volumes, DLC, episodes, seasons.
 - Which Jackett/Torznab categories or indexers are relevant? Preserve them as optional hints. The runtime default is to search all configured Jackett indexers first, because useful results can appear in unexpected trackers; category hints should improve ranking/querying, not hide valid candidates by default.
 - Which reject terms are category-specific red flags? Keep uncertain ones provisional.
@@ -250,7 +252,21 @@ Prefer manifest-driven setup requirements over hard-coded wizard logic. The base
 
 Override `setup_requirements(settings)` only when the category has truly unique requirements. Future provider-specific setup should ideally be derived from `discovery_sources`.
 
-Compass renders per-category paths, provider toggles, and service credentials from the category manifest and ignored live `config/categories/<category_id>.yaml`, bootstrapped from tracked `config/category-templates/<category_id>.yaml`. Do **not** add category-specific service fields to a global settings panel. Put public default category-owned values in the category template using sections such as `metadata.providers`, `scheduler`, `storage`, and `lifecycle_policy`; declare external credentials through `provider_setup_requirements()` / `setup_requirements()` so the UI can show them inside the owning category. The Advanced Category Contracts panel is read-only diagnostics for this manifest contract, not an editable config surface.
+Compass renders optional per-category path overrides, provider toggles, service credentials, tool policy, download preferences, and LLM guidance from the category manifest plus ignored live `config/categories/<category_id>.yaml`, bootstrapped from tracked blank `config/category-config-templates/<category_id>.yaml` and merged with the tracked shareable definition in `config/category-definitions/<category_id>.yaml`. Do **not** add category-specific service fields to a global settings panel. Put shareable category-owned behavior in `config/category-definitions/<category_id>.yaml` using sections such as `services`, `download_profile`, `tools`, `llm_guidance`, `metadata.providers`, `formats`, and `lifecycle_policy`; put only true private overrides such as empty credential fields, scheduler/storage toggles, and user preference defaults in `config/category-config-templates/<category_id>.yaml`. Do not hardcode `./library/<Category>` in templates: when `library_path` is blank, runtime resolves to `settings.library_root/<default_folder>` and setup/path saves create that folder best-effort. Declare external credentials through `provider_setup_requirements()` / `setup_requirements()` using keys like `category_config.<category>.services.<service>.<field>` so the UI can show and save them inside the owning category. The Advanced Category Contracts panel is read-only diagnostics for this manifest contract, not an editable config surface.
+
+Use category inheritance when a new category shares a domain base. Media-like categories should inherit the abstract `media` config with `extends: media` instead of redeclaring TMDB, Trakt, Plex, OpenSubtitles, common media formats, and generic media tools. A parent definition stores common services/tools/guidance once; the child definition contains only child-specific services, workflows, filename examples, lifecycle rules, and LLM guidance, while child config templates contain only actual private overrides/preference defaults. Runtime config is deep-merged for the category, while saving compacts child YAML back to explicit overrides so shared values do not get copied everywhere.
+
+Use `mixins` when a category needs an additional capability but should not become that parent type. For example, Audiobooks should `extend: book` because they are narrated book editions, and `mixins: [audio]` because they also need audio format/conversion behavior. Save compaction must consider both parents and mixins so mixin defaults do not leak into private config files.
+
+A concrete YAML definition without a Python subclass can still become a runtime category through `DefinitionBackedCategory`. This is the preferred first implementation for domains that can be expressed through manifests, routing vocabulary, accepted file patterns, setup requirements, neutral scanning, and declarative workflows. Add a dedicated subclass only when the category needs real provider adapters, custom search/download behavior, or richer canonical object construction. Abstract definitions such as `audio` and `book` should set `abstract: true`; they contribute inherited/mixin behavior but are not registered as user-facing categories.
+
+Do not put category-routing vocabulary into generic substring checks. Router words and item types come from the category profile, but matching must be boundary-aware so short domain tokens do not fire inside unrelated words.
+
+Shared generic behavior should move into focused collaborators only when the seam is real: candidate validation, source-provider adapters, conversion execution, metadata provider profiles, scanner/object-model builders, etc. Avoid splitting files just to reduce line counts.
+
+Declare local binaries/packages under `runtime_dependencies`, for example `ffmpeg` for audio conversion. Runtime dependencies are setup/preflight facts and install hints; YAML must not execute commands. Workflows that use them must validate safe paths and call subprocesses without a shell.
+
+A new external service is a category contract, not a global setting. The nearest meaningful category definition declares the service id, credential field schema, purpose, and LLM usage notes under `services.<service_id>`; the private config template declares only empty local values and enable toggles. The category subclass then consumes those values through `category_service_config()`, `category_service_enabled()`, or `category_service_secret()` and exposes any user-facing behavior as category actions/workflows. A new LLM tool is declared by `declare_actions()` or `declare_workflows()` and registered through `CategoryToolFactory`; YAML may narrow or document tool exposure under `tools`, but it must not invent executable tool plumbing.
 
 ## Required Class Contract
 
@@ -344,7 +360,7 @@ Do not add new parsing or selector logic to `SearchPipeline`, `ContentCleanup`, 
 
 ## Built-in General Files Category
 
-`General Files` (`category_id: general`) is now a built-in conservative catch-all for exact miscellaneous file targets. Do **not** scaffold another generic catch-all category, and do **not** use a custom category as a bypass around richer domain categories. If the user's idea is simply "misc downloads", "random torrents", or "general files", point them to the built-in General Files category and its single required setup field: `library_path`.
+`General Files` (`category_id: general`) is now a built-in conservative catch-all for exact miscellaneous file targets. Do **not** scaffold another generic catch-all category, and do **not** use a custom category as a bypass around richer domain categories. If the user's idea is simply "misc downloads", "random torrents", or "general files", point them to the built-in General Files category; its path is optional and defaults to `settings.library_root/General` unless the user sets a category override.
 
 Rules for the category creation assistant:
 
@@ -353,3 +369,48 @@ Rules for the category creation assistant:
 - Never scaffold executable/software/crack/keygen/activator-oriented categories without a separate safety and policy review.
 - Setup UI is manifest-driven. Newly installed categories should expose setup requirements through `CategoryManifest` / `setup_requirements()` so the frontend can detect them and prompt the user to review required paths or keys.
 - Custom categories still belong under `src/core/categories/custom/`; built-in modules such as General Files remain under `src/core/categories/` and should be edited deliberately, not generated by the scaffold.
+
+## Post-import hooks and metadata adapters
+
+A category may implement `after_library_file_imported(...)` to create sidecars or perform category-owned post-import work after a completed payload is copied/hardlinked into the library. Keep these hooks conservative and idempotent: never move the original seeded payload, never write outside the category safe roots, and return created paths so the library reconciler can refresh them.
+
+Metadata service declarations are not enough by themselves. If a category exposes `resolve_metadata`, it needs a provider adapter that normalizes external results and reports skipped/failed providers without breaking the user turn. Do not put provider-specific calls into the scheduler, generic assistant, or downloader.
+
+Source providers are not interchangeable. Torrents, Soulseek, direct URLs, and future stores have different identity, queue, sharing, and path semantics. Add a dedicated source-provider boundary instead of coercing every source into a magnet-like object.
+
+
+## Search-policy fields
+
+- For non-video or language-irrelevant categories, declare `search_policy.language_relevant: false` and `search_policy.use_global_quality_profile: false`; add category-specific bundle and reject terms rather than relying on movie/TV quality vocabulary.
+
+## Metadata cache, stable IDs, and object models
+
+When a new category uses external metadata services, implement adapters behind the category workflow boundary and normalize provider rows into category-owned object models before exposing them to the LLM. Do not return raw provider JSON as the main decision object.
+
+A strong metadata-enabled category should define:
+
+- stable provider IDs, such as a MusicBrainz release/release-group ID, Open Library work/edition key, ISBN, LibriVox ID, or provider volume ID;
+- an object model that separates concepts the user may care about, such as music release group vs exact release, book work vs edition, or audiobook work vs narrated edition;
+- disambiguation facets the LLM should compare when deterministic scoring is not enough;
+- provider-cache TTLs and provider rate-limit settings;
+- conflict reporting rather than silent first-result selection.
+
+Use the LLM deliberately for ambiguous selection and pruning. Deterministic code should collect evidence, normalize identifiers, detect conflicts, and score obvious matches. The LLM should then apply user-level constraints and explain/ask about unresolved ambiguity.
+
+## Metadata adapters, cache, and disambiguation
+
+Category metadata providers should normalize raw provider payloads into category object models and return stable provider IDs. Do not let provider adapters make irreversible library choices. The deterministic layer may score evidence, group obvious duplicate candidates, and expose conflicts, but ambiguous selection should be handed to the LLM with a compact selection packet.
+
+Use persistent cache entries for provider lookup facts, not user decisions. Cache rows may be reused as stale evidence after live provider failures only when clearly marked as stale. Providers with public rate limits must declare conservative intervals and honor `Retry-After` headers.
+
+### Local scan grouping and provider adapter boundaries
+
+If a definition-backed category needs richer local library units than generic files, declare a `local_scan.grouping_strategy` in the shareable category definition and implement reconstruction behind the category runtime. Existing strategies are intentionally broad:
+
+- `top_level_catalog` — one top-level folder can represent a catalog/artist/collection and nested files become category units.
+- `leaf_folder_or_file` — deepest folder containing accepted files becomes the item; useful for audiobook book folders or single-file narrated releases.
+- `file_or_edition_folder` — accepted files become edition-like items, with same-stem multi-format files grouped together.
+
+Local reconstruction is evidence, not authoritative identity. It should create category-owned units and a `local_object_model`, but provider metadata and the LLM still resolve ambiguous editions, narrators, translations, releases, or series order.
+
+Provider adapters belong under a provider boundary, not in the scheduler/downloader/assistant and not directly in `CategoryMetadataResolver`. The resolver owns cache, rate-limiting, stale reuse, and disambiguation. Provider modules own external URLs, raw JSON parsing, and normalization into category object models.

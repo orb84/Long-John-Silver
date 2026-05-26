@@ -172,7 +172,7 @@ class AIAssistant:
             category_registry=dependencies.category_registry,
             settings=dependencies.settings,
         )
-        self._tool_policy = AgentToolPolicy()
+        self._tool_policy = AgentToolPolicy(settings=dependencies.settings)
         self._taste_signal_ingestor = dependencies.taste_signal_ingestor or (
             TasteSignalIngestionService(
                 llm_client=dependencies.llm_client,
@@ -198,7 +198,11 @@ class AIAssistant:
         pings for trivial CHAT messages such as thanks/acknowledgements.
         """
         pending_action_context = await self._pending_actions.build_for_session(session_id)
-        intent = await self._route_intent(user_prompt, pending_action_context)
+        routing_context = await self._conversation_binding.build_intent_routing_context(
+            session_id,
+            pending_action_context=pending_action_context,
+        )
+        intent = await self._route_intent(user_prompt, routing_context)
         self._preflight_intent_cache[(session_id or "default", user_id or "", user_prompt)] = (
             intent, pending_action_context
         )
@@ -333,7 +337,11 @@ class AIAssistant:
             intent, cached_context = cached
             pending_action_context = cached_context
         else:
-            intent = await self._route_intent(user_prompt, pending_action_context)
+            routing_context = await self._conversation_binding.build_intent_routing_context(
+                session_id,
+                pending_action_context=pending_action_context,
+            )
+            intent = await self._route_intent(user_prompt, routing_context)
 
         if self._structured_logger:
             try:
@@ -350,14 +358,27 @@ class AIAssistant:
             clarification = ClarificationBuilder.build(user_prompt, intent_hint=intent_hint)
             await self._conversation_binding.record_turn(session_id, "user", user_prompt)
             await self._conversation_binding.record_turn(session_id, "assistant", clarification)
-            return ExecutionContext(intent=intent, clarification=clarification)
+            return ExecutionContext(
+                intent=intent,
+                messages=[],
+                allowed_tool_names=set(),
+                tool_definitions=None,
+                max_iterations=0,
+                task="chat",
+                clarification=clarification,
+            )
 
         # Resolve the active category before prompt/tool selection.
-        # The assistant should see only the selected category's full profile;
-        # router briefs for other categories are kept out of the main prompt to
-        # avoid bloating small/local model contexts.
-        active_category = self._category_resolver.resolve(user_prompt, intent)
+        # The assistant should see category-owned guidance, but not a full
+        # library dump unless the category confirms a matched item.  This keeps
+        # short follow-ups and factual research from losing the useful recent
+        # conversation context behind thousands of unrelated library entries.
         agent_context = self._category_resolver.build_context(user_prompt, intent)
+        active_category = (
+            self._category_registry.get(agent_context.category_id)
+            if self._category_registry and agent_context.category_id
+            else None
+        )
 
         goal_context = ""
         if intent in {Intent.SEARCH, Intent.DOWNLOAD, Intent.CONFIG}:
@@ -373,7 +394,7 @@ class AIAssistant:
         if active_category:
             category_guidance = (
                 f"ACTIVE CATEGORY: {active_category.display_name} ({active_category.category_id})\n\n"
-                f"{active_category.build_prompt_guidance(intent.value.lower())}"
+                f"{active_category.build_prompt_guidance(intent.value.lower(), settings=self._settings)}"
             )
             try:
                 import json
@@ -478,6 +499,7 @@ class AIAssistant:
             category_guidance=category_guidance,
             platform_guidance=platform_guidance,
             user_language_hint=detect_user_language_label(user_prompt),
+            active_category_id=active_category.category_id if active_category else None,
         )
 
         allowed_tool_names = self._tool_policy.allowed_tool_names(intent, category=active_category)
@@ -804,6 +826,7 @@ class AIAssistant:
             + "- Treat the ACTIVE GOAL STATE and PENDING ACTION CONTEXT as structured task state. Continue an active goal when the current user message semantically refers to it.\n"
             + "- For torrent discovery, call search_media_torrents with literal item constraints and a category-neutral search_scope. The owning category resolves latest season, missing units, packs, fallbacks, and naming schemas.\n"
             + "- When search results return candidate_picker, summarize candidates by result_set_id/candidate_id/title/size/seeders and choose by candidate_id. Ask to inspect more detail when coverage is ambiguous.\n"
+            + "- If storage context is WARNING/CRITICAL and a candidate size is known, call check_storage_capacity before claiming it cannot fit; deterministic storage math belongs to that tool/queue preflight, not prose guesses.\n"
             + "- Queue only when the chosen candidate or batch is clear and queue_download confirms status=queued or returns download IDs.\n"
             + "- If a tool returns ok=false with recoverable=true, adjust the next tool call using its next_actions instead of ending with a crash.\n"
         )

@@ -1,0 +1,14 @@
+# Local user config for shared Book metadata behavior. Copied to ignored config/categories/book.yaml.
+category_id: book
+enabled: true
+services:
+  open_library:
+    enabled: true
+  internet_archive:
+    enabled: true
+  google_books:
+    enabled: false
+    api_key: ""
+download_profile:
+  preferred_language: English
+  edition_preference: complete

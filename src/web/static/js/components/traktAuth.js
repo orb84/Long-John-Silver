@@ -57,6 +57,7 @@ function markTraktConnected() {
 async function startTraktAuth() {
     try {
         var clientIdInput = getTraktClientIdInput();
+        // Empty value intentionally means "use the bundled public LJS Trakt client ID".
         var clientId = clientIdInput ? clientIdInput.value.trim() : '';
 
         var url = '/api/trakt/auth';

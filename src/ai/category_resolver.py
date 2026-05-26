@@ -7,6 +7,7 @@ LLM calls are scoped to the category that owns the user's request.
 
 from __future__ import annotations
 
+from src.core.categories.router_matching import router_token_matches
 from src.core.models import AgentRunContext, CategoryResolution, Intent
 
 
@@ -83,11 +84,10 @@ class CategoryResolver:
         """Return category IDs whose router brief keywords match the prompt."""
         if not self._registry or not hasattr(self._registry, "router_briefs"):
             return []
-        normalized = user_message.lower()
         matches: list[str] = []
         for brief in self._registry.router_briefs():
             keywords = list(getattr(brief, "keywords", []) or [])
             keywords.extend(getattr(brief, "item_types", []) or [])
-            if any(keyword.lower() in normalized for keyword in keywords if keyword):
+            if any(router_token_matches(user_message, keyword) for keyword in keywords if keyword):
                 matches.append(brief.category_id)
         return matches

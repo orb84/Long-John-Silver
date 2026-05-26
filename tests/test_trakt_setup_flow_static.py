@@ -11,9 +11,11 @@ SETTINGS_PANEL = (ROOT / "src/web/static/js/components/settingsPanel.js").read_t
 
 
 def test_trakt_pkce_state_stores_client_id_with_verifier() -> None:
-    """Callback must use the same client ID that generated the auth URL."""
-    assert 'deps.trakt_pkce_store[state] = {"verifier": verifier, "client_id": actual_client_id}' in SYSTEM_ROUTER
-    assert 'client_id = pkce_record.get("client_id") or settings.trakt_client_id' in SYSTEM_ROUTER
+    """Callback must use the same client ID and redirect URI that generated the auth URL."""
+    assert '"client_id": actual_client_id' in SYSTEM_ROUTER
+    assert '"redirect_uri": redirect_uri' in SYSTEM_ROUTER
+    assert 'client_id = resolve_trakt_client_id(settings, pkce_record.get("client_id"))' in SYSTEM_ROUTER
+    assert 'pkce_record.get("redirect_uri") or trakt_redirect_uri_for_client' in SYSTEM_ROUTER
 
 
 def test_setup_exposes_trakt_client_and_account_status_separately() -> None:

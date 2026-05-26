@@ -21,6 +21,7 @@ class SettingsPanel extends Component {
         this._categories = [];
         this._personas = [];
         this._activePersona = null;
+        this._llmModelCache = {};
 
         if (this.container) {
             this.render();
@@ -64,9 +65,11 @@ class SettingsPanel extends Component {
     populateForm() {
         if (!this._settings) return;
         const defaultQuality = this._settings.default_quality || {};
+        const mediaProfile = ((((this._settings.category_settings || {}).media || {}).download_profile) || {});
         const llm = this._settings.llm || {};
 
         this._setVal('pref-download-dir', this._settings.download_dir || '');
+        this._setVal('pref-library-root', this._settings.library_root || './library');
         this._setVal('pref-max-concurrent', this._settings.max_concurrent_downloads || '3');
         this._setVal('pref-max-dl-speed', defaultQuality.max_download_speed_kbps || '');
         this._setVal('pref-max-ul-speed', defaultQuality.max_upload_speed_kbps || '');
@@ -86,11 +89,11 @@ class SettingsPanel extends Component {
         this._setVal('pref-sharing-duration', sharing.seed_duration_hours || '168');
         this._setCheck('pref-sharing-pause-when-downloading', !!sharing.pause_when_downloading);
 
-        this._setVal('pref-size-limit-mode', defaultQuality.size_limit_mode || 'smart');
-        this._setVal('pref-max-bitrate', defaultQuality.max_bitrate_kbps || '');
-        this._setVal('pref-max-file-size', defaultQuality.max_file_size_mb || '');
-        this._setVal('pref-resolution', defaultQuality.preferred_resolution || '1080p');
-        this._setVal('pref-language', this._settings.language || 'English');
+        this._setVal('pref-size-limit-mode', mediaProfile.size_limit_mode || defaultQuality.size_limit_mode || 'smart');
+        this._setVal('pref-max-bitrate', mediaProfile.max_bitrate_kbps || defaultQuality.max_bitrate_kbps || '');
+        this._setVal('pref-max-file-size', mediaProfile.max_file_size_mb || defaultQuality.max_file_size_mb || '');
+        this._setVal('pref-resolution', mediaProfile.preferred_resolution || defaultQuality.preferred_resolution || '1080p');
+        this._setVal('pref-language', mediaProfile.language || this._settings.language || 'English');
 
         this._setVal('pref-llm-provider', llm.active_provider || 'openrouter');
         this._setVal('pref-llm-model', llm.model || '');
@@ -102,6 +105,7 @@ class SettingsPanel extends Component {
         this._setVal('pref-llm-std-provider', (llm.standard || {}).provider || '');
         this._setVal('pref-llm-hv-model', (llm.heavy || {}).model || '');
         this._setVal('pref-llm-hv-provider', (llm.heavy || {}).provider || '');
+        this._syncLlmModelPickers(false);
         this._setVal('pref-llm-max-context', llm.max_context_tokens === null || llm.max_context_tokens === undefined ? '' : llm.max_context_tokens);
         this._setVal('pref-llm-context-budget-percent', llm.context_budget_percent || 85);
         this._setVal('pref-llm-raw-recent-percent', llm.raw_recent_context_percent === null || llm.raw_recent_context_percent === undefined ? 30 : llm.raw_recent_context_percent);
@@ -119,13 +123,14 @@ class SettingsPanel extends Component {
         this._setVal('pref-jackett-url', this._settings.jackett_url || '');
         this._setVal('pref-jackett-key', this._settings.jackett_api_key || '');
         this._setCheck('pref-direct-scraper-fallback', !!this._settings.direct_scraper_fallback);
-        this._setVal('pref-tmdb-key', this._settings.tmdb_api_key || '');
-        this._setVal('pref-opensubtitles-key', this._settings.opensubtitles_api_key || '');
-        this._setVal('pref-plex-url', this._settings.plex_url || '');
-        this._setVal('pref-plex-token', this._settings.plex_token || '');
-        this._setVal('pref-trakt-custom-id', this._settings.trakt_client_id || '');
+        const mediaServices = (((this._settings.category_settings || {}).media || {}).services || {});
+        this._setVal('pref-tmdb-key', ((mediaServices.tmdb || {}).api_key) || '');
+        this._setVal('pref-opensubtitles-key', ((mediaServices.opensubtitles || {}).api_key) || '');
+        this._setVal('pref-plex-url', ((mediaServices.plex || {}).url) || '');
+        this._setVal('pref-plex-token', ((mediaServices.plex || {}).token) || '');
+        this._setVal('pref-trakt-custom-id', ((mediaServices.trakt || {}).client_id) || '');
         const traktIdEl = document.getElementById('pref-trakt-id');
-        if (traktIdEl) traktIdEl.value = this._settings.trakt_client_id || this._defaultTraktClientId();
+        if (traktIdEl) traktIdEl.value = ((mediaServices.trakt || {}).client_id) || "";
         this._renderTraktStatus();
 
         this._setVal('pref-discord-token', this._settings.discord_token || '');
@@ -140,6 +145,7 @@ class SettingsPanel extends Component {
 
         this._populateCategoryControls();
         this._populateCategoryProviderControls();
+        this._populateCategoryDownloadProfileControls();
         this._populateCategoryNestedControls();
         this._populateCategoryServiceControls();
     }
@@ -187,12 +193,14 @@ class SettingsPanel extends Component {
     async saveDownloadQueue() {
         const downloadDir = this._input('pref-download-dir');
         const maxConcurrent = this._input('pref-max-concurrent');
+        const libraryRoot = this._input('pref-library-root');
         const autoDownload = document.getElementById('pref-auto-download');
         const autoDiscover = document.getElementById('pref-auto-discover');
 
         try {
             await APIClient.post('/api/settings/library', {
                 download_dir: downloadDir ? downloadDir.value : '',
+                library_root: libraryRoot ? libraryRoot.value : './library',
                 max_concurrent: this._intValue(maxConcurrent, 3),
                 stall_check_interval_minutes: this._intById('pref-stall-interval', 30),
                 stall_alternative_hours: this._floatById('pref-stall-alt', 1.0),
@@ -238,20 +246,28 @@ class SettingsPanel extends Component {
     }
 
     /**
-     * Save media quality and torrent-selection preferences.
+     * Save shared media download-profile preferences.
+     *
+     * These are category preferences, not global UI settings: TV Shows and
+     * Movies inherit them from the abstract ``media`` category unless they
+     * override the values in their own private category config.
      */
     async saveContentPreferences() {
         try {
-            await APIClient.post('/api/settings', {
-                default_quality: {
-                    size_limit_mode: this._valueById('pref-size-limit-mode', 'smart'),
-                    max_bitrate_kbps: this._intOrNullById('pref-max-bitrate'),
-                    max_file_size_mb: this._intOrNullById('pref-max-file-size'),
-                    preferred_resolution: this._valueById('pref-resolution', '1080p'),
-                    language: this._valueById('pref-language', 'English')
+            await APIClient.post('/api/settings/library', {
+                category_settings: {
+                    media: {
+                        download_profile: {
+                            size_limit_mode: this._valueById('pref-size-limit-mode', 'smart'),
+                            max_bitrate_kbps: this._intOrNullById('pref-max-bitrate'),
+                            max_file_size_mb: this._intOrNullById('pref-max-file-size'),
+                            preferred_resolution: this._valueById('pref-resolution', '1080p'),
+                            language: this._valueById('pref-language', 'English')
+                        }
+                    }
                 }
             });
-            toast.show('Content selection preferences saved.');
+            toast.show('Shared Media category content preferences saved.');
         } catch (err) {
             toast.error(err.message);
         }
@@ -279,6 +295,15 @@ class SettingsPanel extends Component {
             if (!categorySettings[catId].metadata.providers) categorySettings[catId].metadata.providers = {};
             categorySettings[catId].metadata.providers[provider] = { enabled: !!input.checked };
         });
+        document.querySelectorAll('.pref-category-download-profile-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const prop = input.dataset.profileName;
+            const type = input.dataset.valueType;
+            if (!catId || !prop) return;
+            if (!categorySettings[catId]) categorySettings[catId] = {};
+            if (!categorySettings[catId].download_profile) categorySettings[catId].download_profile = {};
+            categorySettings[catId].download_profile[prop] = this._coerceCategoryValue(input, type);
+        });
         document.querySelectorAll('.pref-category-nested-input').forEach(input => {
             const catId = input.dataset.categoryId;
             const section = input.dataset.sectionName;
@@ -290,12 +315,17 @@ class SettingsPanel extends Component {
             categorySettings[catId][section][prop] = this._coerceCategoryValue(input, type);
         });
 
+        const serviceSettings = this._categoryServiceSettingsPayload();
+        Object.entries(serviceSettings).forEach(([catId, values]) => {
+            if (!categorySettings[catId]) categorySettings[catId] = {};
+            categorySettings[catId].services = {
+                ...(categorySettings[catId].services || {}),
+                ...(values.services || {})
+            };
+        });
+
         try {
             await APIClient.post('/api/settings/library', { category_settings: categorySettings });
-            const integrationPayload = this._categoryIntegrationPayload();
-            if (Object.keys(integrationPayload).length) {
-                await APIClient.post('/api/settings/integrations', integrationPayload);
-            }
             toast.show('Category configuration and category services saved.');
         } catch (err) {
             toast.error(err.message);
@@ -665,6 +695,7 @@ class SettingsPanel extends Component {
         return this._panel('fa-solid fa-download', 'Downloads & Queue', 'Active torrent behavior, queue concurrency, aggregate speed caps, and stall automation live together here.', [
             this._sectionTitle('Storage & active slots'),
             this._createSettingItem('Download staging folder', 'Temporary path where active torrent payloads are written before library filing.', DOM.el('input', { type: 'text', id: 'pref-download-dir', placeholder: '/home/downloads' })),
+            this._createSettingItem('Main library root', 'Default parent folder for category libraries. Blank category paths use this root plus the category default folder, for example Music or Ebooks.', DOM.el('input', { type: 'text', id: 'pref-library-root', placeholder: '/mnt/media/LJS' })),
             this._createSettingItem('Max active downloads', 'Number of torrents allowed to actively transfer at once.', DOM.el('input', { type: 'number', id: 'pref-max-concurrent', min: '1', placeholder: '3' })),
             this._sectionTitle('Aggregate bandwidth caps'),
             this._createSettingItem('Download cap (kB/s)', 'Global session cap shared across all active torrents. Empty or 0 means unlimited.', DOM.el('input', { type: 'number', id: 'pref-max-dl-speed', min: '0', placeholder: '0 = unlimited' })),
@@ -708,20 +739,20 @@ class SettingsPanel extends Component {
      * @private
      */
     _buildContentPanel() {
-        return this._panel('fa-solid fa-filter', 'Content Selection', 'Quality, size, resolution, and language preferences used when choosing media candidates.', [
-            this._createSettingItem('Size limit mode', 'How LJS constrains torrent size during candidate selection.', DOM.el('select', { id: 'pref-size-limit-mode' }, [
+        return this._panel('fa-solid fa-filter', 'Content Selection', 'Shared Media category quality, size, resolution, and language preferences inherited by TV Shows and Movies.', [
+            this._createSettingItem('Size limit mode', 'How the shared Media category constrains torrent size during candidate selection.', DOM.el('select', { id: 'pref-size-limit-mode' }, [
                 DOM.el('option', { value: 'smart' }, ['Smart (LLM decides)']),
                 DOM.el('option', { value: 'bitrate' }, ['Max bitrate']),
                 DOM.el('option', { value: 'file_size' }, ['Max file size'])
             ])),
-            this._createSettingItem('Max bitrate (kbps)', 'Optional video bitrate ceiling.', DOM.el('input', { type: 'number', id: 'pref-max-bitrate', min: '0', placeholder: 'e.g. 8000' })),
-            this._createSettingItem('Max file size (MB)', 'Optional per-release size ceiling.', DOM.el('input', { type: 'number', id: 'pref-max-file-size', min: '0', placeholder: 'e.g. 4000' })),
-            this._createSettingItem('Preferred resolution', 'Default target resolution for search and ranking.', DOM.el('select', { id: 'pref-resolution' }, [
+            this._createSettingItem('Max bitrate (kbps)', 'Optional shared Media category video bitrate ceiling.', DOM.el('input', { type: 'number', id: 'pref-max-bitrate', min: '0', placeholder: 'e.g. 8000' })),
+            this._createSettingItem('Max file size (MB)', 'Optional shared Media category per-release size ceiling.', DOM.el('input', { type: 'number', id: 'pref-max-file-size', min: '0', placeholder: 'e.g. 4000' })),
+            this._createSettingItem('Preferred resolution', 'Default Media category target resolution for search and ranking.', DOM.el('select', { id: 'pref-resolution' }, [
                 DOM.el('option', { value: '2160p' }, ['4K / 2160p']),
                 DOM.el('option', { value: '1080p' }, ['1080p']),
                 DOM.el('option', { value: '720p' }, ['720p'])
             ])),
-            this._createSettingItem('Preferred language', 'Default audio language for discovery and ranking.', DOM.el('select', { id: 'pref-language' }, LANG_OPTIONS.map(lang => DOM.el('option', { value: lang }, [lang])))),
+            this._createSettingItem('Preferred language', 'Default Media category audio language for discovery and ranking.', DOM.el('select', { id: 'pref-language' }, LANG_OPTIONS.map(lang => DOM.el('option', { value: lang }, [lang])))),
             this._saveButton('Save Content Preferences', 'fa-solid fa-circle-check', () => this.saveContentPreferences())
         ], 'settings-content-panel');
     }
@@ -736,14 +767,49 @@ class SettingsPanel extends Component {
         if (!categories.length) {
             controls.push(DOM.el('p', { className: 'empty-msg' }, ['Category settings will appear here after the registry loads.']));
         }
-        if (categories.some(cat => (cat.setup_requirements || []).some(req => req.setting_key === 'trakt_client_id'))) {
-            controls.push(DOM.el('input', { type: 'hidden', id: 'pref-trakt-id', value: this._settings?.trakt_client_id || this._defaultTraktClientId() }));
+        if (categories.some(cat => (cat.setup_requirements || []).some(req => String(req.setting_key || '').includes('.services.trakt.client_id')))) {
+            const mediaTrakt = (((((this._settings || {}).category_settings || {}).media || {}).services || {}).trakt || {}).client_id;
+            controls.push(DOM.el('input', { type: 'hidden', id: 'pref-trakt-id', value: mediaTrakt || '' }));
         }
+        controls.push(this._mediaDefaultsBlock());
         categories.forEach(cat => controls.push(this._categorySettingsBlock(cat)));
         controls.push(this._saveButton('Save Category Settings & Services', 'fa-solid fa-folder-tree', () => this.saveCategorySettings()));
-        return this._panel('fa-solid fa-folder-open', 'Library Categories', 'Per-category paths, provider toggles, service credentials, naming, lifecycle cadence, and workflow options declared by each category manifest.', controls, 'settings-category-panel');
+        return this._panel('fa-solid fa-folder-open', 'Library Categories', 'Optional per-category path overrides, provider toggles, service credentials, naming, lifecycle cadence, and workflow options declared by each category manifest.', controls, 'settings-category-panel');
     }
 
+
+
+    /**
+     * Render the abstract Media base config shared by TV Shows and Movies.
+     * @private
+     */
+    _mediaDefaultsBlock() {
+        const services = [
+            ['tmdb', 'api_key', 'TMDB API key', 'Shared canonical metadata/artwork key for TV Shows and Movies.', true, '••••••••'],
+            ['trakt', 'client_id', 'Custom Trakt Client ID (optional)', 'Leave blank to use the bundled LJS Trakt app and its PIN/code login flow. Only set this for an advanced custom Trakt developer app.', false, 'Use bundled LJS app'],
+            ['plex', 'url', 'Plex server URL', 'Optional shared Plex endpoint for media reconciliation.', false, 'http://localhost:32400'],
+            ['plex', 'token', 'Plex token', 'Optional shared Plex token.', true, '••••••••'],
+            ['opensubtitles', 'api_key', 'OpenSubtitles API key', 'Optional shared subtitle provider key.', true, '••••••••']
+        ];
+        const children = [
+            DOM.el('p', { className: 'empty-msg' }, [
+                'These local values live in ', DOM.el('code', {}, ['config/categories/media.yaml']),
+                ' and are inherited by TV Shows and Movies. Shareable service/tool/LLM definitions live separately in ',
+                DOM.el('code', {}, ['config/category-definitions/media.yaml']), '.'
+            ])
+        ];
+        services.forEach(([serviceId, fieldKey, label, desc, secret, placeholder]) => {
+            children.push(this._createSettingItem(label, desc, this._categoryServiceControl(
+                { id: 'media', display_name: 'Media defaults' },
+                { setting_key: `category_config.media.services.${serviceId}.${fieldKey}` },
+                { label, description: desc, secret, placeholder, trakt: serviceId === 'trakt' && fieldKey === 'client_id', parsed: { categoryId: 'media', section: 'services', serviceId, fieldKey } }
+            )));
+        });
+        return DOM.el('details', { className: 'settings-details category-settings-details', open: true }, [
+            DOM.el('summary', {}, ['Media defaults · private config + shared definition']),
+            DOM.el('div', { className: 'category-settings-body' }, children)
+        ]);
+    }
 
     /**
      * Return manifest-driven setup notices for a category.
@@ -756,7 +822,8 @@ class SettingsPanel extends Component {
         missing.forEach(req => {
             notices.push(DOM.el('div', { className: 'setting-item category-setup-notice category-setup-warning' }, [
                 DOM.el('label', {}, [`Configuration needed: ${req.label || req.id}`]),
-                DOM.el('p', {}, [req.why_it_matters || req.description || 'This category needs a required setting before it can operate safely.'])
+                DOM.el('p', {}, [req.why_it_matters || req.description || 'This category needs a required setting before it can operate safely.']),
+                req.help_url ? DOM.el('a', { href: req.help_url, target: '_blank', rel: 'noopener noreferrer', className: 'api-link' }, ['Service docs / signup ↗']) : DOM.el('span', {})
             ]));
         });
         if (cat.id === 'general') {
@@ -778,13 +845,20 @@ class SettingsPanel extends Component {
      * @private
      */
     _categorySettingsBlock(cat) {
-        const title = `${cat.display_name || cat.id} · local config/categories/${cat.id}.yaml`;
+        const title = `${cat.display_name || cat.id} · private config + shared definition`;
         const children = [];
         this._categorySetupNotices(cat).forEach(node => children.push(node));
+        if (cat.default_library_path) {
+            children.push(this._createSettingItem(
+                'Default library folder',
+                'Used when the category library path below is blank. The folder is created during setup/path-save when possible.',
+                DOM.el('code', {}, [cat.default_library_path])
+            ));
+        }
 
         const properties = cat.properties || [];
         if (properties.length) {
-            children.push(this._sectionTitle('Category-owned config'));
+            children.push(this._sectionTitle('Private user config'));
             properties.forEach(prop => {
                 const desc = prop.description || `Category property: ${prop.name}`;
                 children.push(this._createSettingItem(prop.label || prop.name, desc, this._categoryInput(cat, prop)));
@@ -795,6 +869,12 @@ class SettingsPanel extends Component {
         if (providerRows.length) {
             children.push(this._sectionTitle('Metadata and discovery providers'));
             providerRows.forEach(row => children.push(row));
+        }
+
+        const downloadProfileRows = this._categoryDownloadProfileRows(cat);
+        if (downloadProfileRows.length) {
+            children.push(this._sectionTitle('Download and conversion preferences'));
+            downloadProfileRows.forEach(row => children.push(row));
         }
 
         const nestedRows = this._categoryNestedConfigRows(cat);
@@ -834,12 +914,86 @@ class SettingsPanel extends Component {
             ]);
             return this._createSettingItem(
                 this._humanizeProviderName(provider),
-                `Enable ${provider} for ${cat.display_name || cat.id}. Saved as metadata.providers.${provider}.enabled in this category config.`,
+                `Enable ${provider} for ${cat.display_name || cat.id}. Saved as metadata.providers.${provider}.enabled in private config; provider meaning lives in the category definition.`,
                 toggle
             );
         });
     }
 
+
+
+    /**
+     * Render category-owned download profile controls for non-video domains.
+     * @private
+     */
+    _categoryDownloadProfileRows(cat) {
+        const id = String(cat.id || '');
+        const rows = [];
+        if (id === 'music') {
+            rows.push(this._createSettingItem(
+                'Preferred lossless music format',
+                'Controls whether FLAC is kept as the preferred lossless target or imported lossless files get Apple Lossless M4A sidecars.',
+                this._categoryProfileSelect(cat, 'preferred_lossless_format', 'string', [
+                    ['flac', 'FLAC / keep lossless source'],
+                    ['alac_m4a', 'ALAC in .m4a for Apple Music/iOS']
+                ])
+            ));
+            rows.push(this._createSettingItem(
+                'Auto-convert lossless to lossy AAC',
+                'When enabled and AAC M4A is the preferred portable format, only lossless sources are transcoded. MP3-to-AAC is intentionally not automatic.',
+                this._categoryProfileToggle(cat, 'auto_convert_lossless_to_preferred')
+            ));
+        } else if (id === 'audiobooks') {
+            rows.push(this._createSettingItem(
+                'Preferred audiobook format',
+                'M4B is best for Apple-style audiobook playback with chapters; MP3 remains useful for broad compatibility.',
+                this._categoryProfileSelect(cat, 'preferred_audio_format', 'string', [
+                    ['m4b', 'M4B / Apple-friendly chaptered audiobook'],
+                    ['mp3', 'MP3 / broad compatibility'],
+                    ['flac', 'FLAC / archival lossless']
+                ])
+            ));
+            rows.push(this._createSettingItem(
+                'Auto-convert lossless audiobook sources',
+                'Creates an M4B/M4A sidecar from FLAC/WAV/AIFF audiobook sources while preserving the source and chapter metadata where available.',
+                this._categoryProfileToggle(cat, 'auto_convert_lossless_to_preferred')
+            ));
+        } else if (id === 'ebooks') {
+            rows.push(this._createSettingItem(
+                'Preferred ebook format',
+                'Used by search/ranking hints. LJS does not auto-convert ebooks yet because editions, DRM, scans, and layout semantics are too easy to damage.',
+                this._categoryProfileSelect(cat, 'preferred_ebook_format', 'string', [
+                    ['epub', 'EPUB / reflowable text'],
+                    ['azw3', 'AZW3 / Kindle-oriented'],
+                    ['pdf', 'PDF / fixed-layout scans']
+                ])
+            ));
+        }
+        return rows;
+    }
+
+    /**
+     * Build a download-profile select control.
+     * @private
+     */
+    _categoryProfileSelect(cat, profileName, valueType, options) {
+        const dataset = { categoryId: cat.id, profileName, valueType };
+        return DOM.el('select', { className: 'pref-category-download-profile-input', dataset },
+            options.map(([value, label]) => DOM.el('option', { value }, [label]))
+        );
+    }
+
+    /**
+     * Build a download-profile toggle control.
+     * @private
+     */
+    _categoryProfileToggle(cat, profileName) {
+        const dataset = { categoryId: cat.id, profileName, valueType: 'bool' };
+        return DOM.el('label', { className: 'toggle-switch' }, [
+            DOM.el('input', { type: 'checkbox', className: 'pref-category-download-profile-input', dataset }),
+            DOM.el('span', { className: 'slider' })
+        ]);
+    }
 
     /**
      * Render small editable controls for nested category config sections.
@@ -852,7 +1006,7 @@ class SettingsPanel extends Component {
         if (scheduler && typeof scheduler === 'object') {
             rows.push(this._createSettingItem(
                 'Scheduled category checks',
-                'Enables this category in the background scheduler. Saved as scheduler.enabled in the category YAML.',
+                'Enables this category in the background scheduler. Saved as scheduler.enabled in the private category config.',
                 this._categoryNestedToggle(cat, 'scheduler', 'enabled', 'bool')
             ));
         }
@@ -860,7 +1014,7 @@ class SettingsPanel extends Component {
         if (storage && typeof storage === 'object' && Object.prototype.hasOwnProperty.call(storage, 'inherit_global_thresholds')) {
             rows.push(this._createSettingItem(
                 'Inherit global storage thresholds',
-                'Uses the shared disk-space thresholds for this category root. Saved as storage.inherit_global_thresholds.',
+                'Uses the shared disk-space thresholds for this category root. Saved as storage.inherit_global_thresholds in private config.',
                 this._categoryNestedToggle(cat, 'storage', 'inherit_global_thresholds', 'bool')
             ));
         }
@@ -869,7 +1023,7 @@ class SettingsPanel extends Component {
             const version = lifecycle.policy_version ? `Policy v${lifecycle.policy_version}` : 'Policy declared';
             rows.push(this._createSettingItem(
                 'Lifecycle / suggestion policy',
-                'Read-only summary from lifecycle_policy. Edit config/categories YAML directly when changing policy semantics.',
+                'Read-only summary from the tracked category definition. Personal config stores only toggles/preferences.',
                 DOM.el('span', { className: 'badge' }, [version])
             ));
         }
@@ -900,6 +1054,7 @@ class SettingsPanel extends Component {
             const key = req.setting_key || req.id;
             if (!key) return;
             if (key === 'library_path') return;
+            if (String(key).startsWith('category_config.media.')) return;
             const meta = this._serviceSettingMeta(key);
             if (meta) {
                 const unique = `${cat.id}:${key}`;
@@ -926,14 +1081,53 @@ class SettingsPanel extends Component {
      * @private
      */
     _serviceSettingMeta(settingKey) {
-        const meta = {
-            tmdb_api_key: { label: 'TMDB API key', description: 'Used by categories that declare TMDB metadata enrichment.', secret: true, placeholder: '••••••••' },
-            opensubtitles_api_key: { label: 'OpenSubtitles API key', description: 'Used by categories that declare subtitle discovery or matching.', secret: true, placeholder: '••••••••' },
-            plex_url: { label: 'Plex server URL', description: 'Used by categories that can read watch state or library presence from Plex.', secret: false, placeholder: 'http://localhost:32400' },
-            plex_token: { label: 'Plex token', description: 'Used by categories that can read Plex state.', secret: true, placeholder: '••••••••' },
-            trakt_client_id: { label: 'Trakt connection', description: 'Used by categories that can sync watch state through Trakt.', secret: false, placeholder: 'Trakt Client ID', trakt: true }
+        const parsed = this._parseCategorySettingKey(settingKey);
+        const service = parsed.serviceId || '';
+        const field = parsed.fieldKey || settingKey;
+        const labelMap = {
+            tmdb: 'TMDB', tvmaze: 'TVMaze', opensubtitles: 'OpenSubtitles', trakt: 'Trakt', plex: 'Plex',
+            musicbrainz: 'MusicBrainz', cover_art_archive: 'Cover Art Archive', discogs: 'Discogs', acoustid: 'AcoustID',
+            open_library: 'Open Library', internet_archive: 'Internet Archive', google_books: 'Google Books',
+            librivox: 'LibriVox', gutendex: 'Gutendex', apple_itunes_search: 'Apple iTunes / Books', comic_vine: 'Comic Vine'
         };
-        return meta[settingKey] || null;
+        const fieldLabels = { api_key: 'API key', token: 'Token', url: 'URL', client_id: 'Client ID', enabled: 'Enabled' };
+        const secret = /key|token|secret|password/i.test(field);
+        const placeholders = {
+            api_key: '••••••••',
+            token: '••••••••',
+            url: service === 'plex' ? 'http://localhost:32400' : '',
+            client_id: service === 'trakt' ? 'Custom Trakt Client ID (optional)' : ''
+        };
+        if (parsed.categoryId && service && field) {
+            return {
+                label: `${labelMap[service] || this._humanizeProviderName(service)} ${fieldLabels[field] || this._humanizeProviderName(field)}`,
+                description: `Saved in private category config as services.${service}.${field}; service meaning lives in the category definition.`,
+                secret,
+                placeholder: placeholders[field] || '',
+                trakt: service === 'trakt' && field === 'client_id',
+                parsed
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Parse a manifest setting key like category_config.tv.services.tmdb.api_key.
+     * @private
+     */
+    _parseCategorySettingKey(settingKey, fallbackCategoryId = null) {
+        const text = String(settingKey || '');
+        const parts = text.split('.');
+        if (parts[0] === 'category_config' && parts.length >= 5) {
+            return {
+                categoryId: parts[1],
+                section: parts[2],
+                serviceId: parts[2] === 'services' ? parts[3] : null,
+                fieldKey: parts.slice(4).join('.'),
+                legacyKey: null
+            };
+        }
+        return { categoryId: fallbackCategoryId, section: null, serviceId: null, fieldKey: null, legacyKey: null };
     }
 
     /**
@@ -942,7 +1136,15 @@ class SettingsPanel extends Component {
      */
     _categoryServiceControl(cat, req, meta) {
         const settingKey = req.setting_key || req.id;
-        const id = `pref-cat-service-${cat.id}-${settingKey}`;
+        const parsed = meta.parsed || this._parseCategorySettingKey(settingKey, cat.id);
+        const id = `pref-cat-service-${parsed.categoryId || cat.id}-${parsed.serviceId || 'legacy'}-${parsed.fieldKey || settingKey}`.replace(/[^A-Za-z0-9_-]/g, '-');
+        const dataset = {
+            settingKey,
+            categoryId: parsed.categoryId || cat.id,
+            serviceId: parsed.serviceId || '',
+            serviceKey: parsed.fieldKey || '',
+            legacyKey: parsed.legacyKey || ''
+        };
         if (meta.trakt) {
             return DOM.el('div', { className: 'trakt-control category-service-control' }, [
                 DOM.el('div', { className: 'trakt-status-row' }, [
@@ -953,24 +1155,28 @@ class SettingsPanel extends Component {
                     type: 'text',
                     id,
                     className: 'pref-category-service-input',
-                    dataset: { settingKey },
+                    dataset,
                     placeholder: meta.placeholder,
-                    autocomplete: 'off',
-                    oninput: e => this._syncSharedServiceInputs(settingKey, e.target.value)
+                    autocomplete: 'off'
                 })
+            ]);
+        }
+        if (parsed.fieldKey === 'enabled') {
+            return DOM.el('label', { className: 'toggle-switch' }, [
+                DOM.el('input', { type: 'checkbox', id, className: 'pref-category-service-input', dataset }),
+                DOM.el('span', { className: 'slider' })
             ]);
         }
         return DOM.el('input', {
             type: 'text',
             id,
             className: `pref-category-service-input${meta.secret ? ' ljs-secret-input' : ''}`,
-            dataset: { settingKey },
+            dataset,
             placeholder: meta.placeholder || '',
             autocomplete: 'off',
             'data-lpignore': meta.secret ? 'true' : undefined,
             'data-1p-ignore': meta.secret ? 'true' : undefined,
-            'data-bwignore': meta.secret ? 'true' : undefined,
-            oninput: e => this._syncSharedServiceInputs(settingKey, e.target.value)
+            'data-bwignore': meta.secret ? 'true' : undefined
         });
     }
 
@@ -989,17 +1195,20 @@ class SettingsPanel extends Component {
      * Build integration payload from category service controls.
      * @private
      */
-    _categoryIntegrationPayload() {
-        const payload = {};
-        const seen = new Set();
+    _categoryServiceSettingsPayload() {
+        const categorySettings = {};
         document.querySelectorAll('.pref-category-service-input').forEach(input => {
-            const key = input.dataset.settingKey;
-            if (!key || seen.has(key)) return;
-            const value = String(input.value || '').trim();
-            payload[key] = value || null;
-            seen.add(key);
+            const catId = input.dataset.categoryId;
+            const serviceId = input.dataset.serviceId;
+            const serviceKey = input.dataset.serviceKey;
+            if (!catId || !serviceId || !serviceKey) return;
+            if (!categorySettings[catId]) categorySettings[catId] = {};
+            if (!categorySettings[catId].services) categorySettings[catId].services = {};
+            if (!categorySettings[catId].services[serviceId]) categorySettings[catId].services[serviceId] = {};
+            const value = input.type === 'checkbox' ? !!input.checked : (String(input.value || '').trim() || null);
+            categorySettings[catId].services[serviceId][serviceKey] = value;
         });
-        return payload;
+        return categorySettings;
     }
 
     /**
@@ -1016,6 +1225,22 @@ class SettingsPanel extends Component {
         });
     }
 
+
+    /**
+     * Populate category-owned download profile controls.
+     * @private
+     */
+    _populateCategoryDownloadProfileControls() {
+        document.querySelectorAll('.pref-category-download-profile-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const prop = input.dataset.profileName;
+            const catSettings = ((this._settings || {}).category_settings || {})[catId] || {};
+            const profile = catSettings.download_profile || {};
+            const value = profile[prop];
+            if (input.type === 'checkbox') input.checked = !!value;
+            else if (value !== undefined && value !== null) input.value = value;
+        });
+    }
 
     /**
      * Populate nested category config controls.
@@ -1038,15 +1263,24 @@ class SettingsPanel extends Component {
      * @private
      */
     _populateCategoryServiceControls() {
-        const defaults = { trakt_client_id: this._defaultTraktClientId() };
-        document.querySelectorAll('.pref-category-service-input').forEach(input => {
-            const key = input.dataset.settingKey;
-            if (!key) return;
-            const value = (this._settings && this._settings[key]) || defaults[key] || '';
-            input.value = value;
+                document.querySelectorAll('.pref-category-service-input').forEach(input => {
+            const catId = input.dataset.categoryId;
+            const serviceId = input.dataset.serviceId;
+            const serviceKey = input.dataset.serviceKey;
+            const legacyKey = input.dataset.legacyKey;
+            const catSettings = ((this._settings || {}).category_settings || {})[catId] || {};
+            const serviceConfig = (((catSettings.services || {})[serviceId]) || {});
+            const value = serviceConfig[serviceKey] !== undefined && serviceConfig[serviceKey] !== null
+                ? serviceConfig[serviceKey]
+                : '';
+            if (input.type === 'checkbox') input.checked = value !== false;
+            else input.value = value || '';
         });
         const hidden = document.getElementById('pref-trakt-id');
-        if (hidden) hidden.value = (this._settings && this._settings.trakt_client_id) || this._defaultTraktClientId();
+        if (hidden) {
+            const mediaTrakt = (((((this._settings || {}).category_settings || {}).media || {}).services || {}).trakt || {}).client_id;
+            hidden.value = mediaTrakt || "";
+        }
         this._renderTraktStatus();
     }
 
@@ -1059,9 +1293,9 @@ class SettingsPanel extends Component {
             if (input.dataset.settingKey !== settingKey) return;
             if (input.value !== value) input.value = value;
         });
-        if (settingKey === 'trakt_client_id') {
+        if (String(settingKey || '').includes('services.trakt.client_id')) {
             const hidden = document.getElementById('pref-trakt-id');
-            if (hidden) hidden.value = String(value || '').trim() || this._defaultTraktClientId();
+            if (hidden) hidden.value = String(value || '').trim();
         }
     }
 
@@ -1124,17 +1358,11 @@ class SettingsPanel extends Component {
      */
     _buildLlmPanel() {
         return this._panel('fa-solid fa-brain', 'AI & LLM Gateway', 'Provider, base model, and tier overrides for routing cheap vs. heavy reasoning tasks.', [
-            this._createSettingItem('Active provider', 'Primary inference backend.', DOM.el('select', { id: 'pref-llm-provider', onchange: () => this._syncLlmContextWindowControl(false) }, [
-                DOM.el('option', { value: 'openrouter' }, ['OpenRouter']),
-                DOM.el('option', { value: 'nvidia_nim' }, ['NVIDIA NIM']),
-                DOM.el('option', { value: 'ollama_cloud' }, ['Ollama Cloud']),
-                DOM.el('option', { value: 'ollama_local' }, ['Ollama Local']),
-                DOM.el('option', { value: 'lm_studio' }, ['LM Studio']),
-                DOM.el('option', { value: 'custom' }, ['Custom'])
-            ])),
-            this._createSettingItem('Base model', 'Main model used when a task has no tier override.', DOM.el('input', { type: 'text', id: 'pref-llm-model', placeholder: 'e.g. openrouter/openai/gpt-4o-mini', onchange: () => this._syncLlmContextWindowControl(false) })),
+            this._createSettingItem('Active provider', 'Primary inference backend. Choose a provider, save or configure its key, then refresh models to pick from the endpoint list.', DOM.el('select', { id: 'pref-llm-provider', onchange: () => this._onPrimaryLlmProviderChanged() }, this._llmProviderOptions())),
+            this._createSettingItem('Base model', 'Main model used when a task has no tier override. This list is loaded from the selected provider endpoint; the current custom value is preserved when the endpoint is unavailable.', this._modelSelectControl('pref-llm-model', 'pref-llm-provider', 'base')),
             this._createSettingItem('API base URL', 'Optional provider endpoint override.', DOM.el('input', { type: 'text', id: 'pref-llm-api-base', placeholder: 'Defaults if blank' })),
             this._createSettingItem('API key', 'Optional active provider key.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-llm-api-key', placeholder: '••••••••' })),
+            DOM.el('p', { className: 'empty-msg' }, ['Model menus use the provider /models endpoint. If a key or custom API base changed, save the gateway first, then refresh the model list.']),
             this._sectionTitle('Context budget'),
             this._createSettingItem('Context window cap', 'Maximum prompt context the app may assemble for the selected model. Defaults to the endpoint-reported maximum. Minimum is 10k tokens unless the endpoint itself is smaller.', this._contextWindowControl()),
             this._createSettingItem('Context budget percent', 'Safety headroom applied inside the cap before reserving output tokens.', DOM.el('input', { type: 'number', id: 'pref-llm-context-budget-percent', min: '20', max: '100', step: '1', placeholder: '85' })),
@@ -1298,6 +1526,137 @@ class SettingsPanel extends Component {
         ]);
     }
 
+
+    /**
+     * Return provider options shared by base and tier model selectors.
+     * @private
+     */
+    _llmProviderOptions() {
+        const providers = [
+            ['openrouter', 'OpenRouter'],
+            ['nvidia_nim', 'NVIDIA NIM'],
+            ['ollama_cloud', 'Ollama Cloud'],
+            ['ollama_local', 'Ollama Local'],
+            ['lm_studio', 'LM Studio'],
+            ['custom', 'Custom']
+        ];
+        return providers.map(([value, label]) => DOM.el('option', { value }, [label]));
+    }
+
+    /**
+     * Build a model selector backed by the selected provider's /models endpoint.
+     * @private
+     */
+    _modelSelectControl(modelId, providerId, tierName) {
+        return DOM.el('div', { className: 'llm-model-select-control' }, [
+            DOM.el('select', {
+                id: modelId,
+                'data-provider-input': providerId,
+                'data-tier-name': tierName || '',
+                onchange: () => {
+                    if (modelId === 'pref-llm-model') this._syncLlmContextWindowControl(false);
+                }
+            }, [DOM.el('option', { value: '' }, ['Refresh models to choose…'])]),
+            DOM.el('button', {
+                className: 'btn btn-sm btn-secondary',
+                type: 'button',
+                onclick: () => this._refreshLlmModelSelect(modelId, providerId, true)
+            }, ['Refresh models'])
+        ]);
+    }
+
+    /**
+     * Handle active-provider changes by reloading endpoint model choices.
+     * @private
+     */
+    _onPrimaryLlmProviderChanged() {
+        this._refreshLlmModelSelect('pref-llm-model', 'pref-llm-provider', false);
+        this._syncLlmContextWindowControl(false);
+    }
+
+    /**
+     * Refresh all visible LLM model selectors from their provider endpoints.
+     * @private
+     */
+    _syncLlmModelPickers(refresh) {
+        ['pref-llm-model', 'pref-llm-lw-model', 'pref-llm-std-model', 'pref-llm-hv-model'].forEach(modelId => {
+            const el = this._input(modelId);
+            if (!el) return;
+            const providerId = el.dataset.providerInput || 'pref-llm-provider';
+            this._refreshLlmModelSelect(modelId, providerId, refresh === true);
+        });
+    }
+
+    /**
+     * Populate one model select with models pulled from the selected endpoint.
+     * @private
+     */
+    async _refreshLlmModelSelect(modelId, providerInputId, refresh) {
+        const select = this._input(modelId);
+        if (!select) return;
+        const providerEl = this._input(providerInputId);
+        const provider = (providerEl && providerEl.value) || this._valueById('pref-llm-provider', 'openrouter');
+        const previous = select.value || this._configuredModelValue(modelId) || '';
+        if (!provider) {
+            this._populateModelSelect(select, [], previous, 'Choose a provider first');
+            return;
+        }
+        const cacheKey = `${provider}:${refresh ? 'refresh' : 'cached'}`;
+        select.innerHTML = '';
+        select.appendChild(DOM.el('option', { value: previous || '' }, [previous ? `Loading models… (${previous})` : 'Loading models…']));
+        try {
+            let models = this._llmModelCache[provider];
+            if (refresh || !Array.isArray(models)) {
+                const data = await APIClient.get(`/api/providers/${encodeURIComponent(provider)}/models?refresh=${refresh ? 'true' : 'false'}`);
+                models = data.models || [];
+                this._llmModelCache[provider] = models;
+            }
+            this._populateModelSelect(select, models, previous, 'No models returned by endpoint');
+            if (modelId === 'pref-llm-model') this._syncLlmContextWindowControl(false);
+        } catch (err) {
+            this._populateModelSelect(select, [], previous, `Model list unavailable: ${err.message}`);
+        }
+        void cacheKey;
+    }
+
+    /**
+     * Return the saved model value for a base/tier selector.
+     * @private
+     */
+    _configuredModelValue(modelId) {
+        const llm = (this._settings || {}).llm || {};
+        if (modelId === 'pref-llm-model') return llm.model || '';
+        const key = modelId.includes('-lw-') ? 'lightweight' : (modelId.includes('-std-') ? 'standard' : (modelId.includes('-hv-') ? 'heavy' : ''));
+        return key ? ((llm[key] || {}).model || '') : '';
+    }
+
+    /**
+     * Render endpoint models into a select while preserving current custom IDs.
+     * @private
+     */
+    _populateModelSelect(select, models, selectedValue, emptyLabel) {
+        const current = String(selectedValue || '').trim();
+        select.innerHTML = '';
+        const seen = new Set();
+        if (!models.length) {
+            select.appendChild(DOM.el('option', { value: current || '' }, [current || emptyLabel]));
+            select.value = current || '';
+            return;
+        }
+        select.appendChild(DOM.el('option', { value: '' }, ['Choose a model…']));
+        models.forEach(model => {
+            const id = String(model.id || model.name || '').trim();
+            if (!id || seen.has(id)) return;
+            seen.add(id);
+            const label = model.name && model.name !== id ? `${model.name} · ${id}` : id;
+            select.appendChild(DOM.el('option', { value: id }, [label]));
+        });
+        if (current && !seen.has(current)) {
+            select.appendChild(DOM.el('option', { value: current }, [`Current/custom: ${current}`]));
+        }
+        select.value = current && (seen.has(current) || current) ? current : '';
+    }
+
     /**
      * Mark context cap as explicitly edited by the user.
      * @private
@@ -1384,9 +1743,14 @@ class SettingsPanel extends Component {
      * @private
      */
     _tierControl(prefix) {
-        return DOM.el('div', { className: 'tier-control' }, [
-            DOM.el('input', { type: 'text', id: `pref-llm-${prefix}-model`, placeholder: 'Model override' }),
-            DOM.el('input', { type: 'text', id: `pref-llm-${prefix}-provider`, placeholder: 'Provider' })
+        const providerId = `pref-llm-${prefix}-provider`;
+        const modelId = `pref-llm-${prefix}-model`;
+        return DOM.el('div', { className: 'tier-control llm-tier-control' }, [
+            DOM.el('select', { id: providerId, onchange: () => this._refreshLlmModelSelect(modelId, providerId, true) }, [
+                DOM.el('option', { value: '' }, ['Use active provider']),
+                ...this._llmProviderOptions()
+            ]),
+            this._modelSelectControl(modelId, providerId, prefix)
         ]);
     }
 
@@ -1396,7 +1760,7 @@ class SettingsPanel extends Component {
      */
     _traktControl() {
         return DOM.el('div', { className: 'trakt-control' }, [
-            DOM.el('input', { type: 'hidden', id: 'pref-trakt-id', value: this._defaultTraktClientId() }),
+            DOM.el('input', { type: 'hidden', id: 'pref-trakt-id', value: '' }),
             DOM.el('div', { className: 'trakt-status-row' }, [
                 DOM.el('span', { id: 'pref-trakt-status', className: 'badge' }, ['Not Connected']),
                 DOM.el('button', { className: 'btn btn-sm btn-secondary', type: 'button', onclick: () => this._startTraktAuth() }, ['Link Account'])
@@ -1405,7 +1769,7 @@ class SettingsPanel extends Component {
                 DOM.el('summary', {}, ['Remote setup / custom Trakt app']),
                 DOM.el('input', { type: 'text', id: 'pref-trakt-custom-id', placeholder: 'Custom Trakt Client ID', oninput: e => {
                     const hidden = document.getElementById('pref-trakt-id');
-                    if (hidden) hidden.value = e.target.value.trim() || this._defaultTraktClientId();
+                    if (hidden) hidden.value = e.target.value.trim();
                 }})
             ])
         ]);
@@ -1456,7 +1820,11 @@ class SettingsPanel extends Component {
     _renderTraktStatus() {
         const statuses = document.querySelectorAll('#pref-trakt-status, .pref-trakt-status');
         if (!statuses.length) return;
-        const connected = !!(this._settings && this._settings.trakt_access_token);
+        const categorySettings = ((this._settings || {}).category_settings || {});
+        const connected = !!(
+            (((((this._settings || {}).category_settings || {}).media || {}).services || {}).trakt || {}).access_token ||
+            Object.values(categorySettings).some(cat => (((cat || {}).services || {}).trakt || {}).access_token)
+        );
         statuses.forEach(status => {
             status.textContent = connected ? 'Connected' : 'Not Connected';
             status.classList.toggle('success', connected);
@@ -1609,13 +1977,6 @@ class SettingsPanel extends Component {
         return input.value.trim();
     }
 
-    /**
-     * Return the bundled Trakt client ID fallback.
-     * @private
-     */
-    _defaultTraktClientId() {
-        return '42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac';
-    }
 }
 
 window.SettingsPanel = SettingsPanel;

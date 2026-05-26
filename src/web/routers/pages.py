@@ -8,6 +8,7 @@ settings, and the first-time setup wizard.
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from src.integrations.trakt_defaults import is_bundled_trakt_client_id
 from src.web.dependencies import WebDependencies, verify_auth
 
 
@@ -72,6 +73,7 @@ class PagesRouter:
             "request": request,
             "settings": settings,
             "categories": self._template_categories(),
+            "trakt_custom_client_id": self._custom_trakt_client_id(settings),
         })
 
     async def _setup_page(self, request: Request):
@@ -79,14 +81,16 @@ class PagesRouter:
         if deps.settings_manager.settings.setup_complete:
             return RedirectResponse(url="/", status_code=302)
         presets = deps.llm_manager.list_providers()
+        settings = deps.settings_manager.settings
         return deps.templates.TemplateResponse(request, "setup.html", {
             "request": request,
             "presets": presets,
-            "settings": deps.settings_manager.settings,
+            "settings": settings,
             "categories": self._template_categories(),
-            "default_provider": deps.settings_manager.settings.llm.active_provider,
-            "default_model": deps.settings_manager.settings.llm.model,
-            "default_api_base": deps.settings_manager.settings.llm.api_base or "",
+            "trakt_custom_client_id": self._custom_trakt_client_id(settings),
+            "default_provider": settings.llm.active_provider,
+            "default_model": settings.llm.model,
+            "default_api_base": settings.llm.api_base or "",
         })
 
     def _template_categories(self) -> list[dict]:
@@ -100,8 +104,23 @@ class PagesRouter:
                 "id": category.category_id,
                 "display_name": category.display_name,
                 "default_folder": category.default_folder,
+                "default_library_path": category.default_root_path(settings) if hasattr(category, "default_root_path") else "",
+                "effective_library_path": category.get_root_path(settings),
                 "properties": [p.model_dump() for p in category.get_properties(settings)],
                 "setup_requirements": [r.model_dump() for r in category.setup_requirements(settings)],
             }
             for category in registry.list_all()
         ]
+
+    @staticmethod
+    def _custom_trakt_client_id(settings) -> str:
+        """Return only a user-supplied/custom Trakt app ID for template fields.
+
+        The bundled public Client ID is intentionally not echoed into custom-app
+        inputs.  Blank UI values mean "use the bundled LJS Trakt app".
+        """
+        configured = settings.category_service_value("media", "trakt", "client_id") if hasattr(settings, "category_service_value") else None
+        configured_text = str(configured or "").strip()
+        if not configured_text or is_bundled_trakt_client_id(configured_text):
+            return ""
+        return configured_text

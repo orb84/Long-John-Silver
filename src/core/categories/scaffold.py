@@ -35,7 +35,8 @@ class CategoryScaffoldService:
             files={
                 f"src/core/categories/custom/{spec.category_id}.py": self.render_module(spec),
                 f"src/core/categories/prompts/{spec.category_id}.md": self.render_prompt(spec),
-                f"config/category-templates/{spec.category_id}.yaml": self.render_config(spec),
+                f"config/category-definitions/{spec.category_id}.yaml": self.render_definition(spec),
+                f"config/category-config-templates/{spec.category_id}.yaml": self.render_config_template(spec),
                 f"tests/test_category_{spec.category_id}.py": self.render_test(spec),
             },
             warnings=warnings,
@@ -292,26 +293,49 @@ class {spec.class_name}(CategoryMedia):
 {examples}
 """
 
-    def render_config(self, spec: CategorySpec) -> str:
-        """Render default per-category YAML config."""
+    def render_definition(self, spec: CategorySpec) -> str:
+        """Render the shareable category-definition YAML.
+
+        Definitions are safe to commit/share. They describe behavior, services,
+        tools, lifecycle semantics, and release conventions, but never private
+        paths or real credentials.
+        """
+        discovery_yaml = self._render_discovery_yaml(spec)
+        download_yaml = self._render_download_profile_yaml(spec)
+        lifecycle_yaml = self._render_lifecycle_policy_yaml(spec)
+        return (
+            f"category_id: {spec.category_id}\n"
+            "definition_version: 1\n"
+            f"{download_yaml}"
+            f"{lifecycle_yaml}"
+            f"{discovery_yaml}"
+            "tools:\n"
+            "  allowed_generic: [search_media_torrents, inspect_torrent_candidate, queue_download, list_library_files]\n"
+            "  category_workflows: []\n"
+            "llm_guidance:\n"
+            "  behavior:\n"
+            f"    - Use {spec.display_name} category rules before generic web search.\n"
+            "    - Keep category-specific ambiguity, file formats, and service behavior inside this category contract.\n"
+        )
+
+    def render_config_template(self, spec: CategorySpec) -> str:
+        """Render the blank private-config template for first launch."""
         property_lines: list[str] = []
         for prop in spec.properties:
             if prop.name == "library_path":
                 continue
             property_lines.append(f"  {prop.name}: {repr(prop.default_value)}")
         properties = "\nproperties:\n" + "\n".join(property_lines) + "\n" if property_lines else ""
-        discovery_yaml = self._render_discovery_yaml(spec)
-        download_yaml = self._render_download_profile_yaml(spec)
-        lifecycle_yaml = self._render_lifecycle_policy_yaml(spec)
         return (
             f"category_id: {spec.category_id}\n"
             "enabled: true\n"
             "paths:\n"
             f"  library_path: ./library/{spec.default_folder}\n"
             f"{properties}"
-            f"{download_yaml}"
-            f"{lifecycle_yaml}"
-            f"{discovery_yaml}"
+            "scheduler:\n"
+            "  enabled: false\n"
+            "storage:\n"
+            "  inherit_global_thresholds: true\n"
         )
 
     def render_test(self, spec: CategorySpec) -> str:

@@ -6,11 +6,12 @@ language, and completion. All endpoints are unprotected (no auth
 required) since setup runs before a password is configured.
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 
 from src.core.models import ActionCommand, ActionSource
-from src.web.dependencies import WebDependencies
+from src.integrations.trakt_defaults import has_bundled_trakt_client_id, resolve_trakt_client_id
+from src.web.dependencies import WebDependencies, verify_auth
 
 
 class SetupRouter:
@@ -36,6 +37,7 @@ class SetupRouter:
         router.add_api_route("/api/setup/requirements", self._setup_requirements, methods=["GET"])
         router.add_api_route("/api/setup/password", self._setup_password, methods=["POST"])
         router.add_api_route("/api/setup/paths", self._setup_paths, methods=["POST"])
+        router.add_api_route("/api/setup/category-config", self._setup_category_config, methods=["POST"])
         router.add_api_route("/api/setup/llm", self._setup_llm, methods=["POST"])
         router.add_api_route("/api/setup/embeddings", self._setup_embeddings, methods=["POST"])
         router.add_api_route("/api/setup/channels", self._setup_channels, methods=["POST"])
@@ -67,19 +69,20 @@ class SetupRouter:
                 "settings_path": str(deps.settings_manager.settings_path),
                 "settings_template_path": str(deps.settings_manager.settings_template_path),
                 "category_config_dir": str(deps.settings_manager.category_config_dir),
-                "category_template_dir": str(deps.settings_manager.category_template_dir),
+                "category_config_templates_dir": str(deps.settings_manager.category_template_dir),
+                "category_definitions_dir": str(deps.settings_manager.category_definition_dir),
                 "jackett_configured": bool(settings.jackett_url and settings.jackett_api_key),
                 "direct_scraper_fallback": bool(settings.direct_scraper_fallback),
                 "web_search": settings.web_search.model_dump(),
                 "embeddings": settings.embeddings.model_dump(),
-                "tmdb_configured": bool(settings.tmdb_api_key),
-                "trakt_client_available": bool(settings.trakt_client_id),
-                "trakt_connected": bool(settings.trakt_access_token),
-                "trakt_uses_builtin_client": settings.trakt_client_id == "42bc6ba1535878e40f4773d3e064809f8caf7347e4ba2b3f3ddc61b32f1ab2ac",
+                "tmdb_configured": bool(settings.category_service_value("media", "tmdb", "api_key")),
+                "trakt_client_available": bool(resolve_trakt_client_id(settings)),
+                "trakt_uses_builtin_client": has_bundled_trakt_client_id(),
+                "trakt_connected": bool(settings.category_service_value("media", "trakt", "access_token")),
             },
         }
 
-    async def _setup_password(self, request: Request):
+    async def _setup_password(self, request: Request, _auth: bool = Depends(verify_auth)):
         body = await request.json()
         password = body.get("password", "")
         confirm = body.get("confirm", "")
@@ -89,16 +92,27 @@ class SetupRouter:
             'password': password, 'confirm': confirm,
         })
 
-    async def _setup_paths(self, request: Request):
+    async def _setup_paths(self, request: Request, _auth: bool = Depends(verify_auth)):
         body = await request.json()
         return await self._execute_action('setup_paths', dict(body))
 
-    async def _setup_llm(self, request: Request):
+    async def _setup_llm(self, request: Request, _auth: bool = Depends(verify_auth)):
         body = await request.json()
         return await self._execute_action('setup_llm', dict(body))
 
+    async def _setup_category_config(self, request: Request, _auth: bool = Depends(verify_auth)):
+        """Save first-run category-local services/preferences.
 
-    async def _setup_embeddings(self, request: Request):
+        This is the setup-safe counterpart of Compass category saves.  It keeps
+        TMDB/Trakt/Plex/OpenSubtitles, paths, and media download preferences in
+        ignored category config rather than global settings.
+        """
+        body = await request.json()
+        payload = body.get("category_settings") if isinstance(body, dict) else None
+        return await self._execute_action('setup_category_config', {'category_settings': payload or {}})
+
+
+    async def _setup_embeddings(self, request: Request, _auth: bool = Depends(verify_auth)):
         """Save first-run semantic-memory embedding settings."""
         body = await request.json()
         allowed = {
@@ -107,16 +121,16 @@ class SetupRouter:
         }
         return await self._execute_action('setup_embeddings', {key: body[key] for key in allowed if key in body})
 
-    async def _setup_channels(self, request: Request):
+    async def _setup_channels(self, request: Request, _auth: bool = Depends(verify_auth)):
         body = await request.json()
         return await self._execute_action('setup_channels', dict(body))
 
-    async def _setup_language(self, request: Request):
+    async def _setup_language(self, request: Request, _auth: bool = Depends(verify_auth)):
         body = await request.json()
         lang = body.get("language", "English")
         return await self._execute_action('setup_language', {'language': lang})
 
-    async def _setup_sharing(self, request: Request):
+    async def _setup_sharing(self, request: Request, _auth: bool = Depends(verify_auth)):
         """Save first-run sharing and seed-in-place choices."""
         body = await request.json()
         allowed = {
@@ -127,12 +141,12 @@ class SetupRouter:
         return await self._execute_action('setup_sharing', {key: body[key] for key in allowed if key in body})
 
 
-    async def _setup_startup(self, request: Request):
+    async def _setup_startup(self, request: Request, _auth: bool = Depends(verify_auth)):
         """Save first-run launch-at-login preference."""
         body = await request.json()
         return await self._execute_action('setup_startup', {'enabled': bool(body.get('enabled'))})
 
-    async def _setup_complete(self, request: Request):
+    async def _setup_complete(self, request: Request, _auth: bool = Depends(verify_auth)):
         """Complete setup only when required category-first checks pass."""
         validation = await self._validate_setup()
         if validation["missing_required"]:
@@ -162,10 +176,13 @@ class SetupRouter:
             return
 
         if getattr(deps, "scheduler", None):
-            supervisor.spawn_one_shot(
-                "post_setup_library_scan",
-                deps.scheduler.scan_library(force=True),
-            )
+            if hasattr(deps.scheduler, "request_library_scan"):
+                deps.scheduler.request_library_scan(force=True, refresh_metadata=True, reason="post_setup")
+            else:
+                supervisor.spawn_one_shot(
+                    "post_setup_library_scan",
+                    deps.scheduler.scan_library(force=True),
+                )
 
         if getattr(deps, "comms_registry", None):
             async def _restart_comms() -> None:
@@ -216,13 +233,13 @@ class SetupRouter:
                             "label": requirement.label,
                             "message": requirement.description,
                         })
-        if not settings.trakt_client_id:
+        if not resolve_trakt_client_id(settings):
             warnings.append({
                 "id": "trakt_client",
                 "label": "Trakt client",
-                "message": "Trakt account linking needs a client ID. The bundled LJS client ID is normally used automatically.",
+                "message": "This build is missing the bundled public Trakt Client ID; add it to src/integrations/trakt_defaults.py or set LJS_BUNDLED_TRAKT_CLIENT_ID.",
             })
-        elif not settings.trakt_access_token:
+        elif not settings.category_service_value("media", "trakt", "access_token"):
             warnings.append({
                 "id": "trakt_account",
                 "label": "Trakt account",

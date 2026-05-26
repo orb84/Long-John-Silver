@@ -49,7 +49,7 @@ class TvSuggestionWorkflow:
     def tmdb(self) -> "TMDBClient | None":
         """Return a current TMDB client when the user configured a key."""
         if self._sm:
-            api_key = self._sm.settings.tmdb_api_key
+            api_key = self._sm.settings.category_service_value("tv", "tmdb", "api_key")
             if api_key and (not self._tmdb or getattr(self._tmdb, "_api_key", None) != api_key):
                 from src.integrations.tmdb import TMDBClient
 

@@ -1,0 +1,18 @@
+# Local user config for Music. Copied to ignored config/categories/music.yaml.
+category_id: music
+enabled: true
+services:
+  musicbrainz:
+    enabled: true
+  cover_art_archive:
+    enabled: true
+download_profile:
+  preferred_lossless_format: flac
+  preferred_container: folder_per_album
+  preferred_bitrate_kbps: 320
+  apple_compatibility: convert_flac_to_alac_m4a_when_requested
+  transcode_policy: keep_source_and_write_sidecar
+scheduler:
+  enabled: true
+storage:
+  inherit_global_thresholds: true

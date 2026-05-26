@@ -128,6 +128,11 @@ class MetadataLookupTool:
                     "type": "boolean",
                     "description": "Whether to include episode lists when available. Defaults to true when season is provided.",
                 },
+                "category_id": {
+                    "type": "string",
+                    "description": "Optional category whose service settings should be used, usually tv or movie.",
+                    "enum": ["tv", "movie", "general"],
+                },
             },
             "required": ["query"],
         }
@@ -162,7 +167,7 @@ class MetadataLookupTool:
             if request.service == "auto" and self._result_can_answer(library_result, request):
                 return self._success_payload(request, services_tried, results, library_result)
 
-        tmdb_client = await self._clients.get_tmdb_client()
+        tmdb_client = await self._clients.get_tmdb_client(request.category_id)
         availability = self._clients.availability(
             library_snapshot_found=bool(library_result),
             imdb_client_ready=bool(self._ia),
@@ -246,9 +251,14 @@ class MetadataLookupTool:
                 return None
 
             result_type = "movie" if request.media_type == "movie" else "tv"
-            if selected and selected.get("type") in {"movie", "tv"}:
+            if selected and selected.get("type") in {"movie", "tv", "person"}:
                 result_type = selected["type"]
-            if request.media_type == "movie":
+            if request.media_type == "person" or result_type == "person":
+                if not hasattr(client, "get_person_details"):
+                    return None
+                details = await client.get_person_details(tmdb_id)
+                result_type = "person"
+            elif request.media_type == "movie":
                 details = await client.get_movie_details(tmdb_id)
             else:
                 details = await client.get_tv_details(tmdb_id)
@@ -629,7 +639,7 @@ class ResearchToolProvider:
         """Return instantiated research tool instances."""
         tmdb_setting_present = False
         if self._settings_manager is not None:
-            tmdb_setting_present = bool(getattr(self._settings_manager.settings, "tmdb_api_key", None))
+            tmdb_setting_present = bool(self._settings_manager.settings.first_category_service_value(["tv", "movie", "media"], "tmdb", "api_key"))
         logger.info(
             "Research metadata tool wiring: tmdb_client_injected={} tmdb_setting_present={} "
             "tvmaze_client_injected={} settings_manager_injected={} database_injected={}",

@@ -695,7 +695,7 @@ src/web/routers/pages.py            HTML page routes.
 
 UI rule: prefer manifest-driven category rendering. Do not add hardcoded `/api/shows` or static TV/movie assumptions in global JavaScript.
 
-Trakt is presented differently from API-key providers: LJS ships with a public bundled Trakt client ID for PKCE/OOB login, while user-specific access and refresh tokens are created only after account authorization. The setup and settings UI should explain this distinction and keep custom Trakt client IDs as an advanced option.
+Trakt is presented differently from simple API-key providers: the bundled LJS Client ID is public app configuration in `src/integrations/trakt_defaults.py`, while user-specific access and refresh tokens are created only after account authorization. The bundled app uses Trakt's out-of-band PIN/code redirect URI (`urn:ietf:wg:oauth:2.0:oob`); custom developer apps may use the local callback URL. The optional custom Client ID and all tokens still belong under the abstract `media` category service config, not global settings.
 
 ## 13. Communication Bridges
 
@@ -712,7 +712,7 @@ Bridges should call the same `AIAssistant` and notification services used by the
 
 ### `src/core/config.py`
 
-`SettingsManager` loads live global YAML from ignored `config/settings.local.yaml`, bootstraps it from tracked `config/settings.template.yaml`, migrates legacy `config/settings.yaml` when present, loads live category YAML from ignored `config/categories/<category_id>.yaml`, and bootstraps missing category files from tracked `config/category-templates/<category_id>.yaml`.
+`SettingsManager` loads live global YAML from ignored `config/settings.local.yaml`, bootstraps it from tracked `config/settings.template.yaml`, loads live category YAML from ignored `config/categories/<category_id>.yaml`, and bootstraps missing category files from tracked `config/category-config-templates/<category_id>.yaml` plus shareable definitions from `config/category-definitions/<category_id>.yaml`. The old `config/settings.yaml` path is not a live source in the fresh-install architecture. The category loader resolves abstract parent definitions such as `media.yaml`; TV/Movie use `extends: media` so shared services/tools/defaults live once and child YAML files contain only private overrides.
 
 Important nested configs:
 
@@ -730,12 +730,12 @@ QualityProfile
 .env.example
 config/settings.template.yaml
 config/settings.local.yaml        # ignored live file
-config/category-templates/tv.yaml
-config/category-templates/movie.yaml
+config/category-definitions/*.yaml        # tracked shareable category contracts
+config/category-config-templates/*.yaml   # tracked blank local-category defaults
 config/categories/*.yaml          # ignored live files
 ```
 
-Environment variables may be used for deployment overrides, but normal UI/setup edits write to ignored local files. `config/settings.template.yaml` and `config/category-templates/*.yaml` are public defaults and must not contain secrets. `config/settings.local.yaml` stores live global configuration such as setup completion, global download folder, LLM provider, web-search provider, storage thresholds, and global integrations. Category-specific live paths, naming templates, scheduler defaults, metadata-provider usage, and storage overrides live in ignored `config/categories/<category_id>.yaml`; services consume the merged effective map through `Settings.category_settings`.
+Environment variables may be used for deployment overrides, but normal UI/setup edits write to ignored local files. `config/settings.template.yaml`, `config/category-definitions/*.yaml`, and `config/category-config-templates/*.yaml` are public definitions/templates and must not contain secrets. `config/settings.local.yaml` stores live global configuration such as setup completion, global download folder, global library root, LLM provider, web-search provider, storage thresholds, bridge tokens, and torrent-indexer settings. Category-owned live path overrides, service credentials, provider enable flags, naming templates, scheduler defaults, download preferences, and storage overrides live in ignored `config/categories/<category_id>.yaml`; services consume the merged effective map through `Settings.category_settings`. If a category `library_path` is blank or absent, runtime resolves it to `settings.library_root/<category default_folder>` and setup/path saves create the global/category folders best-effort.
 
 ## 15. Tests and Guard Scripts
 

@@ -1,0 +1,16 @@
+# Local user config for Audiobooks. Copied to ignored config/categories/audiobooks.yaml.
+category_id: audiobooks
+enabled: true
+services:
+  librivox:
+    enabled: true
+download_profile:
+  preferred_audio_format: m4b
+  preferred_lossy_format: m4b_aac
+  preferred_bitrate_kbps: 128
+  preserve_chapters: true
+  chapter_strategy: prefer_m4b_chapters_or_companion_cue
+scheduler:
+  enabled: false
+storage:
+  inherit_global_thresholds: true

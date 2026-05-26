@@ -9,6 +9,8 @@ inherit the safe generic defaults from CategoryContractMixin.
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
+import shutil
 from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
@@ -19,6 +21,7 @@ from src.core.models import (
     CategoryActionDeclaration,
     CategoryLlmProfile,
     CategoryManifest,
+    CategoryRuntimeDependency,
     CategorySetupRequirement,
     CategoryUiSection,
     CategoryWorkflowDeclaration,
@@ -64,22 +67,208 @@ class CategoryContractMixin(CategoryContextMixin):
         value = self.category_runtime_config(settings).get(section)
         return value if isinstance(value, dict) else {}
 
+    def category_service_config(self, settings: Optional['Settings'], service_id: str) -> dict[str, Any]:
+        """Return this category's local configuration for one external service.
+
+        Live values are read from ignored ``config/categories/<category_id>.yaml``
+        under ``services.<service_id>``.  ``metadata.providers.<service_id>`` can contribute enable/disable flags, while credentials and service behavior live under ``services``. Category code should call this method instead of reading global service fields directly.
+        """
+        services = self.category_config_section(settings, "services")
+        service_cfg = services.get(service_id) if isinstance(services, dict) else None
+        result = dict(service_cfg) if isinstance(service_cfg, dict) else {}
+
+        metadata = self.category_config_section(settings, "metadata")
+        providers = metadata.get("providers") if isinstance(metadata, dict) else {}
+        provider_cfg = providers.get(service_id) if isinstance(providers, dict) else None
+        if isinstance(provider_cfg, dict):
+            result = {**provider_cfg, **result}
+        elif isinstance(provider_cfg, bool) and "enabled" not in result:
+            result["enabled"] = provider_cfg
+        return result
+
+    def category_service_enabled(
+        self,
+        settings: Optional['Settings'],
+        service_id: str,
+        default: bool = True,
+    ) -> bool:
+        """Return whether one category-declared external service is enabled."""
+        cfg = self.category_service_config(settings, service_id)
+        if "enabled" in cfg:
+            return bool(cfg.get("enabled"))
+        return bool(default)
+
+    def category_service_secret(
+        self,
+        settings: Optional['Settings'],
+        service_id: str,
+        key: str,
+    ) -> str | None:
+        """Return one service value from this category's effective config.
+
+        Effective config may be inherited from an abstract base such as
+        ``media``. There is deliberately no global fallback: category YAML is the
+        authority for category-owned services.
+        """
+        cfg = self.category_service_config(settings, service_id)
+        value = cfg.get(key)
+        if value not in (None, ""):
+            return str(value)
+        return None
+
+    def category_download_profile(self, settings: Optional['Settings']) -> dict[str, Any]:
+        """Return category-owned download preferences such as quality/language."""
+        return self.category_config_section(settings, "download_profile")
+
+    def language_is_search_relevant(self) -> bool:
+        """Return whether torrent search should use language as a hard facet.
+
+        TV, movies, audiobooks, and ebooks often need language constraints;
+        music albums usually do not.  The default preserves legacy media
+        behavior, while definition-backed categories can opt out declaratively
+        instead of leaking global TV/movie language preferences into every
+        category.
+        """
+        return True
+
+    def normalize_search_language(self, language: str | None, *, explicit: bool = False) -> str | None:
+        """Return the category-approved language constraint for torrent search.
+
+        Args:
+            language: Candidate language constraint from the user, tracked item,
+                or global settings.
+            explicit: Whether the value came from an explicit tool argument.
+
+        Returns:
+            A normalized language string, or ``None`` when language should not
+            affect this category's torrent query/ranking.
+        """
+        value = str(language or "").strip()
+        if not value:
+            return None
+        return value if self.language_is_search_relevant() else None
+
+    def uses_global_quality_profile(self) -> bool:
+        """Return whether global video-oriented quality defaults apply here.
+
+        Legacy media categories use the shared ``QualityProfile`` resolution and
+        codec defaults.  New definition-backed domains can opt out so values
+        like 1080p/720p do not leak into music, ebook, audiobook, or other
+        non-video searches.
+        """
+        return True
+
+    def category_tool_policy(self, settings: Optional['Settings']) -> dict[str, Any]:
+        """Return category-owned LLM tool exposure preferences."""
+        return self.category_config_section(settings, "tools")
+
+    def category_llm_guidance(self, settings: Optional['Settings']) -> dict[str, Any]:
+        """Return natural-language guidance loaded from the category config.
+
+        This lets a tracked category definition teach the assistant domain behavior,
+        release-name examples, ambiguity rules, and tool-use preferences without
+        editing the global prompt builder. Ignored live YAML stores only
+        private enable flags and preferences for that definition.
+        """
+        return self.category_config_section(settings, "llm_guidance")
+
+    def category_configured_tool_names(self, settings: Optional['Settings']) -> list[str]:
+        """Return tool names listed in ``tools.allowed_generic/category_workflows``.
+
+        The names are declarative policy. The ToolRegistry still decides whether
+        a named tool actually exists, and AgentToolPolicy still applies intent
+        and risk gates. This prevents YAML from inventing executable plumbing
+        while allowing category packages to document the tools they want the LLM
+        to consider.
+        """
+        policy = self.category_tool_policy(settings)
+        names: list[str] = []
+        for key in ("allowed_generic", "category_workflows", "tools"):
+            values = policy.get(key) if isinstance(policy, dict) else None
+            if isinstance(values, list):
+                names.extend(str(value) for value in values if value)
+        return sorted(set(names))
+
+    def category_runtime_dependencies(self, settings: Optional['Settings']) -> dict[str, Any]:
+        """Return dependency declarations loaded from category YAML.
+
+        Dependencies are declarative preflight facts, not executable plugin code.
+        The category/workflow implementation decides how to use them.
+        """
+        return self.category_config_section(settings, "runtime_dependencies")
+
+    def resolved_runtime_dependencies(self, settings: Optional['Settings']) -> list[CategoryRuntimeDependency]:
+        """Return category runtime dependencies with local availability status."""
+        raw = self.category_runtime_dependencies(settings)
+        result: list[CategoryRuntimeDependency] = []
+        for dep_id, dep_cfg in sorted((raw or {}).items()):
+            if not isinstance(dep_cfg, dict):
+                continue
+            kind = str(dep_cfg.get("kind") or "binary")
+            command = str(dep_cfg.get("command") or dep_id)
+            configured = self._dependency_available(kind, command)
+            severity = dep_cfg.get("severity") or ("required" if dep_cfg.get("required") else "info")
+            try:
+                result.append(CategoryRuntimeDependency(
+                    id=str(dep_id),
+                    label=str(dep_cfg.get("label") or dep_id),
+                    kind=kind,
+                    command=command,
+                    required=bool(dep_cfg.get("required", False)),
+                    configured=configured,
+                    purpose=str(dep_cfg.get("purpose") or ""),
+                    install_hint=str(dep_cfg.get("install_hint") or ""),
+                    validation_action=dep_cfg.get("validation_action"),
+                    severity=severity,
+                ))
+            except Exception as exc:
+                logger.warning(f"Invalid runtime dependency declaration for {self.category_id}.{dep_id}: {exc}")
+        return result
+
+    @staticmethod
+    def _dependency_available(kind: str, command: str) -> bool:
+        """Check whether a declared dependency appears locally available."""
+        if not command:
+            return False
+        if kind == "binary":
+            return shutil.which(command) is not None
+        if kind == "python_package":
+            return importlib.util.find_spec(command) is not None
+        # Services and other declarative dependencies need explicit category checks.
+        return False
+
+    def sanitized_service_settings(self, settings: Optional['Settings']) -> list[dict[str, Any]]:
+        """Return category service settings without leaking secret values.
+
+        Services are category-owned contracts: a category may declare TMDB,
+        Trakt, Plex, OpenSubtitles, or future services with labels, purposes,
+        enable flags, credentials, and LLM usage notes. The manifest exposes the
+        contract and configured/unconfigured status, never raw secrets.
+        """
+        services = self.category_config_section(settings, "services")
+        result: list[dict[str, Any]] = []
+        for service_id, raw_cfg in sorted((services or {}).items()):
+            if not isinstance(raw_cfg, dict):
+                continue
+            safe: dict[str, Any] = {"id": service_id}
+            for key, value in raw_cfg.items():
+                lower = key.lower()
+                is_secret = any(token in lower for token in ("key", "token", "secret", "password"))
+                if is_secret:
+                    safe[f"{key}_configured"] = bool(value)
+                    safe[f"{key}_secret"] = True
+                else:
+                    safe[key] = value
+            result.append(safe)
+        return result
+
     def metadata_provider_enabled(self, settings: Optional['Settings'], provider: str, default: bool = True) -> bool:
         """Return whether a category metadata/discovery provider is enabled.
 
         This reads ``metadata.providers.<provider>.enabled`` from the owning
-        category config.  Missing values inherit ``default`` so existing installs
-        remain compatible while new category YAML can explicitly disable a
-        provider without generic code learning provider semantics.
+        category config.  Missing values inherit ``default`` so category YAML can explicitly disable a provider without generic code learning provider semantics.
         """
-        metadata = self.category_config_section(settings, "metadata")
-        providers = metadata.get("providers") if isinstance(metadata, dict) else {}
-        provider_cfg = providers.get(provider) if isinstance(providers, dict) else None
-        if isinstance(provider_cfg, dict) and "enabled" in provider_cfg:
-            return bool(provider_cfg.get("enabled"))
-        if isinstance(provider_cfg, bool):
-            return provider_cfg
-        return bool(default)
+        return self.category_service_enabled(settings, provider, default=default)
 
     def lifecycle_policy_from_settings(self, settings: Optional['Settings'] = None) -> dict[str, Any]:
         """Return lifecycle policy with category YAML overrides applied."""
@@ -88,6 +277,26 @@ class CategoryContractMixin(CategoryContextMixin):
         if configured:
             policy.update(configured)
         return policy
+
+    def llm_profile_for_settings(self, settings: Optional['Settings'] = None) -> CategoryLlmProfile:
+        """Return the category LLM profile with YAML guidance merged in."""
+        profile = self.llm_profile()
+        guidance = self.category_llm_guidance(settings)
+        if not guidance:
+            return profile
+        behavior = guidance.get("behavior")
+        if isinstance(behavior, list):
+            profile.tool_usage_notes.extend(str(item) for item in behavior if item)
+        search_examples = guidance.get("search_examples")
+        if isinstance(search_examples, list):
+            profile.search_rules.append("Category release/query examples: " + "; ".join(str(item) for item in search_examples[:8]))
+        extra_search = guidance.get("search_rules")
+        if isinstance(extra_search, list):
+            profile.search_rules.extend(str(item) for item in extra_search if item)
+        extra_download = guidance.get("download_rules")
+        if isinstance(extra_download, list):
+            profile.download_rules.extend(str(item) for item in extra_download if item)
+        return profile
 
     def router_brief(self) -> CategoryRouterBrief:
         """Return the compact category-router description."""
@@ -159,15 +368,15 @@ class CategoryContractMixin(CategoryContextMixin):
     def discovery_contract(self) -> list[dict[str, Any]]:
         """Return declarative discovery/enrichment services owned by this category.
 
-        Core code should not learn provider-specific semantics. Categories declare the provider id,
-        purpose, required settings, and taste metadata it can contribute.
+        This static contract names provider families; live service details and
+        secrets come from ``config/categories/<category_id>.yaml``.
         """
         return [
             {
                 "provider": provider,
                 "purpose": "metadata_enrichment",
                 "required": False,
-                "setting_keys": [],
+                "setting_keys": [f"category_config.{self.category_id}.services.{provider}"],
                 "taste_metadata_keys": self.taste_profile_schema().get("common_keys", []),
             }
             for provider in self.metadata_provider_names
@@ -178,9 +387,24 @@ class CategoryContractMixin(CategoryContextMixin):
 
         The generic search pipeline calls this hook instead of branching on
         category IDs for quality limits, language defaults, or other domain
-        preparation. The default is a no-op.
+        preparation. The default applies safe category ``download_profile``
+        values when the item supports those fields.
         """
-        return item
+        profile = self.category_download_profile(settings)
+        if not profile or not hasattr(item, "model_copy"):
+            return item
+        item_copy = item.model_copy(deep=True)
+        language = profile.get("language")
+        if language and hasattr(item_copy, "language") and not getattr(item_copy, "language", None):
+            item_copy.language = language
+        quality = getattr(item_copy, "quality", None)
+        preferred_resolution = profile.get("preferred_resolution")
+        if quality is not None and preferred_resolution and hasattr(quality, "preferred_resolution"):
+            quality.preferred_resolution = str(preferred_resolution)
+        size_mode = profile.get("size_limit_mode")
+        if quality is not None and size_mode and hasattr(quality, "size_limit_mode"):
+            quality.size_limit_mode = str(size_mode)
+        return item_copy
 
 
     def ui_sections(self) -> list[CategoryUiSection]:
@@ -299,23 +523,31 @@ class CategoryContractMixin(CategoryContextMixin):
         if settings is not None:
             properties = [prop.model_dump() for prop in self.get_properties(settings)]
             setup_requirements = self.setup_requirements(settings)
-        profile = self.llm_profile()
+        profile = self.llm_profile_for_settings(settings)
+        configured_tool_names = self.category_configured_tool_names(settings)
         return CategoryManifest(
             category_id=self.category_id,
             display_name=self.display_name,
             description=profile.user_facing_description,
             default_folder=self.default_folder,
+            default_library_path=self.default_root_path(settings) if settings is not None and hasattr(self, "default_root_path") else "",
+            effective_library_path=self.get_root_path(settings) if settings is not None else "",
             icon=self.icon,
             media_kind=self.media_kind,
             capabilities=list(self.capabilities),
             metadata_providers=list(self.metadata_provider_names),
             discovery_sources=self.discovery_contract(),
+            service_settings=self.sanitized_service_settings(settings),
+            download_profile=self.category_download_profile(settings),
+            tool_policy=self.category_tool_policy(settings),
+            llm_guidance=self.category_llm_guidance(settings),
             properties=properties,
             ui_sections=self.ui_sections(),
             actions=self.declare_actions(),
             workflows=self.declare_workflows(),
             setup_requirements=setup_requirements,
-            tool_names=self.declare_tool_names(),
+            runtime_dependencies=self.resolved_runtime_dependencies(settings),
+            tool_names=sorted(set(self.declare_tool_names() + configured_tool_names)),
             supported_operations=list(self.supported_operations),
             router_brief=self.router_brief(),
             llm_summary=profile.short_description,
@@ -329,14 +561,65 @@ class CategoryContractMixin(CategoryContextMixin):
         return sorted(set(self.category_tool_names + action_tools + workflow_tools))
 
     def provider_setup_requirements(self, settings: 'Settings') -> list[CategorySetupRequirement]:
-        """Return provider-specific setup requirements declared by the category.
+        """Return setup requirements derived from category service declarations.
 
-        The base category intentionally does not know which providers need API
-        keys, which are keyless, or what a provider contributes. Concrete
-        categories can override this hook and append provider-specific guidance
-        while the global setup UI remains category-neutral.
+        Category YAML describes services under ``services`` with labels, purposes,
+        optional fields, and enable flags. The base implementation turns that
+        declarative contract into setup guidance so new categories do not require
+        global setup-code branches for every provider.
         """
-        return []
+        services = self.category_config_section(settings, "services")
+        requirements: list[CategorySetupRequirement] = []
+        for service_id, service_cfg in sorted((services or {}).items()):
+            if not isinstance(service_cfg, dict):
+                continue
+            requirements.extend(self._service_setup_requirements(str(service_id), service_cfg))
+        return requirements
+
+    def _service_setup_requirements(self, service_id: str, service_cfg: dict[str, Any]) -> list[CategorySetupRequirement]:
+        """Build setup rows for one declarative service config."""
+        label = str(service_cfg.get("label") or service_id.replace("_", " ").title())
+        purpose = str(service_cfg.get("purpose") or service_cfg.get("llm_usage") or "Category service.")
+        fields = service_cfg.get("fields") if isinstance(service_cfg.get("fields"), dict) else {}
+        enabled = service_cfg.get("enabled", True)
+        requirements: list[CategorySetupRequirement] = []
+
+        credential_fields = [
+            (str(field), str(kind))
+            for field, kind in fields.items()
+            if str(field) != "enabled" and str(kind) in {"secret", "string", "token", "url"}
+        ]
+        if not credential_fields:
+            requirements.append(CategorySetupRequirement(
+                id=f"{service_id}_service",
+                label=label,
+                description=f"{purpose} No credential is required; this can be toggled per category.",
+                required=bool(service_cfg.get("required", False)),
+                configured=bool(enabled),
+                setting_key=f"category_config.{self.category_id}.services.{service_id}.enabled",
+                help_url=service_cfg.get("help_url"),
+                severity=str(service_cfg.get("severity") or "info"),
+                why_it_matters=str(service_cfg.get("why_it_matters") or ""),
+            ))
+            return requirements
+
+        for field, kind in credential_fields:
+            value = service_cfg.get(field)
+            field_required = bool(service_cfg.get("required", False) or service_cfg.get("required_fields", []) and field in service_cfg.get("required_fields", []))
+            is_secret = kind in {"secret", "token"} or any(token in field.lower() for token in ("key", "token", "secret", "password"))
+            requirements.append(CategorySetupRequirement(
+                id=f"{service_id}_{field}",
+                label=f"{label} {field.replace('_', ' ')}",
+                description=purpose,
+                required=field_required,
+                configured=bool(value),
+                setting_key=f"category_config.{self.category_id}.services.{service_id}.{field}",
+                help_url=service_cfg.get("help_url"),
+                severity=str(service_cfg.get("severity") or ("required" if field_required else "recommended")),
+                why_it_matters=str(service_cfg.get("why_it_matters") or ""),
+                secret=is_secret,
+            ))
+        return requirements
 
 
     def setup_requirements(self, settings: 'Settings') -> list[CategorySetupRequirement]:
@@ -349,18 +632,23 @@ class CategoryContractMixin(CategoryContextMixin):
         """
         category_settings = settings.category_settings.get(self.category_id, {})
         library_path = str(category_settings.get("library_path") or "").strip()
+        default_path = self.default_root_path(settings) if hasattr(self, "default_root_path") else str(Path(settings.library_root) / self.default_folder)
         requirements = [
             CategorySetupRequirement(
                 id="library_path",
                 label=f"{self.display_name} library folder",
                 description=(
-                    f"Where completed {self.display_name.lower()} files are organized. "
-                    "This can be an existing Plex/Emby/Jellyfin library folder."
+                    f"Optional override for completed {self.display_name.lower()} files. "
+                    f"Leave blank to use the library root default: {default_path}"
                 ),
-                required=True,
-                configured=bool(library_path),
+                required=False,
+                configured=bool(getattr(settings, "library_root", "")),
                 setting_key=f"category_config.{self.category_id}.paths.library_path",
-                severity="required",
+                severity="info",
+                why_it_matters=(
+                    "Use a category override only when this category belongs on a different disk, share, "
+                    "or existing server library. Otherwise LJS creates the default folder under the global library root."
+                ),
             )
         ]
 
@@ -383,6 +671,18 @@ class CategoryContractMixin(CategoryContextMixin):
             )
 
         requirements.extend(self.provider_setup_requirements(settings))
+        for dependency in self.resolved_runtime_dependencies(settings):
+            requirements.append(CategorySetupRequirement(
+                id=f"runtime_{dependency.id}",
+                label=dependency.label,
+                description=dependency.purpose or f"Runtime dependency for {self.display_name}.",
+                required=dependency.required,
+                configured=dependency.configured,
+                setting_key=f"runtime_dependencies.{self.category_id}.{dependency.id}",
+                action=dependency.validation_action,
+                severity=dependency.severity,
+                why_it_matters=dependency.install_hint,
+            ))
 
         requirements.append(
             CategorySetupRequirement(
@@ -441,6 +741,26 @@ class CategoryContractMixin(CategoryContextMixin):
             ),
             technical_message="Category workflow declaration exists without implementation.",
         )
+
+
+    async def after_library_file_imported(
+        self,
+        *,
+        imported_path: Path,
+        source_path: Path,
+        item: Any,
+        settings: Optional['Settings'],
+        file_info: Any | None = None,
+    ) -> list[Path]:
+        """Run optional category-owned post-import work.
+
+        Download orchestration calls this after a completed payload has been
+        hardlinked/copied into the category library.  The default does nothing.
+        Categories may return extra sidecar paths they created (for example an
+        Apple-friendly M4A/M4B audio sidecar) so the library reconciler can
+        refresh those files as part of the same managed mutation.
+        """
+        return []
 
 
 

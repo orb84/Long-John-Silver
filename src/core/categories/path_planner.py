@@ -91,7 +91,7 @@ class CategoryPathPlanner:
 
         New category code should call ``compute_target_path_from_fields`` so the
         generic planner is not treated as owning any category-specific unit
-        vocabulary.  This wrapper remains for existing category templates and
+        vocabulary.  This wrapper remains for existing category callers and
         tests; the fields are merely passed through as category-supplied data.
         """
         fields = {

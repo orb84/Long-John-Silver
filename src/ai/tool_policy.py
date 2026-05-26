@@ -21,9 +21,14 @@ class AgentToolPolicy:
     """Computes allowed LLM tools from intent, category manifest, and risk.
 
     The policy exposes only generic application tools plus tools declared by the
-    selected category. Legacy global TMDB/TVMaze/show/delete tools are not
-    allow-listed here; category workflows/actions own those behaviors.
+    selected category. Category YAML may further allow/deny generic tools, but
+    YAML never creates executable plumbing: a tool must still be registered in
+    ToolRegistry and pass the intent/risk gate.
     """
+
+    def __init__(self, settings: object | None = None) -> None:
+        """Create a policy evaluator with optional live settings."""
+        self._settings = settings
 
     _GENERIC_READ_TOOLS = {
         "get_category_definitions",
@@ -102,6 +107,9 @@ class AgentToolPolicy:
         "research_category_download_profile",
         "preview_category_scaffold",
         "apply_category_scaffold",
+        "create_scheduled_task",
+        "list_scheduled_tasks",
+        "remove_scheduled_task",
     }
 
     def allowed_tool_names(
@@ -125,19 +133,30 @@ class AgentToolPolicy:
         if category is None:
             return generic_tools
 
+        tool_policy = category.category_tool_policy(self._settings) if hasattr(category, "category_tool_policy") else {}
+
         if intent == Intent.SEARCH:
-            # SEARCH also uses generic read tools. Category-specific state is
-            # exposed through the category context packet, enquire_about_media,
-            # metadata_lookup, and get_category_manifest instead of bespoke tools.
-            return generic_tools
+            # Category search workflows are now part of the category contract.
+            # Expose only the selected category's read-risk SEARCH workflows/actions,
+            # avoiding the old global pile of TV/movie-specific tools while still
+            # letting a category teach the LLM its own domain operations.
+            return self._apply_category_yaml_tool_policy(
+                generic_tools | self._category_tools_for_intent(category, {"read"}, confirmed, intent),
+                tool_policy,
+            )
         if intent == Intent.DOWNLOAD:
-            # DOWNLOAD is intentionally restricted to a small generic toolchain.
-            # Categories provide context, descriptors, search/ranking hooks, and
-            # UI actions, but the LLM must not see dozens of category-specific
-            # micro-tools such as tv.find_missing_episodes or books.download_volume.
-            return generic_tools
+            # Download turns need the generic candidate workspace plus the selected
+            # category's declared read/write download workflows. Destructive tools
+            # remain gated by confirmation and are not exposed by default.
+            return self._apply_category_yaml_tool_policy(
+                generic_tools | self._category_tools_for_intent(category, {"read", "write"}, confirmed, intent),
+                tool_policy,
+            )
         if intent == Intent.CONFIG:
-            return generic_tools | self._category_action_tools(category, {"read", "write", "destructive"}, confirmed)
+            return self._apply_category_yaml_tool_policy(
+                generic_tools | self._category_action_tools(category, {"read", "write", "destructive"}, confirmed),
+                tool_policy,
+            )
         if intent == Intent.CHAT:
             return generic_tools
         return generic_tools
@@ -163,6 +182,30 @@ class AgentToolPolicy:
         tool_names = self.allowed_tool_names(intent, category=category, confirmed=confirmed)
         return registry.get_definitions(tool_names) or None
 
+    def _apply_category_yaml_tool_policy(self, allowed: set[str], policy: dict | None) -> set[str]:
+        """Apply declarative category allow/deny hints to registered tool names.
+
+        ``tools.allowed_generic`` and ``tools.category_workflows`` can only keep
+        names that were already allowed by intent/risk rules. This makes the
+        category config authoritative about what the category wants to expose
+        without letting a YAML file invent or escalate tool access.
+        """
+        if not isinstance(policy, dict):
+            return allowed
+        deny = {str(name) for name in policy.get("deny", []) if name}
+        requested: set[str] = set()
+        for key in ("allowed_generic", "category_workflows", "tools"):
+            values = policy.get(key)
+            if isinstance(values, list):
+                requested.update(str(name) for name in values if name)
+        result = set(allowed) - deny
+        if requested:
+            # Preserve always-safe manifest/status helpers while narrowing the
+            # noisy domain/search surface to what the category declared.
+            always = {"get_category_definitions", "get_category_manifest", "get_library_status", "get_storage_status"}
+            result = (result & requested) | (result & always)
+        return result
+
     def _generic_tools_for_intent(self, intent: Intent) -> set[str]:
         """Return generic tool names for an intent."""
         if intent == Intent.SEARCH:
@@ -185,11 +228,12 @@ class AgentToolPolicy:
         category: MediaCategory,
         allowed_risks: set[str],
         confirmed: bool,
+        intent: Intent | None = None,
     ) -> set[str]:
-        """Return declared category action and workflow tools matching risk."""
+        """Return declared category action and workflow tools matching risk/intent."""
         return (
             self._category_action_tools(category, allowed_risks, confirmed)
-            | self._category_workflow_tools(category, allowed_risks, confirmed)
+            | self._category_workflow_tools(category, allowed_risks, confirmed, intent)
         )
 
     def _category_action_tools(
@@ -216,10 +260,13 @@ class AgentToolPolicy:
         category: MediaCategory,
         allowed_risks: set[str],
         confirmed: bool,
+        intent: Intent | None = None,
     ) -> set[str]:
-        """Return category workflow tool names filtered by risk."""
+        """Return category workflow tool names filtered by risk and routed intent."""
         allowed: set[str] = set()
         for workflow in category.declare_workflows():
+            if intent is not None and workflow.intent != intent:
+                continue
             risk = workflow.risk_level
             if risk not in allowed_risks:
                 continue

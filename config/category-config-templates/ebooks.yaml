@@ -1,0 +1,15 @@
+# Local user config for Ebooks. Copied to ignored config/categories/ebooks.yaml.
+category_id: ebooks
+enabled: true
+services:
+  gutendex:
+    enabled: true
+download_profile:
+  preferred_ebook_format: epub
+  preferred_ebook_formats: [epub, azw3, pdf]
+  format_priority: [epub, azw3, mobi, pdf, djvu, cbz, cbr]
+  preferred_language: English
+scheduler:
+  enabled: false
+storage:
+  inherit_global_thresholds: true

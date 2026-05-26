@@ -18,7 +18,7 @@ from src.ai.agent_loop_state import (
 from src.ai.tool_executor import ToolCallExecutor
 from src.ai.reasoning import ReasoningPlanner
 from src.ai.plan_executor import PlanExecutor
-from src.core.models import AgentPlan, PlanExecutionResult, AgentLoopState, PlanExecutionStep
+from src.core.models import AgentPlan, PlanExecutionResult, AgentLoopState, PlanExecutionStep, ToolExecutionContext
 from src.utils.circuit_breaker import CircuitOpenError
 from src.ai.error_presenter import AgentErrorPresenter
 from src.ai.bare_tool_call import BareToolCallDetector
@@ -189,6 +189,7 @@ class AgentLoopExecutor:
                             arguments_raw=recovered.arguments,
                             tool_call_id=recovered.call_id,
                             allowed_tool_names=allowed_tool_names,
+                            tool_context=self._tool_context(session_id),
                         )
                         loop_state.tool_results.append(result_summary)
                         messages.append(result_message)
@@ -211,6 +212,7 @@ class AgentLoopExecutor:
                             arguments_raw=function_args,
                             tool_call_id=tool_call_id,
                             allowed_tool_names=allowed_tool_names,
+                            tool_context=self._tool_context(session_id),
                         )
                     )
                     loop_state.tool_results.append(result_summary)
@@ -246,6 +248,16 @@ class AgentLoopExecutor:
             loop_state=loop_state,
             tool_results_count=len(loop_state.tool_results),
         )
+
+    @staticmethod
+    def _tool_context(session_id: str | None) -> ToolExecutionContext:
+        """Build lightweight invocation context for declarative tools."""
+        source = "web"
+        if session_id and ":" in session_id:
+            source = session_id.split(":", 1)[0] or "web"
+        elif session_id and "_" in session_id:
+            source = session_id.split("_", 1)[0] or "web"
+        return ToolExecutionContext(session_id=session_id, source=source)
 
     async def _execute_plan_steps(
         self,

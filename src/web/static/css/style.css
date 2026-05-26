@@ -949,6 +949,34 @@ input:-webkit-autofill:active {
   font-weight: 600;
 }
 
+/* Keep assistant-rendered remote artwork inside the chat bubble.
+   Metadata tools may return cover URLs and the LLM can render them as Markdown
+   images; without explicit constraints a full-resolution cover can expand the
+   whole Helm panel. */
+.msg-bubble {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.msg-bubble img {
+  display: inline-block;
+  max-width: min(100%, 180px);
+  max-height: 180px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 10px;
+}
+.msg-bubble table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.msg-bubble td img,
+.msg-bubble th img {
+  max-width: 96px;
+  max-height: 96px;
+}
+
 /* Immediate UI Feedback styles for pending actions */
 .download-card.dl-card-pending {
   opacity: 0.8;

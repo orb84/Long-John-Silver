@@ -12,6 +12,8 @@ The feature is intentionally user-level and opt-in. It does not install a servic
 | Linux desktop sessions | freedesktop autostart entry | `~/.config/autostart/long-john-silver.desktop` |
 | Windows | Current-user Run key | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
 
+Headless Linux servers and Docker/container deployments should use an external supervisor such as systemd or the container runtime. The in-app checkbox intentionally handles login-session startup only.
+
 The implementation lives in `src/core/autostart.py` behind `AutoStartManager`.
 
 ## User experience
@@ -27,7 +29,8 @@ Compass exposes the same checkbox. Enabling it writes the OS entry immediately; 
 1. **No admin privileges.** LJS only writes per-user startup entries.
 2. **No hidden behavior.** The setting is persisted as `Settings.auto_start_at_login`, and the OS entry is reconciled best-effort on app launch.
 3. **No platform logic in UI code.** Web actions call `AutoStartManager`; templates and JavaScript only deal with a checkbox.
-4. **Packaged-app ready.** Source checkouts default to `sys.executable main.py`; future app bundles can pass an explicit command to `AutoStartManager` without changing UI/actions.
+4. **Packaged-app ready.** Source checkouts default to the source root containing `main.py` plus `sys.executable`; future app bundles can pass an explicit command to `AutoStartManager` without changing UI/actions.
+5. **Stale entry detection.** Existing launch files/registry values are considered enabled only when they point at the current checkout/command. Moving the project and enabling the checkbox rewrites the entry instead of reporting a stale path as healthy.
 
 ## Startup reconciliation
 

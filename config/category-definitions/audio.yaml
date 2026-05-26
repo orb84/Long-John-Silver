@@ -1,0 +1,100 @@
+category_id: audio
+abstract: true
+definition_version: 1
+runtime_dependencies:
+  ffmpeg:
+    label: FFmpeg audio converter
+    kind: binary
+    command: ffmpeg
+    required: true
+    severity: required
+    purpose: Required for category audio-conversion workflows, including FLAC to Apple
+      Lossless ALAC in .m4a and high-quality AAC .m4a conversions.
+    install_hint: Install FFmpeg with your platform package manager, for example macOS
+      Homebrew `brew install ffmpeg`, Debian/Ubuntu `sudo apt install ffmpeg`, Fedora
+      `sudo dnf install ffmpeg`, or Windows `winget install Gyan.FFmpeg`.
+formats:
+  accepted_file_patterns:
+  - '*.flac'
+  - '*.alac'
+  - '*.m4a'
+  - '*.m4b'
+  - '*.mp3'
+  - '*.aac'
+  - '*.ogg'
+  - '*.opus'
+  - '*.wav'
+  - '*.aiff'
+  - '*.ape'
+  lossless_codecs:
+  - FLAC
+  - ALAC
+  - WAV
+  - AIFF
+  - APE
+  lossy_codecs:
+  - AAC
+  - MP3
+  - Opus
+  - OGG
+  apple_friendly_containers:
+  - m4a
+  - m4b
+  apple_lossless_codec: ALAC
+  release_terms:
+  - FLAC
+  - ALAC
+  - AAC
+  - MP3
+  - Opus
+  - 320kbps
+  - V0
+  - VBR
+  - CBR
+  - 16bit
+  - 24bit
+  - 44.1kHz
+  - 48kHz
+  - 96kHz
+download_profile:
+  preferred_lossless_format: flac
+  preferred_lossy_format: aac
+  preferred_bitrate_kbps: 256
+  apple_compatibility: convert_lossless_to_alac_m4a_when_requested
+  transcode_policy: keep_source_and_write_sidecar
+  preserve_chapters: true
+tools:
+  allowed_generic:
+  - search_media_torrents
+  - inspect_torrent_candidate
+  - queue_download
+  - list_library_files
+  category_workflows:
+  - convert_audio_for_apple
+  llm_usage_notes:
+  - Use the owning concrete audio category when searching/queueing audio torrents;
+    the audio definition only contributes shared format and conversion behavior.
+  - Do not claim FLAC is Apple Music's native lossless library format. For Apple-friendly
+    lossless sidecar files, convert to ALAC inside .m4a.
+llm_guidance:
+  behavior:
+  - Audio categories must distinguish codec, container, bitrate, sample rate, bit
+    depth, disc/track ordering, and whether the user wants lossless preservation or
+    portable lossy files.
+  - Keep the original lossless source when transcoding unless the user explicitly
+    asks to replace it.
+  - Prefer ALAC in .m4a for Apple-friendly lossless files and AAC in .m4a for portable
+    lossy Apple-friendly files.
+  search_rules:
+  - Preserve user format constraints such as FLAC, ALAC, AAC, MP3 320, Opus, 24bit,
+    vinyl rip, remaster, explicit, clean, deluxe, and edition tags.
+  download_rules:
+  - Reject candidates that are obvious video, software, books, or unrelated documents
+    unless the concrete category says they are valid companion files.
+display_name: Audio
+default_folder: Audio
+icon: waveform
+media_kind: audio_capability
+search_policy:
+  language_relevant: false
+  use_global_quality_profile: false

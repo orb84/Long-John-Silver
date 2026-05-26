@@ -10,8 +10,10 @@ config/categories/*.yml
 config/local*.yaml
 config/*secret*.yaml
 !config/settings.template.yaml
-!config/category-templates/
-!config/category-templates/*.yaml
+!config/category-definitions/
+!config/category-definitions/*.yaml
+!config/category-config-templates/
+!config/category-config-templates/*.yaml
 
 # Runtime key stores, local databases, caches, and diagnostics
 data/api_keys.json
@@ -29,6 +31,7 @@ diagnostics/
 # Local download/library directories
 downloads/
 library/
+!library/.gitkeep
 
 # Python runtime/build artifacts
 __pycache__/

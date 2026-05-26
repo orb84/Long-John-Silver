@@ -1,0 +1,55 @@
+# TV Shows category definition. Safe to commit/share.
+category_id: tv
+extends: media
+definition_version: 1
+services:
+  tvmaze:
+    label: TVMaze
+    purpose: Keyless TV schedules and episode-level air-date checks.
+    llm_usage: Use for aired/future episode checks and missing-episode reasoning.
+    fields:
+      enabled: bool
+metadata:
+  providers:
+    tvmaze:
+      enabled: true
+download_profile:
+  format_examples:
+    - Show.Name.S05E01.ITA.1080p.WEB-DL.x265
+    - Show Name S05 Complete ITA 1080p
+    - Show.Name.S05E01-E10.1080p
+tools:
+  category_workflows:
+    - tv.resolve_show
+    - tv.find_missing_episodes
+    - tv.download_next_missing_episode
+    - tv.download_specific_episode
+    - tv.download_season_pack
+    - tv.download_missing_batch
+  llm_usage_notes:
+    - Resolve the show and season/episode facts before searching if the user asks for latest season, missing episodes, or aired status.
+    - Prefer category workflows over generic web search when TV metadata/services can answer the question.
+llm_guidance:
+  behavior:
+    - Treat a short correction or follow-up as referring to the active TV goal when recent context makes that clear.
+    - Use episode-level evidence for episode air-date claims.
+    - A season pack is preferred, not mandatory, unless the user says pack-only.
+  search_examples:
+    - Yellowstone S05 ITA 1080p
+    - Yellowstone Season 5 Complete ITA
+    - Yellowstone S05E01-E14 ITA
+lifecycle_policy:
+  policy_version: 2
+  identity_fields: [provider, external_id, title, first_air_date]
+  lifecycle_fields: [airing_status, next_air_date, season_status, missing_episodes, language, quality, release_cadence, specials]
+  suggestion_types: [missing_episode, download_next, download_all_missing, download_remaining_next, quality_upgrade, related_media, metadata_repair]
+  invalidation_triggers: [library_changed, metadata_changed, taste_changed, download_completed, download_failed, new_episode_detected, user_quality_or_language_changed, manual_refresh, policy_version_changed]
+  active_check_interval_days: 7
+  inactive_check_interval_days: 90
+  ended_check_interval_days: 180
+  upgrade_scan_interval_days: 30
+  default_check_interval_days: 30
+  llm_policy_description: >-
+    For TV, suggestions depend on airing status, next known episode date, missing aired episodes,
+    season completeness, language, release quality, and upgrade opportunities. Stable suggestions
+    remain valid until the next known air date or a library/provider/preference change invalidates them.

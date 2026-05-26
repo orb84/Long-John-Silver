@@ -1,0 +1,10 @@
+# Local user config for shared Audio behavior. Copied to ignored config/categories/audio.yaml.
+category_id: audio
+enabled: true
+download_profile:
+  preferred_lossless_format: flac
+  preferred_lossy_format: aac
+  preferred_bitrate_kbps: 256
+  apple_compatibility: convert_lossless_to_alac_m4a_when_requested
+  transcode_policy: keep_source_and_write_sidecar
+  preserve_chapters: true

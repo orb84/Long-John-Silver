@@ -35,7 +35,7 @@ class MediaClassifier:
         Returns:
             "movie" or "tv".
         """
-        api_key = self._settings_manager.settings.tmdb_api_key if self._settings_manager else None
+        api_key = self._settings_manager.settings.first_category_service_value(["tv", "movie", "media"], "tmdb", "api_key") if self._settings_manager else None
         if not api_key:
             logger.debug(f"No TMDB API key configured; falling back to keyword heuristics for '{name}'")
             return self._heuristic_classify(name)

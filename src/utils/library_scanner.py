@@ -149,6 +149,7 @@ class LibraryScanner:
                 subtitle_languages=list(getattr(episode, "subtitle_languages", []) or []),
                 subtitle_tracks=list(getattr(episode, "subtitle_tracks", []) or []),
                 media_probe=dict(getattr(episode, "media_probe", {}) or {}),
+                local_object=dict(getattr(episode, "local_object", {}) or {}),
             )
             for episode in item.detailed_episodes
         ]
@@ -168,4 +169,5 @@ class LibraryScanner:
             detected_languages=list(getattr(item, "detected_languages", []) or []),
             subtitle_languages=list(getattr(item, "subtitle_languages", []) or []),
             year=item.year,
+            local_object_model=dict(getattr(item, "local_object_model", {}) or {}),
         )

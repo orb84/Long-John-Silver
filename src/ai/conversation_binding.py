@@ -96,6 +96,66 @@ class ConversationBinding:
 
         return context_messages
 
+
+    async def build_intent_routing_context(
+        self,
+        session_id: str | None,
+        *,
+        pending_action_context: str | None = None,
+        max_turns: int = 8,
+        max_tokens: int = 1800,
+        max_chars: int = 4200,
+    ) -> str:
+        """Build compact context specifically for intent routing.
+
+        Intent routing must understand short semantic follow-ups such as
+        "I meant released movie" without re-injecting the whole library, tool
+        traces, or category packets.  This packet keeps only recent human and
+        assistant turns plus pending machine-readable action handles.
+        """
+        parts: list[str] = []
+        if pending_action_context:
+            parts.append(pending_action_context.strip())
+
+        if not session_id or not self._conversation:
+            return "\n\n".join(part for part in parts if part)[:max_chars]
+
+        try:
+            messages = await self._conversation.get_context(
+                session_id,
+                max_turns=max_turns,
+                max_tokens=max_tokens,
+                raw_recent_tokens=int(max_tokens * 0.85),
+                compressed_history_tokens=int(max_tokens * 0.15),
+            )
+        except Exception:
+            messages = []
+
+        lines: list[str] = []
+        for msg in messages:
+            role = str(msg.get("role") or "").lower()
+            if role not in {"user", "assistant", "system"}:
+                continue
+            content = msg.get("content")
+            if not content or str(content).startswith("__TOOL_CALLS__:"):
+                continue
+            text = " ".join(str(content).split())
+            if not text:
+                continue
+            if len(text) > 700:
+                text = text[:500].rstrip() + " … " + text[-140:].lstrip()
+            label = "context" if role == "system" else role
+            lines.append(f"[{label}] {text}")
+
+        if lines:
+            parts.append(
+                "RECENT CONVERSATION CONTEXT FOR INTENT ROUTING:\n"
+                "Use this only to understand semantic follow-ups, corrections, and refinements.\n"
+                + "\n".join(lines[-max_turns:])
+            )
+
+        return "\n\n".join(part for part in parts if part)[:max_chars]
+
     async def record_turn(
         self,
         session_id: str | None,

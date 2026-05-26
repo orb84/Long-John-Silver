@@ -44,10 +44,12 @@ class CategoryContextMixin:
         """
         tracked = self._tracked_items_from_settings(settings)
         matched = self._matched_tracked_items(user_message, tracked)
-        # For matched-item requests, do not ship the whole category library.  A
-        # prompt about one show/movie/book needs that item's canonical state plus
-        # compact counts; sending every tracked item wastes context and can force
-        # compression of the information the LLM actually needs.
+        # For matched-item requests, expose only the target item's canonical
+        # state. For broad category words such as "movie" or "show" without a
+        # matched tracked item, do *not* dump dozens of unrelated library rows
+        # into the prompt. That bloat was repeatedly pushing short follow-ups
+        # out of context. The LLM can call library/query tools when the user
+        # actually asks for a complete category inventory.
         if matched:
             summaries = [self.summarize_item_for_llm(item) for item in matched[:5]]
             other_keys = [
@@ -55,9 +57,14 @@ class CategoryContextMixin:
                 for item in tracked
                 if item not in matched
             ][:20]
+            context_scope = "matched_item"
         else:
-            summaries = [self.summarize_item_for_llm(item) for item in tracked[:max_items]]
-            other_keys = []
+            summaries = []
+            other_keys = [
+                str(getattr(item, "key", "") or "")
+                for item in tracked[: min(max_items, 20)]
+            ]
+            context_scope = "category_router_overview"
         packet: dict[str, Any] = {
             "category_id": self.category_id,
             "display_name": self.display_name,
@@ -66,10 +73,11 @@ class CategoryContextMixin:
             "tracked_items": summaries,
             "matched_tracked_items": [self.summarize_item_for_llm(item) for item in matched[:5]],
             "other_tracked_item_keys_sample": other_keys,
-            "context_scope": "matched_item" if matched else "category_overview",
+            "context_scope": context_scope,
             "llm_contract": [
                 "Use exact tracked item keys when a matched_tracked_item fits the user's request.",
                 "If the requested item is not tracked, use this category's metadata/research workflow before acting.",
+                "If context_scope is category_router_overview, treat the item sample as orientation only; do not assume the request targets those items.",
                 "Do not embed category unit information (season, episode, chapter, disc, track) inside name fields when a tool has dedicated fields for those values.",
                 "Treat deterministic parser output as a fallback only; localized phrases in the user request should be interpreted by the LLM and expressed in structured tool arguments.",
             ],
@@ -425,13 +433,17 @@ class CategoryContextMixin:
 
     # ── Prompt guidance injected into LLM system prompt ───────────
 
-    def build_prompt_guidance(self, for_intent: str) -> str:
+    def build_prompt_guidance(self, for_intent: str, settings: object | None = None) -> str:
         """Return category-specific guidance for the LLM prompt.
 
         Args:
             for_intent: One of 'download', 'search', 'chat'.
+            settings: Optional live settings whose category YAML guidance should
+                refine the static category profile.
         """
-        guidance = self.llm_profile().format_for_prompt(for_intent)
+        profile_fn = getattr(self, "llm_profile_for_settings", None)
+        profile = profile_fn(settings) if callable(profile_fn) else self.llm_profile()
+        guidance = profile.format_for_prompt(for_intent)
         prompt_file_guidance = self.load_prompt_file()
         if prompt_file_guidance:
             return f"{guidance}\n\nCategory prompt file guidance:\n{prompt_file_guidance}"

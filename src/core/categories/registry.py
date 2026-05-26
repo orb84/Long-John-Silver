@@ -20,7 +20,10 @@ from src.core.categories.base import MediaCategory
 from src.core.categories.tv import TvShowCategory
 from src.core.categories.movie import MovieCategory
 from src.core.categories.general import GeneralCategory
+from src.core.categories.definition_backed import DefinitionBackedCategory
 from src.core.categories.types import ParsedMedia
+from src.core.category_config import CategoryConfigStore
+from src.core.categories.router_matching import count_router_matches, router_token_matches
 from src.core.models import CategoryManifest, CategoryRouterBrief
 
 
@@ -33,8 +36,10 @@ class CategoryRegistry:
         tv = registry.get("tv")
     """
 
-    def __init__(self):
+    def __init__(self, config_store: CategoryConfigStore | None = None):
+        """Initialize a category registry with an optional config store."""
         self._categories: dict[str, MediaCategory] = {}
+        self._config_store = config_store or CategoryConfigStore()
 
     def register(self, category: MediaCategory) -> None:
         """Register a media category instance."""
@@ -55,7 +60,7 @@ class CategoryRegistry:
             if module_name in (
                 "__init__", "base", "registry", "types", "tv", "movie", "language",
                 "verifier", "path_planner", "consolidator", "search_patterns", "scaffold",
-                "general",
+                "general", "definition_backed",
             ):
                 continue
             full_module_name = f"{package}.{module_name}"
@@ -70,11 +75,37 @@ class CategoryRegistry:
                 logger.error(f"Failed to dynamically load category from {filepath}: {e}")
 
     def register_defaults(self) -> None:
-        """Register built-in categories, then dynamically discover extension categories."""
+        """Register built-in, discovered, and definition-backed categories."""
         self.register(TvShowCategory())
         self.register(MovieCategory())
         self.register(GeneralCategory())
         self.discover_categories()
+        self.register_definition_backed_categories()
+
+    def register_definition_backed_categories(self) -> None:
+        """Register concrete YAML definitions that do not have Python classes.
+
+        This is the generic extension path for categories whose initial needs
+        fit the declarative contract: manifests, routing vocabulary, setup
+        requirements, neutral file scanning, and conservative workflow/tool
+        declarations.  Richer categories can still provide a dedicated subclass;
+        an existing registered category always wins over a YAML-backed fallback.
+        """
+        try:
+            definitions = self._config_store.load_definitions_only()
+        except Exception as exc:
+            logger.warning(f"Failed to load definition-backed categories: {exc}")
+            return
+        for category_id, definition in sorted(definitions.items()):
+            if definition.get("abstract") or category_id in self._categories:
+                continue
+            try:
+                category = DefinitionBackedCategory(definition)
+                if category.category_id:
+                    self.register(category)
+                    logger.info(f"Registered definition-backed category: {category.category_id}")
+            except Exception as exc:
+                logger.warning(f"Failed to register definition-backed category {category_id!r}: {exc}")
 
     @classmethod
     def with_defaults(cls) -> "CategoryRegistry":
@@ -157,35 +188,30 @@ class CategoryRegistry:
         brief keywords. This is intentionally deterministic and cheap;
         an LLM category resolver can be added later as a fallback.
         """
-        normalized = text.lower()
         if tracked_items:
             for item in tracked_items:
                 key = getattr(item, "key", "")
-                if key and key.lower() in normalized:
+                if key and router_token_matches(text, key):
                     category = self.get(getattr(item, "item_type", ""))
                     if category:
                         return category
 
-        scored: list[tuple[int, MediaCategory]] = []
+        scored: list[tuple[int, int, MediaCategory]] = []
         for category in self._categories.values():
             brief = category.router_brief()
-            score = 0
-            for token in [category.category_id, category.display_name.lower(), *brief.keywords, *brief.item_types]:
-                if token and str(token).lower() in normalized:
-                    score += 1
             # Category vocabulary, not registry-owned media assumptions, drives
             # routing boosts.  A custom category can add words like chapters,
             # versions, discs, seasons, or films to its router brief without
-            # modifying this registry.
-            for token in brief.keywords + brief.item_types:
-                if token and str(token).lower() in normalized:
-                    score += 1
+            # modifying this registry.  Matching is boundary-aware so short
+            # terms such as EP/TV do not match unrelated words.
+            tokens = [category.category_id, category.display_name, *brief.keywords, *brief.item_types]
+            score = count_router_matches(text, tokens)
             if score:
-                scored.append((score, category))
+                scored.append((score, int(getattr(category, "router_priority", 0)), category))
         if not scored:
             return None
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return scored[0][1]
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return scored[0][2]
 
     def __contains__(self, category_id: str) -> bool:
         return category_id in self._categories
