@@ -208,7 +208,8 @@ class SlskdTransferReadModel:
                     if current_directory and not _remote_parent(_first_text(row, "filename", "fileName", "fullName", "remoteFilename", "remoteFileName")):
                         filename = _first_text(row, "filename", "fileName", "fullName", "remoteFilename", "remoteFileName")
                         if filename and "/" not in filename.replace("\\", "/"):
-                            row["filename"] = f"{current_directory.rstrip('/\\')}/{filename}"
+                            directory_prefix = current_directory.rstrip("/\\")
+                            row["filename"] = f"{directory_prefix}/{filename}"
                     rows.append(row)
 
             if _looks_like_transfer(value):

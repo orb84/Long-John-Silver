@@ -160,7 +160,7 @@ class AppDeck {
             if (window.bootyPanel && typeof window.bootyPanel.loadCatalog === 'function') jobs.push(window.bootyPanel.loadCatalog());
             if (window.downloads && typeof window.downloads.load === 'function') jobs.push(window.downloads.load());
             if (window.holdPanel && typeof window.holdPanel.loadRecentPlunder === 'function') jobs.push(window.holdPanel.loadRecentPlunder());
-            if (window.suggestionManager && typeof window.suggestionManager.load === 'function') jobs.push(window.suggestionManager.load());
+            if (window.suggestionManager && typeof window.suggestionManager.load === 'function') jobs.push(window.suggestionManager.load({ force: true }));
             if (window.sharingPanel && typeof window.sharingPanel.load === 'function') jobs.push(window.sharingPanel.load());
             if (window.helmPanel && typeof window.helmPanel.updateStats === 'function') jobs.push(window.helmPanel.updateStats());
             if (window.helmPanel && typeof window.helmPanel.updateStorageStatus === 'function') jobs.push(window.helmPanel.updateStorageStatus());

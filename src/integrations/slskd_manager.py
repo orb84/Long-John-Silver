@@ -32,6 +32,7 @@ from src.core.security.command_policy import CommandPolicy, CommandPolicyError
 from src.core.security.path_policy import SafePathResolver
 from src.integrations.slskd_client import SlskdClient
 from src.integrations.slskd_config import build_slskd_share_plan, render_slskd_yaml
+from src.utils.archive_safety import safe_extract_zip
 
 SLSKD_PORT = 5030
 SLSKD_RELEASE_API = "https://api.github.com/repos/slskd/slskd/releases/latest"

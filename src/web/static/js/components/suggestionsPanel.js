@@ -27,12 +27,16 @@ class SuggestionManager extends Component {
             related_media: 'Related item',
             new_season: 'New season'
         };
+        this._pollTimer = null;
+        this._inFlightLoad = null;
+        this._lastLoadAt = 0;
+        this._minLoadIntervalMs = 5000;
 
         shipEvents.subscribe('system', (e) => {
-            if (e.subtype === 'suggestions_updated') this.load();
+            if (e.subtype === 'suggestions_updated') this.load({ force: true });
         });
 
-        this.load();
+        this.load({ force: true });
     }
 
     /**
@@ -42,19 +46,41 @@ class SuggestionManager extends Component {
      * and preserve event names/data attributes so other components can extend
      * this behavior without reaching into private state.
      */
-    async load() {
+    async load(options = {}) {
         if (!this.list) return;
+        const force = Boolean(options.force);
+        const now = Date.now();
+        if (!force && this._inFlightLoad) return this._inFlightLoad;
+        if (!force && now - this._lastLoadAt < this._minLoadIntervalMs) return;
+        this._lastLoadAt = now;
+        this._inFlightLoad = this._loadNow();
+        try {
+            await this._inFlightLoad;
+        } finally {
+            this._inFlightLoad = null;
+        }
+    }
+
+    async _loadNow() {
         try {
             const data = await APIClient.get('/api/suggestions');
             const sugs = data.suggestions || [];
             this._renderList(sugs, Boolean(data.compiling));
-            if (data.compiling) {
+            if (data.compiling && this._isVisible()) {
                 clearTimeout(this._pollTimer);
-                this._pollTimer = setTimeout(() => this.load(), 2500);
+                this._pollTimer = setTimeout(() => this.load({ force: true }), 7500);
+            } else {
+                clearTimeout(this._pollTimer);
+                this._pollTimer = null;
             }
         } catch (e) {
             this.list.innerHTML = '<p class="empty-msg">Failed to load suggestions</p>';
         }
+    }
+
+    _isVisible() {
+        const view = document.getElementById('suggestions');
+        return Boolean(view && view.classList.contains('active'));
     }
 
     _renderList(sugs, compiling = false) {

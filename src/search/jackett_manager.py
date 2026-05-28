@@ -23,6 +23,7 @@ from typing import Optional
 
 from src.core.security.command_policy import CommandPolicy, CommandPolicyError
 from src.core.security.path_policy import SafePathResolver
+from src.utils.archive_safety import safe_extract_tar, safe_extract_zip
 
 
 # Pinned fallback version if GitHub API is unreachable

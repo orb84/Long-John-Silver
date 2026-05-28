@@ -93,7 +93,7 @@ class ViewManager extends Component {
             }
         }
         if (targetId === 'suggestions' && window.suggestionManager) {
-            window.suggestionManager.load();
+            window.suggestionManager.load({ force: true });
         }
         if (targetId === 'sharing' && window.sharingPanel) {
             window.sharingPanel.load();

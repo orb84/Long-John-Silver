@@ -22,6 +22,9 @@ DEFAULT_QUIET_ACCESS_PATHS: frozenset[str] = frozenset(
         "/api/health",
         "/api/storage/status",
         "/api/system/logs",
+        "/api/suggestions",
+        "/api/downloads",
+        "/api/categories",
     }
 )
 
