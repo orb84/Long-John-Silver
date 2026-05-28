@@ -20,7 +20,7 @@ from loguru import logger
 from src.core.categories.base import CategoryMedia
 from src.core.categories.audio_conversion import AudioConversionService
 from src.core.categories.candidate_validation import DANGEROUS_FILE_SUFFIXES, DefinitionCandidateValidator
-from src.core.categories.identity import clean_display_title, clean_path_fragment, canonical_item_key
+from src.core.categories.identity import clean_display_title, clean_path_fragment, canonical_item_key, basename_from_pathish
 from src.core.categories.local_object_reconstruction import (
     category_units_from_local_object,
     enrich_item_payload,
@@ -343,7 +343,7 @@ class DefinitionBackedCategory(CategoryMedia):
 
     def unit_descriptor_from_file(self, file_path: str, parsed: Any | None = None, item_descriptor: dict[str, Any] | None = None) -> dict[str, Any]:
         """Use the torrent-relative filename as a stable file-level descriptor."""
-        label = Path(str(file_path or "")).name or "file"
+        label = basename_from_pathish(file_path, fallback="file")
         return {
             "granularity": "file",
             "label": label,
@@ -376,7 +376,7 @@ class DefinitionBackedCategory(CategoryMedia):
         data = dict(metadata or {})
         title = data.get("title") or getattr(item, "item_name", "") or getattr(item, "torrent_title", "") or source.stem
         folder = clean_path_fragment(title, fallback=self.display_name)
-        filename = Path(source_name or source.name).name
+        filename = basename_from_pathish(source_name or source.name, fallback=source.name or "file")
         return Path(self.get_root_path(settings)) / folder / filename
 
     async def scan(self, root_path: str, existing_keys: set[str] | None = None) -> list[ScannedItem]:
@@ -750,7 +750,7 @@ class DefinitionBackedCategory(CategoryMedia):
 
     def _matches_accepted_pattern(self, file_path: str | Path) -> bool:
         """Return whether the file path matches at least one declared glob."""
-        name = Path(str(file_path)).name.lower()
+        name = basename_from_pathish(file_path, fallback="file").lower()
         for pattern in self.accepted_file_patterns:
             if Path(name).match(str(pattern).lower()):
                 return True

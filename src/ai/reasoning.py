@@ -1,10 +1,10 @@
 """
 Reasoning planner for LJS.
 
-Implements a plan-execute loop for complex tasks (SEARCH, DOWNLOAD).
-Before the regular agentic tool loop, the LLM is asked to produce
-a structured plan (AgentPlan with PlanSteps). The plan is validated
-with Pydantic and can be executed deterministically by PlanExecutor.
+Builds optional, advisory plans for complex tasks (SEARCH, DOWNLOAD).
+The normal tool-calling loop remains authoritative: planner JSON may add
+compact goal/constraint hints, but concrete actions still have to be made
+through the current registered tools and validated at execution time.
 An optional reflection step evaluates whether the results are sufficient.
 """
 
@@ -19,12 +19,13 @@ from src.utils.json_parser import LLMResponseParser
 
 
 class ReasoningPlanner:
-    """Generates execution plans for complex agent tasks.
+    """Generates optional advisory plans for complex agent tasks.
 
-    For SEARCH and DOWNLOAD intents, produces a structured plan
-    before the agent starts calling tools, ensuring multi-step
-    reasoning instead of reactive tool calling. Can also reflect
-    on tool results to decide whether more search is needed.
+    For SEARCH and DOWNLOAD intents, the planner can produce a compact
+    structured sketch that is fed back to the normal tool-calling loop as
+    context. It does not execute tools and does not validate the user's
+    natural-language semantics. It can also reflect on tool results to decide
+    whether more search is needed.
     """
 
     _INTENT_GUIDES: dict[Intent, str] = {
@@ -44,7 +45,96 @@ class ReasoningPlanner:
         ),
     }
 
-    _MAX_RETRIES = 1
+    _MAX_REPAIR_ATTEMPTS = 2
+    """Maximum structured-planner repair attempts after the initial response.
+
+    These retries repair only objective contract failures such as invalid JSON,
+    unavailable tool names, or malformed step structures.  They do not try to
+    semantically prove that a plan matches the user's request.
+    """
+
+
+    _TOOL_ALIASES = {
+        "WebSearch": "web_search",
+        "webSearch": "web_search",
+        "web_search_tool": "web_search",
+        "SearchWeb": "web_search",
+        "MetadataLookup": "metadata_lookup",
+        "TMDBLookup": "metadata_lookup",
+        "ExtractMetadata": "browser_extract",
+        "ReadWebPage": "read_web_page",
+    }
+
+    @classmethod
+    def _available_tool_names(cls, tool_schemas: list[dict] | None) -> set[str]:
+        names: set[str] = set()
+        for schema in tool_schemas or []:
+            func = schema.get("function", {}) if isinstance(schema, dict) else {}
+            name = func.get("name")
+            if name:
+                names.add(str(name))
+        return names
+
+    @classmethod
+    def _canonical_tool_name(cls, name: str, available: set[str]) -> str:
+        if name in available:
+            return name
+        alias = cls._TOOL_ALIASES.get(name)
+        if alias in available:
+            return alias
+        snake = ""
+        for idx, ch in enumerate(str(name or "")):
+            if ch.isupper() and idx > 0 and str(name)[idx - 1].islower():
+                snake += "_"
+            snake += ch.lower()
+        if snake in available:
+            return snake
+        return name
+
+    @classmethod
+    def _validate_plan_contract(
+        cls,
+        plan: AgentPlan,
+        *,
+        available_tools: set[str],
+    ) -> AgentPlan:
+        """Validate only objective planner/tool contracts.
+
+        This deliberately does **not** attempt semantic matching between the
+        user's natural-language request and the plan.  A structured plan is only
+        an advisory hint for the normal agent loop, so the safe checks here are
+        limited to things the application can know objectively:
+
+        - tool names must exist in the current tool surface;
+        - historical aliases may be canonicalized to real exposed tools;
+        - arguments must be dictionaries;
+        - dependencies must refer to earlier step ids.
+
+        Bad plans are discarded; they are never repaired with lexical overlap
+        heuristics and never become authoritative execution.
+        """
+        seen_step_ids: set[str] = set()
+        for index, step in enumerate(plan.steps):
+            if not step.id:
+                step.id = f"step_{index + 1}"
+            canonical = cls._canonical_tool_name(step.tool_name, available_tools)
+            if canonical != step.tool_name:
+                logger.info("Canonicalized planner tool '{}' -> '{}'", step.tool_name, canonical)
+                step.tool_name = canonical
+            if available_tools and step.tool_name not in available_tools:
+                raise ValueError(
+                    f"Planner selected unavailable tool '{step.tool_name}'. "
+                    f"Available tools: {sorted(available_tools)}"
+                )
+            if not isinstance(step.arguments, dict):
+                raise ValueError(f"Planner step '{step.id}' arguments must be an object/dict.")
+            unknown_dependencies = [dep for dep in (step.depends_on or []) if dep not in seen_step_ids]
+            if unknown_dependencies:
+                raise ValueError(
+                    f"Planner step '{step.id}' depends on unknown or later step(s): {unknown_dependencies}."
+                )
+            seen_step_ids.add(step.id)
+        return plan
 
     def __init__(
         self,
@@ -90,14 +180,20 @@ class ReasoningPlanner:
             return None
 
         prompt = self._build_plan_prompt(user_prompt, intent, context, tool_schemas=tool_schemas)
+        base_prompt = prompt
+        available_tools = self._available_tool_names(tool_schemas)
         raw_json = None
 
-        for attempt in range(self._MAX_RETRIES + 1):
+        for attempt in range(self._MAX_REPAIR_ATTEMPTS + 1):
             try:
                 raw_text = await self._call_llm(prompt, intent)
                 raw_json = self._extract_json(raw_text)
                 plan = AgentPlan.model_validate(raw_json)
                 plan.intent = intent
+                plan = self._validate_plan_contract(
+                    plan,
+                    available_tools=available_tools,
+                )
                 
                 # Detailed tree-style logging of the plan steps and argument payloads
                 steps_log = "\n".join(
@@ -119,10 +215,11 @@ class ReasoningPlanner:
                 logger.warning(
                     f"Plan generation attempt {attempt + 1} failed: {e}"
                 )
-                if attempt < self._MAX_RETRIES:
+                if attempt < self._MAX_REPAIR_ATTEMPTS:
                     prompt = self._build_repair_prompt(
                         raw_json if raw_json else raw_text if 'raw_text' in dir() else "",
                         str(e),
+                        original_prompt=base_prompt,
                     )
 
         logger.warning("All plan generation attempts failed. Continuing without plan.")
@@ -155,7 +252,7 @@ class ReasoningPlanner:
 
         prompt = (
             "You are a planning assistant that produces structured plans "
-            "for media automation. Return ONLY valid JSON — no other text.\n\n"
+            "for media automation. The plan is advisory only; the live tool-calling agent will decide and execute. Return ONLY valid JSON — no other text.\n\n"
             f"Request: {user_prompt}\n"
             f"Type of task: {intent.value}\n"
             f"Recommended approach:\n{intent_guide}\n"
@@ -210,7 +307,9 @@ class ReasoningPlanner:
         return prompt
 
     def _build_repair_prompt(self, previous_output: str,
-                              error_message: str) -> str:
+                              error_message: str,
+                              *,
+                              original_prompt: str = "") -> str:
         """Build a repair prompt asking the LLM to fix invalid JSON.
 
         Args:
@@ -222,7 +321,9 @@ class ReasoningPlanner:
         """
         schema_json = json.dumps(AgentPlan.model_json_schema(), indent=2)
         return (
-            "The previous output was not valid JSON matching the required schema.\n"
+            "The previous planner output was invalid or unsafe. Repair it for the SAME current user request.\n"
+            "Do not substitute an example task. Do not invent unavailable tools.\n\n"
+            f"Original planning prompt, including current request and available tools:\n{original_prompt}\n\n"
             f"Error: {error_message}\n"
             f"Previous output:\n{previous_output}\n\n"
             f"Produce a corrected JSON object matching this schema:\n{schema_json}\n"

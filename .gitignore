@@ -21,6 +21,7 @@ data/*.db
 data/*.sqlite*
 data/*.jsonl
 data/jackett/
+data/slskd/
 data/logs/
 data/cache/
 data/categories/*/metadata/

@@ -1192,6 +1192,28 @@
                     </label>
                 </div>
 
+                <!-- Soulseek / slskd Companion -->
+                <div class="channel-config" style="display: block; margin-top: 12px; border: 1px dashed rgba(42, 157, 143, 0.4); background: rgba(42, 157, 143, 0.04);">
+                    <label style="cursor: pointer; display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" id="setup-soulseek-enabled" style="width: 18px; height: 18px; margin: 0;">
+                        <span style="font-weight: 600; font-size: 0.86rem; color: var(--accent-teal);">Enable Soulseek companion through slskd</span>
+                    </label>
+                    <p style="margin: 4px 0 10px 28px; font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;">
+                        Optional fallback/companion source for music, audiobooks, ebooks, and rare material. If enabled, LJS installs and manages slskd invisibly; you only provide Soulseek credentials and choose what to share back. Use an existing Soulseek account, or try a new unique username/password and LJS will validate whether the network accepts it. Soulseek is not marked ready until login succeeds.
+                    </p>
+                    <div class="setup-preferences-grid" style="margin-left: 28px;">
+                        <input type="hidden" id="setup-soulseek-host" value="http://127.0.0.1:5030">
+                        <input type="hidden" id="setup-soulseek-api-key" value="">
+                        <div class="form-group"><label>Soulseek username</label><input type="text" id="setup-soulseek-username" autocomplete="off" placeholder="Soulseek username"></div>
+                        <div class="form-group"><label>Soulseek password</label><input type="password" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-soulseek-password" placeholder="Soulseek password"></div>
+                        <div class="form-group"><label>Share mode</label><select id="setup-soulseek-share-mode"><option value="full_library">Full LJS library root</option><option value="custom">Custom folders later in Settings</option><option value="disabled">Do not share LJS folders</option></select></div>
+                    </div>
+                    <div id="setup-soulseek-login-status" class="setup-soulseek-login-status" style="margin: 10px 0 0 28px; font-size: 0.78rem; color: var(--text-dim);">Soulseek login not checked yet.</div>
+                    <button type="button" id="setup-soulseek-check-login" class="btn btn-secondary btn-sm" onclick="checkSetupSoulseekLogin()" style="margin: 10px 0 0 28px;">
+                        <i class="fa-solid fa-plug-circle-check"></i> Check Soulseek Login
+                    </button>
+                </div>
+
                 <div class="step-actions">
                     <button class="btn btn-skip" onclick="goStep(3)"><i class="fa-solid fa-arrow-left"></i> Back</button>
                     <button class="btn btn-gold" onclick="goStep(5)">Next <i class="fa-solid fa-arrow-right"></i></button>

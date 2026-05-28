@@ -222,7 +222,7 @@ class TvAgentSearchMixin:
         if season is not None and episode is not None:
             return [f"S{int(season):02d}E{int(episode):02d}"]
         if season is None:
-            if scope in {"season_pack_only", "season_pack_preferred"}:
+            if scope in {"bundle_only", "bundle_preferred", "season_pack_only", "season_pack_preferred"}:
                 resolved = await self.resolve_agent_pack_season(item, context) if context is not None else None
                 if resolved is not None:
                     season = int(resolved)
@@ -232,7 +232,7 @@ class TvAgentSearchMixin:
                 return [None]
 
         season_label = f"Season {int(season)}"
-        if scope in {"season_pack_only", "season_pack_preferred"}:
+        if scope in {"bundle_only", "bundle_preferred", "season_pack_only", "season_pack_preferred"}:
             return [season_label]
         if scope == "individual_units_only":
             labels: list[str | None] = []
@@ -260,12 +260,12 @@ class TvAgentSearchMixin:
         UX without pretending packs are always available.
         """
         scope = str(search_scope or "default").strip().lower()
-        if scope in {"season_pack_preferred", "season_pack_only"} and season is None and episode is None:
+        if scope in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"} and season is None and episode is None:
             resolved = await self.resolve_agent_pack_season(item, context)
             if resolved is not None:
                 season = int(resolved)
 
-        if scope == "season_pack_preferred" and season is not None and episode is None:
+        if scope in {"bundle_preferred", "season_pack_preferred"} and season is not None and episode is None:
             pack_results, pack_summary = await self._run_agent_pack_queries(
                 item, int(season), language=language, context=context, summary_suffix="pack preferred",
             )
@@ -277,7 +277,7 @@ class TvAgentSearchMixin:
             if not episode_labels:
                 return [], f"Season {int(season)} pack (no acceptable pack; no episode fallback targets)"
             return await self._run_agent_labels(item, episode_labels, language=language, season=season, episode=episode, context=context, summary_suffix="pack unavailable; individual episodes")
-        if scope == "season_pack_only" and season is not None and episode is None:
+        if scope in {"bundle_only", "season_pack_only"} and season is not None and episode is None:
             return await self._run_agent_pack_queries(
                 item, int(season), language=language, context=context, summary_suffix="pack only",
             )

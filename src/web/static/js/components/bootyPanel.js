@@ -16,6 +16,7 @@ class BootyPanel extends Component {
         this._categories = [];
         this._items = [];
         this._collapsedCategories = new Set();
+        this._categoryViewModes = new Map();
         this._loadAttempts = 0;
         this._hasLoadedCatalogOnce = false;
 
@@ -158,8 +159,8 @@ class BootyPanel extends Component {
         if (!grid) return;
 
         grid.innerHTML = '';
-        if (this._items.length === 0) {
-            grid.appendChild(DOM.el('p', { className: 'empty-msg' }, ['No cargo found. Ready a new hunt below!']));
+        if (!this._categories.length) {
+            grid.appendChild(DOM.el('p', { className: 'empty-msg' }, ['No categories are available yet.']));
             return;
         }
 
@@ -170,20 +171,31 @@ class BootyPanel extends Component {
             grouped.get(categoryId).push(item);
         });
 
-        Array.from(grouped.keys()).sort().forEach(categoryId => {
-            const list = grouped.get(categoryId);
-            const manifest = this._categories.find(c => c.category_id === categoryId) || {};
-            const displayName = (manifest.display_name || categoryId).toUpperCase();
+        this._categories.forEach(manifest => {
+            const categoryId = manifest.category_id;
+            const list = grouped.get(categoryId) || [];
+            const displayName = manifest.display_name || categoryId;
+            const viewMode = this._categoryViewModes.get(categoryId) || 'icons';
             const isCollapsed = this._collapsedCategories.has(categoryId);
             const mediaGrid = DOM.el('div', {
-                className: 'media-grid',
-                style: { display: isCollapsed ? 'none' : 'grid', transition: 'all 0.3s ease' }
+                className: `media-grid category-view-${viewMode}`,
+                style: {
+                    display: isCollapsed ? 'none' : (viewMode === 'list' ? 'flex' : 'grid'),
+                    flexDirection: viewMode === 'list' ? 'column' : undefined,
+                    gap: viewMode === 'list' ? '10px' : undefined,
+                    transition: 'all 0.3s ease'
+                }
             });
 
             const chevron = DOM.el('i', {
                 className: `fa-solid fa-chevron-down category-chevron ${isCollapsed ? 'collapsed' : ''}`,
                 style: { marginLeft: 'auto', marginRight: '16px', transform: isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)' }
             });
+            const title = DOM.el('span', {}, [`${displayName.toUpperCase()} `, DOM.el('small', { style: { color: 'var(--text-dim)', fontFamily: 'var(--font-body)' } }, [`${list.length} item${list.length === 1 ? '' : 's'}`])]);
+            const modeControls = DOM.el('span', { className: 'category-view-controls', style: { display: 'inline-flex', gap: '6px', marginRight: '10px' } }, [
+                DOM.btn('', `icon-btn ${viewMode === 'icons' ? 'active' : ''}`, (e) => { e.stopPropagation(); this._setCategoryViewMode(categoryId, 'icons'); }, { title: 'Icon view', content: '<i class="fa-solid fa-grip"></i>' }),
+                DOM.btn('', `icon-btn ${viewMode === 'list' ? 'active' : ''}`, (e) => { e.stopPropagation(); this._setCategoryViewMode(categoryId, 'list'); }, { title: 'List view', content: '<i class="fa-solid fa-list"></i>' })
+            ]);
             const header = DOM.el('h3', {
                 style: {
                     fontFamily: 'var(--font-display)', fontSize: '1.15rem', color: 'var(--accent-gold)',
@@ -191,13 +203,52 @@ class BootyPanel extends Component {
                     display: 'flex', alignItems: 'center', cursor: 'pointer', userSelect: 'none'
                 },
                 onclick: () => this._toggleCategoryCollapse(categoryId, mediaGrid, chevron)
-            }, [displayName, chevron]);
+            }, [title, chevron, modeControls]);
 
-            const section = DOM.el('div', { className: 'category-section' }, [header]);
-            list.forEach(item => mediaGrid.appendChild(this._renderCard(categoryId, manifest, item)));
+            const section = DOM.el('div', { className: `category-section category-section-${categoryId}` }, [header]);
+            if (!list.length) {
+                mediaGrid.appendChild(DOM.el('p', { className: 'empty-msg', style: { margin: '0.5rem 0 1rem 0' } }, [`No ${displayName} items yet. Add one below or scan the category folder after adding files.`]));
+            } else {
+                list.forEach(item => mediaGrid.appendChild(viewMode === 'list' ? this._renderListRow(categoryId, manifest, item) : this._renderCard(categoryId, manifest, item)));
+            }
             section.appendChild(mediaGrid);
             grid.appendChild(section);
         });
+    }
+
+    _setCategoryViewMode(categoryId, mode) {
+        this._categoryViewModes.set(categoryId, mode === 'list' ? 'list' : 'icons');
+        this.renderCatalogGrid();
+    }
+
+    _categoryIcon(manifest) {
+        const icon = String(manifest.icon || '').toLowerCase();
+        const known = { film: 'fa-film', tv: 'fa-tv', music: 'fa-music', headphones: 'fa-headphones', 'book-open': 'fa-book-open', book: 'fa-book-open', folder: 'fa-folder-open' };
+        return known[icon] || 'fa-folder-open';
+    }
+
+    _renderListRow(categoryId, manifest, item) {
+        const itemId = item.item_id || item.key;
+        const itemTitle = item.display_name || item.title || item.name || itemId;
+        const isPaused = item.enabled === false;
+        const statusLabel = item.progress || item.status || this._formatItemProgress(item);
+        const icon = this._categoryIcon(manifest);
+        return DOM.el('div', {
+            className: 'media-card media-list-row glass-panel',
+            dataset: { item: itemId, category: categoryId },
+            ondblclick: (event) => { event.preventDefault(); this.showDetails(categoryId, itemId); },
+            style: { display: 'grid', gridTemplateColumns: '44px minmax(0, 1fr) auto', alignItems: 'center', gap: '14px', minHeight: '58px', padding: '12px 14px' }
+        }, [
+            DOM.el('div', { className: 'poster-placeholder', style: { width: '44px', height: '44px', minHeight: '44px' } }, [DOM.el('i', { className: `fa-solid ${icon}` })]),
+            DOM.el('div', { className: 'card-content', style: { minWidth: 0 } }, [
+                DOM.el('h3', { style: { margin: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, [itemTitle]),
+                DOM.el('p', { style: { margin: '4px 0 0 0', color: 'var(--text-dim)' } }, [`${manifest.display_name || categoryId} · ${statusLabel} · ${item.language || 'Default'}`])
+            ]),
+            DOM.el('div', { style: { display: 'flex', gap: '8px' } }, [
+                DOM.btn('', 'play-btn category-detail-btn', () => this.showDetails(categoryId, itemId), { content: '<i class="fa-solid fa-circle-info"></i> Details' }),
+                DOM.btn('', 'play-btn pause-toggle-btn', () => this.togglePause(categoryId, itemId, isPaused), { style: { background: 'rgba(255,255,255,0.05)' }, content: `<i class="fa-solid ${isPaused ? 'fa-play' : 'fa-pause'}"></i>` })
+            ])
+        ]);
     }
 
     /** Render one item card. */
@@ -206,7 +257,7 @@ class BootyPanel extends Component {
         const itemTitle = item.display_name || item.title || item.name || itemId;
         const isPaused = item.enabled === false;
         const statusLabel = item.progress || item.status || this._formatItemProgress(item);
-        const icon = manifest.icon === 'film' ? 'fa-film' : (manifest.icon === 'tv' ? 'fa-tv' : 'fa-folder-open');
+        const icon = this._categoryIcon(manifest);
         const posterUrl = this._posterUrlFor(item);
         const placeholder = DOM.el('div', { className: 'poster-placeholder' }, [DOM.el('i', { className: `fa-solid ${icon}` })]);
         if (posterUrl) {
@@ -256,7 +307,7 @@ class BootyPanel extends Component {
     _toggleCategoryCollapse(categoryId, mediaGrid, chevron) {
         if (this._collapsedCategories.has(categoryId)) {
             this._collapsedCategories.delete(categoryId);
-            mediaGrid.style.display = 'grid';
+            mediaGrid.style.display = (this._categoryViewModes.get(categoryId) || 'icons') === 'list' ? 'flex' : 'grid';
             chevron.style.transform = 'rotate(0deg)';
         } else {
             this._collapsedCategories.add(categoryId);

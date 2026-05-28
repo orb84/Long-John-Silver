@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from loguru import logger
 
 from src.core.categories.base_context import CategoryContextMixin
+from src.core.categories.identity import basename_from_pathish
 from src.core.models import (
     ActionReceipt,
     CategoryActionDeclaration,
@@ -762,6 +763,25 @@ class CategoryContractMixin(CategoryContextMixin):
         """
         return []
 
+    def related_sidecar_imports_for_file(
+        self,
+        *,
+        source_path: Path,
+        imported_path: Path,
+        item: Any,
+        settings: Optional['Settings'],
+        file_info: Any | None = None,
+    ) -> list[dict[str, str]]:
+        """Return category-owned sidecar source/target plans for an imported file.
+
+        Generic download code must not decide that every ``.srt`` or ``.nfo``
+        near a payload belongs to a media file.  Categories that understand
+        sidecar naming conventions can return explicit ``source``/``target``
+        pairs.  The download handler then performs the safe copy/hardlink/move
+        according to the current lifecycle phase.
+        """
+        return []
+
 
 
 
@@ -1343,7 +1363,7 @@ class CategoryContractMixin(CategoryContextMixin):
         category facts.  The default descriptor is file-scoped and intentionally
         avoids interpreting coordinates.
         """
-        label = Path(str(file_path or "")).name
+        label = basename_from_pathish(file_path, fallback="file")
         return {
             "granularity": "file",
             "label": label,

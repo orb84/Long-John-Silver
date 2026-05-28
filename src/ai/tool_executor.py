@@ -21,10 +21,38 @@ from src.core.models import ToolExecutionContext
 
 
 _TOOL_NAME_ALIASES = {
-    # Historical/LLM-drift alias kept out of tool definitions but accepted at
+    # Historical/LLM-drift aliases kept out of tool definitions but accepted at
     # execution time when the canonical tool is allowed for the current intent.
     "find_browser_links": "browser_find_links",
+    "WebSearch": "web_search",
+    "webSearch": "web_search",
+    "SearchWeb": "web_search",
+    "MetadataLookup": "metadata_lookup",
+    "TMDBLookup": "metadata_lookup",
+    "ExtractMetadata": "browser_extract",
+    "ReadWebPage": "read_web_page",
 }
+
+_READ_ONLY_RETRYABLE_TOOLS = {
+    "web_search",
+    "read_web_page",
+    "browse_page",
+    "browser_open",
+    "browser_read_selected",
+    "browser_find_links",
+    "browser_evidence_report",
+    "browser_extract",
+    "metadata_lookup",
+    "enquire_about_media",
+    "get_library_status",
+    "list_library_files",
+    "list_downloads",
+    "inspect_torrent_candidate",
+    "search_torrents",
+    "search_media_torrents",
+    "search_soulseek",
+}
+_MAX_TOOL_EXECUTION_ATTEMPTS = 2
 
 
 class ToolCallExecutor:
@@ -44,6 +72,53 @@ class ToolCallExecutor:
         self._tool_registry = tool_registry
         self._result_compactor = ToolResultCompactor()
         self._contract_validator = ToolContractValidator()
+
+    async def _execute_with_bounded_retry(
+        self,
+        executable_name: str,
+        arguments: dict[str, Any],
+        *,
+        tool_context: ToolExecutionContext | None,
+    ) -> Any:
+        """Execute a tool with a small retry budget for safe read/search tools.
+
+        Retries are intentionally limited to read/search style tools to avoid
+        duplicating side effects such as queueing downloads, deleting rows, or
+        changing settings. Validation failures are not retried here; the LLM
+        receives the typed error and may choose corrected arguments in the next
+        loop iteration.
+        """
+        attempts = _MAX_TOOL_EXECUTION_ATTEMPTS if executable_name in _READ_ONLY_RETRYABLE_TOOLS else 1
+        last_result: Any = None
+        for attempt in range(1, attempts + 1):
+            result = await self._tool_registry.execute(
+                executable_name, arguments, context=tool_context,
+            )
+            last_result = result
+            if attempt >= attempts or not self._is_retryable_tool_result(result):
+                return result
+            logger.warning(
+                "Retrying read-only tool '{}' after recoverable result on attempt {}/{}: {}",
+                executable_name,
+                attempt,
+                attempts,
+                result.get("error_code") or result.get("error"),
+            )
+        return last_result
+
+    @staticmethod
+    def _is_retryable_tool_result(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if result.get("ok") is not False and not result.get("error"):
+            return False
+        if result.get("recoverable") is False:
+            return False
+        code = str(result.get("error_code") or "").upper()
+        if any(token in code for token in ("TIMEOUT", "UNREACHABLE", "TEMPORARY", "HTTP_ERROR", "RATE_LIMIT", "NETWORK")):
+            return True
+        error_text = str(result.get("error") or "").casefold()
+        return any(token in error_text for token in ("timeout", "temporar", "unreachable", "connection", "network"))
 
     def get_definitions(self, allowed_tool_names: set[str]) -> list[dict]:
         """Return OpenAI-format definitions for the allowed tool names."""
@@ -128,9 +203,12 @@ class ToolCallExecutor:
                 result = validation.error_payload(executable_name)
             else:
                 # Step 3: Execute via registry using schema-normalized arguments.
-                result = await self._tool_registry.execute(
-                    executable_name, validation.arguments, context=tool_context,
+                result = await self._execute_with_bounded_retry(
+                    executable_name, validation.arguments, tool_context=tool_context,
                 )
+
+        if isinstance(result, dict) and (result.get("ok") is False or result.get("error")):
+            result.setdefault("agent_instruction", "This tool failure is recoverable evidence. Do not stop unless all sensible available sources have been tried or the user must clarify.")
 
         # Step 4: Build a compact tool result message for LLM context.
         # Raw tool results can contain dozens of torrent candidates, full web

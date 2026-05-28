@@ -46,6 +46,48 @@ sharing:
   enabled: false
   mode: disabled
 
+# Optional Soulseek companion source. LJS integrates with slskd instead of
+# speaking the reverse-engineered Soulseek protocol directly. Users normally
+# only provide Soulseek credentials from the app; LJS auto-generates slskd
+# local runtime secrets/API key; sharing defaults to
+# the whole library root and can be narrowed to custom folders.
+soulseek:
+  enabled: false
+  managed: true
+  auto_install: true
+  host: http://127.0.0.1:5030
+  url_base: /
+  api_key: ''
+  verify_ssl: false
+  web_username: ''
+  web_password: ''
+  jwt_key: ''
+  soulseek_username: ''
+  soulseek_password: ''
+  app_dir: ./data/slskd
+  downloads_dir: ./downloads/soulseek
+  incomplete_dir: ./downloads/soulseek-incomplete
+  share_mode: full_library
+  share_directories: []
+  excluded_share_directories: []
+  share_filters:
+    - '\.DS_Store$'
+    - 'Thumbs\.db$'
+    - 'desktop\.ini$'
+    - '\.ljs-trash(?:/|$)'
+    - 'settings\.local\.yaml$'
+    - 'security_audit\.jsonl$'
+  search_enabled_categories:
+    - music
+    - audiobooks
+    - ebooks
+  companion_when_no_torrent_results: true
+  account_status: not_checked
+  account_status_message: ''
+  account_checked_at: ''
+  max_search_results: 20
+  search_timeout_seconds: 12.0
+
 storage:
   enabled: true
   include_in_llm_context: true

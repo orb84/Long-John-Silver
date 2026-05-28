@@ -11,6 +11,7 @@ and web layer from each inventing their own post-download file rules.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from pathlib import Path
 from loguru import logger
@@ -18,7 +19,7 @@ from typing import TYPE_CHECKING, Optional, Any
 
 from src.core.models import DownloadItem, DownloadStatus, Settings
 from src.core.security.path_policy import SafePathResolver, SecurityPolicyError
-from src.core.categories.identity import clean_display_title
+from src.core.categories.identity import clean_display_title, basename_from_pathish
 
 if TYPE_CHECKING:
     from src.core.downloader import DownloadManager
@@ -127,9 +128,40 @@ class DownloadCompletionHandler:
 
     @staticmethod
     def _clean_source_name(path: str) -> str:
-        """Return the final media filename without temporary download suffixes."""
-        name = str(path or "")
-        return name[:-12] if name.endswith(".downloading") else name
+        """Return the final media filename without temporary download suffixes.
+
+        slskd reports remote Soulseek names with Windows-style separators in
+        common responses (for example ``music\\Albums\\Artist\\01.mp3``).
+        On POSIX, ``Path(...).name`` does not treat backslashes as separators,
+        which previously leaked the whole remote path into a single target
+        filename under the library root.  Normalize both separator styles here
+        because this helper is the last generic boundary before category-owned
+        path planning.
+        """
+        return basename_from_pathish(path, fallback="file")
+
+    @staticmethod
+    def _file_probe(path: Path) -> str:
+        """Return compact forensic details for file/path troubleshooting."""
+        try:
+            exists = path.exists()
+        except OSError as exc:
+            return f"path={path} exists=ERROR({exc})"
+        parts = [f"path={path}", f"exists={exists}"]
+        try:
+            parent = path.parent
+            parts.append(f"parent={parent}")
+            parts.append(f"parent_exists={parent.exists()}")
+            parts.append(f"parent_writable={os.access(parent, os.W_OK)}")
+        except Exception as exc:
+            parts.append(f"parent_probe_error={exc}")
+        if exists:
+            try:
+                st = path.stat()
+                parts.extend([f"is_file={path.is_file()}", f"is_dir={path.is_dir()}", f"size={st.st_size}", f"mode={oct(st.st_mode & 0o777)}", f"uid={st.st_uid}", f"gid={st.st_gid}"])
+            except OSError as exc:
+                parts.append(f"stat_error={exc}")
+        return " ".join(parts)
 
     def _resolve_downloaded_source(self, relative_path: str, item: object | None = None) -> Path | None:
         """Find a downloaded file, tolerating final and ``.downloading`` names.
@@ -401,21 +433,182 @@ class DownloadCompletionHandler:
         item: DownloadItem,
     ) -> Path | None:
         """Hardlink or copy a file in a worker thread-friendly sync block."""
+        logger.info(
+            "Library materialize start: "
+            f"item={clean_display_title(item.item_name)!r} source_probe=({self._file_probe(source)}) "
+            f"target_probe=({self._file_probe(safe_target)})"
+        )
         try:
             resolver.safe_hardlink(source, safe_target, purpose="download.ready.hardlink")
-            logger.info(f"Hardlinked '{clean_display_title(item.item_name)}' -> {safe_target}")
+            logger.info(
+                f"Hardlinked '{clean_display_title(item.item_name)}' -> {safe_target}; "
+                f"target_after=({self._file_probe(safe_target)})"
+            )
             return safe_target
-        except OSError:
+        except OSError as hardlink_exc:
+            logger.debug(
+                "Library hardlink unavailable; falling back to copy: "
+                f"source={source} target={safe_target} error={hardlink_exc} "
+                f"source_probe=({self._file_probe(source)}) target_probe=({self._file_probe(safe_target)})"
+            )
             try:
                 resolver.safe_copy(source, safe_target, purpose="download.ready.copy")
-                logger.info(f"Copied '{clean_display_title(item.item_name)}' -> {safe_target}")
+                logger.info(
+                    f"Copied '{clean_display_title(item.item_name)}' -> {safe_target}; "
+                    f"target_after=({self._file_probe(safe_target)})"
+                )
                 return safe_target
             except Exception as exc:
-                logger.error(f"Failed to copy {source} -> {safe_target}: {exc}")
+                logger.error(
+                    f"Failed to copy {source} -> {safe_target}: {exc}; "
+                    f"source_probe=({self._file_probe(source)}) target_probe=({self._file_probe(safe_target)})"
+                )
                 return None
         except SecurityPolicyError as exc:
-            logger.error(f"Ready callback blocked unsafe file operation {source} -> {safe_target}: {exc}")
+            logger.error(
+                f"Ready callback blocked unsafe file operation {source} -> {safe_target}: {exc}; "
+                f"source_probe=({self._file_probe(source)}) target_probe=({self._file_probe(safe_target)})"
+            )
             return None
+
+    def _same_sidecar_payload(self, source: Path, target: Path) -> bool:
+        """Return whether a sidecar target already represents the source file."""
+        return self._same_payload(source, target)
+
+    def _unique_sidecar_destination(self, resolver: SafePathResolver, target: Path, source: Path) -> tuple[Path, bool]:
+        """Return a safe sidecar destination, preserving language/flag suffixes."""
+        candidate = resolver.require(target, purpose="download.sidecar.target", must_exist=False)
+        resolver.safe_mkdir(candidate.parent, purpose="download.sidecar.mkdir")
+        if not candidate.exists():
+            return candidate, False
+        if self._same_sidecar_payload(source, candidate):
+            return candidate, True
+        stem = candidate.stem
+        suffix = candidate.suffix
+        for index in range(2, 1000):
+            next_candidate = resolver.require(
+                candidate.with_name(f"{stem} ({index}){suffix}"),
+                purpose="download.sidecar.dedupe",
+                must_exist=False,
+            )
+            if not next_candidate.exists():
+                return next_candidate, False
+        raise SecurityPolicyError(f"Could not find available sidecar destination near {candidate}")
+
+    def _copy_or_link_sidecar_sync(
+        self,
+        resolver: SafePathResolver,
+        source: Path,
+        target: Path,
+        item: DownloadItem,
+    ) -> Path | None:
+        """Hardlink or copy a category-approved sidecar without mutating staging."""
+        try:
+            resolver.safe_hardlink(source, target, purpose="download.sidecar.hardlink")
+            logger.info(f"Hardlinked sidecar for '{clean_display_title(item.item_name)}' -> {target}")
+            return target
+        except OSError:
+            try:
+                resolver.safe_copy(source, target, purpose="download.sidecar.copy")
+                logger.info(f"Copied sidecar for '{clean_display_title(item.item_name)}' -> {target}")
+                return target
+            except Exception as exc:
+                logger.warning(f"Failed to copy sidecar {source} -> {target}: {exc}")
+                return None
+        except SecurityPolicyError as exc:
+            logger.warning(f"Blocked unsafe sidecar copy {source} -> {target}: {exc}")
+            return None
+
+    def _move_sidecar_sync(
+        self,
+        resolver: SafePathResolver,
+        source: Path,
+        target: Path,
+        item: DownloadItem,
+    ) -> Path | None:
+        """Move a category-approved sidecar after the torrent no longer needs it."""
+        try:
+            resolver.safe_move(source, target, purpose="download.sidecar.move")
+            logger.info(f"Moved sidecar for '{clean_display_title(item.item_name)}' -> {target}")
+            return target
+        except SecurityPolicyError as exc:
+            logger.warning(f"Blocked unsafe sidecar move {source} -> {target}: {exc}")
+            return None
+        except Exception as exc:
+            logger.warning(f"Failed to move sidecar {source} -> {target}: {exc}")
+            return None
+
+    async def _materialize_related_sidecars(
+        self,
+        *,
+        category: object,
+        item: DownloadItem,
+        settings: Settings,
+        source: Path,
+        imported: Path,
+        file_info: object | None,
+        mode: str,
+    ) -> tuple[list[Path], list[Path]]:
+        """Import category-approved sidecars for one media file.
+
+        Returns ``(library_paths, consumed_sources)``.  ``mode='copy'`` is used
+        while libtorrent still owns the payload; ``mode='move'`` is used after
+        seeding/final import so staging sidecars do not keep release folders
+        alive.  The sidecar discovery itself is delegated to the category.
+        """
+        planner = getattr(category, "related_sidecar_imports_for_file", None)
+        if not callable(planner):
+            return [], []
+        try:
+            plans = planner(
+                source_path=source,
+                imported_path=imported,
+                item=item,
+                settings=settings,
+                file_info=file_info,
+            )
+        except Exception as exc:
+            logger.warning(f"Category sidecar planning failed for {getattr(category, 'category_id', 'unknown')}: {exc}")
+            return [], []
+        if not plans:
+            return [], []
+
+        resolver = SafePathResolver.for_category(
+            category,
+            settings,
+            extra_roots=[self._dl_dir, Path(getattr(item, "save_path", "") or self._dl_dir), source.parent, imported.parent],
+        )
+        imported_paths: list[Path] = []
+        consumed_sources: list[Path] = []
+        for plan in plans:
+            try:
+                sidecar_source = resolver.require(plan.get("source") or "", purpose="download.sidecar.source", must_exist=True)
+                sidecar_target_raw = Path(plan.get("target") or "")
+                sidecar_target, already_present = self._unique_sidecar_destination(resolver, sidecar_target_raw, sidecar_source)
+            except Exception as exc:
+                logger.warning(f"Skipping unsafe/unavailable sidecar plan for {item.item_name}: {exc}")
+                continue
+
+            if already_present:
+                imported_paths.append(sidecar_target)
+                if mode == "move" and sidecar_source.exists() and self._path_allowed_for_item(sidecar_source, item):
+                    if self._safe_unlink(sidecar_source):
+                        consumed_sources.append(sidecar_source)
+                continue
+
+            if mode == "move":
+                result = await asyncio.to_thread(self._move_sidecar_sync, resolver, sidecar_source, sidecar_target, item)
+                if result is not None:
+                    imported_paths.append(result)
+                    consumed_sources.append(sidecar_source)
+            else:
+                result = await asyncio.to_thread(self._copy_or_link_sidecar_sync, resolver, sidecar_source, sidecar_target, item)
+                if result is not None:
+                    imported_paths.append(result)
+
+        for sidecar in imported_paths:
+            await self._reconcile_imported_library_item(item, sidecar, reason="download_import_sidecar")
+        return imported_paths, consumed_sources
 
     async def _reconcile_imported_library_item(self, item: DownloadItem, target: Path, *, reason: str = "download_import") -> None:
         """Refresh the affected canonical item after a ready-time import."""
@@ -489,14 +682,21 @@ class DownloadCompletionHandler:
         method hardlinks when possible, falls back to copying, and treats an
         existing same-size target as success so recovery is idempotent.
         """
+        cleaned_source_name = self._clean_source_name(source_name or source.name)
         target = self._planned_target_path(
             source,
             item,
             category,
             settings,
             file_info=file_info,
-            source_name=source_name,
+            source_name=cleaned_source_name,
             episode_title=episode_title,
+        )
+        logger.info(
+            "Library target planned: "
+            f"category={getattr(category, 'category_id', '')!r} item={item.item_name!r} "
+            f"raw_source_name={source_name or source.name!r} cleaned_source_name={cleaned_source_name!r} "
+            f"source={source} target={target}"
         )
         resolver = SafePathResolver.for_category(
             category,
@@ -528,6 +728,15 @@ class DownloadCompletionHandler:
             if already_present:
                 logger.info(f"Library target already present for '{item.item_name}': {safe_target}")
                 await self._reconcile_imported_library_item(item, safe_target)
+                await self._materialize_related_sidecars(
+                    category=category,
+                    item=item,
+                    settings=settings,
+                    source=source,
+                    imported=safe_target,
+                    file_info=file_info,
+                    mode="copy",
+                )
                 await self._run_category_post_import_hooks(
                     category=category,
                     item=item,
@@ -547,6 +756,15 @@ class DownloadCompletionHandler:
             )
             if result is not None:
                 await self._reconcile_imported_library_item(item, result)
+                await self._materialize_related_sidecars(
+                    category=category,
+                    item=item,
+                    settings=settings,
+                    source=source,
+                    imported=result,
+                    file_info=file_info,
+                    mode="copy",
+                )
                 await self._run_category_post_import_hooks(
                     category=category,
                     item=item,
@@ -710,6 +928,9 @@ class DownloadCompletionHandler:
         the download folder.
         """
         changed = False
+        moved_sources: list[Path] = []
+        settings = self._current_settings()
+        category = self._category_for_item(item)
         if item.files:
             for df in item.files:
                 if df.organized_path:
@@ -728,10 +949,31 @@ class DownloadCompletionHandler:
                     episode_title=df.episode_title,
                 )
                 if target:
+                    if category:
+                        _, consumed_sidecars = await self._materialize_related_sidecars(
+                            category=category,
+                            item=item,
+                            settings=settings,
+                            source=source,
+                            imported=target,
+                            file_info=df,
+                            mode="move",
+                        )
+                        moved_sources.extend(consumed_sidecars)
+                        await self._run_category_post_import_hooks(
+                            category=category,
+                            item=item,
+                            settings=settings,
+                            source=source,
+                            imported=target,
+                            file_info=df,
+                        )
                     df.organized_path = str(target)
                     df.status = "organized"
+                    moved_sources.append(source)
                     changed = True
             if changed:
+                self._cleanup_empty_download_parents(moved_sources, item=item)
                 await self._downloader.update_download(item)
             return changed
 
@@ -740,7 +982,28 @@ class DownloadCompletionHandler:
             if source.exists() and self._path_allowed_for_item(source, item):
                 target = await asyncio.to_thread(self._move_completed_file_to_library, source, item)
                 if target:
+                    moved_sources = [source]
+                    if category:
+                        _, consumed_sidecars = await self._materialize_related_sidecars(
+                            category=category,
+                            item=item,
+                            settings=settings,
+                            source=source,
+                            imported=target,
+                            file_info=None,
+                            mode="move",
+                        )
+                        moved_sources.extend(consumed_sidecars)
+                        await self._run_category_post_import_hooks(
+                            category=category,
+                            item=item,
+                            settings=settings,
+                            source=source,
+                            imported=target,
+                            file_info=None,
+                        )
                     item.file_path = str(target)
+                    self._cleanup_empty_download_parents(moved_sources, item=item)
                     await self._downloader.update_download(item)
                     return True
         return False
@@ -779,12 +1042,28 @@ class DownloadCompletionHandler:
         await self._organize_missing_staging_payloads(item)
         item = await self._downloader.get_download(item.id) or item
 
+        deleted_sources: list[Path] = []
+        category = self._category_for_item(item)
         if item.files:
             for df in item.files:
                 if df.organized_path:
                     source = self._resolve_downloaded_source(df.file_path, item)
+                    if source and category:
+                        _, consumed_sidecars = await self._materialize_related_sidecars(
+                            category=category,
+                            item=item,
+                            settings=settings,
+                            source=source,
+                            imported=Path(df.organized_path),
+                            file_info=df,
+                            mode="move",
+                        )
+                        deleted_sources.extend(consumed_sidecars)
                     if source and self._path_in_download_dir(source) and self._safe_unlink(source):
+                        deleted_sources.append(source)
                         logger.debug(f"Cleaned up download copy: {source}")
+            if deleted_sources:
+                self._cleanup_empty_download_parents(deleted_sources, item=item)
 
         if send_notification:
             await self._notifications.send_download_complete(item.item_name, item.season, item.episode)
@@ -843,3 +1122,45 @@ class DownloadCompletionHandler:
         except Exception as exc:
             logger.warning(f"Failed to clean up {path}: {exc}")
             return False
+
+    def _cleanup_empty_download_parents(self, sources: list[Path], *, item: DownloadItem | None = None) -> int:
+        """Remove empty torrent-created parent folders after file cleanup/import.
+
+        Season packs often download as ``downloads/Release.Name/...episode files``.
+        Once every episode has been moved or quarantined, leaving the now-empty
+        release folder behind litters the download directory.  This helper walks
+        upward from cleaned source files and removes only empty directories that
+        are strictly inside the configured download root.  It never removes the
+        download root itself and it does not touch non-empty folders, symlinks,
+        or paths outside the staging area.
+        """
+        removed = 0
+        root = self._dl_dir.resolve(strict=False)
+        candidates: set[Path] = set()
+        for source in sources or []:
+            try:
+                parent = Path(source).resolve(strict=False).parent
+            except Exception:
+                continue
+            while parent != root and self._path_in_download_dir(parent):
+                candidates.add(parent)
+                parent = parent.parent
+
+        for directory in sorted(candidates, key=lambda path: len(path.parts), reverse=True):
+            try:
+                if directory == root or not self._path_in_download_dir(directory):
+                    continue
+                if not directory.exists() or not directory.is_dir() or directory.is_symlink():
+                    continue
+                # A plain rmdir is intentional: it succeeds only when the folder
+                # is genuinely empty, so sidecars, subtitles, samples, or user
+                # files keep their parent folder intact for later inspection.
+                directory.rmdir()
+                removed += 1
+                logger.debug(f"Removed empty download folder after import cleanup: {directory}")
+            except OSError:
+                # Non-empty or concurrently touched directories are left alone.
+                continue
+            except Exception as exc:
+                logger.warning(f"Failed to remove empty download folder {directory}: {exc}")
+        return removed

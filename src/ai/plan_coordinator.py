@@ -1,19 +1,21 @@
 """
 Plan coordinator for LJS.
 
-Prepares and coordinates structured plan generation for complex
-intents (SEARCH, DOWNLOAD). Generates AgentPlan, injects goal
-and constraints into the system prompt, and creates PlanExecutor
-for deterministic step execution.
+Prepares optional structured plan hints for complex intents.
+
+Plans are advisory context for the normal tool-calling loop.  They are not
+trusted as a semantic validator and are not executed deterministically before
+the agent has a chance to observe tool results.
 """
 
 from __future__ import annotations
 
 import re
 
+from loguru import logger
+
 from typing import Any, Optional, TYPE_CHECKING
 
-from src.ai.plan_executor import PlanExecutor
 from src.ai.reasoning import ReasoningPlanner
 from src.ai.tool_executor import ToolCallExecutor
 from src.core.models import Intent, AgentPlan, PlanStep
@@ -25,12 +27,11 @@ if TYPE_CHECKING:
 
 
 class PlanCoordinator:
-    """Prepares and coordinates plan generation for complex intents.
+    """Prepares optional structured plan hints for complex intents.
 
-    Generates structured AgentPlan for SEARCH and DOWNLOAD intents,
-    injects goal and constraints into the system prompt, and creates
-    PlanExecutor for deterministic step execution. Both run() and
-    run_stream() use this coordinator to eliminate duplicate code.
+    The coordinator may ask the planner for a compact goal/step sketch, but
+    that sketch is advisory only.  It is never used as a semantic validator and
+    is not executed before the normal tool-calling loop.
     """
 
     def __init__(self, tool_executor: ToolCallExecutor, llm_client: Any, settings: Optional[Settings] = None) -> None:
@@ -61,6 +62,60 @@ class PlanCoordinator:
         return ReasoningPlanner(llm_client=self._llm_client)
 
 
+
+    def _fallback_metadata_search_plan(self, user_prompt: str, context: str | None) -> AgentPlan | None:
+        """Deprecated: structured fallback plans are intentionally disabled.
+
+        Metadata-first behavior belongs in the live tool loop prompt and tool
+        surface, not in an automatically executed rescue plan.  Keep this seam
+        for old tests/extensions that may still import it, but never return a
+        plan from it.
+        """
+        _ = (user_prompt, context)
+        return None
+
+    @staticmethod
+    def _canonical_plan_tool_name(tool_name: str, allowed_tool_names: set[str]) -> str:
+        aliases = {
+            "WebSearch": "web_search",
+            "webSearch": "web_search",
+            "SearchWeb": "web_search",
+            "MetadataLookup": "metadata_lookup",
+            "TMDBLookup": "metadata_lookup",
+            "ExtractMetadata": "browser_extract",
+            "ReadWebPage": "read_web_page",
+        }
+        if tool_name in allowed_tool_names:
+            return tool_name
+        alias = aliases.get(tool_name)
+        if alias in allowed_tool_names:
+            return alias
+        snake = ""
+        for idx, ch in enumerate(str(tool_name or "")):
+            if ch.isupper() and idx > 0 and str(tool_name)[idx - 1].islower():
+                snake += "_"
+            snake += ch.lower()
+        if snake in allowed_tool_names:
+            return snake
+        return tool_name
+
+    def _repair_and_validate_plan_tools(self, agent_plan: AgentPlan, allowed_tool_names: set[str]) -> bool:
+        """Canonicalize safe aliases and reject unavailable plan tools."""
+        ok = True
+        for step in agent_plan.steps:
+            canonical = self._canonical_plan_tool_name(step.tool_name, allowed_tool_names)
+            if canonical != step.tool_name:
+                logger.info("Canonicalized plan tool '{}' -> '{}'", step.tool_name, canonical)
+                step.tool_name = canonical
+            if step.tool_name not in allowed_tool_names:
+                logger.warning(
+                    "Discarding structured plan because step '{}' selected unavailable tool '{}'. Available: {}",
+                    step.id,
+                    step.tool_name,
+                    sorted(allowed_tool_names),
+                )
+                ok = False
+        return ok
 
     def _looks_like_media_fact_question(self, user_prompt: str) -> bool:
         """Deprecated compatibility seam.
@@ -188,8 +243,11 @@ class PlanCoordinator:
             return agent_plan
         if any(step.tool_name == "metadata_lookup" for step in agent_plan.steps):
             return agent_plan
+        for step in agent_plan.steps:
+            step.tool_name = self._canonical_plan_tool_name(step.tool_name, allowed_tool_names)
         first_tool = agent_plan.steps[0].tool_name
-        if first_tool not in {"web_search", "read_web_page", "browser_extract"}:
+        web_like_tools = {"web_search", "read_web_page", "browser_extract", "browse_page", "browser_open"}
+        if first_tool not in web_like_tools and first_tool in allowed_tool_names:
             return agent_plan
         media_type = self._metadata_media_type_from_context(context)
         query = user_prompt
@@ -205,15 +263,19 @@ class PlanCoordinator:
                 break
         if matched_item is None:
             matched_item = self._recently_mentioned_tracked_item(self._recent_history_context(context))
-        if matched_item is None:
+        if matched_item is not None:
+            query = matched_item.key
+        elif media_type not in {"", "auto", "general"}:
+            query = user_prompt
+        else:
             return agent_plan
-        query = matched_item.key
-        for step in agent_plan.steps:
-            if step.tool_name not in {"web_search", "read_web_page", "browser_extract"} or not isinstance(step.arguments, dict):
-                continue
-            original_query = str(step.arguments.get("query") or step.arguments.get("url") or "").strip()
-            if original_query and not self._metadata_query_has_title(original_query, matched_item):
-                step.arguments["query"] = f"{matched_item.key} {original_query}"
+        if matched_item is not None:
+            for step in agent_plan.steps:
+                if step.tool_name not in {"web_search", "read_web_page", "browser_extract"} or not isinstance(step.arguments, dict):
+                    continue
+                original_query = str(step.arguments.get("query") or step.arguments.get("url") or "").strip()
+                if original_query and not self._metadata_query_has_title(original_query, matched_item):
+                    step.arguments["query"] = f"{matched_item.key} {original_query}"
         agent_plan.steps = [
             PlanStep(
                 id="lookup_metadata",
@@ -230,7 +292,10 @@ class PlanCoordinator:
             *agent_plan.steps,
         ]
         agent_plan.constraints["source_priority"] = "metadata_lookup_before_web_search"
-        agent_plan.constraints["web_queries_include_recent_title"] = matched_item.key
+        if matched_item is not None:
+            agent_plan.constraints["web_queries_include_recent_title"] = matched_item.key
+        else:
+            agent_plan.constraints["metadata_lookup_from_active_category"] = media_type
         return agent_plan
 
     def _infer_requested_season(self, user_prompt: str, agent_plan: AgentPlan, item: Any | None = None) -> int | None:
@@ -341,7 +406,7 @@ class PlanCoordinator:
         """
         text = f"{user_prompt or ''} {agent_plan.user_goal or ''} {agent_plan.constraints}".casefold()
         pack_words = ("pack", "bundle", "complete", "full", "whole", "intera", "completa", "pacchetto")
-        unit_scope = ("season", "stagione", "series", "saga", "volume", "collection", "album")
+        unit_scope = ("season", "stagione", "series", "saga", "volume", "collection", "discography", "catalog", "catalogue")
         explicit_pack_request = any(word in text for word in pack_words) and any(word in text for word in unit_scope)
 
         # A request for a whole/latest/last season is not a request for one
@@ -372,8 +437,8 @@ class PlanCoordinator:
             r"\bnot\s+single\s+episodes\b",
         )
         if explicit_pack_request and any(re.search(pattern, strict_text) for pattern in strict_patterns):
-            return "season_pack_only"
-        return "season_pack_preferred"
+            return "bundle_only"
+        return "bundle_preferred"
 
     @staticmethod
     def _recent_media_name_from_context(context: str | None) -> str | None:
@@ -707,12 +772,12 @@ class PlanCoordinator:
         system_prompt_content: str,
         allowed_tool_names: set[str],
         context: str | None = None,
-    ) -> tuple[AgentPlan | None, PlanExecutor | None, str]:
-        """Generate a structured plan and prepare for execution.
+    ) -> tuple[AgentPlan | None, None, str]:
+        """Generate an optional advisory structured plan.
 
-        Only generates plans for SEARCH and DOWNLOAD intents.
-        Injects the plan's user_goal and constraints into the system
-        prompt and creates a PlanExecutor when the plan has steps.
+        Only generates plans for SEARCH and DOWNLOAD intents. The plan's goal,
+        constraints, and compact step sketch may be injected into the system
+        prompt as guidance, but no PlanExecutor is created here.
 
         Args:
             user_prompt: The user's original request.
@@ -722,8 +787,8 @@ class PlanCoordinator:
             context: Optional preference/behavior context for planning.
 
         Returns:
-            Tuple of (agent_plan, plan_executor, updated_system_prompt_content).
-            agent_plan may be None if the intent does not support planning.
+            Tuple of (agent_plan, None, updated_system_prompt_content).
+            agent_plan may be None if the planner fails; plans are advisory only.
         """
         if intent not in (Intent.SEARCH, Intent.DOWNLOAD):
             return None, None, system_prompt_content
@@ -735,6 +800,7 @@ class PlanCoordinator:
         )
 
         if not agent_plan:
+            logger.info("Structured planner produced no usable advisory plan; continuing with the normal tool loop.")
             return None, None, system_prompt_content
 
         agent_plan = self._normalize_download_plan(agent_plan, user_prompt, allowed_tool_names)
@@ -744,6 +810,10 @@ class PlanCoordinator:
             allowed_tool_names=allowed_tool_names,
             context=context,
         )
+
+        if not self._repair_and_validate_plan_tools(agent_plan, allowed_tool_names):
+            logger.warning("Discarded structured advisory plan because it violated the current tool contract.")
+            return None, None, system_prompt_content
 
         # Post-process constraints and arguments to enforce tracked category item language and key matching
         if self._settings and self._settings.tracked_items:
@@ -761,7 +831,6 @@ class PlanCoordinator:
                 )
                 
                 if is_mentioned:
-                    from loguru import logger
                     logger.info(
                         f"[Tracked Item Binding] Tracked item '{item.key}' detected in plan. "
                         "Binding exact item key and filling configured language only when the plan omitted language."
@@ -871,18 +940,16 @@ class PlanCoordinator:
             )
             updated += f"\nConstraints: {constr_str}"
 
-        plan_exec = None
         if agent_plan.steps:
-            plan_exec = PlanExecutor(
-                tool_executor=self._tool_executor,
-                allowed_tool_names=allowed_tool_names,
+            step_summaries = []
+            for step in agent_plan.steps[:5]:
+                step_summaries.append(f"{step.id}:{step.tool_name} args={step.arguments}")
+            updated += (
+                "\n\nSTRUCTURED PLAN ADVISORY (not automatically executed): "
+                + " | ".join(step_summaries)
+                + "\nUse this only as a hint. Concrete actions must still be chosen through the "
+                "current tool-call channel, validated against current tool schemas, and adapted "
+                "to tool results. If tool results contradict this advisory plan, ignore the plan."
             )
-            if any(step.tool_name in ("queue_download", "queue_media_download") for step in agent_plan.steps):
-                updated += (
-                    "\n\nCRITICAL CONTEXT: A structured download execution plan has been prepared. "
-                    "Only confirm that a download is queued when the queue tool result explicitly has status=queued and a download_id. "
-                    "If the queue tool returns an error or lacks a verified download_id, tell the user the queue action failed and include the error. "
-                    "Use the user's language and list item/unit details only when verified."
-                )
 
-        return agent_plan, plan_exec, updated
+        return agent_plan, None, updated

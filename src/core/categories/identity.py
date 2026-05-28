@@ -13,6 +13,16 @@ _NONE_TOKEN_RE = re.compile(r"\s*[\[(]\s*(?:none|null|undefined|unknown|n/?a)\s*
 _EMPTY_BRACKETS_RE = re.compile(r"\s*[\[(]\s*[\])]\s*")
 _SPACES_RE = re.compile(r"\s+")
 _KEY_RE = re.compile(r"[^a-z0-9]+")
+_PATH_SEP_RE = re.compile(r"[\\/]+")
+# Keep path generation portable across Linux, macOS, and Windows.  Even when
+# running on POSIX, LJS may be planning library paths for files discovered from
+# Windows-style remote paths, and Windows rejects these characters outright.
+_INVALID_PATH_SEGMENT_CHARS_RE = re.compile(r'[<>:"\\|?*\x00-\x1f]+')
+_RESERVED_WINDOWS_BASENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 _VIDEO_EXT_RE = re.compile(r"\.(?:mkv|mp4|avi|m4v|mov|mpg|mpeg|wmv|webm)$", re.IGNORECASE)
 _CAMEL_BOUNDARY_1_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -67,7 +77,7 @@ def clean_release_title(value: object, *, fallback: str = "Unknown", media_hint:
     normalized = raw.replace(".", " ").replace("_", " ").replace("+", " ")
     normalized = split_camel_title(normalized)
     normalized = re.sub(r"[\[\]{}]+", " ", normalized)
-    normalized = _SPACES_RE.sub(" ", normalized).strip(" ._-()[]")
+    normalized = _SPACES_RE.sub(" ", normalized).strip(" ._-")
 
     truncated_at_marker = False
     # TV releases have the most reliable delimiter: the first season/episode
@@ -91,7 +101,7 @@ def clean_release_title(value: object, *, fallback: str = "Unknown", media_hint:
 
     normalized = re.sub(r"\b(?:complete|proper|repack|rerip|extended|unrated|internal)\b", " ", normalized, flags=re.IGNORECASE)
     normalized = _TRAILING_RELEASE_GROUP_RE.sub("", normalized) if _RELEASE_MARKER_RE.search(raw) and not truncated_at_marker else normalized
-    normalized = _SPACES_RE.sub(" ", normalized).strip(" ._-()[]")
+    normalized = _SPACES_RE.sub(" ", normalized).strip(" ._-")
     return clean_display_title(normalized, fallback=fallback)
 
 
@@ -121,7 +131,7 @@ def clean_display_title(value: object, fallback: str = "Unknown") -> str:
     text = text.replace("{year}", "").replace("{episode_title}", "")
     text = _NONE_TOKEN_RE.sub(" ", text)
     text = _EMPTY_BRACKETS_RE.sub(" ", text)
-    text = _SPACES_RE.sub(" ", text).strip(" ._-()[]")
+    text = _SPACES_RE.sub(" ", text).strip(" ._-")
     return text or fallback
 
 
@@ -131,12 +141,52 @@ def canonical_item_key(value: object) -> str:
     return _KEY_RE.sub(" ", cleaned.lower()).strip()
 
 
+def clean_path_segment(value: object, fallback: str = "Unknown") -> str:
+    """Return one portable filesystem path segment.
+
+    This deliberately applies the Windows-invalid character set on every
+    platform.  Otherwise a library path that works on Linux/macOS can fail on
+    Windows, or a Windows-style remote/Soulseek name can create different
+    directory layouts depending on the host OS.
+    """
+    text = clean_display_title(value, fallback="")
+    text = _PATH_SEP_RE.sub(" ", text)
+    text = _INVALID_PATH_SEGMENT_CHARS_RE.sub(" ", text)
+    text = re.sub(r"\s+([.])", r"\1", text)
+    text = _SPACES_RE.sub(" ", text).strip(" ._-")
+    if not text or text in {".", ".."}:
+        return fallback
+    # Windows treats reserved device basenames as invalid even with extensions
+    # such as CON.mp3.  Prefix instead of dropping the user-visible label.
+    basename = text.split(".", 1)[0].upper()
+    if basename in _RESERVED_WINDOWS_BASENAMES:
+        text = f"_{text}"
+    return text or fallback
+
+
 def clean_path_fragment(value: object, fallback: str = "Unknown") -> str:
-    """Clean a formatted path fragment after template substitution."""
-    text = clean_display_title(value, fallback=fallback)
-    # Remove empty path components left by templates such as "Title ()/File".
-    parts = [clean_display_title(part, fallback="") for part in text.split("/")]
+    """Clean a formatted relative path fragment after template substitution.
+
+    Forward slashes in category templates remain intentional hierarchy
+    separators.  Backslashes are normalized to the same separator before each
+    component is sanitized, preventing host-dependent behavior where POSIX would
+    keep a backslash inside a filename while Windows would treat it as a directory.
+    """
+    text = clean_display_title(value, fallback=fallback).replace("\\", "/")
+    parts = [clean_path_segment(part, fallback="") for part in text.split("/")]
     return "/".join(part for part in parts if part) or fallback
+
+
+def basename_from_pathish(value: object, fallback: str = "file") -> str:
+    """Return a portable basename from a POSIX, Windows, or remote path string."""
+    text = "" if value is None else str(value)
+    text = text.replace("\\", "/").strip()
+    while text.endswith("/"):
+        text = text[:-1]
+    name = text.rsplit("/", 1)[-1] if text else ""
+    if name.endswith(".downloading"):
+        name = name[:-12]
+    return clean_path_segment(name, fallback=fallback)
 
 
 def clean_category_item_name(value: object, category_id: str | None = None, *, fallback: str = "Unknown") -> str:

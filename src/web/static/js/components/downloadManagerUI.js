@@ -18,6 +18,8 @@ class DownloadManager extends Component {
         this.gridContainer = document.getElementById('active-downloads');
         this.activeBadge = document.getElementById('stat-active-count');
         this.downloads = new Map();
+        this._pollTimer = null;
+        this._expandedFilePanels = new Set();
         
         if (this.gridContainer) {
             this._init();
@@ -34,19 +36,25 @@ class DownloadManager extends Component {
         shipEvents.subscribe('dl_event', (e) => this._handleEvent(e));
         
         this.load();
+        // slskd/Soulseek transfers do not currently emit torrent telemetry events.
+        // Poll the unified downloads endpoint so Soulseek progress, speed, and
+        // completed/cleared state update without a full browser refresh.
+        if (!this._pollTimer) {
+            this._pollTimer = window.setInterval(() => this.load({ silent: true }), 5000);
+        }
     }
 
     /**
      * Load initial download list state from FastAPI endpoint.
      */
-    async load() {
+    async load(options = {}) {
         try {
             const data = await APIClient.get('/api/downloads');
             this.downloads.clear();
             (data.active || []).forEach(d => this.downloads.set(d.id, d));
             this.render();
         } catch (err) {
-            console.error('[DownloadManager] Failed to load downloads:', err);
+            if (!options.silent) console.error('[DownloadManager] Failed to load downloads:', err);
         }
     }
 
@@ -57,6 +65,7 @@ class DownloadManager extends Component {
     _handleEvent(e) {
         if (e.subtype === 'cancelled' || e.subtype === 'removed') {
             this.downloads.delete(e.id);
+            this._expandedFilePanels.delete(e.id);
         } else if (e.download) {
             this.downloads.set(e.id, e.download);
         }
@@ -101,7 +110,10 @@ class DownloadManager extends Component {
         } else if (actionType === 'resume') {
             targets = all.filter(d => ['paused'].includes(d.status));
         } else if (actionType === 'cancel') {
-            targets = all.filter(d => !['complete', 'cancelled', 'failed'].includes(d.status));
+            targets = all.filter(d => {
+                const isSoulseek = d.source === 'slskd' || d.backend === 'soulseek';
+                return isSoulseek || !['complete', 'cancelled', 'failed'].includes(d.status);
+            });
         }
         if (!targets.length) {
             toast.show('No matching downloads.');
@@ -176,6 +188,7 @@ class DownloadManager extends Component {
 
             if (actionType === 'cancel') {
                 this.downloads.delete(id);
+                this._expandedFilePanels.delete(id);
                 toast.show('Cargo scuttled.');
             } else if (res && res.ok && res.data) {
                 this.downloads.set(id, res.data);
@@ -319,6 +332,35 @@ class DownloadManager extends Component {
         return 'Torrent release name not available yet';
     }
 
+    _downloadExpansionKeys(dl) {
+        const id = String((dl && dl.id) || '').trim();
+        const isSoulseek = dl && (dl.source === 'slskd' || dl.backend === 'soulseek');
+        const keys = new Set();
+        if (id) keys.add(id);
+        if (isSoulseek) {
+            const user = String(dl.slskd_username || '').trim().toLowerCase();
+            const folder = String(dl.slskd_folder || '').trim().toLowerCase();
+            const item = String(dl.item_name || '').trim().toLowerCase();
+            const magnet = String(dl.magnet || '').trim().toLowerCase();
+            if (user || folder || item) keys.add(`slskd:${user}:${folder || item}`);
+            if (user || item) keys.add(`slskd-item:${user}:${item}`);
+            if (magnet) keys.add(`magnet:${magnet}`);
+        }
+        return Array.from(keys).filter(Boolean);
+    }
+
+    _isFilesPanelExpanded(dl) {
+        return this._downloadExpansionKeys(dl).some(key => this._expandedFilePanels.has(key));
+    }
+
+    _setFilesPanelExpanded(dl, expanded) {
+        const keys = this._downloadExpansionKeys(dl);
+        keys.forEach(key => {
+            if (expanded) this._expandedFilePanels.add(key);
+            else this._expandedFilePanels.delete(key);
+        });
+    }
+
     /**
      * Compiles a single download card using Option 1 markup specs.
      * @private
@@ -328,6 +370,7 @@ class DownloadManager extends Component {
         const isPending = ['pausing', 'resuming', 'cancelling', 'restarting', 'updating priority'].includes(dl.status);
 
         const group = this._statusGroup(dl);
+        const isFilesExpanded = this._isFilesPanelExpanded(dl);
         const card = DOM.el('div', { 
             className: `download-card glass-panel dl-state-${group} ${dl.status === 'paused' ? 'dl-card-paused' : ''} ${isPending ? 'dl-card-pending' : ''}`, 
             dataset: { id: dl.id, status: dl.status, stateGroup: group } 
@@ -335,7 +378,8 @@ class DownloadManager extends Component {
 
         // Top icon
         const iconWrap = DOM.el('div', { className: 'dl-icon' });
-        const iconClass = (dl.status === 'seeding' || dl.status === 'complete') ? 'fa-box-open' : 'fa-ship';
+        const isSoulseek = dl.source === 'slskd' || dl.backend === 'soulseek';
+        const iconClass = isSoulseek ? 'fa-music' : ((dl.status === 'seeding' || dl.status === 'complete') ? 'fa-box-open' : 'fa-ship');
         iconWrap.appendChild(DOM.el('i', { className: `fa-solid ${iconClass}` }));
         card.appendChild(iconWrap);
 
@@ -350,6 +394,9 @@ class DownloadManager extends Component {
         }, [torrentTitle]));
 
         const meta = DOM.el('div', { className: 'dl-meta' });
+        if (isSoulseek) {
+            meta.appendChild(DOM.el('span', { className: 'badge', title: 'Soulseek/slskd transfer' }, ['Soulseek']));
+        }
         if (dl.season && dl.episode) {
             meta.appendChild(DOM.el('span', { className: 'badge' }, [`S${String(dl.season).padStart(2, '0')}E${String(dl.episode).padStart(2, '0')}`]));
         }
@@ -377,12 +424,14 @@ class DownloadManager extends Component {
         meta.appendChild(DOM.el('span', {
             className: 'dl-peers dl-swarm',
             style: { marginLeft: '8px' },
-            title: sourceSeeders != null
-                ? `Live seeds/peers from libtorrent. Source seeders (${sourceSeeders}) were reported by the indexer when selected.`
-                : 'Live seeds/peers from libtorrent.'
+            title: isSoulseek
+                ? 'Soulseek is peer-to-peer through one remote user/queue, not a torrent swarm.'
+                : (sourceSeeders != null
+                    ? `Live seeds/peers from libtorrent. Source seeders (${sourceSeeders}) were reported by the indexer when selected.`
+                    : 'Live seeds/peers from libtorrent.')
         }, [
             DOM.el('i', { className: 'fa-solid fa-users' }),
-            ` seeds ${liveSeeds} · peers ${peers}${sourceText}`
+            isSoulseek ? ` user ${dl.slskd_username || 'unknown'}` : ` seeds ${liveSeeds} · peers ${peers}${sourceText}`
         ]));
 
         // ETA
@@ -457,7 +506,21 @@ class DownloadManager extends Component {
         // Active control actions
         const acts = DOM.el('div', { className: 'dl-actions' });
         
-        if (isPending) {
+        if (isSoulseek) {
+            if (hasFiles) {
+                const filesButton = DOM.btn('', 'icon-btn dl-files-btn', () => {
+                    this._toggleFilesPanel(dl, card);
+                }, {
+                    title: 'Show Soulseek files',
+                    content: '<i class="fa-solid fa-list-check"></i>'
+                });
+                acts.appendChild(filesButton);
+            }
+            acts.appendChild(DOM.btn('', 'icon-btn danger cancel-btn', () => this._action(dl.id, 'cancel'), {
+                title: ['complete', 'failed', 'cancelled'].includes(String(dl.status || '').toLowerCase()) ? 'Clear Soulseek transfer' : 'Cancel Soulseek transfer',
+                content: '<i class="fa-solid fa-trash"></i>'
+            }));
+        } else if (isPending) {
             const loader = DOM.el('div', { 
                 className: 'dl-pending-loader'
             }, [
@@ -485,9 +548,7 @@ class DownloadManager extends Component {
 
             if (hasFiles) {
                 const filesButton = DOM.btn('', 'icon-btn dl-files-btn', () => {
-                    const filesDiv = card.querySelector('.dl-files');
-                    const expanded = filesDiv && filesDiv.style.display !== 'none';
-                    if (filesDiv) filesDiv.style.display = expanded ? 'none' : 'block';
+                    this._toggleFilesPanel(dl, card);
                 }, {
                     title: 'Show files and per-file priority',
                     content: '<i class="fa-solid fa-list-check"></i>'
@@ -523,24 +584,41 @@ class DownloadManager extends Component {
 
         // Handle inline file expand toggle panel
         if (hasFiles) {
-            const filesDiv = DOM.el('div', { className: 'dl-files', style: { display: 'none', width: '100%', marginTop: '16px' } });
+            const filesDiv = DOM.el('div', {
+                className: 'dl-files',
+                style: { display: isFilesExpanded ? 'block' : 'none', width: '100%', marginTop: '16px' }
+            });
             this._buildFileRows(dl, filesDiv);
             card.appendChild(filesDiv);
 
             const toggleBtn = meta.querySelector('.dl-expand-toggle');
             if (toggleBtn) {
+                this._syncFilesToggle(toggleBtn, isFilesExpanded);
                 toggleBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    const expanded = filesDiv.style.display !== 'none';
-                    filesDiv.style.display = expanded ? 'none' : 'block';
-                    toggleBtn.innerHTML = expanded ? '<i class="fa-solid fa-list"></i> Files' : '<i class="fa-solid fa-list"></i> Hide files';
-                    toggleBtn.style.color = expanded ? 'var(--text-dim)' : 'var(--accent-teal)';
-                    toggleBtn.style.background = expanded ? 'rgba(255, 255, 255, 0.05)' : 'rgba(42, 157, 143, 0.15)';
+                    this._toggleFilesPanel(dl, card);
                 });
             }
         }
 
         return card;
+    }
+
+    _toggleFilesPanel(downloadOrId, card) {
+        const filesDiv = card.querySelector('.dl-files');
+        if (!filesDiv) return;
+        const dl = typeof downloadOrId === 'object' ? downloadOrId : this.downloads.get(downloadOrId) || { id: downloadOrId };
+        const nextExpanded = filesDiv.style.display === 'none';
+        filesDiv.style.display = nextExpanded ? 'block' : 'none';
+        this._setFilesPanelExpanded(dl, nextExpanded);
+        const toggleBtn = card.querySelector('.dl-expand-toggle');
+        if (toggleBtn) this._syncFilesToggle(toggleBtn, nextExpanded);
+    }
+
+    _syncFilesToggle(toggleBtn, expanded) {
+        toggleBtn.innerHTML = expanded ? '<i class="fa-solid fa-list"></i> Hide files' : '<i class="fa-solid fa-list"></i> Files';
+        toggleBtn.style.color = expanded ? 'var(--accent-teal)' : 'var(--text-dim)';
+        toggleBtn.style.background = expanded ? 'rgba(42, 157, 143, 0.15)' : 'rgba(255, 255, 255, 0.05)';
     }
 
     /**

@@ -423,7 +423,7 @@ class PlanExecutor:
             return None
 
         scope = str(self._extract_dotted_path(payload, "search_scope") or "").lower()
-        if scope.startswith("season_pack"):
+        if scope in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
             for candidate in candidates:
                 if isinstance(candidate, dict) and candidate.get("is_bundle") and (candidate.get("candidate_id") or candidate.get("id")):
                     return [str(candidate.get("candidate_id") or candidate.get("id"))]

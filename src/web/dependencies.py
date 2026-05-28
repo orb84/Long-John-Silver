@@ -46,6 +46,7 @@ class WebDependencies:
     search_aggregator: Any = None
     browser_runtime: Any = None
     jackett_manager: Any = None
+    slskd_manager: Any = None
     storage_monitor: Any = None
     artwork_manager: Any = None
     metadata_enricher: Any = None

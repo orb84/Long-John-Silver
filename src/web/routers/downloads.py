@@ -17,6 +17,7 @@ from src.core.models import ActionCommand, ActionSource
 from src.core.models import DownloadPriority
 from src.web.dependencies import WebDependencies, verify_auth
 from src.web.view_models.download_view_model import DownloadViewModelBuilder
+from src.integrations.slskd_transfer_view import SlskdTransferReadModel
 
 
 class DownloadsRouter:
@@ -58,12 +59,19 @@ class DownloadsRouter:
         return result.data
 
     async def _get_download_queue(self):
-        """Return the current download queue ordered by priority."""
+        """Return the current torrent and Soulseek queue ordered by priority."""
         queued = await self._deps.downloader.get_queued_downloads()
-        return {"queue": [self._view_model_builder.build(d) for d in queued]}
+        rows = [self._view_model_builder.build(d) for d in queued]
+        rows.extend(await self._soulseek_rows(include_completed=False))
+        return {"queue": [row for row in rows if str(row.get("status") or "").lower() == "queued"]}
 
     async def _get_download(self, download_id: str):
-        """Return details for a single download."""
+        """Return details for a single torrent or Soulseek download."""
+        if str(download_id).startswith("slskd:"):
+            for row in await self._soulseek_rows(include_completed=True):
+                if row.get("id") == download_id:
+                    return row
+            raise HTTPException(status_code=404, detail="Soulseek transfer not found")
         item = await self._deps.downloader.get_download(download_id)
         if not item:
             raise HTTPException(status_code=404, detail="Download not found")
@@ -150,9 +158,17 @@ class DownloadsRouter:
         return {'status': 'cancelled', 'download_id': download_id}
 
     async def _get_all_downloads(self):
-        """Return active downloads (used by the show detail modal)."""
+        """Return active torrent and Soulseek downloads."""
         active = await self._deps.downloader.get_active_downloads()
-        return {"active": [self._view_model_builder.build(d) for d in active]}
+        rows = [self._view_model_builder.build(d) for d in active]
+        rows.extend(await self._soulseek_rows(include_completed=True))
+        return {"active": rows}
+
+    async def _soulseek_rows(self, *, include_completed: bool = True) -> list[dict]:
+        try:
+            return await SlskdTransferReadModel(self._deps.settings_manager, self._deps.db).active_download_rows(include_completed=include_completed)
+        except Exception:
+            return []
 
     async def _get_recent_downloads(self):
         """Return recently completed or failed downloads."""

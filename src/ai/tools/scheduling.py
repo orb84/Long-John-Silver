@@ -7,6 +7,7 @@ and removing scheduled tasks, as well as immediate show checking.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Optional, TYPE_CHECKING
 
 from loguru import logger
@@ -32,6 +33,55 @@ def _format_size(size_bytes: int | None) -> str | None:
             return f"{size_bytes / factor:.2f} {suffix}"
     return f"{size_bytes} B"
 
+def _compact_soulseek_candidates(candidates: list[dict[str, Any]], *, result_set_id: str = "", limit: int = 12) -> list[dict[str, Any]]:
+    """Return compact Soulseek rows for the LLM while cache keeps full filenames."""
+    compact: list[dict[str, Any]] = []
+    for raw in (candidates or [])[:limit]:
+        if not isinstance(raw, dict):
+            continue
+        filenames = [str(v) for v in (raw.get("filenames") or []) if str(v).strip()]
+        audio = [str(v) for v in (raw.get("audio_filenames") or []) if str(v).strip()]
+        support = [str(v) for v in (raw.get("supporting_filenames") or []) if str(v).strip()]
+        row = {
+            "index": raw.get("index"),
+            "candidate_id": raw.get("candidate_id"),
+            "result_set_id": result_set_id,
+            "source": "slskd",
+            "candidate_type": raw.get("candidate_type") or ("folder" if filenames else "file"),
+            "username": raw.get("username"),
+            "folder": raw.get("folder"),
+            "filename": raw.get("filename"),
+            "file_count": raw.get("file_count") or (len(filenames) if filenames else None),
+            "audio_file_count": raw.get("audio_file_count") or (len(audio) if audio else None),
+            "supporting_file_count": raw.get("supporting_file_count") or (len(support) if support else None),
+            "size_bytes": raw.get("size_bytes"),
+            "size": _format_size(raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None),
+            "bitrate": raw.get("bitrate"),
+            "extension": raw.get("extension"),
+            "has_free_upload_slot": raw.get("has_free_upload_slot"),
+            "queue_length": raw.get("queue_length"),
+            "folder_relevance": raw.get("folder_relevance"),
+            "folder_query_match_score": raw.get("folder_query_match_score"),
+            "sample_filenames": (audio or filenames or ([raw.get("filename")] if raw.get("filename") else []))[:6],
+            "enqueue_hint": {
+                "tool": "enqueue_soulseek_download",
+                "candidate_id": raw.get("candidate_id"),
+                "result_set_id": result_set_id,
+            },
+        }
+        compact.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
+    return compact
+
+
+def _best_soulseek_candidate_id(candidates: list[dict[str, Any]]) -> str:
+    """Return the most likely Soulseek candidate id for a clear album/folder result."""
+    if not candidates:
+        return ""
+    folders = [c for c in candidates if isinstance(c, dict) and c.get("candidate_type") == "folder"]
+    strong = [c for c in folders if str(c.get("folder_relevance") or "").lower() in {"strong", "partial"}]
+    chosen = (strong or folders or candidates)[0]
+    return str(chosen.get("candidate_id") or "")
+
 
 class CreateScheduledTaskTool:
     """Create a reminder, scheduled prompt, or recurring assistant check."""
@@ -51,6 +101,77 @@ class CreateScheduledTaskTool:
 
     def __init__(self, prompt_scheduler: Optional[PromptScheduler] = None) -> None:
         self._prompt_scheduler = prompt_scheduler
+
+    async def _maybe_schedule_unmatched_retry(
+        self,
+        *,
+        res: dict[str, Any],
+        name: str,
+        category_id: str | None,
+        search_scope: str | None,
+        context: ToolExecutionContext,
+    ) -> None:
+        """Create one automatic recurring retry when both backends return no match.
+
+        Soulseek is peer-to-peer, so a query that returns nothing now can return
+        matches later in the day.  This schedules a normal assistant condition
+        check, deduplicated by search/category/scope, instead of adding a new
+        bespoke scheduler subsystem.
+        """
+        if int(res.get("candidate_count") or 0) > 0:
+            return
+        companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
+        if int(companion.get("candidate_count") or 0) > 0:
+            return
+        scheduler = self._scheduler
+        prompt_scheduler = getattr(scheduler, "_prompt_scheduler", None) if scheduler is not None else None
+        settings = getattr(getattr(scheduler, "_settings_manager", None), "settings", None) if scheduler is not None else None
+        cfg = getattr(settings, "soulseek", None) if settings is not None else None
+        if not prompt_scheduler or not cfg or not getattr(cfg, "auto_retry_unmatched_searches", True):
+            return
+        marker_src = f"{category_id or ''}:{name}:{search_scope or 'default'}"
+        marker = "ljs:auto-retry-search:" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()[:16]
+        try:
+            existing = await prompt_scheduler.list_tasks(user_id=context.user_id)
+            for task in existing:
+                if getattr(task, "enabled", False) and marker in str(getattr(task, "prompt", "")):
+                    res["deferred_search_retry"] = {
+                        "scheduled": True,
+                        "existing": True,
+                        "task_id": getattr(task, "id", ""),
+                        "interval_minutes": getattr(task, "interval_minutes", None),
+                        "reason": "A recurring retry already exists for this missed search.",
+                    }
+                    return
+            prompt = (
+                f"[{marker}] Search again for {name!r} in category {category_id or 'auto'} using both torrents and Soulseek if configured. "
+                f"Use concise Soulseek queries without words like album/track/download unless part of the title. "
+                f"If a clear safe match appears and auto-download is enabled, queue it with the correct backend; otherwise notify me with the best candidates. "
+                f"Original search_scope={search_scope or 'default'}."
+            )
+            task = await prompt_scheduler.create_task(
+                prompt=prompt,
+                interval_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                user_id=context.user_id,
+                channel=context.source or "web",
+                title=f"Retry search: {name}",
+                task_type="condition_check",
+                schedule_type="recurring",
+                delay_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                max_runs=int(getattr(cfg, "retry_search_max_runs", 12) or 12),
+                session_id=context.session_id,
+            )
+            res["deferred_search_retry"] = {
+                "scheduled": True,
+                "existing": False,
+                "task_id": task.id,
+                "interval_minutes": task.interval_minutes,
+                "max_runs": task.max_runs,
+                "reason": "No torrent or Soulseek candidates were found; LJS will retry automatically because P2P availability changes over time.",
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to schedule unmatched-search retry for {name!r}: {exc}")
+            res["deferred_search_retry"] = {"scheduled": False, "error": str(exc)}
 
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
@@ -176,6 +297,77 @@ class ListScheduledTasksTool:
     def __init__(self, prompt_scheduler: Optional[PromptScheduler] = None) -> None:
         self._prompt_scheduler = prompt_scheduler
 
+    async def _maybe_schedule_unmatched_retry(
+        self,
+        *,
+        res: dict[str, Any],
+        name: str,
+        category_id: str | None,
+        search_scope: str | None,
+        context: ToolExecutionContext,
+    ) -> None:
+        """Create one automatic recurring retry when both backends return no match.
+
+        Soulseek is peer-to-peer, so a query that returns nothing now can return
+        matches later in the day.  This schedules a normal assistant condition
+        check, deduplicated by search/category/scope, instead of adding a new
+        bespoke scheduler subsystem.
+        """
+        if int(res.get("candidate_count") or 0) > 0:
+            return
+        companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
+        if int(companion.get("candidate_count") or 0) > 0:
+            return
+        scheduler = self._scheduler
+        prompt_scheduler = getattr(scheduler, "_prompt_scheduler", None) if scheduler is not None else None
+        settings = getattr(getattr(scheduler, "_settings_manager", None), "settings", None) if scheduler is not None else None
+        cfg = getattr(settings, "soulseek", None) if settings is not None else None
+        if not prompt_scheduler or not cfg or not getattr(cfg, "auto_retry_unmatched_searches", True):
+            return
+        marker_src = f"{category_id or ''}:{name}:{search_scope or 'default'}"
+        marker = "ljs:auto-retry-search:" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()[:16]
+        try:
+            existing = await prompt_scheduler.list_tasks(user_id=context.user_id)
+            for task in existing:
+                if getattr(task, "enabled", False) and marker in str(getattr(task, "prompt", "")):
+                    res["deferred_search_retry"] = {
+                        "scheduled": True,
+                        "existing": True,
+                        "task_id": getattr(task, "id", ""),
+                        "interval_minutes": getattr(task, "interval_minutes", None),
+                        "reason": "A recurring retry already exists for this missed search.",
+                    }
+                    return
+            prompt = (
+                f"[{marker}] Search again for {name!r} in category {category_id or 'auto'} using both torrents and Soulseek if configured. "
+                f"Use concise Soulseek queries without words like album/track/download unless part of the title. "
+                f"If a clear safe match appears and auto-download is enabled, queue it with the correct backend; otherwise notify me with the best candidates. "
+                f"Original search_scope={search_scope or 'default'}."
+            )
+            task = await prompt_scheduler.create_task(
+                prompt=prompt,
+                interval_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                user_id=context.user_id,
+                channel=context.source or "web",
+                title=f"Retry search: {name}",
+                task_type="condition_check",
+                schedule_type="recurring",
+                delay_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                max_runs=int(getattr(cfg, "retry_search_max_runs", 12) or 12),
+                session_id=context.session_id,
+            )
+            res["deferred_search_retry"] = {
+                "scheduled": True,
+                "existing": False,
+                "task_id": task.id,
+                "interval_minutes": task.interval_minutes,
+                "max_runs": task.max_runs,
+                "reason": "No torrent or Soulseek candidates were found; LJS will retry automatically because P2P availability changes over time.",
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to schedule unmatched-search retry for {name!r}: {exc}")
+            res["deferred_search_retry"] = {"scheduled": False, "error": str(exc)}
+
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
 
@@ -236,6 +428,77 @@ class RemoveScheduledTaskTool:
     def __init__(self, prompt_scheduler: Optional[PromptScheduler] = None) -> None:
         self._prompt_scheduler = prompt_scheduler
 
+    async def _maybe_schedule_unmatched_retry(
+        self,
+        *,
+        res: dict[str, Any],
+        name: str,
+        category_id: str | None,
+        search_scope: str | None,
+        context: ToolExecutionContext,
+    ) -> None:
+        """Create one automatic recurring retry when both backends return no match.
+
+        Soulseek is peer-to-peer, so a query that returns nothing now can return
+        matches later in the day.  This schedules a normal assistant condition
+        check, deduplicated by search/category/scope, instead of adding a new
+        bespoke scheduler subsystem.
+        """
+        if int(res.get("candidate_count") or 0) > 0:
+            return
+        companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
+        if int(companion.get("candidate_count") or 0) > 0:
+            return
+        scheduler = self._scheduler
+        prompt_scheduler = getattr(scheduler, "_prompt_scheduler", None) if scheduler is not None else None
+        settings = getattr(getattr(scheduler, "_settings_manager", None), "settings", None) if scheduler is not None else None
+        cfg = getattr(settings, "soulseek", None) if settings is not None else None
+        if not prompt_scheduler or not cfg or not getattr(cfg, "auto_retry_unmatched_searches", True):
+            return
+        marker_src = f"{category_id or ''}:{name}:{search_scope or 'default'}"
+        marker = "ljs:auto-retry-search:" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()[:16]
+        try:
+            existing = await prompt_scheduler.list_tasks(user_id=context.user_id)
+            for task in existing:
+                if getattr(task, "enabled", False) and marker in str(getattr(task, "prompt", "")):
+                    res["deferred_search_retry"] = {
+                        "scheduled": True,
+                        "existing": True,
+                        "task_id": getattr(task, "id", ""),
+                        "interval_minutes": getattr(task, "interval_minutes", None),
+                        "reason": "A recurring retry already exists for this missed search.",
+                    }
+                    return
+            prompt = (
+                f"[{marker}] Search again for {name!r} in category {category_id or 'auto'} using both torrents and Soulseek if configured. "
+                f"Use concise Soulseek queries without words like album/track/download unless part of the title. "
+                f"If a clear safe match appears and auto-download is enabled, queue it with the correct backend; otherwise notify me with the best candidates. "
+                f"Original search_scope={search_scope or 'default'}."
+            )
+            task = await prompt_scheduler.create_task(
+                prompt=prompt,
+                interval_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                user_id=context.user_id,
+                channel=context.source or "web",
+                title=f"Retry search: {name}",
+                task_type="condition_check",
+                schedule_type="recurring",
+                delay_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                max_runs=int(getattr(cfg, "retry_search_max_runs", 12) or 12),
+                session_id=context.session_id,
+            )
+            res["deferred_search_retry"] = {
+                "scheduled": True,
+                "existing": False,
+                "task_id": task.id,
+                "interval_minutes": task.interval_minutes,
+                "max_runs": task.max_runs,
+                "reason": "No torrent or Soulseek candidates were found; LJS will retry automatically because P2P availability changes over time.",
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to schedule unmatched-search retry for {name!r}: {exc}")
+            res["deferred_search_retry"] = {"scheduled": False, "error": str(exc)}
+
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
 
@@ -290,6 +553,77 @@ class ListMediaTool:
     def __init__(self, scheduler: Optional[MediaScheduler] = None) -> None:
         self._scheduler = scheduler
 
+    async def _maybe_schedule_unmatched_retry(
+        self,
+        *,
+        res: dict[str, Any],
+        name: str,
+        category_id: str | None,
+        search_scope: str | None,
+        context: ToolExecutionContext,
+    ) -> None:
+        """Create one automatic recurring retry when both backends return no match.
+
+        Soulseek is peer-to-peer, so a query that returns nothing now can return
+        matches later in the day.  This schedules a normal assistant condition
+        check, deduplicated by search/category/scope, instead of adding a new
+        bespoke scheduler subsystem.
+        """
+        if int(res.get("candidate_count") or 0) > 0:
+            return
+        companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
+        if int(companion.get("candidate_count") or 0) > 0:
+            return
+        scheduler = self._scheduler
+        prompt_scheduler = getattr(scheduler, "_prompt_scheduler", None) if scheduler is not None else None
+        settings = getattr(getattr(scheduler, "_settings_manager", None), "settings", None) if scheduler is not None else None
+        cfg = getattr(settings, "soulseek", None) if settings is not None else None
+        if not prompt_scheduler or not cfg or not getattr(cfg, "auto_retry_unmatched_searches", True):
+            return
+        marker_src = f"{category_id or ''}:{name}:{search_scope or 'default'}"
+        marker = "ljs:auto-retry-search:" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()[:16]
+        try:
+            existing = await prompt_scheduler.list_tasks(user_id=context.user_id)
+            for task in existing:
+                if getattr(task, "enabled", False) and marker in str(getattr(task, "prompt", "")):
+                    res["deferred_search_retry"] = {
+                        "scheduled": True,
+                        "existing": True,
+                        "task_id": getattr(task, "id", ""),
+                        "interval_minutes": getattr(task, "interval_minutes", None),
+                        "reason": "A recurring retry already exists for this missed search.",
+                    }
+                    return
+            prompt = (
+                f"[{marker}] Search again for {name!r} in category {category_id or 'auto'} using both torrents and Soulseek if configured. "
+                f"Use concise Soulseek queries without words like album/track/download unless part of the title. "
+                f"If a clear safe match appears and auto-download is enabled, queue it with the correct backend; otherwise notify me with the best candidates. "
+                f"Original search_scope={search_scope or 'default'}."
+            )
+            task = await prompt_scheduler.create_task(
+                prompt=prompt,
+                interval_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                user_id=context.user_id,
+                channel=context.source or "web",
+                title=f"Retry search: {name}",
+                task_type="condition_check",
+                schedule_type="recurring",
+                delay_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                max_runs=int(getattr(cfg, "retry_search_max_runs", 12) or 12),
+                session_id=context.session_id,
+            )
+            res["deferred_search_retry"] = {
+                "scheduled": True,
+                "existing": False,
+                "task_id": task.id,
+                "interval_minutes": task.interval_minutes,
+                "max_runs": task.max_runs,
+                "reason": "No torrent or Soulseek candidates were found; LJS will retry automatically because P2P availability changes over time.",
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to schedule unmatched-search retry for {name!r}: {exc}")
+            res["deferred_search_retry"] = {"scheduled": False, "error": str(exc)}
+
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
 
@@ -323,6 +657,77 @@ class ListMediaItemsTool:
 
     def __init__(self, scheduler: Optional[MediaScheduler] = None) -> None:
         self._scheduler = scheduler
+
+    async def _maybe_schedule_unmatched_retry(
+        self,
+        *,
+        res: dict[str, Any],
+        name: str,
+        category_id: str | None,
+        search_scope: str | None,
+        context: ToolExecutionContext,
+    ) -> None:
+        """Create one automatic recurring retry when both backends return no match.
+
+        Soulseek is peer-to-peer, so a query that returns nothing now can return
+        matches later in the day.  This schedules a normal assistant condition
+        check, deduplicated by search/category/scope, instead of adding a new
+        bespoke scheduler subsystem.
+        """
+        if int(res.get("candidate_count") or 0) > 0:
+            return
+        companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
+        if int(companion.get("candidate_count") or 0) > 0:
+            return
+        scheduler = self._scheduler
+        prompt_scheduler = getattr(scheduler, "_prompt_scheduler", None) if scheduler is not None else None
+        settings = getattr(getattr(scheduler, "_settings_manager", None), "settings", None) if scheduler is not None else None
+        cfg = getattr(settings, "soulseek", None) if settings is not None else None
+        if not prompt_scheduler or not cfg or not getattr(cfg, "auto_retry_unmatched_searches", True):
+            return
+        marker_src = f"{category_id or ''}:{name}:{search_scope or 'default'}"
+        marker = "ljs:auto-retry-search:" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()[:16]
+        try:
+            existing = await prompt_scheduler.list_tasks(user_id=context.user_id)
+            for task in existing:
+                if getattr(task, "enabled", False) and marker in str(getattr(task, "prompt", "")):
+                    res["deferred_search_retry"] = {
+                        "scheduled": True,
+                        "existing": True,
+                        "task_id": getattr(task, "id", ""),
+                        "interval_minutes": getattr(task, "interval_minutes", None),
+                        "reason": "A recurring retry already exists for this missed search.",
+                    }
+                    return
+            prompt = (
+                f"[{marker}] Search again for {name!r} in category {category_id or 'auto'} using both torrents and Soulseek if configured. "
+                f"Use concise Soulseek queries without words like album/track/download unless part of the title. "
+                f"If a clear safe match appears and auto-download is enabled, queue it with the correct backend; otherwise notify me with the best candidates. "
+                f"Original search_scope={search_scope or 'default'}."
+            )
+            task = await prompt_scheduler.create_task(
+                prompt=prompt,
+                interval_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                user_id=context.user_id,
+                channel=context.source or "web",
+                title=f"Retry search: {name}",
+                task_type="condition_check",
+                schedule_type="recurring",
+                delay_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                max_runs=int(getattr(cfg, "retry_search_max_runs", 12) or 12),
+                session_id=context.session_id,
+            )
+            res["deferred_search_retry"] = {
+                "scheduled": True,
+                "existing": False,
+                "task_id": task.id,
+                "interval_minutes": task.interval_minutes,
+                "max_runs": task.max_runs,
+                "reason": "No torrent or Soulseek candidates were found; LJS will retry automatically because P2P availability changes over time.",
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to schedule unmatched-search retry for {name!r}: {exc}")
+            res["deferred_search_retry"] = {"scheduled": False, "error": str(exc)}
 
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
@@ -375,6 +780,77 @@ class SearchMediaTorrentsTool:
     def __init__(self, scheduler: Optional[MediaScheduler] = None) -> None:
         self._scheduler = scheduler
 
+    async def _maybe_schedule_unmatched_retry(
+        self,
+        *,
+        res: dict[str, Any],
+        name: str,
+        category_id: str | None,
+        search_scope: str | None,
+        context: ToolExecutionContext,
+    ) -> None:
+        """Create one automatic recurring retry when both backends return no match.
+
+        Soulseek is peer-to-peer, so a query that returns nothing now can return
+        matches later in the day.  This schedules a normal assistant condition
+        check, deduplicated by search/category/scope, instead of adding a new
+        bespoke scheduler subsystem.
+        """
+        if int(res.get("candidate_count") or 0) > 0:
+            return
+        companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
+        if int(companion.get("candidate_count") or 0) > 0:
+            return
+        scheduler = self._scheduler
+        prompt_scheduler = getattr(scheduler, "_prompt_scheduler", None) if scheduler is not None else None
+        settings = getattr(getattr(scheduler, "_settings_manager", None), "settings", None) if scheduler is not None else None
+        cfg = getattr(settings, "soulseek", None) if settings is not None else None
+        if not prompt_scheduler or not cfg or not getattr(cfg, "auto_retry_unmatched_searches", True):
+            return
+        marker_src = f"{category_id or ''}:{name}:{search_scope or 'default'}"
+        marker = "ljs:auto-retry-search:" + hashlib.sha256(marker_src.encode("utf-8")).hexdigest()[:16]
+        try:
+            existing = await prompt_scheduler.list_tasks(user_id=context.user_id)
+            for task in existing:
+                if getattr(task, "enabled", False) and marker in str(getattr(task, "prompt", "")):
+                    res["deferred_search_retry"] = {
+                        "scheduled": True,
+                        "existing": True,
+                        "task_id": getattr(task, "id", ""),
+                        "interval_minutes": getattr(task, "interval_minutes", None),
+                        "reason": "A recurring retry already exists for this missed search.",
+                    }
+                    return
+            prompt = (
+                f"[{marker}] Search again for {name!r} in category {category_id or 'auto'} using both torrents and Soulseek if configured. "
+                f"Use concise Soulseek queries without words like album/track/download unless part of the title. "
+                f"If a clear safe match appears and auto-download is enabled, queue it with the correct backend; otherwise notify me with the best candidates. "
+                f"Original search_scope={search_scope or 'default'}."
+            )
+            task = await prompt_scheduler.create_task(
+                prompt=prompt,
+                interval_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                user_id=context.user_id,
+                channel=context.source or "web",
+                title=f"Retry search: {name}",
+                task_type="condition_check",
+                schedule_type="recurring",
+                delay_minutes=int(getattr(cfg, "retry_search_interval_minutes", 360) or 360),
+                max_runs=int(getattr(cfg, "retry_search_max_runs", 12) or 12),
+                session_id=context.session_id,
+            )
+            res["deferred_search_retry"] = {
+                "scheduled": True,
+                "existing": False,
+                "task_id": task.id,
+                "interval_minutes": task.interval_minutes,
+                "max_runs": task.max_runs,
+                "reason": "No torrent or Soulseek candidates were found; LJS will retry automatically because P2P availability changes over time.",
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to schedule unmatched-search retry for {name!r}: {exc}")
+            res["deferred_search_retry"] = {"scheduled": False, "error": str(exc)}
+
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
 
@@ -403,8 +879,8 @@ class SearchMediaTorrentsTool:
                 },
                 "search_scope": {
                     "type": "string",
-                    "enum": ["default", "season_pack_preferred", "season_pack_only", "individual_units_only"],
-                    "description": "Category-neutral search phase preference. Use season_pack_preferred when the user asks to prefer a full season/pack but can fall back to individual units; use season_pack_only only when the user explicitly wants pack-only.",
+                    "enum": ["default", "bundle_preferred", "bundle_only", "individual_units_only"],
+                    "description": "Category-neutral search phase preference. Use bundle_preferred when the user asks to prefer a complete category-owned bundle/pack but can fall back to individual units; use bundle_only only when the user explicitly wants bundle-only.",
                 },
                 "category_id": {
                     "type": "string",
@@ -508,6 +984,7 @@ class SearchMediaTorrentsTool:
             "result_set_id": result_set_id,
             "candidates": cache_candidates,
             "batch_recommendation": batch_recommendation,
+            "companion_soulseek": res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {},
         }
 
         db = getattr(self._scheduler, "_db", None)
@@ -571,6 +1048,54 @@ class SearchMediaTorrentsTool:
             result_set_id=result_set_id,
             has_batch=bool(batch_recommendation),
         )
+        companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
+        if companion:
+            full_soulseek_candidates = companion.get("candidates") if isinstance(companion.get("candidates"), list) else []
+            compact_soulseek_candidates = _compact_soulseek_candidates(full_soulseek_candidates, result_set_id=result_set_id, limit=12)
+            companion["candidate_picker"] = compact_soulseek_candidates
+            companion["recommended_candidate_id"] = companion.get("recommended_candidate_id") or _best_soulseek_candidate_id(full_soulseek_candidates)
+            # The full exact filenames are already serialized in the cached result set above.
+            # Keep the LLM-facing tool result compact so long album folders do not blow the token budget.
+            companion["candidates"] = compact_soulseek_candidates
+            companion["full_candidates_cached"] = True
+            res["soulseek_candidate_picker"] = compact_soulseek_candidates
+            res["soulseek_summary"] = {
+                "enabled": companion.get("enabled"),
+                "status": companion.get("status"),
+                "candidate_count": companion.get("candidate_count", 0),
+                "queries": companion.get("queries") or ([companion.get("query")] if companion.get("query") else []),
+                "raw_response_count": companion.get("raw_response_count"),
+                "raw_file_count": companion.get("raw_file_count"),
+                "normalized_file_rows": ((companion.get("filtering") or {}).get("total_file_rows") if isinstance(companion.get("filtering"), dict) else None),
+                "recommended_candidate_id": companion.get("recommended_candidate_id"),
+                "queue_tool": "enqueue_soulseek_download",
+                "error": companion.get("error"),
+            }
+        await self._maybe_schedule_unmatched_retry(
+            res=res,
+            name=res.get("display_name") or res.get("name") or name,
+            category_id=res.get("category_id") or category_id,
+            search_scope=res.get("search_scope") or search_scope,
+            context=context,
+        )
+        if companion.get("candidate_count"):
+            res["next_actions"].append({
+                "action": "evaluate_soulseek_candidates",
+                "tool": "enqueue_soulseek_download",
+                "reason": "Soulseek companion search returned queueable candidates in parallel with torrent search.",
+                "args_hint": {"candidate_id": companion.get("recommended_candidate_id") or "<soulseek candidate_id>", "result_set_id": result_set_id},
+            })
+            res["llm_source_note"] = (
+                "Torrent and Soulseek candidates are both available. Follow source_strategy.download_preference; "
+                "use queue_download only for torrent candidate_id values and enqueue_soulseek_download with Soulseek candidate_id/result_set_id. "
+                "Do not copy long filename arrays into tool arguments; the tool resolves them from the cached result set."
+            )
+        elif companion.get("status") == "account_not_ready":
+            res["next_actions"].append({
+                "action": "fix_soulseek_account",
+                "tool": "get_soulseek_share_plan",
+                "reason": companion.get("error") or "Soulseek is enabled but account login is not ready.",
+            })
         res["search_summary"] = {
             "query": res.get("query"),
             "candidate_count": len(clean_candidates),
@@ -633,14 +1158,14 @@ def _search_result_next_actions(*, candidates: list[dict[str, Any]], search_scop
             "action": "broaden_search",
             "tool": "search_media_torrents",
             "reason": "No usable candidates were returned for this scope.",
-            "args_hint": {"search_scope": "season_pack_preferred" if "pack_only" in scope else "broad"},
+            "args_hint": {"search_scope": "bundle_preferred" if "bundle_only" in scope else "default"},
         })
         if "pack" in scope:
             actions.append({
                 "action": "fallback_to_individual_units",
                 "tool": "search_media_torrents",
                 "reason": "A pack was preferred but not found; per-unit fallback may be necessary unless the user asked for pack-only.",
-                "args_hint": {"search_scope": "individual_units"},
+                "args_hint": {"search_scope": "individual_units_only"},
             })
         return actions
 
@@ -710,7 +1235,7 @@ def _candidate_ids_for_estimate(candidates: list[dict[str, Any]], *, batch_recom
     """Choose which candidate sizes represent the planned download footprint."""
     if batch_recommendation and batch_recommendation.get("candidate_ids"):
         return [str(cid) for cid in batch_recommendation.get("candidate_ids") or [] if cid]
-    if str(search_scope or "").startswith("season_pack"):
+    if str(search_scope or "") in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
         for c in candidates:
             if c.get("is_bundle") and c.get("candidate_id"):
                 return [str(c.get("candidate_id"))]

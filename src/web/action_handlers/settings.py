@@ -12,10 +12,11 @@ from src.ai.assistant import AIAssistant
 from src.core.config import SettingsManager
 from src.core.autostart import AutoStartManager
 from src.core.downloader import DownloadManager
-from src.core.models import WebSearchConfig, SizeLimitMode, BandwidthSchedule, SharingSettings, EmbeddingSettings
+from src.core.models import WebSearchConfig, SizeLimitMode, BandwidthSchedule, SharingSettings, EmbeddingSettings, SoulseekSettings
 from src.llm_providers.manager import LLMProviderManager
 from src.llm_providers.context_limits import MIN_USER_CONTEXT_LIMIT
 from src.utils.auth import AuthService
+from src.integrations.slskd_manager import SlskdManager
 
 
 class SettingsActionHandler:
@@ -32,12 +33,13 @@ class SettingsActionHandler:
         llm_manager — LLMManager (provider preset lookup)
     """
 
-    def __init__(self, settings_manager: SettingsManager, assistant: AIAssistant, downloader: DownloadManager, auth_service: AuthService, llm_manager: LLMProviderManager) -> None:
+    def __init__(self, settings_manager: SettingsManager, assistant: AIAssistant, downloader: DownloadManager, auth_service: AuthService, llm_manager: LLMProviderManager, slskd_manager: SlskdManager | None = None) -> None:
         self._sm = settings_manager
         self._assistant = assistant
         self._downloader = downloader
         self._auth = auth_service
         self._llm = llm_manager
+        self._slskd = slskd_manager
 
     async def update_llm(self, **kwargs: Any) -> dict:
         """Update LLM configuration (model, api_base, provider, api_key)."""
@@ -321,8 +323,46 @@ class SettingsActionHandler:
         web_payload = kwargs.get("web_search")
         if isinstance(web_payload, dict):
             settings.web_search = WebSearchConfig(**{**settings.web_search.model_dump(), **web_payload})
+        soulseek_payload = kwargs.get("soulseek")
+        soulseek_result: dict[str, Any] | None = None
+        if isinstance(soulseek_payload, dict):
+            settings.soulseek = SoulseekSettings(**{**settings.soulseek.model_dump(mode="json"), **soulseek_payload})
+            if self._slskd and settings.soulseek.managed:
+                if settings.soulseek.enabled:
+                    if settings.soulseek.soulseek_username and settings.soulseek.soulseek_password:
+                        try:
+                            ok = await self._slskd.start(settings, login_timeout_seconds=5.0)
+                        except Exception as exc:
+                            ok = False
+                            settings.soulseek.account_status = "error"
+                            settings.soulseek.account_status_message = f"Soulseek start failed while saving settings: {exc}"
+                        self._slskd.save_to_settings(settings)
+                        soulseek_result = {
+                            "status": settings.soulseek.account_status if ok else (settings.soulseek.account_status or "error"),
+                            "running": bool(ok),
+                            "ready": bool(ok and settings.soulseek.account_ready),
+                            "account_status": settings.soulseek.account_status,
+                            "account_status_message": settings.soulseek.account_status_message,
+                            "error": None if (ok or settings.soulseek.account_status == "checking") else (settings.soulseek.account_status_message or self._slskd.last_error),
+                        }
+                    else:
+                        settings.soulseek.account_status = "needs_credentials"
+                        settings.soulseek.account_status_message = "Soulseek username and password are required. Use an existing account, or enter a new unique username/password and LJS will validate it."
+                        soulseek_result = {
+                            "status": "needs_credentials",
+                            "running": False,
+                            "ready": False,
+                            "account_status": settings.soulseek.account_status,
+                            "account_status_message": settings.soulseek.account_status_message,
+                            "error": settings.soulseek.account_status_message,
+                        }
+                else:
+                    await self._slskd.stop()
+                    settings.soulseek.account_status = "not_checked"
+                    settings.soulseek.account_status_message = "Soulseek/slskd is disabled."
+                    soulseek_result = {"status": "disabled", "running": False, "ready": False}
         self._sm.save(settings)
-        return {"status": "ok"}
+        return {"status": "ok", "soulseek": soulseek_result}
 
     async def update_integrations(self, **kwargs: Any) -> dict:
         """Update category-owned service settings from a structured payload.

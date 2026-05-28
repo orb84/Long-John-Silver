@@ -445,8 +445,10 @@ class SettingsRouter:
             args["direct_scraper_fallback"] = bool(body["direct_scraper_fallback"])
         if "web_search" in body and isinstance(body["web_search"], dict):
             args["web_search"] = body["web_search"]
-        await self._execute_action('settings_update_search', args)
-        return {"status": "ok"}
+        if "soulseek" in body and isinstance(body["soulseek"], dict):
+            args["soulseek"] = body["soulseek"]
+        result = await self._execute_action('settings_update_search', args)
+        return result or {"status": "ok"}
 
     async def _update_integrations(self, request: Request, _auth: bool = Depends(verify_auth)):
         body = await request.json()

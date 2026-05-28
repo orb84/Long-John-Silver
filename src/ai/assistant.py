@@ -507,6 +507,14 @@ class AIAssistant:
         tool_definitions = self._tool_policy.definitions_for_intent(
             self._tool_registry, intent, category=active_category,
         )
+        system_prompt = self._append_live_tool_contract(system_prompt, allowed_tool_names, tool_definitions)
+        logger.debug(
+            "Prepared agent context: intent={} category={} tools={} messages_context_chars={}",
+            intent.value,
+            active_category.category_id if active_category else None,
+            sorted(allowed_tool_names),
+            len(system_prompt),
+        )
 
         llm = self._settings.llm
         max_iterations = (
@@ -556,6 +564,23 @@ class AIAssistant:
             pref_summary=planning_pref_context,
             agent_context=agent_context,
             category_id=agent_context.category_id,
+        )
+
+
+    @staticmethod
+    def _append_live_tool_contract(system_prompt: str, allowed_tool_names: set[str], tool_definitions: list[dict] | None) -> str:
+        """Append compact, live tool-loop rules to every tool-using turn."""
+        if not tool_definitions:
+            return system_prompt
+        names = sorted(allowed_tool_names or [])
+        return (
+            system_prompt
+            + "\n\nLIVE TOOL CONTRACT:\n"
+            + "- Use only the tools exposed in this turn; never invent historical/tool-alias names.\n"
+            + "- Tool failures with ok=false/recoverable=true are evidence, not final answers. Try a different available source or corrected arguments before giving up, within the iteration limit.\n"
+            + "- Prefer direct provider/category tools before broad web search when the category guidance says they can answer.\n"
+            + "- Do not claim a download/search/action succeeded unless the latest tool result explicitly says it succeeded.\n"
+            + f"- Available tool names now: {', '.join(names[:40])}."
         )
 
     async def run(self, user_prompt: str, session_id: str | None = None,

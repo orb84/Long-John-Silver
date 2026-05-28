@@ -17,9 +17,10 @@ from loguru import logger
 
 from src.core.categories.base import CategoryMedia
 from src.core.categories.search_patterns import SearchPatterns
-from src.core.categories.identity import clean_display_title, clean_release_title, extract_release_year, canonical_item_key
+from src.core.categories.identity import clean_display_title, clean_release_title, extract_release_year, canonical_item_key, clean_path_fragment, basename_from_pathish
 from src.core.categories.types import ParsedMedia, ScannedItem, ScannedFileObservation
 from src.core.categories.media_probe import probe_media_files_serial, resolution_label_from_probe_payload
+from src.core.categories.video_sidecars import plan_video_sidecar_imports
 from src.core.security.path_policy import SafePathResolver, SecurityPolicyError
 from src.core.models import (
     CategoryActionDeclaration,
@@ -791,18 +792,40 @@ class MovieCategory(CategoryMedia):
             return None
         return int((size * 8) / max(runtime_minutes * 60, 1) / 1000)
 
+    def related_sidecar_imports_for_file(
+        self,
+        *,
+        source_path: Path,
+        imported_path: Path,
+        item: Any,
+        settings: "Settings" | None,
+        file_info: Any | None = None,
+    ) -> list[dict[str, str]]:
+        """Plan external subtitle sidecars that should follow an imported video.
+
+        The download handler performs the actual safe filesystem mutation, but
+        this video category owns the rule that matching subtitle sidecars are
+        named from the video basename plus optional language/forced/SDH tokens.
+        """
+        return plan_video_sidecar_imports(
+            source_path=source_path,
+            imported_path=imported_path,
+            allowed_extensions={".srt", ".ass", ".ssa", ".vtt", ".smi", ".idx", ".sub"},
+        )
+
     @staticmethod
     def _subtitle_sidecars(file_path: str) -> list[str]:
-        """Return nearby subtitle files that share the media file stem."""
+        """Return nearby external subtitle files that share the media file stem.
+
+        This includes plain ``Movie.srt`` and language/flag variants such as
+        ``Movie.en.srt``, ``Movie.eng.forced.ass``, and VobSub ``idx/sub``
+        pairs so scans mirror the import-time sidecar rules.
+        """
         if not file_path:
             return []
         path = Path(file_path)
-        subtitles: list[str] = []
-        for suffix in (".srt", ".ass", ".ssa", ".vtt"):
-            candidate = path.with_suffix(suffix)
-            if candidate.exists():
-                subtitles.append(str(candidate))
-        return subtitles
+        plans = plan_video_sidecar_imports(source_path=path, imported_path=path)
+        return [plan["source"] for plan in plans if plan.get("source")]
 
     @staticmethod
     def _best_resolution(resolutions: list[str]) -> str | None:
@@ -1287,11 +1310,12 @@ class MovieCategory(CategoryMedia):
         settings = kwargs.get("settings")
         library_root = Path(kwargs.get("library_root") or self.get_root_path(settings))
         parsed = self.parse_name(source_name or item_name)
-        title = (item_name or parsed.title or Path(source_name).stem or "Unknown").strip()
+        safe_source = basename_from_pathish(source_name, fallback="movie.mkv")
+        title = (item_name or parsed.title or Path(safe_source).stem or "Unknown").strip()
         # Prefer explicit metadata year, then parsed file/torrent year.
         year = kwargs.get("year") or parsed.year
-        folder_name = f"{title} ({year})" if year else title
-        suffix = Path(source_name).suffix or ".mkv"
+        folder_name = clean_path_fragment(f"{title} ({year})" if year else title, fallback="Unknown")
+        suffix = Path(safe_source).suffix or ".mkv"
         return library_root / folder_name / f"{folder_name}{suffix}"
 
 

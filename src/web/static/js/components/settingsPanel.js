@@ -123,6 +123,29 @@ class SettingsPanel extends Component {
         this._setVal('pref-jackett-url', this._settings.jackett_url || '');
         this._setVal('pref-jackett-key', this._settings.jackett_api_key || '');
         this._setCheck('pref-direct-scraper-fallback', !!this._settings.direct_scraper_fallback);
+        const soulseek = this._settings.soulseek || {};
+        this._setCheck('pref-soulseek-enabled', !!soulseek.enabled);
+        this._setVal('pref-soulseek-host', soulseek.host || 'http://127.0.0.1:5030');
+        this._setVal('pref-soulseek-api-key', soulseek.api_key || '');
+        this._setVal('pref-soulseek-username', soulseek.soulseek_username || '');
+        this._setVal('pref-soulseek-password', soulseek.soulseek_password || '');
+        this._setVal('pref-soulseek-share-mode', soulseek.share_mode || 'full_library');
+        this._setCheck('pref-soulseek-parallel', soulseek.parallel_search_enabled !== false);
+        this._setVal('pref-soulseek-download-preference', soulseek.download_preference || 'torrent_first');
+        this._setCheck('pref-soulseek-auto-retry', soulseek.auto_retry_unmatched_searches !== false);
+        this._setVal('pref-soulseek-retry-interval', soulseek.retry_search_interval_minutes || 360);
+        this._setVal('pref-soulseek-retry-max-runs', soulseek.retry_search_max_runs || 12);
+        this._setVal('pref-soulseek-categories', (soulseek.search_enabled_categories || ['music','audiobooks','ebooks','tv','movie','general']).join('\n'));
+        this._setVal('pref-soulseek-shares', (soulseek.share_directories || []).join('\n'));
+        this._setVal('pref-soulseek-exclusions', (soulseek.excluded_share_directories || []).join('\n'));
+        this._updateSoulseekLoginStatus({
+            status: soulseek.account_status || 'not_checked',
+            ready: soulseek.account_status === 'ready',
+            account_status: soulseek.account_status || 'not_checked',
+            account_status_message: soulseek.account_status_message || '',
+            account_checked_at: soulseek.account_checked_at || '',
+            credentials_configured: !!(soulseek.soulseek_username && soulseek.soulseek_password)
+        }, { silent: true });
         const mediaServices = (((this._settings.category_settings || {}).media || {}).services || {});
         this._setVal('pref-tmdb-key', ((mediaServices.tmdb || {}).api_key) || '');
         this._setVal('pref-opensubtitles-key', ((mediaServices.opensubtitles || {}).api_key) || '');
@@ -539,16 +562,111 @@ class SettingsPanel extends Component {
     }
 
     /**
+     * Collect Soulseek controls into the backend settings shape.
+     * @private
+     */
+    _collectSoulseekPayload(forceEnabled = false) {
+        const linesFrom = (id) => ((document.getElementById(id) || {}).value || '')
+            .split(/\r?\n/)
+            .map(v => v.trim())
+            .filter(Boolean);
+        return {
+            enabled: forceEnabled || !!(document.getElementById('pref-soulseek-enabled') || {}).checked,
+            managed: true,
+            auto_install: true,
+            host: this._nullableValueById('pref-soulseek-host') || 'http://127.0.0.1:5030',
+            api_key: this._nullableValueById('pref-soulseek-api-key') || '',
+            soulseek_username: this._nullableValueById('pref-soulseek-username') || '',
+            soulseek_password: this._nullableValueById('pref-soulseek-password') || '',
+            share_mode: (document.getElementById('pref-soulseek-share-mode') || {}).value || 'full_library',
+            parallel_search_enabled: !!(document.getElementById('pref-soulseek-parallel') || {}).checked,
+            download_preference: (document.getElementById('pref-soulseek-download-preference') || {}).value || 'torrent_first',
+            auto_retry_unmatched_searches: !!(document.getElementById('pref-soulseek-auto-retry') || {}).checked,
+            retry_search_interval_minutes: parseInt((document.getElementById('pref-soulseek-retry-interval') || {}).value || '360', 10) || 360,
+            retry_search_max_runs: parseInt((document.getElementById('pref-soulseek-retry-max-runs') || {}).value || '12', 10) || 12,
+            search_enabled_categories: linesFrom('pref-soulseek-categories'),
+            share_directories: linesFrom('pref-soulseek-shares'),
+            excluded_share_directories: linesFrom('pref-soulseek-exclusions')
+        };
+    }
+
+    /**
+     * Immediate Soulseek login verification from Compass.
+     */
+    async checkSoulseekLogin() {
+        const enabledEl = document.getElementById('pref-soulseek-enabled');
+        if (enabledEl) enabledEl.checked = true;
+        const payload = this._collectSoulseekPayload(true);
+        const statusEl = document.getElementById('pref-soulseek-login-status');
+        if (!payload.soulseek_username || !payload.soulseek_password) {
+            const msg = 'Enter a Soulseek username and password, then press Check login again.';
+            this._updateSoulseekLoginStatus({ status: 'needs_credentials', ready: false, error: msg, account_status_message: msg });
+            toast.error(msg);
+            return;
+        }
+        const btn = document.getElementById('pref-soulseek-check-login');
+        if (btn) btn.disabled = true;
+        if (statusEl) {
+            statusEl.textContent = 'Installing/starting slskd and checking Soulseek login...';
+            statusEl.className = 'soulseek-login-status setting-status checking';
+        }
+        try {
+            const result = await APIClient.post('/api/soulseek/check-login', {
+                soulseek: payload,
+                timeout_seconds: 45
+            });
+            this._updateSoulseekLoginStatus(result);
+            if (result.ready || result.status === 'ready') toast.show('Soulseek login verified. slskd is running and search is available.');
+            else if (result.status === 'auth_failed') toast.error(result.error || 'Soulseek rejected these credentials. Change them and press Check login again.');
+            else if (result.status === 'needs_credentials') toast.error(result.error || 'Soulseek username/password are required.');
+            else if (result.error) toast.error(result.error);
+            else toast.show(result.account_status_message || 'Soulseek login is still being checked. Press Check login again in a few seconds.');
+        } catch (err) {
+            const msg = err.message || 'Soulseek login check failed.';
+            this._updateSoulseekLoginStatus({ status: 'error', ready: false, error: msg, account_status_message: msg });
+            toast.error(msg);
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    /**
+     * Render Soulseek login status in the Settings panel.
+     * @private
+     */
+    _updateSoulseekLoginStatus(state, opts = {}) {
+        const el = document.getElementById('pref-soulseek-login-status');
+        if (!el || !state) return;
+        const status = state.status || state.account_status || 'not_checked';
+        const ready = !!(state.ready || status === 'ready');
+        const msg = state.error || state.account_status_message || (ready ? 'Soulseek login verified.' : 'Soulseek login not checked yet.');
+        const checked = state.account_checked_at ? ` Last checked: ${String(state.account_checked_at).replace('T', ' ').slice(0, 19)}.` : '';
+        const probe = state.search_probe_ok ? ' Search probe succeeded.' : '';
+        el.textContent = ready
+            ? `Ready: Soulseek login verified and usable.${probe}${checked}`
+            : `${this._humanizeProviderName(status)}: ${msg}${checked}`;
+        el.className = `soulseek-login-status setting-status ${ready ? 'success' : (status === 'checking' ? 'checking' : (status === 'not_checked' ? 'neutral' : 'danger'))}`;
+    }
+
+    /**
      * Save search provider and metadata integration credentials.
      */
     async saveServices() {
         try {
-            await APIClient.post('/api/settings/search', {
+            const result = await APIClient.post('/api/settings/search', {
                 jackett_url: this._nullableValueById('pref-jackett-url'),
                 jackett_api_key: this._nullableValueById('pref-jackett-key'),
-                direct_scraper_fallback: !!(document.getElementById('pref-direct-scraper-fallback') || {}).checked
+                direct_scraper_fallback: !!(document.getElementById('pref-direct-scraper-fallback') || {}).checked,
+                soulseek: this._collectSoulseekPayload(false)
             });
-            toast.show('Shared torrent search services saved. Category metadata/watch credentials live inside each category block.');
+            const sl = result && result.soulseek;
+            if (sl) this._updateSoulseekLoginStatus(sl);
+            if (sl && (sl.status === 'ready' || sl.ready)) toast.show('Shared search services saved. Soulseek/slskd is installed, running, and logged in.');
+            else if (sl && sl.status === 'checking') toast.show(sl.account_status_message || 'Soulseek/slskd is running; login validation is still pending.');
+            else if (sl && sl.status === 'needs_credentials') toast.error(sl.error || 'Soulseek needs username and password. Use an existing account, or try a new unique username/password.');
+            else if (sl && (sl.status === 'auth_failed' || sl.status === 'error' || sl.error)) toast.error(sl.error || sl.account_status_message || 'Soulseek/slskd could not confirm login.');
+            else if (sl && sl.status === 'disabled') toast.show('Shared search services saved. Soulseek/slskd disabled and stopped.');
+            else toast.show('Shared search services saved.');
         } catch (err) {
             toast.error(err.message);
         }
@@ -805,8 +923,8 @@ class SettingsPanel extends Component {
                 { label, description: desc, secret, placeholder, trakt: serviceId === 'trakt' && fieldKey === 'client_id', parsed: { categoryId: 'media', section: 'services', serviceId, fieldKey } }
             )));
         });
-        return DOM.el('details', { className: 'settings-details category-settings-details', open: true }, [
-            DOM.el('summary', {}, ['Media defaults · private config + shared definition']),
+        return DOM.el('details', { className: 'settings-details category-settings-details category-root-details' }, [
+            DOM.el('summary', {}, ['Media defaults · inherited by TV/Movies']),
             DOM.el('div', { className: 'category-settings-body' }, children)
         ]);
     }
@@ -845,57 +963,44 @@ class SettingsPanel extends Component {
      * @private
      */
     _categorySettingsBlock(cat) {
-        const title = `${cat.display_name || cat.id} · private config + shared definition`;
-        const children = [];
-        this._categorySetupNotices(cat).forEach(node => children.push(node));
+        const title = `${cat.display_name || cat.id} · ${cat.id}`;
+        const groups = [];
+
+        const basics = [];
+        this._categorySetupNotices(cat).forEach(node => basics.push(node));
         if (cat.default_library_path) {
-            children.push(this._createSettingItem(
+            basics.push(this._createSettingItem(
                 'Default library folder',
                 'Used when the category library path below is blank. The folder is created during setup/path-save when possible.',
                 DOM.el('code', {}, [cat.default_library_path])
             ));
         }
-
         const properties = cat.properties || [];
-        if (properties.length) {
-            children.push(this._sectionTitle('Private user config'));
-            properties.forEach(prop => {
-                const desc = prop.description || `Category property: ${prop.name}`;
-                children.push(this._createSettingItem(prop.label || prop.name, desc, this._categoryInput(cat, prop)));
-            });
-        }
+        properties.forEach(prop => {
+            const desc = prop.description || `Category property: ${prop.name}`;
+            basics.push(this._createSettingItem(prop.label || prop.name, desc, this._categoryInput(cat, prop)));
+        });
+        if (basics.length) groups.push(this._settingsSubsection('Basics & private paths', basics, { open: true, indent: false }));
 
         const providerRows = this._categoryProviderRows(cat);
-        if (providerRows.length) {
-            children.push(this._sectionTitle('Metadata and discovery providers'));
-            providerRows.forEach(row => children.push(row));
-        }
+        if (providerRows.length) groups.push(this._settingsSubsection('Metadata providers', providerRows, { indent: true }));
 
         const downloadProfileRows = this._categoryDownloadProfileRows(cat);
-        if (downloadProfileRows.length) {
-            children.push(this._sectionTitle('Download and conversion preferences'));
-            downloadProfileRows.forEach(row => children.push(row));
-        }
+        if (downloadProfileRows.length) groups.push(this._settingsSubsection('Download / conversion preferences', downloadProfileRows, { indent: true }));
 
         const nestedRows = this._categoryNestedConfigRows(cat);
-        if (nestedRows.length) {
-            children.push(this._sectionTitle('Automation, storage, and lifecycle'));
-            nestedRows.forEach(row => children.push(row));
-        }
+        if (nestedRows.length) groups.push(this._settingsSubsection('Automation, storage & lifecycle', nestedRows, { indent: true }));
 
         const serviceRows = this._categoryServiceRows(cat);
-        if (serviceRows.length) {
-            children.push(this._sectionTitle('Category services'));
-            serviceRows.forEach(row => children.push(row));
+        if (serviceRows.length) groups.push(this._settingsSubsection('Service credentials', serviceRows, { indent: true }));
+
+        if (!groups.length) {
+            groups.push(DOM.el('p', { className: 'empty-msg' }, ['This category has no user-editable settings yet.']));
         }
 
-        if (!children.length) {
-            children.push(DOM.el('p', { className: 'empty-msg' }, ['This category has no user-editable settings yet.']));
-        }
-
-        return DOM.el('details', { className: 'settings-details category-settings-details', open: true }, [
+        return DOM.el('details', { className: 'settings-details category-settings-details category-root-details' }, [
             DOM.el('summary', {}, [title]),
-            DOM.el('div', { className: 'category-settings-body' }, children)
+            DOM.el('div', { className: 'category-settings-body category-settings-body-nested' }, groups)
         ]);
     }
 
@@ -1324,12 +1429,43 @@ class SettingsPanel extends Component {
      * @private
      */
     _buildServicesPanel() {
-        return this._panel('fa-solid fa-plug', 'Shared Torrent Search & Indexers', 'Category-agnostic torrent search infrastructure. Metadata, subtitle, Plex, and Trakt settings are now shown inside the categories that use them.', [
-            this._sectionTitle('Torrent search backend'),
+        const torrentBackend = [
             this._createSettingItem('Jackett URL', 'Primary torrent indexer endpoint shared by downloadable categories.', DOM.el('input', { type: 'text', id: 'pref-jackett-url', placeholder: 'http://localhost:9117' })),
             this._createSettingItem('Jackett API key', 'API key for the configured Jackett server.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-jackett-key', placeholder: '••••••••' })),
-            this._createSettingItem('Direct scraper fallback', 'Use slower direct scrapers only when Jackett returns no usable candidates.', this._toggle('pref-direct-scraper-fallback')),
-            this._sectionTitle('Jackett indexers'),
+            this._createSettingItem('Direct scraper fallback', 'Use slower direct scrapers only when Jackett returns no usable candidates.', this._toggle('pref-direct-scraper-fallback'))
+        ];
+        const soulseekRuntime = [
+            DOM.el('p', { className: 'empty-msg' }, ['Optional managed Soulseek/slskd runtime. LJS installs, configures, starts, and stops slskd automatically. Users provide only Soulseek credentials and sharing/source preferences.']),
+            this._createSettingItem('Enable Soulseek companion', 'Install/start managed slskd automatically and use it as a parallel companion source. It remains separate from torrent/magnet queueing.', this._toggle('pref-soulseek-enabled')),
+            this._createSettingItem('Soulseek username', 'Soulseek network username. Existing accounts work; a new unique username/password may create an account if the network accepts it.', DOM.el('input', { type: 'text', id: 'pref-soulseek-username', autocomplete: 'off', placeholder: 'Soulseek username' })),
+            this._createSettingItem('Soulseek password', 'Soulseek network password. LJS validates login after starting slskd and will not mark Soulseek ready if credentials are rejected.', DOM.el('input', { type: 'password', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-soulseek-password', placeholder: '••••••••' })),
+            DOM.el('div', { id: 'pref-soulseek-login-status', className: 'soulseek-login-status setting-status neutral' }, ['Soulseek login not checked yet.']),
+            DOM.el('div', { className: 'settings-button-row' }, [
+                DOM.el('button', { type: 'button', id: 'pref-soulseek-check-login', className: 'quick-btn btn-secondary', onclick: () => this.checkSoulseekLogin() }, [DOM.el('i', { className: 'fa-solid fa-plug-circle-check' }), ' Check Soulseek Login'])
+            ]),
+            this._createSettingItem('Search Soulseek in parallel', 'When Soulseek is ready, category torrent searches also fetch a Soulseek companion result set so the LLM compares both sources in one decision.', this._toggle('pref-soulseek-parallel')),
+            this._createSettingItem('First download attempt', 'When both torrent and Soulseek options are viable, choose which backend the assistant should prefer first.', DOM.el('select', { id: 'pref-soulseek-download-preference' }, [
+                DOM.el('option', { value: 'torrent_first' }, ['Prefer torrents first']),
+                DOM.el('option', { value: 'soulseek_first' }, ['Prefer Soulseek first']),
+                DOM.el('option', { value: 'ask' }, ['Ask me when both look good'])
+            ])),
+            this._createSettingItem('Auto-retry no-match searches', 'When both torrent and Soulseek find nothing, create a recurring assistant check so rare P2P results can be found at another time of day.', this._toggle('pref-soulseek-auto-retry')),
+            this._createSettingItem('Retry every minutes', 'Cadence for automatic no-match retry checks. Six hours samples morning/evening/weekend Soulseek peer availability without flooding.', DOM.el('input', { type: 'number', id: 'pref-soulseek-retry-interval', min: '30', step: '30', placeholder: '360' })),
+            this._createSettingItem('Max retry runs', 'How many automatic checks to run before the missed-search watch retires.', DOM.el('input', { type: 'number', id: 'pref-soulseek-retry-max-runs', min: '1', max: '100', placeholder: '12' })),
+            this._createSettingItem('Soulseek-enabled categories', 'One category id per line. Defaults include music, audiobooks, ebooks, TV, movies, and general exact files.', DOM.el('textarea', { id: 'pref-soulseek-categories', rows: '4', placeholder: `music\naudiobooks\nebooks\ntv\nmovie\ngeneral` })),
+            this._createSettingItem('Share mode', 'Default is full LJS library. Pick custom to share only selected folders, or disabled to download without advertising LJS folders.', DOM.el('select', { id: 'pref-soulseek-share-mode' }, [
+                DOM.el('option', { value: 'full_library' }, ['Full LJS library root']),
+                DOM.el('option', { value: 'custom' }, ['Custom folders only']),
+                DOM.el('option', { value: 'disabled' }, ['Do not share LJS folders'])
+            ])),
+            this._createSettingItem('Custom share folders', 'One folder per line. Used only in custom mode. Paths are aliased before slskd exposes them.', DOM.el('textarea', { id: 'pref-soulseek-shares', rows: '3', placeholder: `/path/to/Music\n/path/to/Audiobooks` })),
+            this._createSettingItem('Excluded share folders', 'One folder per line. Downloads/incomplete folders are automatically excluded too.', DOM.el('textarea', { id: 'pref-soulseek-exclusions', rows: '3', placeholder: '/path/to/private-recordings' }))
+        ];
+        const soulseekAdvanced = [
+            this._createSettingItem('slskd URL', 'Advanced: local managed slskd endpoint. Normally leave this at the default; LJS fills it automatically.', DOM.el('input', { type: 'text', id: 'pref-soulseek-host', placeholder: 'http://127.0.0.1:5030' })),
+            this._createSettingItem('slskd API key', 'Advanced: generated automatically for the managed local slskd runtime. Leave blank unless connecting to a remote/manual slskd.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-soulseek-api-key', placeholder: '••••••••' }))
+        ];
+        const jackettIndexers = [
             DOM.el('div', { id: 'jackett-indexer-health', className: 'setting-item jackett-indexer-health' }, [
                 DOM.el('p', { className: 'empty-msg' }, ['Indexer diagnostics not loaded yet.'])
             ]),
@@ -1338,17 +1474,23 @@ class SettingsPanel extends Component {
                 this._saveButton('Refresh indexers', 'fa-solid fa-rotate', () => this.loadJackettIndexers(), 'quick-btn btn-secondary'),
                 this._saveButton('Open Jackett UI', 'fa-solid fa-arrow-up-right-from-square', () => this.openJackettUi(), 'quick-btn btn-secondary')
             ]),
-            DOM.el('details', { className: 'settings-details' }, [
+            DOM.el('details', { className: 'settings-details nested-settings-details' }, [
                 DOM.el('summary', {}, ['Advanced: add private/closed tracker indexer']),
-                DOM.el('p', { className: 'empty-msg' }, ['Use this when you have access to a closed tracker. Enter its Jackett indexer ID, load the schema, fill credentials/cookies/passkeys, then configure.']),
+                DOM.el('p', { className: 'empty-msg' }, ['Enter a Jackett indexer ID, load the schema, fill credentials/cookies/passkeys, then configure.']),
                 DOM.el('div', { className: 'tier-control' }, [
                     DOM.el('input', { type: 'text', id: 'jackett-custom-indexer-id', autocomplete: 'off', placeholder: 'indexer id, e.g. mytracker' }),
                     DOM.el('button', { className: 'btn btn-sm btn-secondary', type: 'button', onclick: () => this.loadJackettCustomIndexerSchema() }, ['Load fields'])
                 ]),
                 DOM.el('div', { id: 'jackett-custom-indexer-fields', className: 'jackett-custom-indexer-fields' }, []),
                 DOM.el('button', { className: 'btn btn-sm btn-gold', type: 'button', onclick: () => this.configureJackettCustomIndexer() }, ['Configure indexer'])
-            ]),
-            this._saveButton('Save Shared Search Services', 'fa-solid fa-circle-check', () => this.saveServices())
+            ])
+        ];
+        return this._panel('fa-solid fa-plug', 'Search Sources', 'Torrent infrastructure plus managed Soulseek/slskd, with source preference kept separate from category behavior.', [
+            this._settingsSubsection('Torrent backend', torrentBackend, { open: true }),
+            this._settingsSubsection('Soulseek / slskd runtime', soulseekRuntime, { open: true }),
+            this._settingsSubsection('Advanced slskd endpoint', soulseekAdvanced),
+            this._settingsSubsection('Jackett indexers', jackettIndexers),
+            this._saveButton('Save Search Sources', 'fa-solid fa-circle-check', () => this.saveServices())
         ], 'settings-services-panel');
     }
 
@@ -1452,6 +1594,19 @@ class SettingsPanel extends Component {
         return DOM.el('div', { className: 'setting-item' }, [
             DOM.el('div', { className: 'setting-info' }, [DOM.el('h4', {}, [title]), DOM.el('p', {}, [desc])]),
             DOM.el('div', { className: 'setting-control' }, [controlEl])
+        ]);
+    }
+
+    /**
+     * Create a collapsible settings subsection.
+     * @private
+     */
+    _settingsSubsection(title, children, opts = {}) {
+        const attrs = { className: `settings-details nested-settings-details${opts.indent === false ? '' : ' indented-settings-details'}` };
+        if (opts.open) attrs.open = true;
+        return DOM.el('details', attrs, [
+            DOM.el('summary', {}, [title]),
+            DOM.el('div', { className: 'settings-subsection-body' }, children || [])
         ]);
     }
 

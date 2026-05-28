@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from src.ai.tools.download_support import DownloadSnapshotPresenter
+from src.integrations.slskd_transfer_view import SlskdTransferReadModel
 
 if TYPE_CHECKING:
     from src.core.downloader import DownloadManager
@@ -18,20 +19,44 @@ if TYPE_CHECKING:
 class DownloadListReportService:
     """Build the structured list_downloads report from the download manager."""
 
-    def __init__(self, downloader: "DownloadManager") -> None:
-        """Create a report service backed by a concrete download manager."""
+    def __init__(self, downloader: "DownloadManager", settings_manager: object | None = None, database: object | None = None) -> None:
+        """Create a report service backed by concrete download and optional Soulseek managers."""
         self._downloader = downloader
+        self._settings_manager = settings_manager
+        self._database = database
 
     async def report(self) -> dict[str, Any]:
         """Return serialized active downloads, queue view, and summary counts."""
         active = await self._downloader.get_active_downloads()
-        queue_items = self._queued_items(active)
-        queue_positions = self._queue_positions(queue_items)
+        serialized_active = self._serialized(active, {})
+        soulseek_rows = await self._soulseek_rows()
+        combined_active = serialized_active + soulseek_rows
+        queue_items = [item for item in combined_active if str(item.get("status") or "").lower() == "queued"]
+        for index, item in enumerate(sorted(queue_items, key=lambda row: str(row.get("created_at") or "")), start=1):
+            item["queue_position"] = index
         return {
-            "active": self._serialized(active, queue_positions),
-            "queue": self._serialized(queue_items, queue_positions),
-            "summary": self._summary(active),
-            "count": len(active),
+            "active": combined_active,
+            "queue": queue_items,
+            "summary": self._summary_from_rows(combined_active),
+            "count": len(combined_active),
+        }
+
+    async def _soulseek_rows(self) -> list[dict[str, Any]]:
+        if not self._settings_manager:
+            return []
+        try:
+            return await SlskdTransferReadModel(self._settings_manager, self._database).active_download_rows(include_completed=True)
+        except Exception:
+            return []
+
+    def _summary_from_rows(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "total": len(rows),
+            "by_status": self._count_by(rows, lambda row: str(row.get("status") or "unknown")),
+            "by_health": self._count_by(rows, lambda row: "ok"),
+            "active_slots": self._call_optional("active_count"),
+            "max_concurrent": self._call_optional("max_concurrent"),
+            "soulseek": len([row for row in rows if row.get("source") == "slskd" or row.get("backend") == "soulseek"]),
         }
 
     def _queued_items(self, active: list[object]) -> list[object]:

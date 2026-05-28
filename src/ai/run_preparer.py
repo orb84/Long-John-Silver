@@ -191,12 +191,15 @@ class AgentRunPreparer:
                     )
                     system_prompt += f"\nConstraints: {constr_str}"
                 
-                if any(step.tool_name in ("queue_download", "queue_media_download") for step in agent_plan.steps):
+                if agent_plan.steps:
+                    step_summaries = []
+                    for step in agent_plan.steps[:5]:
+                        step_summaries.append(f"{step.id}:{step.tool_name} args={step.arguments}")
                     system_prompt += (
-                        "\n\nCRITICAL CONTEXT: A structured download execution plan has been prepared. "
-                        "Only confirm that a download is queued when the queue tool result explicitly has status=queued and a download_id. "
-                        "If the queue tool returns an error or lacks a verified download_id, tell the user the queue action failed and include the error. "
-                        "Use the user's language and list item/unit details only when verified."
+                        "\n\nSTRUCTURED PLAN ADVISORY (not automatically executed): "
+                        + " | ".join(step_summaries)
+                        + "\nUse this only as a hint. Concrete actions must still be chosen through the "
+                        "current tool-call channel, validated against current tool schemas, and adapted to tool results."
                     )
 
         # Step 6: Build messages

@@ -23,7 +23,7 @@ from src.core.categories.base_contract import CategoryContractMixin
 from src.core.security.path_policy import SafePathResolver, SecurityPolicyError
 from src.core.security.confirmation import SecurityConfirmationService
 from src.core.categories.types import ScannedItem, ParsedMedia
-from src.core.categories.identity import clean_display_title
+from src.core.categories.identity import clean_display_title, basename_from_pathish
 from src.core.models import (
     ActionReceipt,
     CategoryActionDeclaration,
@@ -447,7 +447,7 @@ class MediaCategory(CategoryContractMixin, ABC):
         """
         root = Path(self.get_root_path(settings))
         title = clean_display_title(item_name or source.stem, fallback="Unknown")
-        filename = source_name or source.name
+        filename = basename_from_pathish(source_name or source.name, fallback=source.name or "file")
         return root / title / filename
 
     def download_target_for_item(

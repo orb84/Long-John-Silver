@@ -45,6 +45,20 @@ class ToolResultCompactor:
             return self._compact_media_search(result)
         if tool_name == "search_torrents":
             return self._compact_generic_search(result)
+        if tool_name == "search_soulseek" and isinstance(result, dict):
+            return {
+                "ok": result.get("ok"),
+                "query": result.get("query"),
+                "source": result.get("source"),
+                "error_code": result.get("error_code"),
+                "error": result.get("error"),
+                "recoverable": result.get("recoverable"),
+                "next_actions": result.get("next_actions"),
+                "agent_instruction": result.get("agent_instruction"),
+                "queueing_note": result.get("queueing_note"),
+                "candidate_count": len(result.get("candidates") or []),
+                "candidates": list(result.get("candidates") or [])[:12],
+            }
         if tool_name == "list_downloads" and isinstance(result, (dict, list)):
             return self._compact_download_list(result)
         if tool_name in {"read_web_page", "browse_page", "browser_read_selected"}:
@@ -62,6 +76,7 @@ class ToolResultCompactor:
                 "recoverable": result.get("recoverable", True),
                 "error": result.get("error"),
                 "next_actions": result.get("next_actions"),
+                "agent_instruction": result.get("agent_instruction"),
             }
         candidates = list(result.get("candidates") or [])
         batch = result.get("batch_recommendation") if isinstance(result.get("batch_recommendation"), dict) else None
@@ -87,6 +102,17 @@ class ToolResultCompactor:
             "candidate_picker": self._compact_candidate_picker(result.get("candidate_picker")),
             "candidates": [self._compact_candidate(c, fallback_result_set_id=result.get("result_set_id")) for c in selected],
         }
+        if result.get("soulseek_summary"):
+            compact["soulseek_summary"] = result.get("soulseek_summary")
+        companion = result.get("companion_soulseek") if isinstance(result.get("companion_soulseek"), dict) else None
+        if companion and companion.get("candidate_count"):
+            compact["companion_soulseek"] = {
+                "status": companion.get("status"),
+                "candidate_count": companion.get("candidate_count"),
+                "queries": companion.get("queries"),
+                "candidates": list(companion.get("candidates") or [])[:self._SEARCH_CANDIDATE_LIMIT],
+                "queueing_note": companion.get("queueing_note"),
+            }
         omitted = max(0, len(candidates) - len(selected))
         if omitted:
             compact["omitted_candidates_count"] = omitted

@@ -317,15 +317,21 @@ class AgentLoopExecutor:
         if first_failure is not None:
             tool_name = first_failure.step.tool_name
             error = first_failure.error or "Unknown error"
-            if tool_name == "queue_download":
-                response = self._error_presenter.queue_failure(error)
-            else:
-                response = self._error_presenter.plan_failure(tool_name, error)
-            return AgentLoopResult(
-                response=response,
-                loop_state=loop_state,
-                tool_results_count=len(loop_state.tool_results),
+            logger.warning(
+                "Structured plan step '{}' failed before the agent loop: {}. "
+                "Continuing with normal tool calling instead of ending the turn.",
+                tool_name,
+                error,
             )
+            messages.append({
+                "role": "system",
+                "content": (
+                    "The pre-generated structured plan failed on tool "
+                    f"{tool_name!r}: {error}. Do not repeat the same invalid call. "
+                    "Continue using the currently available canonical tools and try the next sensible source."
+                ),
+            })
+            return None
 
         return None
 

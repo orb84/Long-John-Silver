@@ -3,6 +3,7 @@ import os
 import signal
 import socket
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from loguru import logger
 import uvicorn
@@ -50,6 +51,8 @@ from src.web.access_logs import install_quiet_polling_access_log_filter
 from src.web.comms import create_registry
 from src.core.state_coordinator import StateCoordinator
 from src.search.jackett_manager import JackettManager
+from src.integrations.slskd_manager import SlskdManager
+from src.integrations.slskd_import_monitor import SlskdImportMonitor
 from src.core.categories.artwork import CategoryArtworkManager
 from src.utils.browser.runtime import BrowserRuntime
 from src.utils.browser.domain_policy import BrowserDomainPolicy
@@ -217,6 +220,67 @@ async def _event_loop_watchdog(interval_seconds: float = 1.0, warn_after_seconds
         expected = now + interval_seconds
 
 
+async def _start_managed_soulseek_after_ui(settings_manager: SettingsManager, slskd_manager: SlskdManager) -> None:
+    """Best-effort managed slskd startup after the web UI is already reachable.
+
+    Soulseek is useful, but it must never be on the critical path for opening
+    the dashboard.  Installation, process start, API probing, and account login
+    validation are all recoverable setup states shown in Compass/Setup.
+    """
+    settings = settings_manager.settings
+    cfg = getattr(settings, "soulseek", None)
+    if cfg is None or not getattr(cfg, "enabled", False) or not getattr(cfg, "managed", True):
+        return
+    if not cfg.soulseek_username or not cfg.soulseek_password:
+        cfg.account_status = "needs_credentials"
+        cfg.account_status_message = "Soulseek username and password are required before LJS can start slskd."
+        cfg.account_checked_at = datetime.now(timezone.utc).isoformat()
+        settings_manager.save(settings)
+        logger.warning("Soulseek companion is enabled but credentials are missing; managed slskd was not started.")
+        return
+
+    cfg.account_status = "checking"
+    cfg.account_status_message = "Starting managed slskd in the background."
+    cfg.account_checked_at = datetime.now(timezone.utc).isoformat()
+    settings_manager.save(settings)
+
+    try:
+        logger.info("Soulseek companion enabled — starting managed slskd in the background after web startup...")
+        ok = await slskd_manager.start(settings, login_timeout_seconds=120.0)
+        slskd_manager.save_to_settings(settings)
+        if ok:
+            logger.info(f"slskd managed runtime active at {slskd_manager.url}")
+        elif cfg.account_status == "checking":
+            logger.warning(
+                "slskd is running or starting, but LJS has not confirmed Soulseek login yet. "
+                "Continuing background validation after startup."
+            )
+            for _ in range(24):
+                await asyncio.sleep(5)
+                account = await slskd_manager.validate_account(settings, timeout_seconds=0)
+                if account.get("status") == "ready":
+                    logger.info("slskd managed runtime authenticated during background validation.")
+                    break
+                if account.get("status") == "auth_failed":
+                    logger.warning("slskd background validation stopped because Soulseek rejected the credentials.")
+                    break
+        else:
+            logger.warning(f"slskd managed runtime did not become ready: {cfg.account_status_message or slskd_manager.last_error}")
+    except Exception as exc:
+        cfg.account_status = "error"
+        cfg.account_status_message = f"Managed slskd background startup failed: {exc}"
+        cfg.account_checked_at = datetime.now(timezone.utc).isoformat()
+        logger.exception(cfg.account_status_message)
+    finally:
+        try:
+            settings_manager.save(settings)
+        except Exception as exc:
+            # Managed Soulseek is a best-effort background startup job.  A
+            # settings persistence failure should be visible in logs, but it
+            # must not crash the app after the UI has opened.
+            logger.exception(f"Could not persist managed slskd startup status: {exc}")
+
+
 async def _run_deferred_startup_jobs(
     *,
     supervisor: TaskSupervisor,
@@ -271,6 +335,7 @@ async def main():
     supervisor = None
     downloader = None
     jackett_manager = JackettManager()
+    slskd_manager = SlskdManager()
     plex_client = None
     tmdb_client = None
     tvmaze_client = None
@@ -400,6 +465,12 @@ async def main():
             from src.search.jackett import JackettSearch
             providers.append(JackettSearch(settings.jackett_url, settings.jackett_api_key))
             logger.info("Jackett search provider active from saved settings")
+
+        if getattr(settings.soulseek, "enabled", False) and getattr(settings.soulseek, "managed", True):
+            if settings.soulseek.soulseek_username and settings.soulseek.soulseek_password:
+                logger.info("Soulseek companion enabled — managed slskd will start after the web UI is reachable.")
+            else:
+                logger.warning("Soulseek companion is enabled but credentials are missing; slskd will not start until credentials are saved.")
 
         if settings.direct_scraper_fallback:
             logger.info(
@@ -732,6 +803,7 @@ async def main():
             comms_registry=comms_registry,
             browser_runtime=browser_runtime,
             jackett_manager=jackett_manager,
+            slskd_manager=slskd_manager,
             storage_monitor=storage_monitor,
             artwork_manager=artwork_manager,
             metadata_enricher=metadata_enricher,
@@ -771,6 +843,11 @@ async def main():
 
         access_urls = _format_access_urls(web_host, port)
         logger.info("LJS web UI answered /api/live. Try: " + ", ".join(access_urls))
+        if getattr(settings.soulseek, "enabled", False) and getattr(settings.soulseek, "managed", True):
+            supervisor.spawn_one_shot(
+                "soulseek_managed_startup",
+                _start_managed_soulseek_after_ui(settings_manager, slskd_manager),
+            )
         if web_host in {"127.0.0.1", "localhost"}:
             logger.warning(
                 "LJS_HOST is bound to localhost only; other devices on the LAN will not reach it. "
@@ -780,6 +857,18 @@ async def main():
         # --- Start background services only after web readiness. ---
         scheduler.set_event_bus(getattr(app.state.deps, "event_bus", None))
         await scheduler.initialize()
+        if getattr(settings.soulseek, "enabled", False):
+            slskd_import_monitor = SlskdImportMonitor(
+                settings_manager=settings_manager,
+                database=db,
+                category_registry=cat_registry,
+                completion_handler=completion_handler,
+            )
+            supervisor.spawn_restartable(
+                "slskd_import_monitor",
+                slskd_import_monitor.run_forever,
+                TaskCriticality.IMPORTANT,
+            )
         supervisor.spawn_restartable(
             "event_loop_watchdog",
             lambda: _event_loop_watchdog(),
@@ -913,6 +1002,15 @@ async def main():
             except Exception as e:
                 logger.error(f"Error stopping Jackett manager: {e}")
 
+        if slskd_manager:
+            try:
+                logger.info("Stopping slskd manager...")
+                await asyncio.wait_for(slskd_manager.stop(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning("slskd manager shutdown timed out after 10s")
+            except Exception as e:
+                logger.error(f"Error stopping slskd manager: {e}")
+
         if db:
             try:
                 logger.info("Closing database...")
@@ -947,3 +1045,6 @@ if __name__ == "__main__":
         logger.info("Keyboard interrupt. Shutting down LJS...")
     except SystemExit:
         pass
+    except Exception as exc:
+        logger.exception(f"Fatal LJS startup/runtime error: {exc}")
+        raise

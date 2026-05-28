@@ -204,43 +204,69 @@ class SetupRouter:
         settings = deps.settings_manager.settings
         missing: list[dict] = []
         warnings: list[dict] = []
+        seen_missing: set[str] = set()
+        seen_warnings: set[str] = set()
+
+        def issue_key(issue: dict) -> str:
+            raw_id = str(issue.get("id") or "")
+            # Runtime dependencies are shared by category mixins.  Show one global
+            # setup item instead of repeating e.g. FFmpeg for Music and Audiobooks.
+            if ".runtime_" in raw_id:
+                raw_id = "runtime_" + raw_id.split(".runtime_", 1)[1]
+            label = str(issue.get("label") or "").strip().casefold()
+            message = str(issue.get("message") or "").strip().casefold()
+            return raw_id or f"{label}:{message}"
+
+        def add_missing(issue: dict) -> None:
+            key = issue_key(issue)
+            if key in seen_missing:
+                return
+            seen_missing.add(key)
+            missing.append(issue)
+
+        def add_warning(issue: dict) -> None:
+            key = issue_key(issue)
+            if key in seen_missing or key in seen_warnings:
+                return
+            seen_warnings.add(key)
+            warnings.append(issue)
 
         if not settings.web_password_hash:
-            warnings.append({
+            add_warning({
                 "id": "web_password",
                 "label": "Web password",
                 "message": "No admin password is set. LJS will allow open local access until you set one in Settings.",
             })
         if not settings.download_dir:
-            missing.append({"id": "download_dir", "label": "Download folder", "message": "Choose where active downloads are stored."})
+            add_missing({"id": "download_dir", "label": "Download folder", "message": "Choose where active downloads are stored."})
         if not settings.llm.active_provider or not settings.llm.model:
-            missing.append({"id": "llm", "label": "LLM provider", "message": "Choose an LLM provider and model."})
+            add_missing({"id": "llm", "label": "LLM provider", "message": "Choose an LLM provider and model."})
         if settings.llm.active_provider not in {"ollama", "lm_studio", "local"} and not settings.llm.api_key:
-            warnings.append({"id": "llm_api_key", "label": "LLM API key", "message": "Remote LLM providers usually need an API key."})
+            add_warning({"id": "llm_api_key", "label": "LLM API key", "message": "Remote LLM providers usually need an API key."})
 
         if deps.category_registry:
             for category in deps.category_registry.list_all():
                 for requirement in category.setup_requirements(settings):
                     if requirement.required and not requirement.configured:
-                        missing.append({
+                        add_missing({
                             "id": f"{category.category_id}.{requirement.id}",
                             "label": requirement.label,
                             "message": requirement.description,
                         })
                     elif not requirement.configured and requirement.severity in {"recommended", "warning"}:
-                        warnings.append({
+                        add_warning({
                             "id": f"{category.category_id}.{requirement.id}",
                             "label": requirement.label,
                             "message": requirement.description,
                         })
         if not resolve_trakt_client_id(settings):
-            warnings.append({
+            add_warning({
                 "id": "trakt_client",
                 "label": "Trakt client",
                 "message": "This build is missing the bundled public Trakt Client ID; add it to src/integrations/trakt_defaults.py or set LJS_BUNDLED_TRAKT_CLIENT_ID.",
             })
         elif not settings.category_service_value("media", "trakt", "access_token"):
-            warnings.append({
+            add_warning({
                 "id": "trakt_account",
                 "label": "Trakt account",
                 "message": "Trakt is optional, but linking it enables personalized recommendations and watch-state aware automation.",
@@ -248,10 +274,17 @@ class SetupRouter:
 
 
         if getattr(settings, "embeddings", None) and settings.embeddings.enabled and settings.embeddings.provider == "disabled":
-            warnings.append({
+            add_warning({
                 "id": "semantic_memory",
                 "label": "Semantic memory",
                 "message": "Semantic embeddings are disabled, so long-term memory recall and taste profiling will be much weaker.",
+            })
+
+        if getattr(settings, "soulseek", None) and settings.soulseek.enabled and not settings.soulseek.account_ready:
+            add_warning({
+                "id": "soulseek_account",
+                "label": "Soulseek account",
+                "message": settings.soulseek.account_status_message or "Soulseek is enabled, but LJS has not confirmed account login yet.",
             })
 
         if settings.web_search.enabled:
@@ -259,5 +292,5 @@ class SetupRouter:
 
             health = await WebSearchService(settings.web_search).health_check()
             if not health.ok:
-                warnings.append({"id": "web_search", "label": "Web search", "message": health.last_error or "Web search provider is not healthy."})
+                add_warning({"id": "web_search", "label": "Web search", "message": health.last_error or "Web search provider is not healthy."})
         return {"missing_required": missing, "warnings": warnings}

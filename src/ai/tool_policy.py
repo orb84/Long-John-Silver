@@ -78,7 +78,10 @@ class AgentToolPolicy:
     _GENERIC_DOWNLOAD_TOOLS = {
         "search_torrents",
         "search_media_torrents",
+        "search_soulseek",
         "queue_download",
+        "enqueue_soulseek_download",
+        "get_soulseek_share_plan",
         "inspect_torrent_candidate",
         "suggestions_list",
         "list_downloads",
@@ -202,7 +205,18 @@ class AgentToolPolicy:
         if requested:
             # Preserve always-safe manifest/status helpers while narrowing the
             # noisy domain/search surface to what the category declared.
-            always = {"get_category_definitions", "get_category_manifest", "get_library_status", "get_storage_status"}
+            always = {
+                "get_category_definitions",
+                "get_category_manifest",
+                "get_library_status",
+                "get_storage_status",
+                # Source companion tools stay globally available for downloadable categories.
+                # Logs from Round 135 showed category YAML narrowing hid search_soulseek
+                # from Music even though the global download policy allowed it.
+                "search_soulseek",
+                "enqueue_soulseek_download",
+                "get_soulseek_share_plan",
+            }
             result = (result & requested) | (result & always)
         return result
 

@@ -1,3 +1,30 @@
+
+/**
+ * Return a stable dedupe key for setup requirement rows.
+ * Shared runtime dependencies can be inherited by multiple categories.
+ */
+function setupRequirementKey(item) {
+    var rawId = String((item && item.id) || '');
+    if (rawId.indexOf('.runtime_') !== -1) {
+        rawId = 'runtime_' + rawId.split('.runtime_')[1];
+    }
+    var label = String((item && item.label) || '').trim().toLowerCase();
+    var message = String((item && (item.message || item.description)) || '').trim().toLowerCase();
+    return rawId || (label + ':' + message);
+}
+
+/**
+ * De-duplicate setup requirement rows before rendering counts or toast text.
+ */
+function uniqueSetupItems(items) {
+    var seen = {};
+    return (items || []).filter(function(item) {
+        var key = setupRequirementKey(item);
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+    });
+}
 /**
  * LJS Setup Wizard — handles multi-step first-time configuration.
  *
@@ -96,6 +123,71 @@ async function installBridge(bridgeId) {
         }
     } catch (e) {
         console.warn('Bridge install for ' + bridgeId + ' failed:', e);
+    }
+}
+
+/**
+ * Collect first-run Soulseek credential fields into the managed slskd payload.
+ */
+function collectSetupSoulseekPayload(forceEnabled) {
+    var enabledEl = document.getElementById('setup-soulseek-enabled');
+    return {
+        enabled: !!forceEnabled || (enabledEl ? enabledEl.checked : false),
+        managed: true,
+        auto_install: true,
+        host: ((document.getElementById('setup-soulseek-host') || {}).value || 'http://127.0.0.1:5030').trim(),
+        api_key: ((document.getElementById('setup-soulseek-api-key') || {}).value || '').trim(),
+        soulseek_username: ((document.getElementById('setup-soulseek-username') || {}).value || '').trim(),
+        soulseek_password: ((document.getElementById('setup-soulseek-password') || {}).value || '').trim(),
+        share_mode: ((document.getElementById('setup-soulseek-share-mode') || {}).value || 'full_library'),
+        parallel_search_enabled: true,
+        download_preference: 'torrent_first',
+        search_enabled_categories: ['music', 'audiobooks', 'ebooks', 'tv', 'movie', 'general']
+    };
+}
+
+/**
+ * Render immediate Soulseek login-check feedback in setup.
+ */
+function renderSetupSoulseekStatus(state) {
+    var el = document.getElementById('setup-soulseek-login-status');
+    if (!el || !state) return;
+    var status = state.status || state.account_status || 'not_checked';
+    var ready = !!(state.ready || status === 'ready');
+    var msg = state.error || state.account_status_message || (ready ? 'Soulseek login verified.' : 'Soulseek login not checked yet.');
+    var checked = state.account_checked_at ? ' Last checked: ' + String(state.account_checked_at).replace('T', ' ').slice(0, 19) + '.' : '';
+    el.textContent = ready ? 'Ready: Soulseek login verified and search is available.' + checked : status + ': ' + msg + checked;
+    el.style.color = ready ? 'var(--accent-teal)' : (status === 'checking' || status === 'not_checked' ? 'var(--text-dim)' : 'var(--danger, #f87171)');
+}
+
+/**
+ * Install/start slskd and verify the entered Soulseek credentials from setup.
+ */
+async function checkSetupSoulseekLogin() {
+    var enabledEl = document.getElementById('setup-soulseek-enabled');
+    if (enabledEl) enabledEl.checked = true;
+    var payload = collectSetupSoulseekPayload(true);
+    var btn = document.getElementById('setup-soulseek-check-login');
+    if (!payload.soulseek_username || !payload.soulseek_password) {
+        var msg = 'Enter a Soulseek username and password, then press Check Soulseek Login again.';
+        renderSetupSoulseekStatus({ status: 'needs_credentials', error: msg });
+        toast.show(msg, 'err');
+        return;
+    }
+    if (btn) btn.disabled = true;
+    renderSetupSoulseekStatus({ status: 'checking', account_status_message: 'Installing/starting slskd and checking Soulseek login...' });
+    try {
+        var result = await APIClient.post('/api/soulseek/check-login', { soulseek: payload, timeout_seconds: 45 });
+        renderSetupSoulseekStatus(result);
+        if (result.ready || result.status === 'ready') toast.show('Soulseek login verified. slskd is running and search is available.');
+        else if (result.status === 'auth_failed') toast.show(result.error || 'Soulseek rejected these credentials. Change them and check again.', 'err');
+        else if (result.error) toast.show(result.error, 'err');
+        else toast.show(result.account_status_message || 'Soulseek login is still being checked. Try again in a few seconds.');
+    } catch (e) {
+        renderSetupSoulseekStatus({ status: 'error', error: e.message || 'Soulseek login check failed.' });
+        toast.show(e.message || 'Soulseek login check failed.', 'err');
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 
@@ -538,14 +630,27 @@ async function finishSetup() {
 
 
     var directFallback = document.getElementById('setup-direct-scraper-fallback');
+    var soulseekEnabled = document.getElementById('setup-soulseek-enabled');
+    var soulseekPayload = collectSetupSoulseekPayload(soulseekEnabled ? soulseekEnabled.checked : false);
     try {
-        await fetch('/api/settings/search', {
+        const soulseekResponse = await fetch('/api/settings/search', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ direct_scraper_fallback: directFallback ? directFallback.checked : true })
+            body: JSON.stringify({
+                direct_scraper_fallback: directFallback ? directFallback.checked : true,
+                soulseek: soulseekPayload
+            })
         });
+        const soulseekResult = await soulseekResponse.json().catch(() => ({}));
+        if (soulseekPayload.enabled) {
+            const state = soulseekResult && soulseekResult.soulseek;
+            renderSetupSoulseekStatus(state);
+            if (state && (state.status === 'ready' || state.ready)) toast.show('Soulseek/slskd installed, running, and logged in.');
+            else if (state && state.status === 'checking') toast.show(state.account_status_message || 'Soulseek/slskd is running; login validation is still pending.');
+            else if (state && (state.error || state.account_status_message)) toast.show('Soulseek/slskd setup needs attention: ' + (state.error || state.account_status_message), 'err');
+        }
     } catch (e) {
-        console.warn('Failed to save direct scraper fallback preference', e);
+        console.warn('Failed to save search/Soulseek preference', e);
     }
 
     var automationMode = document.querySelector('input[name="automation"]:checked');
@@ -609,7 +714,7 @@ async function finishSetup() {
 
     var result = await APIClient.post('/api/setup/complete', {});
     if (!result || result.status === 'blocked' || result.setup_complete === false) {
-        var missing = (result && result.missing_required) ? result.missing_required : [];
+        var missing = uniqueSetupItems((result && result.missing_required) ? result.missing_required : []);
         var message = missing.length
             ? 'Setup is missing required items: ' + missing.map(function(item) { return item.label || item.id; }).join(', ')
             : 'Setup could not be completed. Please review the highlighted requirements.';
@@ -660,14 +765,17 @@ async function loadSetupRequirements() {
         var response = await fetch('/api/setup/requirements');
         if (!response.ok) return;
         var data = await response.json();
-        var required = 0;
-        var configured = 0;
+        var requiredItems = [];
+        var configuredItems = [];
         (data.categories || []).forEach(function(category) {
             (category.requirements || []).forEach(function(req) {
-                if (req.required) required += 1;
-                if (req.required && req.configured) configured += 1;
+                if (!req.required) return;
+                requiredItems.push(req);
+                if (req.configured) configuredItems.push(req);
             });
         });
+        var required = uniqueSetupItems(requiredItems).length;
+        var configured = uniqueSetupItems(configuredItems).length;
         summary.style.display = 'block';
         summary.innerHTML = '<strong>Category-first setup status:</strong> ' + configured + '/' + required + ' required items configured. ' +
             'Use these requirements to understand why folders, Jackett, TMDB, TVMaze, and web search matter.';

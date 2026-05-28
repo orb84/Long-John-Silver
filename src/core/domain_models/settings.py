@@ -156,6 +156,147 @@ class SharingSettings(BaseModel):
             return bool(self.category_overrides[key])
         return True
 
+
+
+class SoulseekShareMode(str, Enum):
+    """How LJS tells slskd which local folders may be shared back."""
+
+    DISABLED = "disabled"
+    FULL_LIBRARY = "full_library"
+    CUSTOM = "custom"
+
+
+class SoulseekSettings(BaseModel):
+    """Configuration for the optional slskd-backed Soulseek companion source.
+
+    Soulseek is not torrent-like: downloads are queued against individual users
+    through slskd, and sharing is a first-class part of the network.  These
+    settings keep that source behind its own explicit boundary instead of
+    pretending Soulseek candidates are magnet links.
+    """
+
+    enabled: bool = False
+    managed: bool = True
+    """Whether LJS owns the local slskd process lifecycle. Disable only for advanced remote slskd setups."""
+    auto_install: bool = True
+    """Whether enabling Soulseek should install the native slskd binary automatically."""
+    host: str = "http://127.0.0.1:5030"
+    url_base: str = "/"
+    api_key: str = ""
+    verify_ssl: bool = False
+    web_username: str = ""
+    web_password: str = ""
+    jwt_key: str = ""
+    soulseek_username: str = ""
+    soulseek_password: str = ""
+    app_dir: str = "./data/slskd"
+    downloads_dir: str = ""
+    incomplete_dir: str = ""
+    managed_directory_mode: Literal["explicit", "slskd_default"] = "explicit"
+    """Managed slskd storage mode. ``slskd_default`` is legacy-only and is migrated back to explicit mode at startup."""
+    managed_runtime_app_dir: str = ""
+    """Legacy Round 168 APP_DIR override; ignored in managed mode and cleared at startup."""
+    share_mode: SoulseekShareMode = SoulseekShareMode.FULL_LIBRARY
+    share_directories: list[str] = Field(default_factory=list)
+    excluded_share_directories: list[str] = Field(default_factory=list)
+    share_filters: list[str] = Field(default_factory=lambda: [
+        r"\.DS_Store$",
+        r"Thumbs\.db$",
+        r"desktop\.ini$",
+        r"\.ljs-trash(?:/|$)",
+        r"settings\.local\.yaml$",
+        r"security_audit\.jsonl$",
+    ])
+    search_enabled_categories: list[str] = Field(default_factory=lambda: ["music", "audiobooks", "ebooks", "tv", "movie", "general"])
+    parallel_search_enabled: bool = True
+    """Whether category torrent searches should also fetch a Soulseek companion result set when Soulseek is ready."""
+    download_preference: Literal["torrent_first", "soulseek_first", "ask"] = "torrent_first"
+    """Preferred first download backend when both torrent and Soulseek candidates look viable."""
+    companion_when_no_torrent_results: bool = False
+    auto_retry_unmatched_searches: bool = True
+    """Automatically schedule recurring assistant checks when torrent/Soulseek searches find nothing."""
+    retry_search_interval_minutes: int = 360
+    """Cadence for automatic no-match retry searches. Six hours samples different Soulseek peer availability windows."""
+    retry_search_max_runs: int = 12
+    """Maximum automatic retry runs for one missed-search watch before it retires."""
+    account_status: str = "not_checked"
+    """Soulseek network account status: not_checked, needs_credentials, checking, ready, auth_failed, or error."""
+    account_status_message: str = ""
+    """Human-readable Soulseek setup/login status for setup and Compass."""
+    account_checked_at: str = ""
+    """ISO timestamp of the last managed slskd Soulseek account validation."""
+    max_search_results: int = 20
+    search_timeout_seconds: float = 12.0
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def _normalize_host(cls, value: Any) -> str:
+        text = str(value or "http://127.0.0.1:5030").strip()
+        if not text:
+            return "http://127.0.0.1:5030"
+        if not re.match(r"^[a-z][a-z0-9+.-]*://", text, re.I):
+            text = "http://" + text
+        return text.rstrip("/")
+
+    @field_validator("url_base", mode="before")
+    @classmethod
+    def _normalize_url_base(cls, value: Any) -> str:
+        text = str(value or "/").strip() or "/"
+        if not text.startswith("/"):
+            text = "/" + text
+        return text.rstrip("/") or "/"
+
+    @field_validator("share_directories", "excluded_share_directories", "search_enabled_categories", "share_filters", mode="before")
+    @classmethod
+    def _normalize_string_list(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.replace(";", "\n").splitlines()]
+            return [part for part in parts if part]
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    @model_validator(mode="after")
+    def _normalize_soulseek(self) -> "SoulseekSettings":
+        self.max_search_results = max(1, min(int(self.max_search_results or 20), 100))
+        self.search_timeout_seconds = max(2.0, min(float(self.search_timeout_seconds or 12.0), 60.0))
+        self.retry_search_interval_minutes = max(30, min(int(self.retry_search_interval_minutes or 360), 7 * 24 * 60))
+        self.retry_search_max_runs = max(1, min(int(self.retry_search_max_runs or 12), 100))
+        if self.managed:
+            # Blank/legacy managed paths are resolved by slskd_config to the
+            # user-selected LJS download_dir.  Managed slskd is a download
+            # backend, not a project-local cache.
+            if not str(self.downloads_dir or "").strip() or str(self.downloads_dir).strip().replace("\\", "/") == "./downloads/soulseek":
+                self.downloads_dir = ""
+            if not str(self.incomplete_dir or "").strip() or str(self.incomplete_dir).strip().replace("\\", "/") == "./downloads/soulseek-incomplete":
+                self.incomplete_dir = ""
+        if not self.share_filters:
+            self.share_filters = [r"\.DS_Store$", r"Thumbs\.db$", r"desktop\.ini$"]
+        self.search_enabled_categories = [str(cat).strip().lower() for cat in self.search_enabled_categories if str(cat).strip()]
+        if self.download_preference not in {"torrent_first", "soulseek_first", "ask"}:
+            self.download_preference = "torrent_first"
+        if self.share_mode == SoulseekShareMode.DISABLED:
+            self.share_directories = []
+        return self
+
+    @property
+    def api_configured(self) -> bool:
+        """Return whether LJS has enough information to call slskd."""
+        return bool(self.enabled and self.host and self.api_key)
+
+    @property
+    def soulseek_credentials_configured(self) -> bool:
+        """Return whether slskd can be configured with Soulseek credentials."""
+        return bool(self.soulseek_username and self.soulseek_password)
+
+    @property
+    def account_ready(self) -> bool:
+        """Return whether managed slskd has confirmed a Soulseek network login."""
+        return self.account_status == "ready"
+
+
 class Settings(BaseModel):
     """Main application settings."""
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -164,6 +305,7 @@ class Settings(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
+    soulseek: SoulseekSettings = Field(default_factory=SoulseekSettings)
     tracked_items: ItemList = Field(default_factory=ItemList)
     bandwidth_schedules: list[BandwidthSchedule] = Field(default_factory=list)
     download_dir: str = "./downloads"
@@ -258,6 +400,8 @@ class Settings(BaseModel):
     auto_discover: bool = True
     direct_scraper_fallback: bool = True
     last_library_scan_at: str = ""
+    last_media_metadata_repair_at: str = ""
+    """Last time the background stale stream-metadata repair was allowed to trigger a full scan."""
     stall_check_interval_minutes: int = 10
     stall_alternative_hours: float = 1.0
     stall_cancel_hours: float = 5.0

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +30,7 @@ from src.core.models import (
     SecurityConfig,
     Settings,
     SharingSettings,
+    SoulseekSettings,
     StorageConfig,
     WebSearchConfig,
     EmbeddingSettings,
@@ -85,6 +88,7 @@ class SettingsManager:
         definition_dir = Path(category_definition_dir) if category_definition_dir else self._yaml_path.parent / 'category-definitions'
         self._category_store = CategoryConfigStore(category_dir, template_directory=template_dir, definition_directory=definition_dir)
         self._settings: Optional[Settings] = None
+        self._save_lock = threading.RLock()
 
     @property
     def settings(self) -> Settings:
@@ -148,27 +152,50 @@ class SettingsManager:
         return settings
 
     def save(self, settings: Settings) -> None:
-        """Save global settings and split category settings into local files."""
-        tmp_path = self._yaml_path.with_suffix('.yaml.tmp')
+        """Save global settings and split category settings into local files.
+
+        Startup and UI/background tasks may save settings at nearly the same
+        time (for example slskd status updates, bridge startup, setup forms,
+        and category config writes).  Earlier versions used one fixed
+        ``settings.local.yaml.tmp`` path, so concurrent saves could race: one
+        save would replace the temp file while the other was still about to
+        rename it, causing a launch-time ``ENOENT``.  A process lock plus a
+        unique temp file keeps the atomic-write behavior without making
+        settings saves a crash vector.
+        """
         self._yaml_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            global_payload = settings.model_dump(mode='json')
-            category_settings = global_payload.pop('category_settings', {}) or {}
-            with tmp_path.open('w', encoding='utf-8') as handle:
-                yaml.safe_dump(global_payload, handle, default_flow_style=False, sort_keys=False)
-            tmp_path.replace(self._yaml_path)
-            self._category_store.save_all(category_settings)
-            self._settings = settings
-            logger.info('Settings saved to {}.', self._yaml_path)
-        except Exception as exc:
-            logger.error(f'Failed to write settings atomically: {exc}')
-            if tmp_path.exists():
-                SafePathResolver.for_application(extra_roots=[tmp_path.parent]).safe_unlink(
-                    tmp_path,
-                    purpose='settings.cleanup_tmp',
-                    move_to_trash=False,
+        tmp_path: Path | None = None
+        with self._save_lock:
+            try:
+                global_payload = settings.model_dump(mode='json')
+                category_settings = global_payload.pop('category_settings', {}) or {}
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f'.{self._yaml_path.name}.',
+                    suffix='.tmp',
+                    dir=str(self._yaml_path.parent),
+                    text=True,
                 )
-            raise
+                tmp_path = Path(tmp_name)
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    yaml.safe_dump(global_payload, handle, default_flow_style=False, sort_keys=False)
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                tmp_path.replace(self._yaml_path)
+                self._category_store.save_all(category_settings)
+                self._settings = settings
+                logger.info('Settings saved to {}.', self._yaml_path)
+            except Exception as exc:
+                logger.error(f'Failed to write settings atomically: {exc}')
+                if tmp_path and tmp_path.exists():
+                    SafePathResolver.for_application(extra_roots=[tmp_path.parent]).safe_unlink(
+                        tmp_path,
+                        purpose='settings.cleanup_tmp',
+                        move_to_trash=False,
+                    )
+                raise
 
     def reload(self) -> Settings:
         """Force reload settings from disk."""
@@ -205,6 +232,8 @@ class SettingsManager:
             settings.security = SecurityConfig(**{**settings.security.model_dump(), **data['security']})
         if 'sharing' in data and isinstance(data['sharing'], dict):
             settings.sharing = SharingSettings(**{**settings.sharing.model_dump(), **data['sharing']})
+        if 'soulseek' in data and isinstance(data['soulseek'], dict):
+            settings.soulseek = SoulseekSettings(**{**settings.soulseek.model_dump(), **data['soulseek']})
         if 'embeddings' in data and isinstance(data['embeddings'], dict):
             settings.embeddings = EmbeddingSettings(**{**settings.embeddings.model_dump(), **data['embeddings']})
         if 'tracked_items' in data:
@@ -216,7 +245,7 @@ class SettingsManager:
                 if isinstance(item, (dict, BandwidthSchedule))
             ]
         for key, value in data.items():
-            if key in {'llm', 'web_search', 'storage', 'security', 'sharing', 'embeddings', 'tracked_items', 'bandwidth_schedules', 'category_settings', 'library_paths'}:
+            if key in {'llm', 'web_search', 'storage', 'security', 'sharing', 'soulseek', 'embeddings', 'tracked_items', 'bandwidth_schedules', 'category_settings', 'library_paths'}:
                 continue
             if hasattr(settings, key) and value is not None:
                 if key == 'default_quality' and isinstance(value, dict):

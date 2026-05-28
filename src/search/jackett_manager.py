@@ -242,14 +242,11 @@ class JackettManager:
 
     @staticmethod
     def _extract_zip(archive: Path, dest: Path) -> None:
-        with zipfile.ZipFile(str(archive), "r") as zf:
-            zf.extractall(str(dest))
+        safe_extract_zip(archive, dest)
 
     @staticmethod
     def _extract_tarball(archive: Path, dest: Path) -> None:
-        import tarfile
-        with tarfile.open(str(archive), "r:gz") as tf:
-            tf.extractall(str(dest))
+        safe_extract_tar(archive, dest)
 
     # ── start / stop ───────────────────────────────────────────────
 

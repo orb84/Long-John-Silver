@@ -2274,3 +2274,104 @@ button.is-loading i {
   color: var(--text-main);
   background: rgba(148, 163, 184, 0.16);
 }
+
+/* ─── Round 136: Compass accordions and category hierarchy ───────── */
+.category-root-details,
+.nested-settings-details {
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 14px;
+  background: rgba(0,0,0,.12);
+  padding: 0;
+  overflow: hidden;
+}
+.category-root-details > summary,
+.nested-settings-details > summary {
+  list-style: none;
+  padding: 13px 16px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-main);
+  border-bottom: 1px solid transparent;
+}
+.category-root-details > summary::-webkit-details-marker,
+.nested-settings-details > summary::-webkit-details-marker {
+  display: none;
+}
+.category-root-details > summary::before,
+.nested-settings-details > summary::before {
+  content: '▸';
+  color: var(--accent-gold);
+  transition: transform .16s ease;
+}
+.category-root-details[open] > summary::before,
+.nested-settings-details[open] > summary::before {
+  transform: rotate(90deg);
+}
+.category-root-details[open] > summary,
+.nested-settings-details[open] > summary {
+  border-bottom-color: rgba(255,255,255,.08);
+}
+.category-settings-body,
+.settings-subsection-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 16px 14px;
+}
+.category-settings-body-nested {
+  gap: 12px;
+}
+.indented-settings-details {
+  margin-left: 16px;
+  background: rgba(255,255,255,.025);
+}
+.indented-settings-details .setting-item {
+  padding-left: 8px;
+}
+.settings-subsection-body .empty-msg {
+  margin: 4px 0;
+}
+#settings-services-panel .nested-settings-details {
+  background: rgba(0,0,0,.10);
+}
+@media (max-width: 760px) {
+  .indented-settings-details { margin-left: 0; }
+  .category-root-details > summary,
+  .nested-settings-details > summary { padding: 12px; }
+  .category-settings-body,
+  .settings-subsection-body { padding: 8px 12px 12px; }
+}
+
+/* Round 163: library list rows must opt out of poster-card geometry. */
+.media-grid.category-view-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.media-card.media-list-row {
+  aspect-ratio: auto;
+  min-height: 58px;
+  height: auto;
+  width: 100%;
+  overflow: visible;
+}
+.media-card.media-list-row:hover {
+  transform: none;
+}
+.media-card.media-list-row .poster-placeholder {
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  aspect-ratio: 1;
+  border-radius: 10px;
+  font-size: 1.1rem;
+}
+.media-card.media-list-row .card-content h3 {
+  margin: 0;
+}
+.media-card.media-list-row .play-btn {
+  width: auto;
+  white-space: nowrap;
+}

@@ -15,6 +15,7 @@ from src.ai.tools.download_control import ManageDownloadsTool
 from src.ai.tools.download_list_support import DownloadListReportService
 from src.ai.tools.queue_download_support import QueueDownloadService
 from src.ai.tools.torrent_search_support import TorrentSearchToolService
+from src.ai.tools.soulseek import SoulseekToolProvider
 from src.core.library_sharing import LibrarySharingService
 from src.core.models import ToolExecutionContext
 from src.core.models import Intent
@@ -38,13 +39,11 @@ class ListDownloadsTool:
     destructive = False
     required_dependencies = ["downloader"]
 
-    def __init__(self, downloader: Optional[DownloadManager] = None) -> None:
-        """Initialize the tool with a download manager.
-
-        Args:
-            downloader: DownloadManager instance for querying download state.
-        """
+    def __init__(self, downloader: Optional[DownloadManager] = None, settings_manager: Optional[SettingsManager] = None, database: Optional[Database] = None) -> None:
+        """Initialize the tool with download manager and optional companion-source read models."""
         self._downloader = downloader
+        self._settings_manager = settings_manager
+        self._database = database
 
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
@@ -69,7 +68,7 @@ class ListDownloadsTool:
         if not self._downloader:
             return {"error": "Download manager not available"}
         try:
-            return await DownloadListReportService(self._downloader).report()
+            return await DownloadListReportService(self._downloader, self._settings_manager, self._database).report()
         except Exception as e:
             return {"error": str(e)}
 
@@ -361,7 +360,7 @@ class DownloadToolProvider:
             List of AgentTool-compatible tool instances.
         """
         return [
-            ListDownloadsTool(downloader=self._downloader),
+            ListDownloadsTool(downloader=self._downloader, settings_manager=self._settings_manager, database=self._database),
             ListLibrarySharesTool(downloader=self._downloader, settings_manager=self._settings_manager),
             QueueDownloadTool(scheduler=self._scheduler, database=self._database),
             InspectTorrentCandidateTool(database=self._database),
@@ -369,6 +368,7 @@ class DownloadToolProvider:
             ManageDownloadsTool(downloader=self._downloader),
             GetUpgradesTool(database=self._database),
             SearchTorrentsTool(search_aggregator=self._search_aggregator, database=self._database),
+            *SoulseekToolProvider(settings_manager=self._settings_manager, database=self._database).get_tools(),
         ]
 
 

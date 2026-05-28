@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from src.core.categories.identity import clean_display_title, clean_path_fragment
+from src.core.categories.identity import clean_display_title, clean_path_fragment, basename_from_pathish
 
 if TYPE_CHECKING:
     from src.core.models import Settings
@@ -63,7 +63,8 @@ class CategoryPathPlanner:
         source suffix.  Categories are responsible for adding any domain fields
         their naming template supports.
         """
-        source = Path(source_name or "")
+        source_filename = basename_from_pathish(source_name or "", fallback="file")
+        source = Path(source_filename)
         template_data: dict[str, Any] = dict(fields or {})
         template_data.setdefault("title", clean_display_title(template_data.get("title"), fallback="Unknown"))
         template_data.setdefault("filename", source.name)

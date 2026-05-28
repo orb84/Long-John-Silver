@@ -73,6 +73,11 @@ class SystemRouter:
         router.add_api_route("/api/jackett/health", self._jackett_health, methods=["GET"])
         router.add_api_route("/api/jackett/install", self._jackett_install, methods=["POST"])
         router.add_api_route("/api/jackett/start", self._jackett_start, methods=["POST"])
+        router.add_api_route("/api/soulseek/health", self._soulseek_health, methods=["GET"])
+        router.add_api_route("/api/soulseek/install", self._soulseek_install, methods=["POST"])
+        router.add_api_route("/api/soulseek/start", self._soulseek_start, methods=["POST"])
+        router.add_api_route("/api/soulseek/check-login", self._soulseek_check_login, methods=["POST"])
+        router.add_api_route("/api/soulseek/stop", self._soulseek_stop, methods=["POST"])
         router.add_api_route("/api/jackett/configure-default-indexers", self._jackett_configure_default_indexers, methods=["POST"])
         router.add_api_route("/api/jackett/indexers", self._jackett_indexers, methods=["GET"])
         router.add_api_route("/api/jackett/configure-indexers", self._jackett_configure_indexers, methods=["POST"])
@@ -212,6 +217,28 @@ class SystemRouter:
 
     async def _jackett_start(self, _auth: bool = Depends(verify_auth)):
         return await self._execute_action('system_start_jackett', {})
+
+    async def _soulseek_health(self, _auth: bool = Depends(verify_auth)):
+        deps = self._deps
+        if not deps.slskd_manager:
+            return {"installed": False, "running": False, "error": "slskd manager not configured"}
+        return await deps.slskd_manager.health_check(deps.settings_manager.settings)
+
+    async def _soulseek_install(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_install_soulseek', {})
+
+    async def _soulseek_start(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_start_soulseek', {})
+
+    async def _soulseek_check_login(self, request: Request, _auth: bool = Depends(verify_auth)):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        return await self._execute_action('system_check_soulseek_login', body if isinstance(body, dict) else {})
+
+    async def _soulseek_stop(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_stop_soulseek', {"disable": True})
 
     async def _jackett_configure_default_indexers(self, _auth: bool = Depends(verify_auth)):
         return await self._execute_action('system_configure_default_indexers', {})

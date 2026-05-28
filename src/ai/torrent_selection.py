@@ -368,7 +368,7 @@ class TorrentSelectionService:
         )
 
         if not normalized:
-            logger.info(f"No candidates after normalization for {item_display_name} {unit_key or ""}")
+            logger.info(f"No candidates after normalization for {item_display_name} {unit_key or ''}")
             return None
 
         preferred_resolution = quality_profile.preferred_resolution if quality_profile else None
@@ -393,7 +393,7 @@ class TorrentSelectionService:
         )
 
         if not normalized:
-            logger.info(f"No queueable candidates after hard filtering for {item_display_name} {unit_key or ""}")
+            logger.info(f"No queueable candidates after hard filtering for {item_display_name} {unit_key or ''}")
             return None
 
         if self._release_group_tracker:

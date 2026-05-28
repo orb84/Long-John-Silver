@@ -784,3 +784,8 @@ Recoverable provider misses are not terminal plan errors. When a tool such as `m
 Concrete media categories inherit abstract `media` service credentials. During setup and Compass hot-saves, the in-memory settings object may contain the user-owned TMDB key only under `media.services.tmdb.api_key` while `movie` and `tv` contain only sparse private overrides. Runtime metadata client resolution must therefore check the concrete category first and then the abstract parent rather than clearing a working client.
 
 Jackett search and Jackett indexer administration are separate health surfaces. A `/UI/Login` redirect from an indexer administration endpoint means indexer auto-configuration is degraded/action-required; it does not by itself mean every torrent search path should crash. Search health must reject UI-login redirects, report degraded diagnostics, and let explicit fallback providers run when primary search returns no usable results.
+
+## Soulseek / slskd source boundary
+
+Soulseek is modeled as a companion source provider through slskd, not as a Jackett/torrent fallback. `SoulseekSettings` stores the endpoint, API key, Soulseek credentials, and sharing policy. `slskd_config.py` computes the effective share plan, and `slskd_client.py` owns API/search/queue calls. Agent tools use `search_soulseek` and `enqueue_soulseek_download`; they must not pass Soulseek candidates to `queue_download`. A future transfer-monitor boundary should import completed slskd downloads through category hooks.
+

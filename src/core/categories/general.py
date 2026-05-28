@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from src.core.categories.base import CategoryMedia
-from src.core.categories.identity import clean_display_title, clean_path_fragment, canonical_item_key
+from src.core.categories.identity import clean_display_title, clean_path_fragment, canonical_item_key, basename_from_pathish
 from src.core.categories.types import ParsedMedia, ScannedFileObservation, ScannedItem
 from src.core.models import CategoryLlmProfile, CategoryPromptExample, CategoryProperty, CategorySetupRequirement
 
@@ -232,7 +232,7 @@ class GeneralCategory(CategoryMedia):
 
     def unit_descriptor_from_file(self, file_path: str, parsed: Any | None = None, item_descriptor: dict[str, Any] | None = None) -> dict[str, Any]:
         """Use torrent-relative filenames as file-level descriptors for selective downloads."""
-        label = Path(str(file_path or "")).name or "file"
+        label = basename_from_pathish(file_path, fallback="file")
         return {
             "granularity": "file",
             "label": label,
@@ -270,7 +270,7 @@ class GeneralCategory(CategoryMedia):
         data = dict(metadata or {})
         title = data.get("title") or getattr(item, "item_name", "") or getattr(item, "torrent_title", "") or source.stem
         folder = clean_path_fragment(title, fallback="General File")
-        filename = Path(source_name or source.name).name
+        filename = basename_from_pathish(source_name or source.name, fallback=source.name or "file")
         return Path(self.get_root_path(settings)) / folder / filename
 
     def sharing_save_path_for_item(self, item: Any, settings: "Settings", staging_root: Path) -> tuple[Path, bool]:

@@ -26,8 +26,9 @@ from src.core.categories.season_folders import SeasonFolderLayout
 from src.core.categories.search_patterns import SearchPatterns
 from src.core.categories.types import ParsedMedia, ScannedItem, ScannedFileObservation
 from src.core.categories.media_probe import probe_media_files_serial, resolution_label_from_probe_payload
+from src.core.categories.video_sidecars import plan_video_sidecar_imports
 from src.core.security.path_policy import SafePathResolver, SecurityPolicyError
-from src.core.categories.identity import clean_display_title, canonical_item_key, clean_release_title, extract_release_year
+from src.core.categories.identity import clean_display_title, canonical_item_key, clean_release_title, extract_release_year, basename_from_pathish
 from src.core.categories.tv_bundle import TVBundleKnowledge
 from src.core.models import (
     CategoryActionDeclaration,
@@ -720,18 +721,40 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             return None
         return int((size * 8) / max(runtime_minutes * 60, 1) / 1000)
 
+    def related_sidecar_imports_for_file(
+        self,
+        *,
+        source_path: Path,
+        imported_path: Path,
+        item: Any,
+        settings: "Settings" | None,
+        file_info: Any | None = None,
+    ) -> list[dict[str, str]]:
+        """Plan external subtitle sidecars that should follow an imported video.
+
+        The download handler performs the actual safe filesystem mutation, but
+        this video category owns the rule that matching subtitle sidecars are
+        named from the video basename plus optional language/forced/SDH tokens.
+        """
+        return plan_video_sidecar_imports(
+            source_path=source_path,
+            imported_path=imported_path,
+            allowed_extensions={".srt", ".ass", ".ssa", ".vtt", ".smi", ".idx", ".sub"},
+        )
+
     @staticmethod
     def _subtitle_sidecars(file_path: str) -> list[str]:
-        """Return nearby subtitle files that share the media file stem."""
+        """Return nearby external subtitle files that share the media file stem.
+
+        This includes plain ``Movie.srt`` and language/flag variants such as
+        ``Movie.en.srt``, ``Movie.eng.forced.ass``, and VobSub ``idx/sub``
+        pairs so scans mirror the import-time sidecar rules.
+        """
         if not file_path:
             return []
         path = Path(file_path)
-        subtitles: list[str] = []
-        for suffix in (".srt", ".ass", ".ssa", ".vtt"):
-            candidate = path.with_suffix(suffix)
-            if candidate.exists():
-                subtitles.append(str(candidate))
-        return subtitles
+        plans = plan_video_sidecar_imports(source_path=path, imported_path=path)
+        return [plan["source"] for plan in plans if plan.get("source")]
 
     @staticmethod
     def _provider_episode_rows(metadata_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -982,9 +1005,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 coordinates.update({k: v for k, v in descriptor["coordinates"].items() if v is not None})
         season = self._safe_positive_int(coordinates.get("season")) or self._safe_positive_int(getattr(file_info, "season", None)) or self._safe_positive_int(getattr(item, "season", None)) or 1
         episode = self._safe_positive_int(coordinates.get("episode")) or self._safe_positive_int(getattr(file_info, "episode", None)) or self._safe_positive_int(getattr(item, "episode", None)) or 1
-        payload_name = Path(str(source_name or source.name)).name or source.name
-        if payload_name.endswith(".downloading"):
-            payload_name = payload_name[:-12]
+        payload_name = basename_from_pathish(source_name or source.name, fallback=source.name or "file")
         return self.fallback_library_path(
             source,
             title,

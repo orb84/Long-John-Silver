@@ -41,7 +41,7 @@ LJS does not include media content, indexer accounts, API keys, or any right to 
 | Area | What it means in plain English |
 |---|---|
 | Chat with your library | Ask questions like “what am I missing?”, “download the latest season in Italian”, or “why did you suggest this?” |
-| Search and queue downloads | LJS searches through configured torrent/indexer sources, ranks candidates, and queues the right one only after app-side validation. |
+| Search and queue downloads | LJS searches through configured torrent/indexer sources, can use managed Soulseek/slskd as a companion source for supported categories, ranks candidates, and queues the right one only after app-side validation. |
 | Keep categories separate | TV logic belongs to TV. Movie logic belongs to Movies. General Files is deliberately conservative. Generic code should not hardcode category rules. |
 | Inspect candidates safely | Large raw torrent results stay out of the LLM prompt. The model sees compact candidate IDs, summaries, and valid next actions. |
 | Import completed files | Completed downloads are linked/copied into category-owned safe library paths, then reconciled with the local library state. |
@@ -175,6 +175,7 @@ Recommended integrations:
 | TMDB | Highly recommended for TV/movie identity, artwork, years, cast, seasons, genres, and ratings. |
 | TVMaze | Useful for TV episode schedules and aired/future episode checks. |
 | Jackett / Torznab | Aggregates configured indexers for torrent searches. |
+| Soulseek / slskd | Optional managed companion source for music, audiobooks, ebooks, rare releases, and user-share searches. LJS installs and runs slskd locally when enabled, while keeping Soulseek separate from torrent semantics. |
 | Plex | Optional library refresh and watch-state reconciliation. |
 | Trakt | Optional watched-state/taste integration. LJS ships a public Trakt app Client ID, so normal users should only link their account with the Trakt PIN/code flow; custom Client IDs are advanced overrides only. |
 | OpenSubtitles | Optional subtitle search/download support. |
@@ -191,6 +192,23 @@ Recommended integrations:
 | Comic Vine | Optional keyed comics metadata/covers for CBZ/CBR graphic novel/comic-library workflows. |
 
 ---
+
+
+## Soulseek / slskd companion support
+
+Soulseek support is optional and managed through **slskd**, a local headless Soulseek client. When enabled from first-run setup or Compass/Settings, LJS follows the same invisible setup principle used for Jackett:
+
+- downloads and installs the native slskd binary for the current platform;
+- generates the local slskd API/web secrets automatically;
+- writes a safe `slskd.yml` using the LJS share plan;
+- starts slskd when LJS starts and stops it when LJS exits;
+- lets the user choose what to share back, defaulting to the LJS library root;
+- keeps Soulseek transfers separate from torrent/magnet queueing.
+- stores completed Soulseek files in the same user-selected LJS download folder, then imports finished files through category-owned library rules.
+
+The only user-facing requirement is a **Soulseek username and password**. You can use an existing Soulseek account, or try a new unique username/password. Account creation is handled by the Soulseek network, not by LJS directly, so LJS validates the login after starting slskd. If the network rejects the credentials, Soulseek is left in a clear `auth_failed` state and is not marked ready until the user fixes the credentials.
+
+For source strategy, LJS can search Soulseek in parallel with torrent/indexer discovery for configured categories, then choose according to the source preference set in Compass. Music prefers Soulseek for single tracks, singles, EPs, and normal albums when Soulseek is ready, while torrents remain the better first attempt for full discographies and large bundle requests. Audiobooks, ebooks, TV, Movies, and exact General-file searches can also use Soulseek as a configured companion path.
 
 ## Chat bridges: web, Discord, Telegram, WhatsApp, and more
 
@@ -262,19 +280,40 @@ For a first install, run LJS manually until your settings and paths are correct.
 ```bash
 git clone https://github.com/orb84/Long-John-Silver.git
 cd Long-John-Silver
-./run.sh                 # Starts on port 8088
-./run.sh 9000            # Custom port
-LJS_PORT=3000 ./run.sh   # Port via environment variable
+./run.sh                 # macOS/Linux: creates .venv, installs dependencies, starts on port 8088
+./run.sh 9000            # macOS/Linux custom port
+LJS_PORT=3000 ./run.sh   # macOS/Linux port via environment variable
+./run.sh install         # Install/reinstall dependencies only
+./run.sh update          # Update dependencies
+./run.sh doctor          # Print launcher diagnostics
+./run.sh reset-venv      # Remove .venv so it is recreated on next start
 ```
 
+On Windows Command Prompt or PowerShell:
+
+```bat
+run.bat                  REM Creates .venv, installs dependencies, starts on port 8088
+run.bat 9000             REM Custom port
+run.bat install          REM Install/reinstall dependencies only
+run.bat update           REM Update dependencies
+run.bat doctor           REM Print launcher diagnostics
+run.bat install-python   REM Install Python 3.11 with winget
+run.bat install-ffmpeg   REM Install FFmpeg with winget/choco/scoop
+run.bat reset-venv       REM Remove .venv so it is recreated on next start
+```
+
+The launchers require Python 3.10+. On macOS, Linux, and Windows they search common Python 3.10/3.11/3.12 installs, validate any existing virtual environment, and can attempt an automatic Python install when no compatible interpreter is found. On macOS, this means prompting for Homebrew if needed. On Windows, this means using `winget` to install Python 3.11 for the current user when available. Set `LJS_AUTO_INSTALL_PYTHON=0` to disable Python auto-install attempts; on macOS you can also set `LJS_AUTO_INSTALL_HOMEBREW=0`.
+
 Then open the web UI and follow setup.
+
+FFmpeg is recommended for Music and Audiobooks conversion workflows. The launcher tries to install FFmpeg automatically by default when it is missing; the macOS/Linux and Windows launchers now do this through their platform package managers: on macOS through Homebrew, on Linux through the detected system package manager, and on Windows through `winget` (`Gyan.FFmpeg`) with Chocolatey/Scoop fallbacks. It is still not a first-run setup blocker; if the automatic install fails, LJS starts and reports conversion workflows as unavailable. Use `LJS_AUTO_INSTALL_FFMPEG=0 ./run.sh` or `set LJS_AUTO_INSTALL_FFMPEG=0` before `run.bat` to skip automatic FFmpeg installation, or run `./run.sh install-ffmpeg` / `run.bat install-ffmpeg` to run only the FFmpeg installer.
 
 The first-run wizard helps configure:
 
 - the LLM provider;
 - library paths for TV, Movies, and General Files;
 - TMDB and other optional services;
-- search/indexer settings;
+- search/indexer settings, including optional managed Soulseek/slskd;
 - chat bridges;
 - storage thresholds and safety settings.
 
@@ -296,6 +335,12 @@ LJS_HOST=0.0.0.0
 LJS_ACCESS_LOGS=quiet       # quiet | verbose
 LJS_WEB_SECRET=<random secret for signed auth tokens>
 LJS_ALLOW_INSECURE_DEV=1    # development only, used by run.sh/run.bat
+LJS_AUTO_INSTALL_FFMPEG=0   # optional: skip default FFmpeg auto-install in run.sh/run.bat
+LJS_PYTHON=/path/to/python3.11   # Windows also accepts C:\Path\To\python.exe
+LJS_AUTO_INSTALL_PYTHON=0   # disable launcher Python auto-install attempts
+LJS_VENV_DIR=.venv-alt     # optional alternate virtualenv directory
+LJS_AUTO_INSTALL_HOMEBREW=0 # disable run.sh Homebrew prompt on macOS
+LJS_VENV_DIR=.venv          # override launcher virtualenv directory
 ```
 
 ---

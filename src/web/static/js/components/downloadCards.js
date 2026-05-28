@@ -240,8 +240,10 @@ class DownloadManager extends Component {
         card.appendChild(bw);
         const stats = DOM.el('div', { className: 'dl-stats' });
         const source = dl.source_seeders != null ? ` / src ${dl.source_seeders}` : '';
-        stats.innerHTML = '<span class="dl-stat dl-stat-speed"><span class="stat-icon">⬇</span><span class="stat-val">0</span> kB/s</span>' +
-                         '<span class="dl-stat dl-stat-up"><span class="stat-icon">⬆</span><span class="stat-val">0</span> kB/s</span>' +
+        const initialDownKbps = ((dl.download_rate || 0) / 1024).toFixed(0);
+        const initialUpKbps = ((dl.upload_rate || 0) / 1024).toFixed(0);
+        stats.innerHTML = `<span class="dl-stat dl-stat-speed"><span class="stat-icon">⬇</span><span class="stat-val">${initialDownKbps}</span> kB/s</span>` +
+                         `<span class="dl-stat dl-stat-up"><span class="stat-icon">⬆</span><span class="stat-val">${initialUpKbps}</span> kB/s</span>` +
                          `<span class="dl-stat dl-stat-peers" title="Live seeds/peers from libtorrent; src is the search-time indexer snapshot."><span class="stat-icon">👥</span><span class="stat-val">${dl.num_seeds || 0} seeds · ${dl.num_peers || 0} peers${source}</span></span>` +
                          '<span class="dl-stat dl-stat-eta"><span class="stat-icon">⏳</span><span class="stat-val">—</span></span>';
         card.appendChild(stats);

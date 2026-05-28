@@ -53,16 +53,17 @@ class ActionRegistrationService:
 
     def _register_downloader_actions(self) -> None:
         gw = self._gateway
-        dl = self._deps.downloader
-        for action_name, method_name in (
-            ("pause_download", "pause_download"),
-            ("resume_download", "resume_download"),
-            ("download_set_priority", "set_priority"),
-            ("cancel_download", "cancel_download"),
-            ("restart_download", "restart_download"),
-            ("set_file_priority", "set_file_priority"),
+        deps = self._deps
+        handler = DownloadsActionHandler(deps.downloader, deps.settings_manager, deps.db)
+        for action_name, method in (
+            ("pause_download", handler.pause_download),
+            ("resume_download", handler.resume_download),
+            ("download_set_priority", handler.set_priority),
+            ("cancel_download", handler.cancel_download),
+            ("restart_download", handler.restart_download),
+            ("set_file_priority", handler.set_file_priority),
         ):
-            gw.register(action_name, getattr(dl, method_name))
+            gw.register(action_name, method)
 
     # ── Category item management actions ──
 
@@ -91,7 +92,7 @@ class ActionRegistrationService:
         deps = self._deps
         handler = SettingsActionHandler(
             deps.settings_manager, deps.assistant, deps.downloader,
-            deps.auth_service, deps.llm_manager,
+            deps.auth_service, deps.llm_manager, deps.slskd_manager,
         )
         gw = self._gateway
         for action_name, method in (
@@ -135,7 +136,7 @@ class ActionRegistrationService:
         deps = self._deps
         handler = SystemActionHandler(
             deps.settings_manager, deps.browser_runtime,
-            deps.jackett_manager, deps.comms_registry, deps.db,
+            deps.jackett_manager, deps.slskd_manager, deps.comms_registry, deps.db,
             deps.auth_service,
         )
         gw = self._gateway
@@ -143,6 +144,10 @@ class ActionRegistrationService:
             ("system_install_playwright", handler.install_playwright),
             ("system_install_jackett", handler.install_jackett),
             ("system_start_jackett", handler.start_jackett),
+            ("system_install_soulseek", handler.install_soulseek),
+            ("system_start_soulseek", handler.start_soulseek),
+            ("system_check_soulseek_login", handler.check_soulseek_login),
+            ("system_stop_soulseek", handler.stop_soulseek),
             ("system_configure_default_indexers", handler.configure_default_indexers),
             ("system_configure_jackett_indexers", handler.configure_jackett_indexers),
             ("system_jackett_indexer_diagnostics", handler.jackett_indexer_diagnostics),
@@ -242,7 +247,7 @@ class ActionRegistrationService:
 
     def _register_download_batch_actions(self) -> None:
         deps = self._deps
-        handler = DownloadsActionHandler(deps.downloader)
+        handler = DownloadsActionHandler(deps.downloader, deps.settings_manager, deps.db)
         gw = self._gateway
         gw.register("download_upload", handler.upload)
         gw.register("pause_downloads", handler.pause_downloads)

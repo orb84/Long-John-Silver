@@ -24,6 +24,7 @@ from src.core.models import (
     SearchResult,
 )
 from src.utils.quality import QualityAnalyzer
+from src.integrations.slskd_client import SlskdClient
 
 
 @dataclass
@@ -39,6 +40,7 @@ class DownloadHealthState:
     test_baseline_bytes: int = 0
     original_priority: DownloadPriority | None = None
     alternative_checked_at: datetime | None = None
+    soulseek_checked_at: datetime | None = None
 
 
 class DownloadHealthSupervisor:
@@ -89,7 +91,7 @@ class DownloadHealthSupervisor:
             except Exception as exc:
                 logger.debug(f"Completed-download reconciliation skipped: {exc}")
         active = await self._downloader.get_active_downloads()
-        counters = {"observed": 0, "parked": 0, "tests_started": 0, "alternatives": 0, "completed_repaired": repaired_completed}
+        counters = {"observed": 0, "parked": 0, "tests_started": 0, "alternatives": 0, "soulseek_hits": 0, "completed_repaired": repaired_completed}
         live_ids = {d.id for d in active}
         for stale_id in list(self._states):
             if stale_id not in live_ids:
@@ -112,6 +114,8 @@ class DownloadHealthSupervisor:
             if item.status == DownloadStatus.STALLED:
                 alt_count = await self._maybe_find_alternatives(item, state, now)
                 counters["alternatives"] += alt_count
+                soulseek_count = await self._maybe_find_soulseek_candidates(item, state, now, had_torrent_alternatives=alt_count > 0)
+                counters["soulseek_hits"] += soulseek_count
                 if await self._maybe_start_health_test(item, state, now):
                     counters["tests_started"] += 1
 
@@ -256,6 +260,87 @@ class DownloadHealthSupervisor:
             await self._notifications.send_message(message, title="Stalled Download Alternatives", level="info")
         self._emit_status(f"Found alternatives for parked download: {item.item_name}", phase="info", item=item.item_name)
 
+    async def _maybe_find_soulseek_candidates(
+        self,
+        item: DownloadItem,
+        state: DownloadHealthState,
+        now: datetime,
+        *,
+        had_torrent_alternatives: bool,
+    ) -> int:
+        """Search Soulseek for stalled eligible downloads when torrent retries came up empty."""
+        settings = self._settings_manager.settings
+        cfg = getattr(settings, "soulseek", None)
+        if cfg is None or not getattr(cfg, "api_configured", False):
+            return 0
+        if had_torrent_alternatives and getattr(cfg, "companion_when_no_torrent_results", True):
+            return 0
+        enabled_categories = {str(cat).strip().lower() for cat in (cfg.search_enabled_categories or []) if str(cat).strip()}
+        category_id = str(item.category_id or "").strip().lower()
+        if enabled_categories and category_id not in enabled_categories:
+            return 0
+        if state.soulseek_checked_at and (now - state.soulseek_checked_at) < self._soulseek_cooldown():
+            return 0
+        state.soulseek_checked_at = now
+        query = self._soulseek_query(item)
+        if not query:
+            return 0
+        try:
+            result = await SlskdClient(cfg).search(query, max_results=min(int(getattr(cfg, "max_search_results", 5) or 5), 5))
+        except Exception as exc:
+            logger.warning(f"Failed Soulseek search for stalled download {item.id}: {exc}")
+            return 0
+        if not isinstance(result, dict) or result.get("ok") is False:
+            return 0
+        candidates = result.get("candidates") or []
+        if not isinstance(candidates, list) or not candidates:
+            return 0
+        await self._surface_soulseek_candidates(item, query, candidates[:3], result.get("filtering") or {})
+        return len(candidates[:3])
+
+    @staticmethod
+    def _soulseek_query(item: DownloadItem) -> str:
+        parts = [str(item.item_name or "").strip()]
+        episode_label = DownloadHealthSupervisor._episode_label(item)
+        if episode_label:
+            parts.append(episode_label)
+        text = " ".join(part for part in parts if part)
+        return text.strip()
+
+    async def _surface_soulseek_candidates(
+        self,
+        item: DownloadItem,
+        query: str,
+        candidates: list[dict[str, Any]],
+        filtering: dict[str, Any],
+    ) -> None:
+        lines = [
+            f"The parked download for '{item.item_name}' also triggered a Soulseek/slskd companion search.",
+            f"Query: {query}",
+            "The original torrent was not removed; it will still be tested again later.",
+        ]
+        locked_filtered = int(filtering.get("locked_or_private_filtered") or 0)
+        if locked_filtered:
+            lines.append(f"Filtered out {locked_filtered} locked/private Soulseek results before presenting candidates.")
+        lines.extend(["", "Top Soulseek candidates:"])
+        for i, cand in enumerate(candidates, 1):
+            queue = cand.get("queue_length")
+            slot = cand.get("has_free_upload_slot")
+            queue_text = "free slot" if slot is True else ("slot unknown" if slot is None else "queued")
+            if queue not in (None, ""):
+                queue_text += f", queue {queue}"
+            size_text = "Unknown size"
+            try:
+                if cand.get("size_bytes") not in (None, ""):
+                    size_text = QualityAnalyzer.format_size(int(cand.get("size_bytes") or 0))
+            except Exception:
+                pass
+            lines.append(f"{i}. {cand.get('filename')} — user {cand.get('username')} ({size_text}, {queue_text})")
+        message = "\n".join(lines)
+        if self._notifications:
+            await self._notifications.send_message(message, title="Stalled Download Soulseek Options", level="info")
+        self._emit_status(f"Found Soulseek options for parked download: {item.item_name}", phase="info", item=item.item_name)
+
     def _emit_status(self, message: str, *, phase: str = "info", item: str | None = None) -> None:
         if not self._event_bus:
             return
@@ -282,6 +367,9 @@ class DownloadHealthSupervisor:
     def _alternative_cooldown(self) -> timedelta:
         minutes = max(30.0, float(getattr(self._settings_manager.settings, "stall_alternative_cooldown_minutes", 180.0) or 180.0))
         return timedelta(minutes=minutes)
+
+    def _soulseek_cooldown(self) -> timedelta:
+        return self._alternative_cooldown()
 
     def _min_progress_bytes(self) -> int:
         return max(64 * 1024, int(getattr(self._settings_manager.settings, "stall_min_progress_bytes", 512 * 1024) or 512 * 1024))

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from src.integrations.slskd_client import SlskdClient
 from src.core.models import CategoryItem, DownloadPriority, GenericMediaItem, ScannedLibraryItem, SearchResult
 from src.core.library_objects import CanonicalLibraryObjectBuilder
 
@@ -282,7 +283,194 @@ class SchedulerTorrentSearchService:
             media, category_id, season, episode, normalized_scope, settings,
         )
         results, query_summary = await self._search(media, category_id, season, episode, target_lang, settings, normalized_scope)
-        return self._response(media, category_id, season, episode, target_lang, results, query_summary, normalized_scope)
+        response = self._response(media, category_id, season, episode, target_lang, results, query_summary, normalized_scope)
+        response["source_strategy"] = self._source_strategy(category_id, normalized_name, normalized_scope, settings)
+        response["companion_soulseek"] = await self._soulseek_companion_search(
+            query_summary=query_summary,
+            media=media,
+            category_id=category_id,
+            search_scope=normalized_scope,
+            settings=settings,
+        )
+        return response
+
+    def _source_strategy(self, category_id: str, name: str, search_scope: str, settings: object) -> dict[str, Any]:
+        """Return the effective source strategy for the current category search."""
+        cfg = getattr(settings, "soulseek", None)
+        preference = getattr(cfg, "download_preference", "torrent_first") if cfg else "torrent_first"
+        category = str(category_id or "").lower()
+        text = str(name or "").lower()
+        is_large_music_bundle = category == "music" and any(term in text for term in ("discography", "complete", "catalog", "catalogue", "collection"))
+        if category == "music" and not is_large_music_bundle and search_scope == "default" and getattr(cfg, "enabled", False):
+            # The user specifically asked for this behavior: albums and single songs
+            # should prefer Soulseek when it is enabled, while full discographies
+            # remain torrent-first because bundles are more torrent-shaped.
+            preference = "soulseek_first"
+        return {
+            "parallel_search_enabled": bool(getattr(cfg, "parallel_search_enabled", False)) if cfg else False,
+            "download_preference": preference,
+            "torrent_queue_tool": "queue_download",
+            "soulseek_queue_tool": "enqueue_soulseek_download",
+            "note": "Evaluate torrent and Soulseek candidates together when companion_soulseek has ready candidates; use the queue tool that matches the selected backend.",
+        }
+
+    async def _soulseek_companion_search(
+        self,
+        *,
+        query_summary: str,
+        media: CategoryItem,
+        category_id: str,
+        search_scope: str,
+        settings: object,
+    ) -> dict[str, Any]:
+        """Run a bounded Soulseek companion search alongside torrent search.
+
+        The result is presented next to torrent candidates without mixing backend
+        semantics.  Queueing remains explicit through enqueue_soulseek_download.
+        """
+        cfg = getattr(settings, "soulseek", None)
+        if not cfg or not getattr(cfg, "enabled", False):
+            return {"enabled": False, "status": "disabled", "candidate_count": 0, "candidates": []}
+        enabled_categories = {str(cat).strip().lower() for cat in (getattr(cfg, "search_enabled_categories", []) or []) if str(cat).strip()}
+        if enabled_categories and str(category_id or "").lower() not in enabled_categories:
+            return {"enabled": True, "status": "category_disabled", "category_id": category_id, "candidate_count": 0, "candidates": []}
+        if not getattr(cfg, "parallel_search_enabled", True):
+            return {"enabled": True, "status": "parallel_disabled", "candidate_count": 0, "candidates": []}
+        if not getattr(cfg, "api_configured", False):
+            return {"enabled": True, "status": "not_configured", "candidate_count": 0, "candidates": [], "error": "slskd is not configured."}
+        if getattr(cfg, "managed", True):
+            if not getattr(cfg, "soulseek_credentials_configured", False):
+                return {
+                    "enabled": True,
+                    "status": "needs_credentials",
+                    "account_status": getattr(cfg, "account_status", "needs_credentials"),
+                    "candidate_count": 0,
+                    "candidates": [],
+                    "error": "Soulseek username and password are required before searching.",
+                }
+            if str(getattr(cfg, "account_status", "")).lower() == "auth_failed":
+                return {
+                    "enabled": True,
+                    "status": "auth_failed",
+                    "account_status": getattr(cfg, "account_status", "auth_failed"),
+                    "candidate_count": 0,
+                    "candidates": [],
+                    "error": getattr(cfg, "account_status_message", "Soulseek rejected these credentials."),
+                }
+        # For very broad pack searches, keep Soulseek as visible-but-secondary;
+        # a single-user queue is rarely the best way to pull huge catalogues.
+        queries = self._soulseek_query_variants(query_summary, media)
+        if not queries:
+            return {"enabled": True, "status": "empty_query", "candidate_count": 0, "candidates": []}
+        result: dict[str, Any] = {}
+        candidates: list[dict[str, Any]] = []
+        tried_queries: list[str] = []
+        try:
+            for query in queries:
+                tried_queries.append(query)
+                logger.info(f"Soulseek companion search: category={category_id} query={query!r}")
+                result = await SlskdClient(cfg).search(query, max_results=min(int(getattr(cfg, "max_search_results", 10) or 10), 10))
+                candidate_rows = result.get("candidates") if isinstance(result, dict) else []
+                if isinstance(candidate_rows, list) and candidate_rows:
+                    candidates = candidate_rows
+                    break
+        except Exception as exc:
+            logger.warning("Soulseek companion search failed for %s: %s", queries, exc)
+            return {"enabled": True, "status": "error", "candidate_count": 0, "candidates": [], "error": str(exc), "queries": tried_queries}
+        logger.info(f"Soulseek companion search complete: category={category_id} queries={tried_queries} candidates={len(candidates)}")
+        if not isinstance(candidates, list):
+            candidates = []
+        if isinstance(result, dict) and result.get("ok") is True:
+            try:
+                cfg.account_status = "ready"
+                cfg.account_status_message = "Soulseek account authenticated."
+            except Exception:
+                pass
+        elif isinstance(result, dict):
+            error_text = str(result.get("error") or "").lower()
+            if any(token in error_text for token in ("not logged in", "not connected", "connect to server")):
+                try:
+                    cfg.account_status = "checking"
+                    cfg.account_status_message = "slskd is running but not connected/logged in to Soulseek yet."
+                except Exception:
+                    pass
+        return {
+            "enabled": True,
+            "status": "ready" if result.get("ok") is True else ("account_not_ready" if isinstance(result, dict) and any(token in str(result.get("error") or "").lower() for token in ("not logged in", "not connected", "connect to server")) else "error"),
+            "source": "slskd",
+            "query": tried_queries[0] if tried_queries else "",
+            "queries": tried_queries,
+            "candidate_count": len(candidates),
+            "candidates": candidates[:10],
+            "filtering": result.get("filtering") if isinstance(result, dict) else {},
+            "raw_response_count": result.get("raw_response_count") if isinstance(result, dict) else None,
+            "raw_file_count": result.get("raw_file_count") if isinstance(result, dict) else None,
+            "queueing_note": "Use enqueue_soulseek_download with username + filename. Do not pass these candidates to queue_download.",
+            "error": result.get("error") if isinstance(result, dict) else None,
+        }
+
+    @staticmethod
+    def _soulseek_query_variants(query_summary: str, media: CategoryItem) -> list[str]:
+        """Return ordered Soulseek queries for one category item.
+
+        Soulseek is much more literal than torrent indexers.  Do not include
+        explanatory words such as "album" or torrent-style quality noise in
+        the first search.  Try a few short artist/title permutations so album
+        folders shared as either "Artist/Album" or "Album Artist" can match.
+        """
+        raw_values = [
+            str(query_summary or "").strip(),
+            str(getattr(media, "key", "") or "").strip(),
+            str(getattr(media, "display_name", "") or "").strip(),
+        ]
+        queries: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            cleaned = SchedulerTorrentSearchService._clean_soulseek_query(value)
+            if cleaned and cleaned.casefold() not in seen:
+                seen.add(cleaned.casefold())
+                queries.append(cleaned)
+
+        for value in raw_values:
+            cleaned = SchedulerTorrentSearchService._clean_soulseek_query(value)
+            # Handle common natural phrases before stripping relation words.
+            natural = re.search(r"(?P<title>.+?)\s+(?:by|from|di|da)\s+(?P<artist>.+)$", cleaned, re.IGNORECASE)
+            if natural:
+                title = natural.group("title")
+                artist = natural.group("artist")
+                add(f"{artist} {title}")
+                add(f"{title} {artist}")
+                add(title)
+                add(artist)
+            add(re.sub(r"\b(?:from|by|di|da)\b", " ", cleaned, flags=re.IGNORECASE))
+            if " - " in cleaned:
+                left, right = [part.strip() for part in cleaned.split(" - ", 1)]
+                add(f"{left} {right}")
+                add(f"{right} {left}")
+                add(left)
+                add(right)
+            tokens = cleaned.split()
+            if len(tokens) >= 4:
+                mid = len(tokens) // 2
+                first = " ".join(tokens[:mid])
+                second = " ".join(tokens[mid:])
+                add(f"{second} {first}")
+                add(first)
+                add(second)
+            elif len(tokens) == 3:
+                add(" ".join(tokens[1:] + tokens[:1]))
+
+        return queries[:8]
+
+    @staticmethod
+    def _clean_soulseek_query(value: str) -> str:
+        text = str(value or "")
+        text = re.sub(r"\b(?:album|track|song|single|ep|music|release|download|torrent|torrents|grab|get|please)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:flac|mp3|aac|alac|m4a|lossless|bitrate|kbps)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"[\[\]{}()]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" -_.,")
+        return text
 
     def _category_for_units(self, season: int | None, episode: int | None) -> str | None:
         """Return the first category that accepts requested structured unit arguments."""
@@ -298,7 +486,7 @@ class SchedulerTorrentSearchService:
 
     def _category_for_search_scope(self, search_scope: str | None) -> str | None:
         """Resolve a category for category-neutral pack search scopes."""
-        if search_scope not in {"season_pack_preferred", "season_pack_only"}:
+        if search_scope not in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
             return None
         for category in (self._context.categories.list_all() if self._context.categories else []):
             try:
@@ -358,7 +546,7 @@ class SchedulerTorrentSearchService:
         """Let the category resolve omitted season coordinates for pack searches."""
         if season is not None or episode is not None:
             return season
-        if search_scope not in {"season_pack_preferred", "season_pack_only"}:
+        if search_scope not in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
             return season
         category = self._context.categories.get(category_id) if self._context.categories else None
         if not category or not hasattr(category, "resolve_agent_pack_season"):
@@ -418,9 +606,22 @@ class SchedulerTorrentSearchService:
     @staticmethod
     def _normalize_search_scope(value: str | None) -> str:
         """Normalize category-neutral assistant search scope hints."""
-        allowed = {"default", "season_pack_preferred", "season_pack_only", "individual_units_only"}
+        aliases = {
+            "": "default",
+            "broad": "default",
+            "default": "default",
+            "pack_preferred": "bundle_preferred",
+            "season_pack_preferred": "bundle_preferred",
+            "bundle_preferred": "bundle_preferred",
+            "pack_only": "bundle_only",
+            "season_pack_only": "bundle_only",
+            "bundle_only": "bundle_only",
+            "individual_units": "individual_units_only",
+            "individual_unit_only": "individual_units_only",
+            "individual_units_only": "individual_units_only",
+        }
         text = str(value or "default").strip().lower()
-        return text if text in allowed else "default"
+        return aliases.get(text, "default")
 
     def _response(self, media: CategoryItem, category_id: str, season: int | None, episode: int | None, target_lang: str, results: list[SearchResult], query_summary: str, search_scope: str = "default") -> dict[str, Any]:
         """Build the final search_media_torrents response payload."""

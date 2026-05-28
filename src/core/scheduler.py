@@ -644,6 +644,28 @@ class MediaScheduler:
             return
         if self._library_scan_lock.locked():
             return
+        # Do not force a full-library crawl on every boot.  Older rows without
+        # ffprobe metadata are useful to repair, but that repair is opportunistic
+        # and should never make startup feel like LJS is re-reading the whole
+        # collection.  Run it at most weekly unless the user manually scans.
+        now = datetime.now(timezone.utc)
+        last_repair_text = str(getattr(settings, "last_media_metadata_repair_at", "") or "")
+        if last_repair_text:
+            try:
+                last_repair = datetime.fromisoformat(last_repair_text)
+                if (now - last_repair).total_seconds() < 7 * SECONDS_PER_DAY:
+                    logger.debug("Stale media metadata repair skipped — last repair scan was < 7 days ago")
+                    return
+            except (TypeError, ValueError):
+                pass
+        if settings.last_library_scan_at:
+            try:
+                last_scan = datetime.fromisoformat(settings.last_library_scan_at)
+                if (now - last_scan).total_seconds() < 24 * 3600:
+                    logger.info("Stale media metadata repair deferred — recent library scan exists; no startup full scan needed.")
+                    return
+            except (TypeError, ValueError):
+                pass
         try:
             stale = await self._has_stale_media_file_metadata(limit_items=40)
         except Exception as exc:
@@ -653,8 +675,10 @@ class MediaScheduler:
             return
         logger.info(
             "Detected downloaded media files with missing stream metadata; "
-            "running serialized metadata repair scan."
+            "running serialized metadata repair scan (weekly repair throttle)."
         )
+        settings.last_media_metadata_repair_at = now.isoformat()
+        await asyncio.to_thread(self._settings_manager.save, settings)
         self._emit_status("Repairing media language/resolution metadata", phase="running")
         await self.scan_library(force=True, refresh_metadata=False)
 
