@@ -221,7 +221,7 @@ class ToolResultCompactor:
         if not isinstance(rows, list):
             return []
         compact_rows: list[dict[str, Any]] = []
-        keys = ("id", "index", "title", "size", "size_bytes", "seeders", "unit", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count")
+        keys = ("id", "index", "title", "size", "size_bytes", "seeders", "languages", "resolution", "source", "unit", "auto_queue_allowed", "blocked_reason", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count")
         for row in rows[: self._SEARCH_PICKER_LIMIT]:
             if not isinstance(row, dict):
                 continue
@@ -233,7 +233,7 @@ class ToolResultCompactor:
             "index", "option_index", "candidate_id", "title", "size", "size_bytes",
             "seeders", "source", "quality_score", "season", "episode", "languages",
             "resolution", "codec", "per_episode_size", "per_episode_size_bytes",
-            "estimated_bitrate_kbps", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count",
+            "estimated_bitrate_kbps", "selection_warnings", "selection_blockers", "auto_queue_allowed", "auto_queue_blocked_reason", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count",
         )
         compact = {key: candidate.get(key) for key in keys if candidate.get(key) not in (None, "", [])}
         compact["result_set_id"] = candidate.get("result_set_id") or fallback_result_set_id

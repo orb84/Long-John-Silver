@@ -487,6 +487,17 @@ class QueueDownloadService:
         candidate_name = cache.get("name") or request.name
         if not candidate.get("magnet"):
             return {"error": "Candidate has no queueable magnet/link"}
+        if candidate.get("auto_queue_allowed") is False and not request.raw_arguments.get("confirmed"):
+            reason = candidate.get("auto_queue_blocked_reason") or "candidate requires user confirmation"
+            return {
+                "error": f"Candidate requires user confirmation before queueing: {reason}",
+                "confirmation_required": True,
+                "candidate_id": candidate.get("candidate_id"),
+                "title": candidate.get("title"),
+                "seeders": candidate.get("seeders"),
+                "languages": candidate.get("languages"),
+                "next_action": "Show this candidate and at least one safer alternative, then queue with confirmed=true only if the user explicitly accepts it.",
+            }
         if not candidate_name:
             return {"error": "Candidate result set has no media item name"}
         unit_descriptor = self._candidate_unit_descriptor(candidate, request, cache)

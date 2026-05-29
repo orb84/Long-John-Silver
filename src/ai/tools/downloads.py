@@ -193,6 +193,7 @@ class QueueDownloadTool:
                 "release_year": {"type": "integer", "description": "Movie/release year used as a fallback when series_start_year is not applicable."},
                 "item_id": {"type": "string", "description": "Optional category-local tracked item ID. Provider IDs should still be supplied separately when known."},
                 "season_order_type": {"type": "string", "description": "Episode-order namespace, e.g. official, aired, dvd, absolute. Default: official."},
+                "confirmed": {"type": "boolean", "description": "Set true only after the user explicitly confirms queueing a candidate that search_media_torrents marked as blocked/low-confidence."},
             },
             "required": [],
         }

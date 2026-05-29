@@ -875,7 +875,11 @@ class SearchMediaTorrentsTool:
                 },
                 "language": {
                     "type": "string",
-                    "description": "Preferred language only when relevant to the active category (e.g. movies, ebooks, audiobooks). For music, omit unless the user explicitly asks for language-specific music.",
+                    "description": "Media/download language only, not chat language. Set this only when the user explicitly asks for an audio/subtitle/translation language, or when category/tracked-item context supplies a configured media language. Omit it to let LJS apply tracked/category/global media language defaults. Never set it merely because the user wrote the chat message in English/Italian/etc.",
+                },
+                "language_is_explicit": {
+                    "type": "boolean",
+                    "description": "True only when the user explicitly requested this media/download language in the current request. Omit or false for language inferred from the chat/reply language or for ordinary default preference handling.",
                 },
                 "search_scope": {
                     "type": "string",
@@ -896,6 +900,15 @@ class SearchMediaTorrentsTool:
         season = arguments.get("season")
         episode = arguments.get("episode")
         language = arguments.get("language")
+        language_is_explicit = bool(arguments.get("language_is_explicit") or arguments.get("explicit_language"))
+        if language and not language_is_explicit:
+            logger.warning(
+                "Ignoring non-explicit search_media_torrents language argument {!r} for {!r}; "
+                "tool language is media audio/subtitle language, not chat/reply language; scheduler will apply configured defaults.",
+                language,
+                arguments.get("name"),
+            )
+            language = None
         search_scope = arguments.get("search_scope") or "default"
         category_id = str(arguments.get("category_id") or "").strip() or None
         session_id = context.session_id or "default"
@@ -907,6 +920,7 @@ class SearchMediaTorrentsTool:
             season=season,
             episode=episode,
             language=language,
+            language_explicit=language_is_explicit,
             search_scope=search_scope,
             category_id=category_id,
         )
@@ -941,6 +955,10 @@ class SearchMediaTorrentsTool:
                 "bundle_scope": c.get("bundle_scope"),
                 "pack_type": c.get("pack_type"),
                 "bundle_unit_count": c.get("bundle_unit_count"),
+                "selection_warnings": c.get("selection_warnings") or [],
+                "selection_blockers": c.get("selection_blockers") or [],
+                "auto_queue_allowed": c.get("auto_queue_allowed"),
+                "auto_queue_blocked_reason": c.get("auto_queue_blocked_reason"),
             })
 
         cache_candidates = attach_candidate_ids(cache_candidates)
@@ -1020,7 +1038,20 @@ class SearchMediaTorrentsTool:
                 "bundle_scope": c.get("bundle_scope"),
                 "pack_type": c.get("pack_type"),
                 "bundle_unit_count": c.get("bundle_unit_count"),
+                "selection_warnings": c.get("selection_warnings") or [],
+                "selection_blockers": c.get("selection_blockers") or [],
+                "auto_queue_allowed": c.get("auto_queue_allowed"),
+                "auto_queue_blocked_reason": c.get("auto_queue_blocked_reason"),
             })
+
+        _annotate_selection_policy(clean_candidates, preferred_language=res.get("language") or language)
+        for cache_candidate in cache_candidates:
+            clean_match = next((c for c in clean_candidates if c.get("candidate_id") == cache_candidate.get("candidate_id")), None)
+            if clean_match:
+                cache_candidate["selection_warnings"] = clean_match.get("selection_warnings") or []
+                cache_candidate["selection_blockers"] = clean_match.get("selection_blockers") or []
+                cache_candidate["auto_queue_allowed"] = clean_match.get("auto_queue_allowed")
+                cache_candidate["auto_queue_blocked_reason"] = clean_match.get("auto_queue_blocked_reason")
 
         selected_for_estimate = _candidate_ids_for_estimate(
             clean_candidates,
@@ -1143,6 +1174,68 @@ class SearchMediaTorrentsTool:
         return res
 
 
+def _annotate_selection_policy(candidates: list[dict[str, Any]], *, preferred_language: str | None = None) -> None:
+    """Mark candidates that should not be queued without user confirmation.
+
+    This is a narrow safety layer for the tool contract: it does not try to
+    semantically choose the best torrent, but it prevents a low-availability or
+    wrong-language row from being advertised as a clear one-click choice.
+    """
+    preferred = _canonical_language_token(preferred_language) if preferred_language else ""
+    for candidate in candidates:
+        warnings: list[str] = []
+        blockers: list[str] = []
+        seeders = _safe_int(candidate.get("seeders"))
+        if seeders <= 0:
+            blockers.append("no seeder count reported")
+        elif seeders < 5:
+            blockers.append(f"very low seeders ({seeders})")
+        elif seeders < 10:
+            warnings.append(f"low seeders ({seeders})")
+
+        if preferred:
+            languages = candidate.get("languages") or []
+            if isinstance(languages, str):
+                languages = [languages]
+            normalized = {_canonical_language_token(lang) for lang in languages if lang}
+            title = str(candidate.get("title") or "")
+            title_has_preferred = _title_has_language_token(title, preferred)
+            multi = "multi" in normalized or "multi" in title.lower() or "dual" in title.lower()
+            if normalized and preferred not in normalized and not multi and not title_has_preferred:
+                blockers.append(f"does not advertise preferred media language {preferred_language}")
+            elif not normalized and not title_has_preferred:
+                warnings.append(f"language not advertised; preferred media language is {preferred_language}")
+
+        candidate["selection_warnings"] = warnings
+        candidate["selection_blockers"] = blockers
+        if blockers:
+            candidate["auto_queue_allowed"] = False
+            candidate["auto_queue_blocked_reason"] = "; ".join(blockers)
+        else:
+            candidate["auto_queue_allowed"] = True
+            candidate["auto_queue_blocked_reason"] = ""
+
+
+def _title_has_language_token(title: str, preferred_token: str) -> bool:
+    import re
+    title_lower = str(title or "").lower()
+    if preferred_token == "italian":
+        return bool(re.search(r"(?:^|[\s._\-\[\]()])(?:ita|italian|italiano)(?:$|[\s._\-\[\]()])", title_lower, re.I))
+    if preferred_token == "english":
+        return bool(re.search(r"(?:^|[\s._\-\[\]()])(?:eng|english)(?:$|[\s._\-\[\]()])", title_lower, re.I))
+    return preferred_token in title_lower
+
+
+def _canonical_language_token(value: object) -> str:
+    token = str(value or "").strip().lower()
+    aliases = {
+        "italian": "italian", "italiano": "italian", "ita": "italian", "it": "italian",
+        "english": "english", "eng": "english", "en": "english",
+        "multi": "multi", "multilanguage": "multi", "multi-audio": "multi", "dual": "multi",
+    }
+    return aliases.get(token, token)
+
+
 def _search_result_next_actions(*, candidates: list[dict[str, Any]], search_scope: str | None, result_set_id: str, has_batch: bool) -> list[dict[str, Any]]:
     """Return prompt-safe affordances for a cached torrent result set.
 
@@ -1186,12 +1279,27 @@ def _search_result_next_actions(*, candidates: list[dict[str, Any]], search_scop
             "args_hint": {"result_set_id": result_set_id, "candidate_id": bundle_candidates[0].get("candidate_id"), "detail": "file_list"},
         })
 
-    actions.append({
-        "action": "queue_clear_candidate",
-        "tool": "queue_download",
-        "reason": "Use this only when the candidate clearly matches the user's target and constraints.",
-        "args_hint": {"result_set_id": result_set_id, "candidate_id": candidates[0].get("candidate_id")},
-    })
+    first = candidates[0]
+    if first.get("auto_queue_allowed") is False:
+        actions.append({
+            "action": "do_not_auto_queue_top_candidate",
+            "tool": None,
+            "reason": first.get("auto_queue_blocked_reason") or "The top candidate has selection warnings; ask the user or inspect alternatives before queueing.",
+        })
+        if scope in {"bundle_preferred", "season_pack_preferred"}:
+            actions.append({
+                "action": "try_individual_units_before_queueing_weak_pack",
+                "tool": "search_media_torrents",
+                "reason": "A season/bundle pack was found, but the best pack is low-confidence; search individual units before accepting a weak pack.",
+                "args_hint": {"search_scope": "individual_units_only"},
+            })
+    else:
+        actions.append({
+            "action": "queue_clear_candidate",
+            "tool": "queue_download",
+            "reason": "Use this only when the candidate clearly matches the user's target and constraints.",
+            "args_hint": {"result_set_id": result_set_id, "candidate_id": first.get("candidate_id")},
+        })
     actions.append({
         "action": "show_or_request_choice",
         "tool": None,
@@ -1217,6 +1325,15 @@ def _candidate_picker_rows(candidates: list[dict[str, Any]], limit: int = 60) ->
             "size_bytes": c.get("size_bytes"),
             "seeders": c.get("seeders"),
         }
+        if c.get("languages"):
+            row["languages"] = c.get("languages")
+        if c.get("resolution"):
+            row["resolution"] = c.get("resolution")
+        if c.get("source"):
+            row["source"] = c.get("source")
+        if c.get("auto_queue_allowed") is False:
+            row["auto_queue_allowed"] = False
+            row["blocked_reason"] = c.get("auto_queue_blocked_reason")
         if c.get("is_bundle"):
             row.update({
                 "is_bundle": True,

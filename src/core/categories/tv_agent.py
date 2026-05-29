@@ -352,7 +352,7 @@ class TvAgentSearchMixin:
             for result in results or []:
                 if not getattr(result, "magnet", None):
                     continue
-                if not self._is_relevant_season_pack_result(result, season):
+                if not self._is_relevant_season_pack_result(result, season, item=item):
                     continue
                 identity = str(getattr(result, "magnet", None) or f"{getattr(result, 'source', '')}|{getattr(result, 'title', '')}").lower()
                 if identity in seen:
@@ -487,11 +487,14 @@ class TvAgentSearchMixin:
             queries.append(query.strip())
         return queries[:12]
 
-    def _is_relevant_season_pack_result(self, result: Any, season: int) -> bool:
+    def _is_relevant_season_pack_result(self, result: Any, season: int, item: Any | None = None) -> bool:
         """Return whether a detected TV bundle can contain the requested season."""
         from src.core.categories.tv_bundle import TVBundleKnowledge
 
-        pack = TVBundleKnowledge.detect_season_pack(str(getattr(result, "title", "") or ""))
+        title = str(getattr(result, "title", "") or "")
+        if item is not None and not self._title_matches_requested_series(title, str(getattr(item, "key", "") or "")):
+            return False
+        pack = TVBundleKnowledge.detect_season_pack(title)
         if not pack:
             return False
         if pack.get("pack_type") == "series_complete":
@@ -499,6 +502,33 @@ class TvAgentSearchMixin:
         start = self._safe_positive_int(pack.get("season_start")) or self._safe_positive_int(pack.get("season"))
         end = self._safe_positive_int(pack.get("season_end")) or start
         return bool(start is not None and end is not None and int(start) <= int(season) <= int(end))
+
+    @staticmethod
+    def _title_matches_requested_series(result_title: str, requested_title: str) -> bool:
+        """Return true when a torrent title actually names the requested show.
+
+        Short TV names such as "The Boys" are easy to over-match against
+        unrelated shows like "The Hardy Boys" if ranking only checks a common
+        noun. Require the requested title phrase at a token boundary before
+        considering season-pack semantics.
+        """
+        import re
+        requested = re.sub(r"[^a-z0-9]+", " ", str(requested_title or "").lower()).strip()
+        result = re.sub(r"[^a-z0-9]+", " ", str(result_title or "").lower()).strip()
+        if not requested:
+            return True
+        if re.search(rf"(?:^| ){re.escape(requested)}(?: |$)", result):
+            return True
+        # Conservative fallback for titles with a leading article removed by an
+        # indexer. Do not allow single-token fallback; it caused Hardy Boys to
+        # match The Boys.
+        tokens = requested.split()
+        if tokens and tokens[0] in {"the", "a", "an"}:
+            tokens = tokens[1:]
+        if len(tokens) >= 2:
+            phrase = " ".join(tokens)
+            return bool(re.search(rf"(?:^| ){re.escape(phrase)}(?: |$)", result))
+        return False
 
     @staticmethod
     def _is_season_pack_result(result: Any) -> bool:

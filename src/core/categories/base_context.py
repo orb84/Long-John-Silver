@@ -65,10 +65,21 @@ class CategoryContextMixin:
                 for item in tracked[: min(max_items, 20)]
             ]
             context_scope = "category_router_overview"
+        download_profile = self.category_download_profile(settings) if hasattr(self, "category_download_profile") else {}
+        media_language_keys = (
+            "language", "preferred_language", "audio_language", "preferred_audio_language",
+            "audio_languages", "preferred_audio_languages", "subtitle_languages",
+        )
+        media_language_preferences = {
+            key: download_profile.get(key)
+            for key in media_language_keys
+            if isinstance(download_profile, dict) and download_profile.get(key) not in (None, "", [], {})
+        }
         packet: dict[str, Any] = {
             "category_id": self.category_id,
             "display_name": self.display_name,
             "intent": getattr(intent, "value", str(intent)),
+            "download_preferences": media_language_preferences,
             "tracked_items_count": len(tracked),
             "tracked_items": summaries,
             "matched_tracked_items": [self.summarize_item_for_llm(item) for item in matched[:5]],
@@ -80,6 +91,7 @@ class CategoryContextMixin:
                 "If context_scope is category_router_overview, treat the item sample as orientation only; do not assume the request targets those items.",
                 "Do not embed category unit information (season, episode, chapter, disc, track) inside name fields when a tool has dedicated fields for those values.",
                 "Treat deterministic parser output as a fallback only; localized phrases in the user request should be interpreted by the LLM and expressed in structured tool arguments.",
+                "download_preferences describe media/audio/subtitle preferences, not the language the assistant should use when replying.",
             ],
         }
         if matched:

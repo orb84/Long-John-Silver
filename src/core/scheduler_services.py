@@ -239,6 +239,7 @@ class SchedulerTorrentSearchService:
         season: int | None = None,
         episode: int | None = None,
         language: str | None = None,
+        language_explicit: bool = False,
         search_scope: str | None = None,
         category_id: str | None = None,
     ) -> dict[str, Any]:
@@ -266,18 +267,23 @@ class SchedulerTorrentSearchService:
         if not requested_category:
             requested_category = self._category_for_search_scope(normalized_scope)
         initial_category = self._context.categories.get(requested_category) if requested_category and self._context.categories else None
-        initial_lang = self._normalize_category_search_language(
+        initial_lang = self._effective_search_language(
             initial_category,
-            language or settings.language,
-            explicit=language is not None,
+            requested_language=language,
+            explicit=language_explicit,
+            settings=settings,
+            category_id=requested_category,
         )
         media = await self._media_for_request(name, normalized_name, requested_category, initial_lang or "")
         category_id = getattr(media, "category_id", None) or getattr(media, "item_type", "")
         category = self._context.categories.get(category_id) if self._context.categories else None
-        target_lang = self._normalize_category_search_language(
+        target_lang = self._effective_search_language(
             category,
-            language or getattr(media, "language", None) or settings.language,
-            explicit=language is not None,
+            requested_language=language,
+            explicit=language_explicit,
+            settings=settings,
+            category_id=category_id,
+            tracked_language=getattr(media, "language", None),
         )
         season = await self._resolve_category_default_season(
             media, category_id, season, episode, normalized_scope, settings,
@@ -519,6 +525,95 @@ class SchedulerTorrentSearchService:
             except TypeError:
                 return normalizer(value)
         return value
+
+    def _effective_search_language(
+        self,
+        category: object | None,
+        *,
+        requested_language: str | None,
+        explicit: bool,
+        settings: object,
+        category_id: str | None = None,
+        tracked_language: str | None = None,
+    ) -> str | None:
+        """Resolve media/download language without confusing it with chat language.
+
+        The language of the current chat message is only a reply-language hint and
+        must not become a torrent audio/subtitle constraint.  ``settings.language``
+        is different: it is the user's global/default media preference from setup
+        and Compass.  Use it only after explicit request, tracked-item language,
+        and category/media download-profile language have had a chance to win.
+        """
+        if explicit and requested_language:
+            return self._normalize_category_search_language(category, requested_language, explicit=True)
+        if tracked_language:
+            normalized = self._normalize_category_search_language(category, tracked_language, explicit=False)
+            if normalized:
+                return normalized
+        for candidate in self._category_profile_language_candidates(category, settings, category_id):
+            normalized = self._normalize_category_search_language(category, candidate, explicit=False)
+            if normalized:
+                return normalized
+        return None
+
+    def _category_profile_language_candidates(self, category: object | None, settings: object, category_id: str | None) -> list[str]:
+        """Return configured media-language candidates for a category search."""
+        candidates: list[str] = []
+
+        def add(value: object) -> None:
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+            elif isinstance(value, list):
+                for entry in value:
+                    if isinstance(entry, str) and entry.strip():
+                        candidates.append(entry.strip())
+
+        for owner in (category,):
+            profile_getter = getattr(owner, "category_download_profile", None)
+            if callable(profile_getter):
+                try:
+                    profile = profile_getter(settings) or {}
+                except Exception:
+                    profile = {}
+                if isinstance(profile, dict):
+                    for key in (
+                        "language",
+                        "preferred_language",
+                        "audio_language",
+                        "preferred_audio_language",
+                        "audio_languages",
+                        "preferred_audio_languages",
+                    ):
+                        add(profile.get(key))
+
+        # TV/movie inherit abstract media defaults at the config layer in normal
+        # installations, but some old local configs predate that inheritance.
+        # Search category/media download profiles before falling back to the
+        # global setup language.
+        category_settings = getattr(settings, "category_settings", {}) or {}
+        for key in (str(category_id or ""), "media"):
+            value = category_settings.get(key) if isinstance(category_settings, dict) else None
+            profile = value.get("download_profile") if isinstance(value, dict) else None
+            if isinstance(profile, dict):
+                for field in ("language", "preferred_language", "audio_language", "preferred_audio_language", "audio_languages", "preferred_audio_languages"):
+                    add(profile.get(field))
+
+        # The global language chosen during setup is the user's default media
+        # language when no category/tracked-item preference is more specific.
+        # This is not inferred from the current chat message.
+        add(getattr(settings, "language", None))
+
+        # Preserve order but deduplicate case-insensitively.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for value in candidates:
+            marker = value.casefold()
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(value)
+        return unique
+
 
     async def _temporary_media(self, normalized_name: str, category_id: str | None, language: str) -> CategoryItem:
         """Create an in-memory item using category-aware classification when possible."""
