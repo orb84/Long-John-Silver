@@ -13,7 +13,6 @@ from fastapi.encoders import jsonable_encoder
 
 from src.core.models import ActionCommand, ActionSource
 from src.core.categories.identity import clean_display_title
-from src.core.library_objects import CanonicalLibraryObjectBuilder
 from src.web.dependencies import WebDependencies, verify_auth
 
 
@@ -40,59 +39,65 @@ class CategoryItemsRouter:
     async def _list_items(self, category_id: str, _auth: bool = Depends(verify_auth)) -> dict[str, Any]:
         """List tracked items for one category, enriched with display metadata."""
         category = self._require_category(category_id)
+        overview = await self._category_list_overview(category_id)
         repo_items = await self._repo_items(category_id)
         if repo_items is not None:
-            items = [await self._enrich_list_item(category, category_id, item) for item in repo_items]
+            items = [self._enrich_list_item(category, category_id, item, overview) for item in repo_items]
             return {"category_id": category_id, "items": jsonable_encoder(items)}
         settings = self._deps.settings_manager.settings
         items = [
             item for item in getattr(settings, "tracked_items", [])
             if getattr(item, "item_type", category_id) == category_id
         ]
-        public_items = [await self._enrich_list_item(category, category_id, item) for item in items]
+        public_items = [self._enrich_list_item(category, category_id, item, overview) for item in items]
         return {"category_id": category_id, "items": jsonable_encoder(public_items)}
 
 
-    async def _enrich_list_item(self, category: Any, category_id: str, item: Any) -> dict[str, Any]:
-        """Return a lightweight list-card payload with cached artwork/metadata."""
+    def _enrich_list_item(self, category: Any, category_id: str, item: Any, overview: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Return a fast list-card payload.
+
+        The tracked-items grid must be a cheap overview.  Round 177/178 made the
+        endpoint build full canonical objects and cache artwork for every row; on
+        large TV libraries that meant dozens of unit/metadata queries plus
+        possible poster downloads before the library tab painted.  Keep the
+        category boundary intact by exposing only cached item/metadata fields
+        here, and reserve expensive canonical/detail work for
+        ``GET /api/categories/{category_id}/items/{item_id}``.
+        """
         if hasattr(item, "model_dump"):
             payload = item.model_dump(mode="json")
         elif isinstance(item, dict):
             payload = dict(item)
         else:
             payload = {"key": str(item), "item_id": str(item), "display_name": str(item)}
+
         item_id = str(payload.get("item_id") or payload.get("key") or payload.get("name") or payload.get("display_name") or "")
         display_name = clean_display_title(str(payload.get("display_name") or payload.get("title") or payload.get("name") or item_id))
         payload.setdefault("item_id", item_id)
         payload.setdefault("key", item_id)
         payload["display_name"] = display_name or item_id
         payload.setdefault("category_id", category_id)
-        db = getattr(self._deps, "db", None)
-        if db and getattr(db, "media", None) and item_id:
-            try:
-                builder = CanonicalLibraryObjectBuilder(db, getattr(self._deps, "category_registry", None))
-                canonical = await builder.build(category_id, item_id)
-                payload["canonical_object"] = canonical
-                payload["computed"] = canonical.get("computed") or {}
-                payload["total_units"] = len(canonical.get("units") or [])
-                for section_key in ("seasons", "files", "volumes", "versions", "tracks"):
-                    if canonical.get(section_key) is not None:
-                        payload[section_key] = canonical.get(section_key)
-            except Exception:
-                pass
-            try:
-                rows = await db.media.get_category_metadata(category_id, item_id)
-                if hasattr(category, "maybe_cache_detail_artwork"):
-                    rows = await category.maybe_cache_detail_artwork(
-                        item_id, rows, db=db, artwork_manager=getattr(self._deps, "artwork_manager", None),
-                    )
-                metadata = rows[0].get("metadata") if rows else {}
-                if metadata:
-                    payload.setdefault("metadata", metadata)
-                    if hasattr(category, "merge_display_metadata"):
-                        category.merge_display_metadata(payload, metadata)
-            except Exception:
-                pass
+
+        overview = overview or {}
+        counts = (overview.get("counts") or {}).get(item_id) or {}
+        if counts:
+            downloaded = int(counts.get("downloaded") or 0)
+            total = int(counts.get("total") or 0)
+            payload["total_units"] = total
+            payload["computed"] = {
+                "unit_count": total,
+                "downloaded_unit_count": downloaded,
+                "has_local_files": downloaded > 0,
+            }
+
+        metadata = (overview.get("metadata") or {}).get(item_id) or {}
+        if metadata:
+            # Do not run category artwork caching from the list path.
+            # It can perform network/disk work and belongs to the detail
+            # modal or background artwork repair jobs, not tab paint.
+            payload.setdefault("metadata", metadata)
+            if hasattr(category, "merge_display_metadata"):
+                category.merge_display_metadata(payload, metadata)
         return payload
 
     async def _add_item(self, category_id: str, request: Request, _auth: bool = Depends(verify_auth)) -> dict[str, Any]:
@@ -191,6 +196,28 @@ class CategoryItemsRouter:
         if not result.ok:
             raise HTTPException(status_code=400, detail=result.error or "Action failed")
         return jsonable_encoder(result.data)
+
+
+    async def _category_list_overview(self, category_id: str) -> dict[str, Any]:
+        """Return cheap per-category overview maps for list-card rendering."""
+        db = getattr(self._deps, "db", None)
+        if not db or not getattr(db, "media", None):
+            return {"counts": {}, "metadata": {}}
+        counts: dict[str, dict[str, int]] = {}
+        metadata_by_item: dict[str, dict[str, Any]] = {}
+        try:
+            if hasattr(db.media, "list_category_unit_counts"):
+                counts = await db.media.list_category_unit_counts(category_id)
+        except Exception:
+            counts = {}
+        try:
+            for row in await db.media.get_all_category_metadata(category_id):
+                item_id = str(row.get("item_id") or "")
+                if item_id and item_id not in metadata_by_item:
+                    metadata_by_item[item_id] = row.get("metadata") or {}
+        except Exception:
+            metadata_by_item = {}
+        return {"counts": counts, "metadata": metadata_by_item}
 
     async def _repo_items(self, category_id: str) -> list[dict[str, Any]] | None:
         """Return repository-backed category items when the database is available."""

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from loguru import logger
 
 from src.core.models import (
     ActionReceipt,
+    NotificationMessage,
     CategoryActionDeclaration,
     CategoryLlmProfile,
     CategoryPromptExample,
@@ -25,6 +27,325 @@ class TvWorkflowMixin:
     lookups should be delegated to metadata/search helpers so new TV workflows
     can be added without growing the base category class.
     """
+
+
+
+    def candidate_requires_user_language_confirmation(self, result: Any, item: Any, unit_label: str | None, preferred_language: str | None) -> bool:
+        """Return True when a torrent candidate is visibly not the preferred TV audio language."""
+        language = str(preferred_language or self._preferred_media_language(item, type("Ctx", (), {"settings": object()})())).strip()
+        status = self._candidate_language_status(str(getattr(result, "title", "") or ""), language)
+        return status == "non_preferred"
+
+    async def handle_release_event(
+        self,
+        item: Any,
+        event: dict[str, Any],
+        context: Any,
+        *,
+        notifications: Any | None = None,
+        lifecycle: Any | None = None,
+    ) -> dict[str, Any]:
+        """Handle a concrete TV release event from RSS/search.
+
+        TV-specific semantics stay here: parsing SxxEyy, deciding whether this
+        is the user's current frontier episode, enforcing strict media-language
+        fallback rules, and deciding whether to auto-download, notify, or watch.
+        """
+        title = getattr(item, "key", "") or str(event.get("item_id") or "")
+        unit_label = str(event.get("unit_label") or "")
+        source_result = event.get("source_result") if isinstance(event.get("source_result"), dict) else {}
+        season, episode = self._unit_coordinates(unit_label or str(source_result.get("title") or ""))
+        unit_key = f"S{season:02d}E{episode:02d}" if season and episode else unit_label
+        if not title or not season or not episode:
+            logger.info("TV release event ignored for %s: no concrete unit in %r", title, unit_label)
+            return {"status": "ignored", "reason": "no_concrete_tv_unit", "unit_label": unit_label}
+
+        downloaded = await self._downloaded_episode_keys(context, title)
+        if (season, episode) in downloaded:
+            return {"status": "ignored", "reason": "already_downloaded", "unit_key": unit_key}
+
+        frontier = self._is_frontier_episode(downloaded, season, episode)
+        preferred_language = self._preferred_media_language(item, context)
+        candidate_title = str(source_result.get("title") or "")
+        language_status = self._candidate_language_status(candidate_title, preferred_language)
+        item_auto = getattr(item, "auto_download", None)
+        can_auto = bool(item_auto) and frontier and language_status == "preferred"
+        action_arguments: dict[str, Any] = {"item_id": title, "season": season, "episode": episode}
+        source_magnet = str(source_result.get("magnet") or "")
+        if source_magnet:
+            # The notification action is explicit user approval of this concrete
+            # provider/RSS candidate.  Passing the magnet preserves the detected
+            # release instead of throwing it away and re-running a weaker search.
+            action_arguments.update({
+                "magnet": source_magnet,
+                "torrent_title": candidate_title,
+                "estimated_size_bytes": source_result.get("size_bytes"),
+                "source_seeders": source_result.get("seeders"),
+                "approved_from_notification": True,
+                "approved_candidate_language_status": language_status,
+            })
+        action = {
+            "key": "download",
+            "label": f"Download {unit_key}",
+            "category_workflow": {
+                "category_id": self.category_id,
+                "workflow": "download_specific_episode",
+                "arguments": action_arguments,
+            },
+        }
+        metadata = {
+            "unit_key": unit_key,
+            "season": season,
+            "episode": episode,
+            "frontier_episode": frontier,
+            "preferred_language": preferred_language,
+            "candidate_language_status": language_status,
+            "candidate_title": candidate_title,
+            "trigger": event.get("trigger") or "release_event",
+        }
+
+        if can_auto:
+            ok = await context.pipeline.run_discovery(item, episode_label=unit_key, force=False, language=preferred_language)
+            if ok:
+                if getattr(context.db, "release_watches", None):
+                    await context.db.release_watches.complete(self.category_id, title, unit_key)
+                return {"status": "queued", "reason": "frontier_auto_download", **metadata}
+            # Auto was allowed but no acceptable candidate could be queued; keep watching.
+            await self._watch_release(context, title, unit_key, preferred_language, metadata)
+            await self._notify_release(
+                notifications,
+                title=title,
+                unit_key=unit_key,
+                level="warning",
+                body=(f"{title} {unit_key} is available, but I could not queue an acceptable {preferred_language} candidate yet. "
+                      "I will retry every couple of hours."),
+                action=action,
+                metadata=metadata,
+            )
+            return {"status": "watching", "reason": "auto_candidate_not_acceptable", **metadata}
+
+        await self._watch_release(context, title, unit_key, preferred_language, metadata)
+        if language_status != "preferred":
+            body = (
+                f"{title} {unit_key} was detected, but the release language does not clearly match your preference "
+                f"({preferred_language}). Non-preferred language downloads require approval."
+            )
+        elif frontier:
+            body = f"{title} {unit_key} is the next episode after your local frontier. Download it?"
+        else:
+            body = f"{title} {unit_key} looks missing, but it is an older historical gap. Download it?"
+        await self._notify_release(
+            notifications,
+            title=title,
+            unit_key=unit_key,
+            level="info" if frontier else "warning",
+            body=body,
+            action=action,
+            metadata=metadata,
+        )
+        return {"status": "notified", "reason": "approval_required", **metadata}
+
+
+    def release_watch_notification_action(self, item_id: str, unit_key: str, candidate: Any, preferred_language: str | None = None) -> dict[str, Any]:
+        """Build a TV-owned web-inbox action for a release-watch candidate."""
+        season, episode = self._unit_coordinates(unit_key)
+        arguments: dict[str, Any] = {"item_id": item_id, "unit_key": unit_key}
+        if season and episode:
+            arguments.update({"season": season, "episode": episode})
+        magnet = str(getattr(candidate, "magnet", "") or "")
+        if magnet:
+            arguments.update({
+                "magnet": magnet,
+                "torrent_title": str(getattr(candidate, "title", "") or ""),
+                "estimated_size_bytes": getattr(candidate, "size_bytes", None),
+                "source_seeders": getattr(candidate, "seeders", None),
+                "approved_from_notification": True,
+            })
+        return {
+            "key": "download",
+            "label": f"Download {unit_key}",
+            "category_workflow": {
+                "category_id": self.category_id,
+                "workflow": "download_specific_episode",
+                "arguments": arguments,
+            },
+        }
+
+    async def _watch_release(self, context: Any, title: str, unit_key: str, preferred_language: str, payload: dict[str, Any]) -> None:
+        repo = getattr(context.db, "release_watches", None)
+        if not repo:
+            return
+        await repo.upsert(
+            category_id=self.category_id,
+            item_id=title,
+            unit_key=unit_key,
+            preferred_language=preferred_language,
+            interval_hours=2.0,
+            payload=payload,
+        )
+
+    async def _soulseek_fallback_for_episode(
+        self,
+        context: Any,
+        title: str,
+        season: int,
+        episode: int,
+        preferred_language: str | None = None,
+    ) -> dict[str, Any]:
+        """Try a TV-owned Soulseek fallback after torrent discovery fails.
+
+        Torrent and Soulseek are different backends, so this helper does not
+        silently queue Soulseek files. It makes the fallback visible in logs and
+        receipts, returning candidates for a later explicit queue action.
+        """
+        cfg = getattr(getattr(context, "settings", None), "soulseek", None)
+        if not cfg or not getattr(cfg, "enabled", False):
+            return {"attempted": False, "status": "disabled", "candidate_count": 0}
+        enabled_categories = {str(cat).strip().lower() for cat in (getattr(cfg, "search_enabled_categories", []) or []) if str(cat).strip()}
+        if enabled_categories and self.category_id not in enabled_categories:
+            return {"attempted": False, "status": "category_disabled", "category_id": self.category_id, "candidate_count": 0}
+        if not getattr(cfg, "api_configured", False):
+            return {"attempted": False, "status": "not_configured", "candidate_count": 0, "error": "slskd API is not configured"}
+        if getattr(cfg, "managed", True):
+            if not getattr(cfg, "soulseek_credentials_configured", False):
+                return {"attempted": False, "status": "needs_credentials", "candidate_count": 0, "error": "Soulseek credentials are missing"}
+            if str(getattr(cfg, "account_status", "")).lower() == "auth_failed":
+                return {"attempted": False, "status": "auth_failed", "candidate_count": 0, "error": getattr(cfg, "account_status_message", "Soulseek authentication failed")}
+
+        label = f"S{season:02d}E{episode:02d}"
+        dotted = re.sub(r"\s+", ".", title.strip())
+        queries = [
+            f"{title} {label}",
+            f"{dotted}.{label}",
+            f"{title} {season}x{episode:02d}",
+            f"{title} S{season:02d}",
+        ]
+        if preferred_language:
+            queries.append(f"{title} {label} {preferred_language}")
+        seen: set[str] = set()
+        queries = [q for q in queries if q and not (q.casefold() in seen or seen.add(q.casefold()))]
+
+        tried: list[str] = []
+        last_result: dict[str, Any] = {}
+        candidates: list[dict[str, Any]] = []
+        try:
+            from src.integrations.slskd_client import SlskdClient
+            client = SlskdClient(cfg)
+            for query in queries:
+                tried.append(query)
+                logger.info(f"TV Soulseek fallback search: item={title!r} unit={label} query={query!r}")
+                result = await client.search(query, max_results=min(int(getattr(cfg, "max_search_results", 10) or 10), 10))
+                last_result = result if isinstance(result, dict) else {}
+                rows = last_result.get("candidates") if isinstance(last_result.get("candidates"), list) else []
+                if rows:
+                    candidates = rows
+                    break
+        except Exception as exc:
+            logger.warning(f"TV Soulseek fallback failed for {title} {label}: {exc}")
+            return {"attempted": True, "status": "error", "candidate_count": 0, "queries": tried, "error": str(exc)}
+
+        logger.info(f"TV Soulseek fallback complete: item={title!r} unit={label} queries={tried} candidates={len(candidates)}")
+        return {
+            "attempted": True,
+            "enabled": True,
+            "status": "ready" if last_result.get("ok") is True else (last_result.get("error_code") or "error"),
+            "source": "slskd",
+            "queries": tried,
+            "candidate_count": len(candidates),
+            "candidates": candidates[:10],
+            "error": last_result.get("error") if isinstance(last_result, dict) else None,
+            "queueing_note": "Soulseek candidates are not magnets; queue them through enqueue_soulseek_download after review.",
+        }
+
+
+    async def _notify_release(
+        self,
+        notifications: Any | None,
+        *,
+        title: str,
+        unit_key: str,
+        level: str,
+        body: str,
+        action: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> None:
+        if not notifications:
+            return
+        await notifications.notify(
+            NotificationMessage(title=f"{title} {unit_key}", body=body, level=level),
+            category_id=self.category_id,
+            item_id=title,
+            event_type="tv_release_available",
+            actions=[action],
+            metadata=metadata,
+            dedupe_key=f"tv_release:{title}:{unit_key}",
+        )
+
+    async def _downloaded_episode_keys(self, context: Any, title: str) -> set[tuple[int, int]]:
+        downloaded: set[tuple[int, int]] = set()
+        try:
+            rows = await context.db.media.list_category_units(self.category_id, title, status="downloaded")
+            for row in rows or []:
+                season = self._safe_int(row.get("season"))
+                episode = self._safe_int(row.get("episode"))
+                if season > 0 and episode > 0:
+                    downloaded.add((season, episode))
+        except Exception as exc:
+            logger.debug("TV release event could not read downloaded episode keys for %s: %s", title, exc)
+        return downloaded
+
+    @staticmethod
+    def _unit_coordinates(text: str) -> tuple[int, int]:
+        match = re.search(r"S(\d{1,2})E(\d{1,3})", str(text or ""), flags=re.IGNORECASE)
+        if not match:
+            match = re.search(r"(\d{1,2})x(\d{1,3})", str(text or ""), flags=re.IGNORECASE)
+        if not match:
+            return 0, 0
+        return int(match.group(1)), int(match.group(2))
+
+    @staticmethod
+    def _is_frontier_episode(downloaded: set[tuple[int, int]], season: int, episode: int) -> bool:
+        if not downloaded:
+            return False
+        latest_season = max(s for s, _ in downloaded)
+        latest_episode = max(e for s, e in downloaded if s == latest_season)
+        return season > latest_season or (season == latest_season and episode > latest_episode)
+
+    @staticmethod
+    def _preferred_media_language(item: Any, context: Any) -> str:
+        value = str(getattr(item, "language", "") or "").strip()
+        if value:
+            return value
+        return str(getattr(context.settings, "language", "Italian") or "Italian").strip() or "Italian"
+
+    @staticmethod
+    def _candidate_language_status(title: str, preferred_language: str) -> str:
+        """Return preferred/non_preferred/unknown from release-title evidence only.
+
+        Subtitles are not audio fallbacks, and Spanish is never inferred as an
+        acceptable media fallback from subtitle settings.
+        """
+        text = f" {title.casefold()} "
+        pref = preferred_language.casefold().strip()
+        preferred_markers = {
+            "italian": [" ita ", ".ita.", " italian ", " italiano ", " iTa ".casefold()],
+            "english": [" eng ", ".eng.", " english "],
+        }.get(pref, [f" {pref} ", f".{pref}."])
+        if any(marker in text for marker in preferred_markers):
+            return "preferred"
+        if any(marker in text for marker in [" multi ", ".multi.", " multi-audio ", " dlmux ", " mux "]):
+            return "preferred"
+        non_pref_markers = [" hindi ", " hin ", ".hin.", " spanish ", " spa ", ".spa.", " latino "]
+        if any(marker in text for marker in non_pref_markers):
+            return "non_preferred"
+        return "unknown"
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
 
     def taste_profile_schema(self) -> dict[str, Any]:
         """Return TV-specific taste metadata fields for the agent."""
@@ -464,11 +785,43 @@ class TvWorkflowMixin:
         if workflow_name in {"download_specific_episode", "download_specific_unit"}:
             if not title:
                 return self._workflow_failed(workflow_name, "A TV item id is required.")
-            season = int(arguments.get("season") or 1)
-            episode = int(arguments.get("episode") or 1)
+            raw_season = arguments.get("season")
+            raw_episode = arguments.get("episode")
+            if (not raw_season or not raw_episode) and arguments.get("unit_key"):
+                parsed_season, parsed_episode = self._unit_coordinates(str(arguments.get("unit_key") or ""))
+                raw_season = raw_season or parsed_season
+                raw_episode = raw_episode or parsed_episode
+            season = int(raw_season or 1)
+            episode = int(raw_episode or 1)
             unit_key = f"S{season:02d}E{episode:02d}"
             magnet = str(arguments.get("magnet") or "")
             if magnet and getattr(context, "downloader", None):
+                torrent_title = str(arguments.get("torrent_title") or title)
+                candidate_probe = type("TvNotificationCandidate", (), {
+                    "title": torrent_title,
+                    "magnet": magnet,
+                    "size_bytes": arguments.get("estimated_size_bytes"),
+                    "seeders": arguments.get("source_seeders"),
+                    "source": arguments.get("source") or "notification",
+                })()
+                descriptor = self.unit_descriptor_from_agent_args(season=season, episode=episode)
+                bundle_context = self.torrent_bundle_candidate_context(candidate_probe, item=self.create_item(title), unit_label=unit_key)
+                import_context = {
+                    "category_id": self.category_id,
+                    "item_id": title,
+                    "display_title": title,
+                    "canonical_title": title,
+                    "season": season,
+                    "episode": episode,
+                    "unit_descriptor": descriptor,
+                    "release_title": torrent_title,
+                    "candidate_snapshot": {
+                        "title": torrent_title,
+                        "source": getattr(candidate_probe, "source", "notification"),
+                        "size_bytes": arguments.get("estimated_size_bytes"),
+                        "bundle_context": bundle_context or {},
+                    },
+                }
                 item = await context.downloader.add_magnet(
                     magnet_link=magnet,
                     item_name=title,
@@ -476,7 +829,17 @@ class TvWorkflowMixin:
                     category_id=self.category_id,
                     season=season,
                     episode=episode,
-                    reason=f"Manual TV workflow {workflow_name}" if workflow_name != "scheduled_check" else "Scheduled TV workflow",
+                    torrent_title=torrent_title,
+                    language=getattr(context.settings, "language", ""),
+                    estimated_size_bytes=arguments.get("estimated_size_bytes"),
+                    source_seeders=arguments.get("source_seeders"),
+                    reason=(
+                        f"user approved TV notification candidate for {unit_key}"
+                        if arguments.get("approved_from_notification")
+                        else (f"user approved TV workflow {workflow_name}" if workflow_name != "scheduled_check" else "Scheduled TV workflow")
+                    ),
+                    import_context=import_context,
+                    selective_descriptors=[descriptor] if bundle_context and descriptor else None,
                 )
                 return ActionReceipt(
                     category_id=self.category_id,
@@ -493,12 +856,33 @@ class TvWorkflowMixin:
             )
             item = tracked or self.create_item(title, language=getattr(context.settings, "language", "English"))
             ok = await context.pipeline.run_discovery(item, episode_label=unit_key, force=True)
+            soulseek = None
+            user_message = f"Queued discovery for {title} {unit_key}." if ok else f"No torrent candidate found for {title} {unit_key}."
+            if not ok:
+                soulseek = await self._soulseek_fallback_for_episode(context, title, season, episode, getattr(item, "language", None))
+                if soulseek.get("attempted"):
+                    count = int(soulseek.get("candidate_count") or 0)
+                    if count:
+                        user_message = (
+                            f"No torrent candidate was queued for {title} {unit_key}. "
+                            f"Soulseek was searched and returned {count} candidate(s); review them before queueing."
+                        )
+                    elif soulseek.get("error"):
+                        user_message = (
+                            f"No torrent candidate was queued for {title} {unit_key}. "
+                            f"Soulseek fallback was attempted but failed: {soulseek.get('error')}"
+                        )
+                    else:
+                        user_message = f"No torrent or Soulseek candidate found for {title} {unit_key}."
+                else:
+                    reason = soulseek.get("status") or soulseek.get("reason") or "not_available"
+                    user_message = f"No torrent candidate found for {title} {unit_key}. Soulseek fallback was not available ({reason})."
             return ActionReceipt(
                 category_id=self.category_id,
                 action_name=workflow_name,
                 status="success" if ok else "partial",
-                user_message=(f"Queued discovery for {title} {unit_key}." if ok else f"No candidate found for {title} {unit_key}."),
-                data={"unit_key": unit_key, "queued": ok},
+                user_message=user_message,
+                data={"unit_key": unit_key, "queued": ok, "soulseek": soulseek or {}},
             )
 
         if workflow_name in {"download_missing_batch", "download_all_missing", "download_remaining_next"}:

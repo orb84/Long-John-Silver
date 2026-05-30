@@ -431,6 +431,14 @@ class DownloadLifecycleMonitor:
         self._stall_count = 0
         self._stall_start: float | None = None
         self._last_downloaded_bytes: int = 0
+        # libtorrent's instantaneous rate can legitimately report 0 between
+        # piece bursts even while bytes continue moving. Persisting that raw
+        # value makes the UI flicker between healthy and dead every poll. Keep
+        # a tiny per-monitor EWMA based on byte deltas so visible telemetry
+        # reflects recent transfer health without hiding real stalls.
+        self._rate_sample_time: float | None = None
+        self._rate_sample_bytes: int = 0
+        self._smoothed_download_rate: float = 0.0
 
     async def run(self, download_id: str, handle: Any) -> None:
         """Main monitoring entry point for a single download.
@@ -536,6 +544,7 @@ class DownloadLifecycleMonitor:
         while True:
             await asyncio.sleep(3)
             stats = self._ctx.progress_store.extract_stats(handle)
+            stats = self._stabilize_transfer_stats(stats)
             item: DownloadItem | None = await self._ctx.db.downloads.get_download(download_id)
             if item:
                 item = self._ctx.progress_store.update_item(item, stats)
@@ -557,6 +566,47 @@ class DownloadLifecycleMonitor:
                 return True
         return False
 
+
+
+    def _stabilize_transfer_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
+        """Smooth bursty libtorrent telemetry without lying about progress.
+
+        Public torrents often download in short piece bursts.  On some builds,
+        ``torrent_status.download_rate`` drops to zero for an interval even when
+        ``total_done`` advanced since the previous monitor pass.  The engine is
+        not necessarily broken in that case; the UI was simply displaying a raw
+        instantaneous sample as if it were a stable state.  Use byte deltas to
+        compute a recent transfer rate and decay it quickly when progress stops.
+        """
+        now = asyncio.get_event_loop().time()
+        downloaded = int(stats.get("downloaded_bytes", 0) or 0)
+        raw_rate = float(stats.get("download_rate", 0.0) or 0.0)
+        if self._rate_sample_time is None:
+            self._rate_sample_time = now
+            self._rate_sample_bytes = downloaded
+            self._smoothed_download_rate = max(0.0, raw_rate)
+            stats["raw_download_rate"] = raw_rate
+            return stats
+
+        elapsed = max(0.001, now - self._rate_sample_time)
+        delta = max(0, downloaded - self._rate_sample_bytes)
+        delta_rate = float(delta) / elapsed if delta > 0 else 0.0
+        observed = max(raw_rate, delta_rate)
+        if observed > 0:
+            previous = self._smoothed_download_rate or observed
+            self._smoothed_download_rate = (previous * 0.55) + (observed * 0.45)
+        else:
+            # Decay fast enough that a true stall still becomes visible and the
+            # existing byte-based stall detector remains authoritative.
+            self._smoothed_download_rate *= 0.50
+            if self._smoothed_download_rate < 1024:
+                self._smoothed_download_rate = 0.0
+
+        stats["raw_download_rate"] = raw_rate
+        stats["download_rate"] = self._smoothed_download_rate
+        self._rate_sample_time = now
+        self._rate_sample_bytes = downloaded
+        return stats
 
     @staticmethod
     def _is_content_complete(handle: Any, stats: dict[str, Any]) -> bool:

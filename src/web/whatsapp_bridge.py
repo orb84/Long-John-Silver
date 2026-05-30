@@ -122,11 +122,12 @@ class WhatsAppBridge(CommsBridge):
             logger.warning(f"WhatsApp API unreachable: {e}")
 
         bridge = _WhatsAppNotificationBridge(self)
-        self._notifications.register_bridge(bridge)
+        self._notifications.register_bridge(bridge, bridge_id="whatsapp")
         logger.info("WhatsApp notification bridge registered")
 
     async def stop(self) -> None:
         """Close the HTTP client."""
+        self._notifications.unregister_bridge("whatsapp")
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             logger.info("WhatsApp HTTP client closed")

@@ -19,6 +19,10 @@ class BootyPanel extends Component {
         this._categoryViewModes = new Map();
         this._loadAttempts = 0;
         this._hasLoadedCatalogOnce = false;
+        this._catalogLoadPromise = null;
+        this._catalogLoadToken = 0;
+        this._loadingCategories = new Set();
+        this._lastCatalogLoadedAt = 0;
 
         if (this.container) {
             this.render();
@@ -97,48 +101,76 @@ class BootyPanel extends Component {
     }
 
     /** Retrieve all categories and their tracked items. */
-    async loadCatalog() {
+    async loadCatalog(options = {}) {
         const grid = document.getElementById('library-grid-container');
         if (!grid) return;
+        const force = Boolean(options && options.force);
+        if (this._catalogLoadPromise && !force) return this._catalogLoadPromise;
 
-        try {
-            const categoriesResponse = await CategoryApiClient.listCategories();
-            this._categories = categoriesResponse.categories || [];
-            this._populateCategorySelect();
-
-            const allItems = [];
-            for (const category of this._categories) {
-                const categoryId = category.category_id;
-                try {
-                    const itemResponse = await CategoryApiClient.listItems(categoryId);
-                    (itemResponse.items || []).forEach(item => {
-                        allItems.push({ ...item, category_id: categoryId, category_display_name: category.display_name });
-                    });
-                } catch (err) {
-                    // One category endpoint should not blank the whole library.
-                    // Keep rendering other categories and expose enough console
-                    // detail for open-source testers to report the bad manifest.
-                    console.warn(`[BootyPanel] Failed to load category ${categoryId}:`, err);
+        const token = ++this._catalogLoadToken;
+        this._catalogLoadPromise = (async () => {
+            try {
+                if (!this._categories.length) {
+                    grid.innerHTML = '<p class="empty-msg">Loading library categories...</p>';
                 }
-            }
-            this._items = allItems;
-            this._loadAttempts = 0;
-            this.renderCatalogGrid();
 
-            if (!this._hasLoadedCatalogOnce && this._categories.length && allItems.length === 0) {
-                this._hasLoadedCatalogOnce = true;
-                setTimeout(() => this.loadCatalog(), 1200);
-            } else {
-                this._hasLoadedCatalogOnce = true;
+                const categoriesResponse = await CategoryApiClient.listCategories();
+                if (token !== this._catalogLoadToken) return;
+
+                this._categories = categoriesResponse.categories || [];
+                this._items = [];
+                this._loadingCategories = new Set(this._categories.map(category => category.category_id).filter(Boolean));
+                this._populateCategorySelect();
+                this.renderCatalogGrid();
+
+                const loadedItems = [];
+                const jobs = this._categories.map(async (category) => {
+                    const categoryId = category.category_id;
+                    try {
+                        const itemResponse = await CategoryApiClient.listItems(categoryId);
+                        if (token !== this._catalogLoadToken) return;
+                        (itemResponse.items || []).forEach(item => {
+                            loadedItems.push({ ...item, category_id: categoryId, category_display_name: category.display_name });
+                        });
+                    } catch (err) {
+                        // One category endpoint should not blank the whole library.
+                        console.warn(`[BootyPanel] Failed to load category ${categoryId}:`, err);
+                    } finally {
+                        if (token === this._catalogLoadToken) {
+                            this._loadingCategories.delete(categoryId);
+                            this._items = loadedItems.slice();
+                            this.renderCatalogGrid();
+                        }
+                    }
+                });
+
+                await Promise.allSettled(jobs);
+                if (token !== this._catalogLoadToken) return;
+
+                this._items = loadedItems;
+                this._loadingCategories.clear();
+                this._lastCatalogLoadedAt = Date.now();
+                this._loadAttempts = 0;
+                this.renderCatalogGrid();
+
+                if (!this._hasLoadedCatalogOnce && this._categories.length && loadedItems.length === 0) {
+                    this._hasLoadedCatalogOnce = true;
+                    setTimeout(() => this.loadCatalog({ force: true }), 1200);
+                } else {
+                    this._hasLoadedCatalogOnce = true;
+                }
+            } catch (err) {
+                console.error('[BootyPanel] Failed to load the library catalog:', err);
+                grid.innerHTML = '<p class="empty-msg">Failed to load the library catalog</p>';
+                if (this._loadAttempts < 3) {
+                    this._loadAttempts += 1;
+                    setTimeout(() => this.loadCatalog({ force: true }), 1000 * this._loadAttempts);
+                }
+            } finally {
+                if (token === this._catalogLoadToken) this._catalogLoadPromise = null;
             }
-        } catch (err) {
-            console.error('[BootyPanel] Failed to load the library catalog:', err);
-            grid.innerHTML = '<p class="empty-msg">Failed to load the library catalog</p>';
-            if (this._loadAttempts < 3) {
-                this._loadAttempts += 1;
-                setTimeout(() => this.loadCatalog(), 1000 * this._loadAttempts);
-            }
-        }
+        })();
+        return this._catalogLoadPromise;
     }
 
     /** Fill the add-item category select from manifests. */
@@ -207,7 +239,10 @@ class BootyPanel extends Component {
 
             const section = DOM.el('div', { className: `category-section category-section-${categoryId}` }, [header]);
             if (!list.length) {
-                mediaGrid.appendChild(DOM.el('p', { className: 'empty-msg', style: { margin: '0.5rem 0 1rem 0' } }, [`No ${displayName} items yet. Add one below or scan the category folder after adding files.`]));
+                const message = this._loadingCategories.has(categoryId)
+                    ? 'Loading tracked items...'
+                    : `No ${displayName} items yet. Add one below or scan the category folder after adding files.`;
+                mediaGrid.appendChild(DOM.el('p', { className: 'empty-msg', style: { margin: '0.5rem 0 1rem 0' } }, [message]));
             } else {
                 list.forEach(item => mediaGrid.appendChild(viewMode === 'list' ? this._renderListRow(categoryId, manifest, item) : this._renderCard(categoryId, manifest, item)));
             }

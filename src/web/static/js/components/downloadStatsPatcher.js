@@ -29,19 +29,37 @@ class DownloadStatsPatcher {
 
     static _patchSpeed(card, dl) {
         const speedVal = card.querySelector('.dl-speed');
-        if (speedVal) speedVal.innerHTML = `<i class="fa-solid fa-arrow-down"></i> ${Math.round((dl.download_rate || 0) / 1024)} kB/s`;
+        const rate = dl.display_download_rate != null ? dl.display_download_rate : dl.download_rate;
+        if (speedVal) speedVal.innerHTML = `<i class="fa-solid fa-arrow-down"></i> ${Math.round((rate || 0) / 1024)} kB/s`;
         const upSpeedEl = card.querySelector('.dl-upspeed');
         if (upSpeedEl) upSpeedEl.innerHTML = `<i class="fa-solid fa-arrow-up"></i> ${Math.round((dl.upload_rate || 0) / 1024)} kB/s`;
+    }
+
+    static _swarmDisplay(dl) {
+        const liveSeeds = Number(dl.num_seeds || 0);
+        const sourceSeeders = dl.source_seeders != null ? Number(dl.source_seeders || 0) : 0;
+        const scrapeSeeds = Math.max(Number(dl.num_complete || 0), Number(dl.list_seeds || 0));
+        if (dl.display_seeders != null) {
+            return { seeds: Number(dl.display_seeders || 0), basis: dl.display_seeders_basis || 'display' };
+        }
+        if (liveSeeds > 0) return { seeds: liveSeeds, basis: 'connected' };
+        if (scrapeSeeds > 0) return { seeds: scrapeSeeds, basis: 'tracker' };
+        if (sourceSeeders > 0) return { seeds: sourceSeeders, basis: 'source' };
+        return { seeds: 0, basis: 'none' };
     }
 
     static _patchSwarm(card, dl) {
         const peersEl = card.querySelector('.dl-peers');
         if (!peersEl) return;
+        const swarm = this._swarmDisplay(dl);
+        const liveSeeds = Number(dl.num_seeds || 0);
+        const peers = Number(dl.num_peers || 0);
         const source = dl.source_seeders != null ? ` · src ${dl.source_seeders}` : '';
-        peersEl.innerHTML = `<i class="fa-solid fa-users"></i> seeds ${dl.num_seeds || 0} · peers ${dl.num_peers || 0}${source}`;
+        const basisLabel = swarm.basis === 'source' ? 'source snapshot' : (swarm.basis === 'tracker' ? 'tracker scrape' : 'connected');
+        peersEl.innerHTML = `<i class="fa-solid fa-users"></i> seeds ${swarm.seeds} · peers ${peers}${source}`;
         peersEl.title = dl.source_seeders != null
-            ? `Live seeds/peers from libtorrent. Source seeders (${dl.source_seeders}) were reported by the indexer when selected.`
-            : 'Live seeds/peers from libtorrent.';
+            ? `Displayed seeds use ${basisLabel}. Connected seeds: ${liveSeeds}. Source seeders (${dl.source_seeders}) were reported by the indexer when selected.`
+            : `Displayed seeds use ${basisLabel}. Connected seeds: ${liveSeeds}.`;
     }
 
     static _patchEta(card, dl) {

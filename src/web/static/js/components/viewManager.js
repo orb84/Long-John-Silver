@@ -92,6 +92,9 @@ class ViewManager extends Component {
                 window.holdPanel.loadRecentPlunder();
             }
         }
+        if (targetId === 'booty' && window.bootyPanel && typeof window.bootyPanel.loadCatalog === 'function') {
+            window.bootyPanel.loadCatalog();
+        }
         if (targetId === 'suggestions' && window.suggestionManager) {
             window.suggestionManager.load({ force: true });
         }

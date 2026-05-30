@@ -1432,7 +1432,7 @@ class SettingsPanel extends Component {
         const torrentBackend = [
             this._createSettingItem('Jackett URL', 'Primary torrent indexer endpoint shared by downloadable categories.', DOM.el('input', { type: 'text', id: 'pref-jackett-url', placeholder: 'http://localhost:9117' })),
             this._createSettingItem('Jackett API key', 'API key for the configured Jackett server.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-jackett-key', placeholder: '••••••••' })),
-            this._createSettingItem('Direct scraper fallback', 'Use slower direct scrapers only when Jackett returns no usable candidates.', this._toggle('pref-direct-scraper-fallback'))
+            this._createSettingItem('Direct scraper fallback', 'Advanced/off by default: use slower public scrapers only if Jackett is unavailable and you explicitly opt in. Keep disabled for normal Jackett/Soulseek flows.', this._toggle('pref-direct-scraper-fallback'))
         ];
         const soulseekRuntime = [
             DOM.el('p', { className: 'empty-msg' }, ['Optional managed Soulseek/slskd runtime. LJS installs, configures, starts, and stops slskd automatically. Users provide only Soulseek credentials and sharing/source preferences.']),

@@ -14,6 +14,8 @@ from src.core.repositories.media import MediaRepository
 from src.core.repositories.download import DownloadRepository
 from src.core.repositories.user import UserRepository
 from src.core.repositories.system import SystemRepository
+from src.core.repositories.notifications import NotificationRepository
+from src.core.repositories.release_watch import ReleaseWatchRepository
 from src.core.repositories.base import BaseRepository
 
 
@@ -103,6 +105,8 @@ class Database:
         self.users: Optional[UserRepository] = None
         self.system: Optional[SystemRepository] = None
         self.plan_traces: Optional[PlanTraceStore] = None
+        self.notifications: Optional[NotificationRepository] = None
+        self.release_watches: Optional[ReleaseWatchRepository] = None
 
     async def initialize(self) -> None:
         """Create the base schema and run any pending migrations.
@@ -124,6 +128,8 @@ class Database:
         self.users = UserRepository(self._db)
         self.system = SystemRepository(self._db)
         self.plan_traces = PlanTraceStore(self._db)
+        self.notifications = NotificationRepository(self._db)
+        self.release_watches = ReleaseWatchRepository(self._db)
 
         logger.info(
             f"Database initialized at {self._db_path} "
@@ -556,6 +562,47 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_downloads_item ON downloads(category_id, item_id);
             CREATE INDEX IF NOT EXISTS idx_downloads_import_context ON downloads(category_id, item_id, season, episode);
             CREATE INDEX IF NOT EXISTS idx_suggestions_item ON suggested_actions(category_id, item_id, status);
+
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                level TEXT NOT NULL DEFAULT 'info',
+                category_id TEXT NOT NULL DEFAULT '',
+                item_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT 'general',
+                status TEXT NOT NULL DEFAULT 'unread',
+                actions_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                dedupe_key TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                read_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe
+                ON notifications(dedupe_key) WHERE dedupe_key != '';
+            CREATE INDEX IF NOT EXISTS idx_notifications_status
+                ON notifications(status, created_at);
+
+            CREATE TABLE IF NOT EXISTS release_watches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                unit_key TEXT NOT NULL,
+                preferred_language TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                next_check_at TEXT NOT NULL DEFAULT '',
+                interval_hours REAL NOT NULL DEFAULT 2.0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(category_id, item_id, unit_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_release_watches_due
+                ON release_watches(status, next_check_at);
+
             CREATE INDEX IF NOT EXISTS idx_upgrades_item ON upgrade_candidates(category_id, item_id, status);
             CREATE INDEX IF NOT EXISTS idx_behavior_item ON behavior_log(category_id, item_id, action);
             CREATE INDEX IF NOT EXISTS idx_taste_signals_category ON category_taste_signals(user_id, category_id, signal_type);

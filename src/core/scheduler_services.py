@@ -516,6 +516,8 @@ class SchedulerTorrentSearchService:
     def _normalize_category_search_language(category: object | None, language: str | None, *, explicit: bool = False) -> str | None:
         """Return the category-approved language facet for a search."""
         value = str(language or "").strip()
+        if "," in value:
+            value = next((part.strip() for part in value.split(",") if part.strip()), "")
         if not value:
             return None
         normalizer = getattr(category, "normalize_search_language", None)
@@ -562,11 +564,13 @@ class SchedulerTorrentSearchService:
 
         def add(value: object) -> None:
             if isinstance(value, str) and value.strip():
-                candidates.append(value.strip())
+                for part in value.split(','):
+                    text = part.strip()
+                    if text:
+                        candidates.append(text)
             elif isinstance(value, list):
                 for entry in value:
-                    if isinstance(entry, str) and entry.strip():
-                        candidates.append(entry.strip())
+                    add(entry)
 
         for owner in (category,):
             profile_getter = getattr(owner, "category_download_profile", None)

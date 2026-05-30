@@ -24,6 +24,32 @@ class DownloadViewModelBuilder:
     def __init__(self, downloader: Any) -> None:
         self._downloader = downloader
 
+
+    @staticmethod
+    def _add_swarm_display_fields(result: dict) -> None:
+        """Add stable swarm fields for UI display.
+
+        ``num_seeds`` is connected live seeds and may be zero while the indexer
+        snapshot or tracker scrape still proves that a swarm exists.  Keeping a
+        separate display value prevents cards from bouncing between "60 seeds"
+        and "0 seeds" when the raw connected count changes between polls.
+        """
+        live = int(result.get('num_seeds') or 0)
+        source = result.get('source_seeders')
+        try:
+            source_int = int(source) if source is not None else 0
+        except (TypeError, ValueError):
+            source_int = 0
+        if live > 0:
+            result['display_seeders'] = live
+            result['display_seeders_basis'] = 'connected'
+        elif source_int > 0:
+            result['display_seeders'] = source_int
+            result['display_seeders_basis'] = 'source'
+        else:
+            result['display_seeders'] = 0
+            result['display_seeders_basis'] = 'none'
+
     def build(self, item: Any) -> dict:
         """Merge live file progress from cache into the model's per-file data.
 
@@ -50,6 +76,7 @@ class DownloadViewModelBuilder:
             result['eta_seconds'] = 0.0
             result['num_peers'] = 0
             result['num_seeds'] = 0
+        self._add_swarm_display_fields(result)
         cache_files = self._downloader.get_file_progress(item.id)
 
         if item.files:

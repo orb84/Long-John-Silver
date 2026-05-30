@@ -47,9 +47,9 @@ class SuggestionsRouter:
         router.add_api_route("/api/suggestions/approve-all/{item_id}", self._approve_all_suggestions, methods=["POST"])
         return router
 
-    async def _get_suggestions(self, item_id: str | None = None):
+    async def _get_suggestions(self, category_id: str | None = None, item_id: str | None = None):
         deps = self._deps
-        suggestions = await deps.db.downloads.get_suggested_actions(item_id=item_id, status="pending")
+        suggestions = await deps.db.downloads.get_suggested_actions(category_id=category_id, item_id=item_id, status="pending")
         compiling = False
         needs_refresh = self._needs_suggestion_refresh(suggestions)
         # First visit after startup/setup may arrive before the background job has
@@ -77,7 +77,7 @@ class SuggestionsRouter:
                     pass
                 except Exception:
                     pass
-                suggestions = await deps.db.downloads.get_suggested_actions(item_id=item_id, status="pending")
+                suggestions = await deps.db.downloads.get_suggested_actions(category_id=category_id, item_id=item_id, status="pending")
                 compiling = not task.done()
         return {
             "suggestions": [enrich_suggestion_record(s) for s in suggestions],

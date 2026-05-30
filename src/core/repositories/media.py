@@ -447,6 +447,47 @@ class MediaRepository(BaseRepository):
             unit_type="progress",
         )
 
+
+
+    async def list_category_unit_counts(self, category_id: str) -> dict[str, dict[str, int]]:
+        """Return cheap per-item unit counts for one category overview."""
+        cursor = await self._db.execute(
+            """SELECT
+                   item_id,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded
+               FROM category_item_units
+               WHERE category_id = ?
+               GROUP BY item_id""",
+            (category_id,),
+        )
+        rows = await cursor.fetchall()
+        return {
+            str(row["item_id"]): {
+                "total": int(row["total"] or 0),
+                "downloaded": int(row["downloaded"] or 0),
+            }
+            for row in rows
+        }
+
+    async def get_category_unit_counts(self, category_id: str, item_id: str) -> dict[str, int]:
+        """Return cheap unit counts for overview/list-card rendering."""
+        cursor = await self._db.execute(
+            """SELECT
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded
+               FROM category_item_units
+               WHERE category_id = ? AND item_id = ?""",
+            (category_id, item_id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"total": 0, "downloaded": 0}
+        return {
+            "total": int(row["total"] or 0),
+            "downloaded": int(row["downloaded"] or 0),
+        }
+
     async def get_item_progress(self, category_id: str, item_id: str) -> dict[str, Any] | None:
         """Return category-owned progress state for one item."""
         return await self.get_category_unit(category_id, item_id, "progress")

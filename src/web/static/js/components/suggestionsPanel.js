@@ -21,6 +21,7 @@ class SuggestionManager extends Component {
         this.typeLabels = {
             missing_episode: 'Missing episode',
             download_next: 'Download next',
+            download_latest_frontier: 'Latest episode',
             download_all_missing: 'Download all missing',
             download_remaining_next: 'Catch up',
             quality_upgrade: 'Quality upgrade',
@@ -31,6 +32,9 @@ class SuggestionManager extends Component {
         this._inFlightLoad = null;
         this._lastLoadAt = 0;
         this._minLoadIntervalMs = 5000;
+        this._actionBusy = false;
+        this._actionOverlay = null;
+        this._lockedControls = [];
 
         shipEvents.subscribe('system', (e) => {
             if (e.subtype === 'suggestions_updated') this.load({ force: true });
@@ -126,7 +130,7 @@ class SuggestionManager extends Component {
             const group = byItem.get(key);
             group.all.push(s);
             if (s.explanation) group.explanations.push(s.explanation);
-            if (['download_next', 'download_all_missing', 'download_remaining_next', 'new_season'].includes(s.action_type)) group.macro.push(s);
+            if (['download_latest_frontier', 'download_next', 'download_all_missing', 'download_remaining_next', 'new_season'].includes(s.action_type)) group.macro.push(s);
             else if (s.action_type === 'missing_episode') group.episodes.push(s);
             else if (s.action_type === 'quality_upgrade') group.upgrades.push(s);
             else group.related.push(s);
@@ -249,6 +253,86 @@ class SuggestionManager extends Component {
         ));
     }
 
+    _actionTitle(s) {
+        if (!s) return 'suggestion action';
+        return s.title || this.typeLabels[s.action_type] || s.action_type || s.item_name || 'suggestion action';
+    }
+
+    _setActionBusy(isBusy, message = 'Processing suggestion action…') {
+        const root = this.container || document.getElementById('crows-nest');
+        if (!root) return;
+        this._actionBusy = Boolean(isBusy);
+        if (this._actionBusy) {
+            root.classList.add('is-action-busy');
+            root.setAttribute('aria-busy', 'true');
+            this._lockControls(root);
+            if (!this._actionOverlay) {
+                this._actionOverlay = DOM.el('div', { className: 'suggestion-action-overlay', role: 'status', 'aria-live': 'polite' }, [
+                    DOM.el('div', { className: 'suggestion-action-overlay-card' }, [
+                        DOM.el('i', { className: 'fa-solid fa-spinner suggestion-action-spinner' }),
+                        DOM.el('strong', { className: 'suggestion-action-overlay-title' }, ['Working on it…']),
+                        DOM.el('p', { className: 'suggestion-action-overlay-message' }, [message]),
+                        DOM.el('small', {}, ['The suggestions panel is locked until this action finishes.'])
+                    ])
+                ]);
+                document.body.appendChild(this._actionOverlay);
+            } else {
+                const msg = this._actionOverlay.querySelector('.suggestion-action-overlay-message');
+                if (msg) msg.textContent = message;
+            }
+            return;
+        }
+        root.classList.remove('is-action-busy');
+        root.removeAttribute('aria-busy');
+        this._unlockControls();
+        if (this._actionOverlay) {
+            this._actionOverlay.remove();
+            this._actionOverlay = null;
+        }
+    }
+
+    _lockControls(root) {
+        this._lockedControls = Array.from(root.querySelectorAll('button, input, select, textarea, a[href]')).map(node => ({
+            node,
+            disabled: Boolean(node.disabled),
+            ariaDisabled: node.getAttribute('aria-disabled'),
+            tabindex: node.getAttribute('tabindex')
+        }));
+        this._lockedControls.forEach(({ node }) => {
+            if ('disabled' in node) node.disabled = true;
+            node.setAttribute('aria-disabled', 'true');
+            node.setAttribute('tabindex', '-1');
+        });
+    }
+
+    _unlockControls() {
+        (this._lockedControls || []).forEach(({ node, disabled, ariaDisabled, tabindex }) => {
+            if (!node) return;
+            if ('disabled' in node) node.disabled = disabled;
+            if (ariaDisabled === null) node.removeAttribute('aria-disabled');
+            else node.setAttribute('aria-disabled', ariaDisabled);
+            if (tabindex === null) node.removeAttribute('tabindex');
+            else node.setAttribute('tabindex', tabindex);
+        });
+        this._lockedControls = [];
+    }
+
+    async _runLockedSuggestionAction(message, task) {
+        if (this._actionBusy) {
+            toast.show('A suggestion action is already running.', 'warning');
+            return null;
+        }
+        this._setActionBusy(true, message);
+        try {
+            return await task();
+        } catch (e) {
+            toast.error(e && e.message ? e.message : 'Suggestion action failed');
+            return null;
+        } finally {
+            this._setActionBusy(false);
+        }
+    }
+
     /**
      * Public method for the SuggestionManager.approve workflow.
      *
@@ -257,22 +341,29 @@ class SuggestionManager extends Component {
      * this behavior without reaching into private state.
      */
     async approve(s) {
-        try {
-            if (s.endpoint) {
-                let payload = {};
-                if (s.body_json && s.body_json !== '{}') {
-                    try { payload = JSON.parse(s.body_json); } catch (e) {}
-                }
-                if (Object.keys(payload).length === 0 && s.body) payload = s.body;
-                await APIClient.fetch(s.endpoint, { method: s.method || 'POST', body: JSON.stringify(payload) });
+        return this._runLockedSuggestionAction(`Processing “${this._actionTitle(s)}”…`, async () => {
+            let response = null;
+            if (s.synthetic && s.endpoint) {
+                response = await APIClient.fetch(s.endpoint, { method: s.method || 'POST' });
+            } else if (s.id) {
+                response = await APIClient.post(`/api/suggestions/${s.id}/approve`);
+            } else {
+                throw new Error('Suggestion is missing an approval id.');
             }
-            if (!s.synthetic && s.id) {
-                await APIClient.post(`/api/suggestions/${s.id}/approve`);
+            const receipt = response && response.receipt ? response.receipt : null;
+            const message = response?.message
+                || receipt?.user_message
+                || receipt?.message
+                || (response?.status === 'approved' ? 'Suggestion approved' : 'Action submitted');
+            if (receipt?.status === 'partial' || receipt?.status === 'failed' || response?.queued === false || response?.ok === false) {
+                toast.show(message, receipt?.status === 'failed' || response?.ok === false ? 'err' : 'warning');
+            } else {
+                toast.show(message);
             }
-            toast.show('Approved');
-            this.load();
-            if (window.downloads) downloads.load();
-        } catch (e) { toast.error(e.message); }
+            await this.load({ force: true });
+            if (window.downloads) await downloads.load();
+            return response;
+        });
     }
 
     /**
@@ -283,11 +374,11 @@ class SuggestionManager extends Component {
      * this behavior without reaching into private state.
      */
     async deny(id) {
-        try {
+        return this._runLockedSuggestionAction('Dismissing suggestion…', async () => {
             await APIClient.post(`/api/suggestions/${id}/deny`);
             toast.show('Dismissed');
-            this.load();
-        } catch (e) { toast.error(e.message); }
+            await this.load({ force: true });
+        });
     }
 
     _categoryLabel(categoryId) {

@@ -154,6 +154,7 @@ class DiscordBridge(CommsBridge):
                 self._bridge = bridge
                 self._notifications = notifications
                 self._slash_commands_registered = False
+                self._notification_bridge_registered = False
 
             async def on_ready(self) -> None:
                 """Log readiness and sync slash commands once Discord connects."""
@@ -165,6 +166,14 @@ class DiscordBridge(CommsBridge):
                 )
                 if not self._slash_commands_registered:
                     await self._sync_slash_commands_once()
+                if not self._notification_bridge_registered:
+                    channel_id = _channel_id(getattr(self._bridge._settings, "discord_channel_id", None))
+                    self._notifications.register_bridge(
+                        _DiscordNotificationBridge(self, channel_id=channel_id),
+                        bridge_id="discord",
+                    )
+                    self._notification_bridge_registered = True
+                    logger.info(f"Discord notification bridge registered; channel_id={channel_id or 'not configured'}")
 
             async def _sync_slash_commands_once(self) -> None:
                 if app_commands is None:
@@ -308,10 +317,6 @@ class DiscordBridge(CommsBridge):
                 """Route a slash-command download prompt into the shared assistant runtime."""
                 await bot.handle_interaction_prompt(interaction, f"download {query}")
 
-        channel_id = _channel_id(getattr(self._settings, "discord_channel_id", None))
-        notifications.register_bridge(_DiscordNotificationBridge(bot, channel_id=channel_id))
-        logger.info(f"Discord notification bridge registered; channel_id={channel_id or 'not configured'}")
-
         if self._supervisor:
             from src.core.models import TaskCriticality
             self._supervisor.spawn_restartable(
@@ -325,6 +330,7 @@ class DiscordBridge(CommsBridge):
     async def stop(self) -> None:
         """Stop the Discord bot gracefully."""
         if self._bot:
+            self._notifications.unregister_bridge("discord")
             await self._bot.close()
             logger.info("Discord bot stopped")
 

@@ -289,6 +289,12 @@ class MediaScheduler:
                 id="suggestion_compilation",
                 initial_delay_seconds=3600,
             )
+        if getattr(self._db, "release_watches", None):
+            self._scheduler.add_job(
+                self.process_release_watches, interval_seconds=2 * 3600,
+                id="release_watch_retry",
+                initial_delay_seconds=120,
+            )
         
         if self._prompt_scheduler:
             self._scheduler.add_job(
@@ -1617,6 +1623,142 @@ class MediaScheduler:
     def _torrent_search_service(self) -> SchedulerTorrentSearchService:
         """Return a torrent search service for assistant media searches."""
         return SchedulerTorrentSearchService(self._service_context())
+
+
+    async def handle_release_event(
+        self,
+        item: CategoryItem,
+        *,
+        unit_label: str | None,
+        source_result: SearchResult | None = None,
+        trigger: str = "manual",
+    ) -> dict[str, Any]:
+        """Handle a concrete provider/RSS release event through the owning category.
+
+        The scheduler is category-neutral: it identifies the category and passes
+        the event/context to the category. TV decides what a frontier episode is;
+        other categories may later implement equivalent unit semantics.
+        """
+        category_id = getattr(item, "item_type", "") or ""
+        category = self._categories.get(category_id) if self._categories else None
+        if not category or not hasattr(category, "handle_release_event"):
+            logger.info("Release event ignored: no category handler for %s/%s", category_id, getattr(item, "key", ""))
+            return {"status": "ignored", "reason": "no_category_release_handler"}
+        from src.core.categories.base import CategoryWorkflowContext
+        context = CategoryWorkflowContext(
+            db=self._db,
+            pipeline=self._pipeline,
+            aggregator=self._aggregator,
+            settings=self._settings_manager.settings,
+            downloader=self._downloader,
+            category_registry=self._categories,
+            metadata_clients={"tvmaze": self._tvmaze} if self._tvmaze else {},
+            metadata_enricher=self._metadata_enricher,
+            artwork_manager=self._artwork_manager,
+        )
+        event = {
+            "trigger": trigger,
+            "unit_label": unit_label or "",
+            "source_result": source_result.model_dump() if hasattr(source_result, "model_dump") else dict(source_result or {}),
+        }
+        result = await category.handle_release_event(item, event, context, notifications=self._notifications, lifecycle=self._lifecycle)
+        try:
+            await self._lifecycle.invalidate_item(category_id, getattr(item, "key", ""), reason="new_episode_detected", payload=result)
+        except Exception as exc:
+            logger.debug("Release event lifecycle invalidation failed for %s/%s: %s", category_id, getattr(item, "key", ""), exc)
+        if self._event_bus:
+            self._event_bus.emit_system("release_event", {"category_id": category_id, "item_id": getattr(item, "key", ""), "result": result})
+        return result if isinstance(result, dict) else {"status": "ok"}
+
+    async def process_release_watches(self) -> None:
+        """Retry pending release watches until a category queues or resolves them."""
+        repo = getattr(self._db, "release_watches", None)
+        if not repo:
+            return
+        watches = await repo.due(limit=20)
+        if not watches:
+            return
+        logger.info("Processing %s due release watch(es).", len(watches))
+        for watch in watches:
+            category_id = str(watch.get("category_id") or "")
+            item_id = str(watch.get("item_id") or "")
+            unit_key = str(watch.get("unit_key") or "")
+            category = self._categories.get(category_id) if self._categories else None
+            item = next(
+                (tracked for tracked in getattr(self._settings_manager.settings, "tracked_items", [])
+                 if getattr(tracked, "item_type", "") == category_id and getattr(tracked, "key", "") == item_id),
+                None,
+            )
+            if not category or not item:
+                await repo.record_attempt(int(watch["id"]), status="cancelled", error="tracked item disappeared")
+                continue
+            try:
+                preferred_language = str(watch.get("preferred_language") or getattr(item, "language", "") or self._settings_manager.settings.language)
+                item_auto = getattr(item, "auto_download", None)
+                can_auto_download = bool(item_auto if item_auto is not None else self._settings_manager.settings.auto_download)
+
+                if not can_auto_download:
+                    # Auto-download-disabled watches are still useful: run a
+                    # non-queueing category search and notify the web inbox when
+                    # an acceptable candidate exists.  The action remains a
+                    # category workflow so the scheduler does not learn TV/movie
+                    # unit semantics.
+                    candidate = await self._pipeline.run_search(
+                        item, episode_label=unit_key, mode="auto", language=preferred_language,
+                    )
+                    if candidate and hasattr(category, "candidate_requires_user_language_confirmation"):
+                        try:
+                            if category.candidate_requires_user_language_confirmation(candidate, item, unit_key, preferred_language):
+                                candidate = None
+                        except Exception:
+                            pass
+                    if candidate:
+                        if self._notifications:
+                            from src.core.models import NotificationMessage
+                            action_builder = getattr(category, "release_watch_notification_action", None)
+                            actions = []
+                            if callable(action_builder):
+                                try:
+                                    actions = [action_builder(item_id, unit_key, candidate, preferred_language)]
+                                except Exception as exc:
+                                    logger.debug("Category release-watch action build failed for %s/%s/%s: %s", category_id, item_id, unit_key, exc)
+                            await self._notifications.notify(
+                                NotificationMessage(
+                                    title=f"{item_id} {unit_key}",
+                                    body=f"I found an acceptable release for {item_id} {unit_key}. Download it?",
+                                    level="info",
+                                ),
+                                category_id=category_id,
+                                item_id=item_id,
+                                event_type="release_watch_candidate_found",
+                                actions=actions,
+                                metadata={"unit_key": unit_key, "preferred_language": preferred_language, "watch_id": watch.get("id")},
+                                dedupe_key=f"release_watch_found:{category_id}:{item_id}:{unit_key}",
+                            )
+                        await repo.record_attempt(int(watch["id"]), status="completed")
+                    else:
+                        await repo.record_attempt(int(watch["id"]), status="pending", error="no acceptable candidate", interval_hours=float(watch.get("interval_hours") or 2.0))
+                    continue
+
+                ok = await self._pipeline.run_discovery(
+                    item,
+                    episode_label=unit_key,
+                    force=False,
+                    language=preferred_language,
+                )
+                if ok:
+                    await repo.record_attempt(int(watch["id"]), status="completed")
+                    if self._notifications:
+                        await self._notifications.send_message(
+                            f"Queued {item_id} {unit_key} after a release-watch retry.",
+                            title="Release Found",
+                            level="success",
+                        )
+                else:
+                    await repo.record_attempt(int(watch["id"]), status="pending", error="no acceptable candidate", interval_hours=float(watch.get("interval_hours") or 2.0))
+            except Exception as exc:
+                logger.warning("Release watch retry failed for %s/%s/%s: %s", category_id, item_id, unit_key, exc)
+                await repo.record_attempt(int(watch["id"]), status="pending", error=str(exc), interval_hours=float(watch.get("interval_hours") or 2.0))
 
     async def list_media(self) -> dict:
         """Return tracked media rows with category-neutral progress fields."""

@@ -637,7 +637,7 @@ async function finishSetup() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                direct_scraper_fallback: directFallback ? directFallback.checked : true,
+                direct_scraper_fallback: directFallback ? directFallback.checked : false,
                 soulseek: soulseekPayload
             })
         });

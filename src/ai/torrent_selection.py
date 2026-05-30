@@ -110,6 +110,7 @@ class TorrentSelectionService:
         require_magnet: bool = True,
         preferred_language: str | None = None,
         category_id: str = '',
+        unit_label: str | None = None,
     ) -> list[NormalizedTorrentCandidate]:
         """Convert raw SearchResult objects into compact normalized candidates.
 
@@ -144,7 +145,7 @@ class TorrentSelectionService:
             bundle_context = {}
             if category and hasattr(category, "torrent_bundle_candidate_context"):
                 try:
-                    bundle_context = category.torrent_bundle_candidate_context(r) or {}
+                    bundle_context = category.torrent_bundle_candidate_context(r, unit_label=unit_label) or {}
                 except Exception as exc:
                     logger.debug(f"Category bundle annotation failed for {r.title}: {exc}")
                     bundle_context = {}
@@ -365,6 +366,7 @@ class TorrentSelectionService:
             results, require_magnet=require_magnet,
             preferred_language=preferred_language,
             category_id=parse_category,
+            unit_label=unit_key,
         )
 
         if not normalized:

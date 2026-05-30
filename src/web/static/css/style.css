@@ -2375,3 +2375,223 @@ button.is-loading i {
   width: auto;
   white-space: nowrap;
 }
+
+.notification-inbox {
+    position: fixed;
+    top: 82px;
+    right: 22px;
+    z-index: 1000;
+    width: min(430px, calc(100vw - 32px));
+    max-height: 70vh;
+    overflow: auto;
+    padding: 14px;
+    border-radius: 18px;
+    background: rgba(16, 22, 34, 0.96);
+    border: 1px solid rgba(255,255,255,0.12);
+    box-shadow: 0 18px 50px rgba(0,0,0,0.35);
+}
+.notification-inbox.hidden { display: none; }
+.notification-inbox-header,
+.notification-row,
+.notification-actions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+.notification-inbox-header { justify-content: space-between; margin-bottom: 10px; }
+.notification-row {
+    align-items: flex-start;
+    justify-content: space-between;
+    padding: 12px;
+    margin: 8px 0;
+    border-radius: 14px;
+    background: rgba(255,255,255,0.06);
+}
+.notification-row.unread { border-left: 3px solid var(--gold, #d9a441); }
+.notification-actions { flex-wrap: wrap; justify-content: flex-end; min-width: 110px; }
+#notification-bell.has-unread::after {
+    content: attr(data-count);
+    position: absolute;
+    transform: translate(-6px, -8px);
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 99px;
+    background: #d94b4b;
+    color: white;
+    font-size: 10px;
+    line-height: 16px;
+}
+
+/* Round 180: visible locked state while suggestion actions run. */
+#crows-nest.suggestions-page {
+  position: relative;
+}
+#crows-nest.suggestions-page.is-action-busy #suggestion-list {
+  filter: blur(1px);
+  opacity: .62;
+  user-select: none;
+  pointer-events: none;
+}
+.suggestion-action-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, .58);
+  backdrop-filter: blur(2px);
+  pointer-events: all;
+  cursor: progress;
+}
+.suggestion-action-overlay-card {
+  width: min(420px, 92vw);
+  border: 1px solid rgba(244,162,97,.32);
+  background: rgba(14, 18, 26, .94);
+  box-shadow: 0 24px 70px rgba(0,0,0,.42);
+  border-radius: 22px;
+  padding: 24px;
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  text-align: center;
+}
+.suggestion-action-spinner {
+  font-size: 2rem;
+  color: var(--accent-gold);
+  animation: spin 1s linear infinite;
+}
+.suggestion-action-overlay-title {
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+}
+.suggestion-action-overlay-message {
+  margin: 0;
+  color: var(--text-main);
+  line-height: 1.45;
+}
+.suggestion-action-overlay-card small {
+  color: var(--text-dim);
+}
+
+
+/* Round 182: suggestions inside category item inspector. */
+.category-detail-suggestions .suggestion-action-card {
+  margin: 10px 0;
+}
+.category-detail-suggestions-empty {
+  color: var(--text-dim);
+}
+.category-detail-action-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, .58);
+  backdrop-filter: blur(2px);
+  cursor: progress;
+}
+.category-detail-modal.is-action-busy {
+  pointer-events: none;
+}
+.category-detail-action-overlay .suggestion-action-overlay-card {
+  pointer-events: auto;
+}
+
+/* Round 184: compact item-inspector suggestion presentation. */
+.category-detail-suggestion-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  border-radius: 14px;
+  background: rgba(255,255,255,.055);
+  border: 1px solid rgba(255,255,255,.08);
+}
+.category-detail-suggestion-summary p {
+  margin: 3px 0 0;
+}
+.category-detail-suggestions-lead {
+  display: grid;
+  gap: 10px;
+}
+.category-detail-suggestions-lead .suggestion-action-card {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+.category-detail-suggestions-lead .suggestion-action-copy p {
+  margin: 4px 0 0;
+}
+.category-detail-suggestion-overflow {
+  margin-top: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,.09);
+  background: rgba(255,255,255,.035);
+  overflow: hidden;
+}
+.category-detail-suggestion-overflow > summary {
+  cursor: pointer;
+  padding: 11px 13px;
+  color: var(--text-main);
+  font-weight: 700;
+}
+.category-detail-suggestion-overflow[open] > summary {
+  border-bottom: 1px solid rgba(255,255,255,.08);
+}
+.category-detail-suggestion-overflow-group {
+  padding: 10px 13px 12px;
+}
+.category-detail-suggestion-overflow-group + .category-detail-suggestion-overflow-group {
+  border-top: 1px solid rgba(255,255,255,.07);
+}
+.category-detail-suggestion-overflow-group h4 {
+  margin: 0 0 8px;
+  font-size: .92rem;
+  color: var(--text-dim);
+}
+.category-detail-suggestion-mini-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+}
+.category-detail-suggestion-mini-row + .category-detail-suggestion-mini-row {
+  border-top: 1px solid rgba(255,255,255,.06);
+}
+.category-detail-suggestion-mini-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.category-detail-suggestion-mini-copy strong,
+.category-detail-suggestion-mini-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 720px) {
+  .category-detail-suggestion-summary,
+  .category-detail-suggestions-lead .suggestion-action-card,
+  .category-detail-suggestion-mini-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  .category-detail-suggestion-summary {
+    display: grid;
+  }
+  .category-detail-suggestion-mini-row .suggestion-actions,
+  .category-detail-suggestions-lead .suggestion-actions {
+    justify-content: flex-start;
+  }
+}

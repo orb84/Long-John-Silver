@@ -104,18 +104,19 @@ class TelegramBridge(CommsBridge):
         self.application.add_handler(CommandHandler("search", self._search_command))
         self.application.add_handler(CommandHandler("download", self._download_command))
 
-        bridge = _TelegramNotificationBridge(self)
-        self._notifications.register_bridge(bridge)
-        logger.info("Telegram notification bridge registered")
-
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling()
+
+        bridge = _TelegramNotificationBridge(self)
+        self._notifications.register_bridge(bridge, bridge_id="telegram")
+        logger.info("Telegram notification bridge registered")
         logger.info("Telegram bot started")
 
     async def stop(self) -> None:
         """Stop the Telegram bot gracefully."""
         if self.application:
+            self._notifications.unregister_bridge("telegram")
             await self.application.updater.stop()
             await self.application.stop()
             await self.application.shutdown()

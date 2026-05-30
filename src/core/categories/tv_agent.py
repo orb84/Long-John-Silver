@@ -281,6 +281,19 @@ class TvAgentSearchMixin:
             return await self._run_agent_pack_queries(
                 item, int(season), language=language, context=context, summary_suffix="pack only",
             )
+        if season is not None and episode is not None:
+            exact_label = f"S{int(season):02d}E{int(episode):02d}"
+            exact_results, exact_summary = await self._run_agent_labels(
+                item, [exact_label], language=language, season=season, episode=episode, context=context,
+            )
+            if exact_results:
+                return exact_results, exact_summary
+            pack_results, pack_summary = await self._run_agent_episode_pack_fallback(
+                item, int(season), int(episode), language=language, context=context,
+            )
+            summary = f"{exact_summary}; {pack_summary}" if pack_summary else exact_summary
+            return pack_results, summary
+
         labels = await self.build_agent_search_labels(
             item, season=season, episode=episode, language=language, search_scope=search_scope, context=context,
         )
@@ -316,6 +329,60 @@ class TvAgentSearchMixin:
         if summary_suffix:
             label_summary = f"{label_summary} ({summary_suffix})"
         return ranked, label_summary
+
+    async def _run_agent_episode_pack_fallback(
+        self,
+        item: Any,
+        season: int,
+        episode: int,
+        *,
+        language: str | None,
+        context: Any,
+    ) -> tuple[list[Any], str]:
+        """Search season/series packs when an exact TV episode has no row.
+
+        This keeps the fallback inside the TV category.  Generic search only sees
+        category-owned candidates and unit descriptors; TV owns the idea that a
+        requested SxxEyy can be satisfied by file-selecting one payload from a
+        season pack.
+        """
+        queries = await self.agent_pack_search_queries(item, season, language=None, context=context)
+        merged: list[Any] = []
+        seen: set[str] = set()
+        quality_profile = getattr(item, "quality", None)
+        for query in queries:
+            try:
+                results = await context.aggregator.search(
+                    query,
+                    category=self.category_id,
+                    quality_profile=quality_profile,
+                    preferred_language=language,
+                )
+            except Exception as exc:
+                logger.debug(f"TV episode pack fallback query failed for {item.key}: {query}: {exc}")
+                continue
+            for result in results or []:
+                if not getattr(result, "magnet", None):
+                    continue
+                if not self._title_matches_requested_series(str(getattr(result, "title", "") or ""), str(getattr(item, "key", "") or "")):
+                    continue
+                contains = False
+                try:
+                    contains = bool(self._bundle_contains_episode(str(getattr(result, "title", "") or ""), season, episode))
+                except Exception:
+                    contains = False
+                if not contains:
+                    continue
+                identity = str(getattr(result, "magnet", None) or f"{getattr(result, 'source', '')}|{getattr(result, 'title', '')}").lower()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                merged.append(result)
+        ranked = await self.rank_agent_search_results(
+            merged, item=item, language=language, season=season, episode=episode, context=context,
+        )
+        return ranked, f"S{season:02d}E{episode:02d} exact unavailable; searched season-pack fallback: " + " | ".join(queries[:8])
+
 
     async def _run_agent_pack_queries(
         self,
@@ -618,11 +685,11 @@ class TvAgentSearchMixin:
             title_lower = (getattr(result, "title", "") or "").lower()
             preferred_token = self._canonical_language_token(preferred) if preferred else ""
             title_has_preferred = bool(preferred_token and self._title_has_language_token(title_lower, preferred_token))
-            if preferred_token and not (preferred_token in languages or tags.get("is_multi_language") or title_has_preferred):
-                # A user-requested or item-configured language is a hard download
-                # constraint for assistant searches. Unknown-language torrents are
-                # left for explicit user override instead of being silently queued.
-                continue
+            # Language evidence is not reliable enough to be a hard display
+            # filter.  Unknown/non-preferred releases should be shown to the LLM
+            # and user with blockers/warnings, not hidden as "no results".
+            # Queueing remains guarded later by candidate annotations and
+            # explicit user confirmation.
             resolution = tags.get("resolution")
             if preferred_resolution and resolution:
                 if QualityAnalyzer.rank_resolution(resolution) > QualityAnalyzer.rank_resolution(preferred_resolution):
@@ -645,7 +712,9 @@ class TvAgentSearchMixin:
             result, tags, per_ep_bytes = item_tuple
             languages = {self._canonical_language_token(lang) for lang in (tags.get("languages") or [])}
             preferred_token = self._canonical_language_token(preferred) if preferred else ""
-            lang_score = 2 if preferred_token and preferred_token in languages else 1 if tags.get("is_multi_language") else 0
+            title_has_preferred = bool(preferred_token and self._title_has_language_token((getattr(result, "title", "") or "").lower(), preferred_token))
+            known_language_mismatch = bool(preferred_token and languages and preferred_token not in languages and not tags.get("is_multi_language") and not title_has_preferred)
+            lang_score = 3 if preferred_token and (preferred_token in languages or title_has_preferred) else 2 if tags.get("is_multi_language") else -2 if known_language_mismatch else 0
             resolution = tags.get("resolution")
             res_rank = QualityAnalyzer.rank_resolution(resolution or "") if resolution else 0
             codec = str(tags.get("codec") or "").lower()

@@ -213,30 +213,109 @@ class SearchLogger:
         total_raw: int,
         unique_deduped: int,
         quality_filtered: int,
+        *,
+        provider_diagnostics: dict[str, Any] | None = None,
+        raw_results: Sequence[Any] | None = None,
+        deduped_results: Sequence[Any] | None = None,
+        accepted_results: Sequence[Any] | None = None,
+        ranked_results: Sequence[Any] | None = None,
+        fallback_used: bool | None = None,
+        max_results_to_log: int = 50,
     ) -> None:
-        """Log indexing queries and results count breakdown to searches.log.
+        """Log indexing queries, provider diagnostics, and visible candidates.
 
-        Args:
-            query: The search query string.
-            category: Target search category.
-            active_providers: Active providers queried.
-            total_raw: Total raw candidate results gathered.
-            unique_deduped: Number of results remaining after deduplication.
-            quality_filtered: Number of results accepted after quality filtering.
+        Search failures are often query-shape failures, not provider outages.
+        Counts alone hide the important evidence, so this logger records a
+        redacted candidate snapshot for every query: provider/source, title,
+        seeders, size, quality score, and whether a magnet/link was present.
+        Full magnet URLs are intentionally not written because private tracker
+        passkeys can appear in them.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
+        diagnostics_lines = self._format_provider_diagnostics(provider_diagnostics or {})
+        raw_lines = self._format_result_block("Raw Results", raw_results or [], max_results_to_log)
+        deduped_lines = self._format_result_block("Deduped Results", deduped_results or [], max_results_to_log)
+        accepted_lines = self._format_result_block("Accepted Results", accepted_results or [], max_results_to_log)
+        ranked_lines = self._format_result_block("Ranked Results", ranked_results or [], max_results_to_log)
         log_entry = (
             "================================================================================\n"
             f"Timestamp: {timestamp}\n"
             f"Query: {query!r} | Category: {category}\n"
             f"Active Providers: {active_providers}\n"
+            f"Fallback Used: {fallback_used}\n"
             "Result Status:\n"
             f"  - Total Raw Results: {total_raw}\n"
             f"  - Unique Deduplicated: {unique_deduped}\n"
             f"  - Quality Filtered (Accepted): {quality_filtered}\n"
+            f"{diagnostics_lines}"
+            f"{raw_lines}"
+            f"{deduped_lines}"
+            f"{accepted_lines}"
+            f"{ranked_lines}"
             "================================================================================\n\n"
         )
         await self._writer.write(log_entry)
+
+    @staticmethod
+    def _format_provider_diagnostics(provider_diagnostics: dict[str, Any]) -> str:
+        if not provider_diagnostics:
+            return "Provider Diagnostics: []\n"
+        lines = ["Provider Diagnostics:"]
+        for key, diag in provider_diagnostics.items():
+            provider = getattr(diag, "provider", key)
+            ok = getattr(diag, "ok", None)
+            result_count = getattr(diag, "result_count", None)
+            magnet_count = getattr(diag, "magnet_count", None)
+            elapsed_ms = getattr(diag, "elapsed_ms", None)
+            blocked = getattr(diag, "blocked_reason", None)
+            error = getattr(diag, "error", None)
+            suffix = []
+            if blocked:
+                suffix.append(f"blocked={blocked}")
+            if error:
+                suffix.append(f"error={error}")
+            suffix_text = f" ({'; '.join(suffix)})" if suffix else ""
+            lines.append(
+                f"  - {provider}: ok={ok}, results={result_count}, magnets={magnet_count}, elapsed_ms={elapsed_ms}{suffix_text}"
+            )
+        return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _format_result_block(cls, label: str, results: Sequence[Any], max_results: int) -> str:
+        lines = [f"{label} ({len(results)}):"]
+        if not results:
+            lines.append("  - none")
+            return "\n".join(lines) + "\n"
+        clipped = list(results)[:max(0, max_results)]
+        for idx, result in enumerate(clipped, start=1):
+            lines.append(f"  {idx:02d}. {cls._format_result(result)}")
+        remaining = len(results) - len(clipped)
+        if remaining > 0:
+            lines.append(f"  ... {remaining} more result(s) omitted from log snapshot")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _format_result(result: Any) -> str:
+        title = str(getattr(result, "title", "") or "").replace("\n", " ").strip()
+        source = str(getattr(result, "source", "unknown") or "unknown")
+        seeders = getattr(result, "seeders", None)
+        size = getattr(result, "size", None) or "Unknown"
+        size_bytes = getattr(result, "size_bytes", None)
+        quality_score = getattr(result, "quality_score", None)
+        has_magnet = bool(getattr(result, "magnet", None))
+        url = str(getattr(result, "url", "") or "")
+        url_hint = ""
+        if url:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                url_hint = f", url_host={parsed.netloc or 'unknown'}"
+            except Exception:
+                url_hint = ", url_host=unparsed"
+        return (
+            f"source={source!r}, seeders={seeders}, size={size!r}, size_bytes={size_bytes}, "
+            f"score={quality_score}, magnet={'yes' if has_magnet else 'no'}{url_hint}, title={title!r}"
+        )
 
 
 class TorrentLogger:

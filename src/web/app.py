@@ -29,6 +29,7 @@ from src.web.routers.category_items import CategoryItemsRouter
 from src.web.routers.downloads import DownloadsRouter
 from src.web.routers.health import HealthRouter
 from src.web.routers.library import LibraryRouter
+from src.web.routers.notifications import NotificationsRouter
 from src.web.routers.pages import PagesRouter
 from src.web.routers.personas import PersonasRouter
 from src.web.routers.providers import ProvidersRouter
@@ -64,6 +65,8 @@ def create_app(**kwargs: Any) -> FastAPI:
     deps.chat_ws_manager = chat_ws_manager
     deps.dl_ws_manager = dl_ws_manager
     deps.event_bus = event_bus
+    if deps.notifications and hasattr(deps.notifications, "set_event_bus"):
+        deps.notifications.set_event_bus(event_bus)
 
     audit_store = deps.action_event_store
 
@@ -197,7 +200,7 @@ def create_app(**kwargs: Any) -> FastAPI:
     for router_cls in (
         DownloadsRouter, ActionsRouter, HealthRouter,
         PagesRouter, PersonasRouter, ProvidersRouter, SetupRouter, CategoriesRouter,
-        SettingsRouter, CategoryItemsRouter, LibraryRouter,
+        SettingsRouter, CategoryItemsRouter, LibraryRouter, NotificationsRouter,
         UpgradesRouter, SuggestionsRouter, SystemRouter, StorageRouter, SharingRouter,
     ):
         app.include_router(router_cls(deps).get_router())

@@ -398,7 +398,7 @@ class Settings(BaseModel):
     auto_delete_watched: bool = False
     auto_download: bool = False
     auto_discover: bool = True
-    direct_scraper_fallback: bool = True
+    direct_scraper_fallback: bool = False
     last_library_scan_at: str = ""
     last_media_metadata_repair_at: str = ""
     """Last time the background stale stream-metadata repair was allowed to trigger a full scan."""

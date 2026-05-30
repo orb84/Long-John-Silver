@@ -67,6 +67,9 @@ class AppDeck {
         if (window.SuggestionManager) {
             window.suggestionManager = new SuggestionManager();
         }
+        if (window.NotificationInbox) {
+            window.notificationInbox = new NotificationInbox();
+        }
 
         // Trigger active downloads UI load since DownloadManager is now fully defined
         if (window.holdPanel) {
@@ -157,7 +160,9 @@ class AppDeck {
         if (this._hydrateTimer) clearTimeout(this._hydrateTimer);
         this._hydrateTimer = setTimeout(async () => {
             const jobs = [];
-            if (window.bootyPanel && typeof window.bootyPanel.loadCatalog === 'function') jobs.push(window.bootyPanel.loadCatalog());
+            // The Booty/library catalog performs its own progressive initial load.
+            // Do not duplicate it during global hydration: large libraries were
+            // issuing overlapping category/item reads before the tab could paint.
             if (window.downloads && typeof window.downloads.load === 'function') jobs.push(window.downloads.load());
             if (window.holdPanel && typeof window.holdPanel.loadRecentPlunder === 'function') jobs.push(window.holdPanel.loadRecentPlunder());
             if (window.suggestionManager && typeof window.suggestionManager.load === 'function') jobs.push(window.suggestionManager.load({ force: true }));

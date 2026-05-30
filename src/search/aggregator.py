@@ -103,15 +103,15 @@ class SearchAggregator:
         )
 
         fallback_used = False
-        if not ranked and self._fallback_providers:
+        if not ranked and self._fallback_providers and not active_providers:
             fallback_providers = [
                 provider for provider in self._fallback_providers
                 if self._provider_supports_category(provider, category)
             ]
             if fallback_providers:
                 logger.warning(
-                    f"Primary torrent search returned no usable results for '{query}'. "
-                    "Trying explicit direct-scraper fallback providers."
+                    f"No primary torrent provider is available for '{query}'. "
+                    "Trying explicitly enabled direct-scraper emergency providers."
                 )
                 fallback_results, fallback_diagnostics = await self._search_providers_with_diagnostics(
                     query, providers=fallback_providers, category=category,
@@ -121,6 +121,11 @@ class SearchAggregator:
                     fallback_results, preferred_language=preferred_language, quality_profile=profile,
                 )
                 fallback_used = True
+        elif not ranked and self._fallback_providers and active_providers:
+            logger.info(
+                f"Primary torrent search returned no usable results for '{query}', "
+                "but direct-scraper fallback is not used while a primary provider is configured."
+            )
 
         self._provider_diagnostics = diagnostics
         logger.info(
@@ -140,6 +145,12 @@ class SearchAggregator:
                     total_raw=len(all_results),
                     unique_deduped=len(deduped),
                     quality_filtered=len(quality_filtered),
+                    provider_diagnostics=diagnostics,
+                    raw_results=all_results,
+                    deduped_results=deduped,
+                    accepted_results=quality_filtered,
+                    ranked_results=ranked,
+                    fallback_used=fallback_used,
                 )
             except Exception as le:
                 logger.warning(f"Failed to log search details: {le}")
@@ -167,7 +178,7 @@ class SearchAggregator:
         ranked, quality_filtered, filtered, deduped = await self._prepare_results(
             all_results, preferred_language=preferred_language, quality_profile=profile,
         )
-        if not ranked and self._fallback_providers:
+        if not ranked and self._fallback_providers and not active_providers:
             fallback_providers = [
                 provider for provider in self._fallback_providers
                 if self._provider_supports_category(provider, category)
@@ -178,6 +189,11 @@ class SearchAggregator:
             diagnostics.update({f"fallback:{key}": value for key, value in fallback_diagnostics.items()})
             ranked, quality_filtered, filtered, deduped = await self._prepare_results(
                 fallback_results, preferred_language=preferred_language, quality_profile=profile,
+            )
+        elif not ranked and self._fallback_providers and active_providers:
+            logger.info(
+                f"Primary torrent diagnostics returned no usable results for '{query}', "
+                "but direct-scraper fallback is not used while a primary provider is configured."
             )
         self._provider_diagnostics = diagnostics
         if ranked:
@@ -218,6 +234,18 @@ class SearchAggregator:
             "last_successful_search_at": self._last_successful_search_at,
             "last_error": self._last_error,
         }
+
+
+    @property
+    def provider_diagnostics(self) -> dict[str, ProviderSearchDiagnostics]:
+        """Return diagnostics from the most recent aggregate search."""
+        return dict(getattr(self, "_provider_diagnostics", {}) or {})
+
+    def last_search_timed_out(self) -> bool:
+        """Return whether the most recent provider call was killed by timeout."""
+        diagnostics = getattr(self, "_provider_diagnostics", {}) or {}
+        return any("timeout" in str(getattr(diag, "error", "") or "").casefold() for diag in diagnostics.values())
+
 
 
     def _provider_timeout_for(self, provider: SearchProvider) -> int:
@@ -267,7 +295,7 @@ class SearchAggregator:
                     try:
                         return await asyncio.wait_for(
                             provider.search(q),
-                            timeout=self._provider_timeout
+                            timeout=self._provider_timeout_for(provider)
                         )
                     except (asyncio.TimeoutError, Exception) as e:
                         if attempt < self._provider_retries:

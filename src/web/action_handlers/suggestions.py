@@ -72,19 +72,26 @@ class SuggestionsActionHandler:
         if not action:
             return {"found": False}
 
-        await self._db.downloads.set_suggested_action_status(action_id, "approved")
-
         try:
             invocation = self._workflow_invocation_from_suggestion(action)
             if invocation:
                 category_id, workflow_name, arguments = invocation
                 receipt = await self._scheduler.execute_category_workflow(category_id, workflow_name, arguments)
+                receipt_status = str(getattr(receipt, "status", "success") or "success")
+                if receipt_status == "success":
+                    await self._db.downloads.set_suggested_action_status(action_id, "approved")
+                else:
+                    # Keep unresolved suggestions visible.  A user click that finds
+                    # no candidate is feedback, not successful completion of the
+                    # suggested work.
+                    logger.info(f"Suggestion {action_id} left pending after {receipt_status} receipt")
                 return {
-                    "status": "approved",
+                    "status": "approved" if receipt_status == "success" else receipt_status,
                     "action_id": action_id,
                     "message": getattr(receipt, "user_message", "Suggestion action submitted"),
                     "receipt": receipt.model_dump() if hasattr(receipt, "model_dump") else str(receipt),
                 }
+            await self._db.downloads.set_suggested_action_status(action_id, "approved")
             item = next(
                 (i for i in self._sm.settings.tracked_items if i.key == action.item_name or i.key == action.item_id), None
             )

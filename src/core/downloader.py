@@ -439,45 +439,81 @@ class DownloadManager(DownloadSharingMixin):
         )
 
         download_id = hashlib.md5(magnet_link.encode()).hexdigest()[:12]
+        explicit_user_request = self._is_explicit_user_reason(reason)
 
         lock = self._start_coordinator.get_add_lock(download_id)
         async with lock:
             existing = await self._db.downloads.get_download(download_id)
             if existing:
                 if existing.status in (
-                    DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED,
-                    DownloadStatus.PAUSED, DownloadStatus.STALLED,
+                    DownloadStatus.DOWNLOADING,
                     DownloadStatus.COMPLETE,
                 ):
                     logger.info(
                         f'Skipping duplicate magnet {download_id} '
-                        f'(status={existing.status.value}) for \'{item_name}\''
+                        f"(status={existing.status.value}) for '{item_name}'"
                     )
                     return existing
-
-            duplicate = await _find_duplicate_import_context(
-                self._db.downloads, normalized_context, download_id=download_id
-            )
-            if duplicate:
-                logger.info(
-                    f"Skipping duplicate media identity "
-                    f"{normalized_context.stable_unit_key or normalized_context.stable_provider_key} for '{item_name}'"
+                if existing.status in (DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.STALLED):
+                    if explicit_user_request:
+                        existing.reason = reason or existing.reason
+                        existing.priority = priority
+                        if normalized_context and not existing.import_context:
+                            existing.import_context = normalized_context
+                        await self._db.downloads.upsert_download(existing)
+                        item = existing
+                        logger.info(
+                            f"User-approved duplicate magnet {download_id} is already {existing.status.value}; "
+                            f"promoting it for immediate queue processing."
+                        )
+                    else:
+                        logger.info(
+                            f'Skipping duplicate magnet {download_id} '
+                            f"(status={existing.status.value}) for '{item_name}'"
+                        )
+                        return existing
+                else:
+                    logger.info(
+                        f'Skipping duplicate magnet {download_id} '
+                        f"(status={existing.status.value}) for '{item_name}'"
+                    )
+                    return existing
+            else:
+                duplicate = await _find_duplicate_import_context(
+                    self._db.downloads, normalized_context, download_id=download_id
                 )
-                return duplicate
+                if duplicate:
+                    if duplicate.status in (DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.STALLED) and explicit_user_request:
+                        duplicate.reason = reason or duplicate.reason
+                        duplicate.priority = priority
+                        await self._db.downloads.upsert_download(duplicate)
+                        item = duplicate
+                        download_id = duplicate.id
+                        logger.info(
+                            f"User-approved duplicate media identity "
+                            f"{normalized_context.stable_unit_key or normalized_context.stable_provider_key} "
+                            f"is already {duplicate.status.value}; promoting it for immediate queue processing."
+                        )
+                    else:
+                        logger.info(
+                            f"Skipping duplicate media identity "
+                            f"{normalized_context.stable_unit_key or normalized_context.stable_provider_key} for '{item_name}'"
+                        )
+                        return duplicate
+                else:
+                    item = DownloadItem(
+                        id=download_id, item_name=item_name, magnet=magnet_link,
+                        status=DownloadStatus.QUEUED, priority=priority, reason=reason,
+                        season=season, episode=episode, user_id=user_id,
+                        language=language, category_id=category_id,
+                        torrent_title=torrent_title or item_name,
+                        item_id=item_id or item_name,
+                        source_seeders=source_seeders,
+                        import_context=normalized_context,
+                    )
+                    await self._db.downloads.upsert_download(item)
 
-            item = DownloadItem(
-                id=download_id, item_name=item_name, magnet=magnet_link,
-                status=DownloadStatus.QUEUED, priority=priority, reason=reason,
-                season=season, episode=episode, user_id=user_id,
-                language=language, category_id=category_id,
-                torrent_title=torrent_title or item_name,
-                item_id=item_id or item_name,
-                source_seeders=source_seeders,
-                import_context=normalized_context,
-            )
-            await self._db.downloads.upsert_download(item)
-
-        if self._is_explicit_user_reason(reason):
+        if explicit_user_request:
             self._explicit_start_allowed.add(download_id)
 
         bundle_context = (normalized_context.candidate_snapshot or {}).get('bundle_context') if normalized_context else None
@@ -922,9 +958,10 @@ class DownloadManager(DownloadSharingMixin):
         """Return whether a persisted queue reason represents user-approved work.
 
         ``auto_download=False`` should stop background discovery, not prevent a
-        torrent the user already approved from continuing after a restart.  Keep
-        this intentionally narrow so unrelated phrases like "manual discovery"
-        do not unexpectedly auto-start stale background rows.
+        torrent the user just approved in chat, Suggestions, Notifications, or
+        the library inspector from starting immediately.  Background rows keep
+        using explicit auto-discovery reasons and remain held when automation is
+        disabled.
         """
         text = (reason or "").strip().lower().replace("_", " ")
         explicit_reasons = {
@@ -935,7 +972,14 @@ class DownloadManager(DownloadSharingMixin):
             "ui",
             "approved",
         }
-        return text in explicit_reasons or text.startswith("manual user upload")
+        explicit_prefixes = (
+            "manual user upload",
+            "user approved",
+            "user-approved",
+            "suggestion approved",
+            "notification approved",
+        )
+        return text in explicit_reasons or any(text.startswith(prefix) for prefix in explicit_prefixes)
 
     async def _can_start_queued_download(self, item: DownloadItem) -> bool:
         """Return whether a queued item may consume a download slot now.

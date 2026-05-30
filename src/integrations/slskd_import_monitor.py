@@ -73,6 +73,12 @@ class SlskdImportMonitor:
         self._failure_backoff: dict[str, tuple[float, int, str]] = {}
         self._storage_circuit_until = 0.0
         self._max_import_attempts_per_pass = 4
+        # Root diagnostics are valuable when slskd path planning is wrong, but
+        # logging them every poll makes normal torrent debugging unreadable.
+        # Keep the signal: emit once on startup, whenever the effective roots
+        # change, and only rarely as a debug heartbeat.
+        self._last_roots_signature: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._last_roots_debug_at = 0.0
 
     async def run_forever(self) -> None:
         """Run the import loop forever as a supervisor-managed background task."""
@@ -103,11 +109,7 @@ class SlskdImportMonitor:
                 f"soulseek.incomplete_dir={getattr(cfg, 'incomplete_dir', '')!r}"
             )
             return {"seen": 0, "complete": 0, "imported": 0, "missing": 0, "skipped": 0}
-        logger.info(
-            "Soulseek import monitor roots: "
-            f"completed={[str(r) for r in self._download_roots(settings)]} "
-            f"incomplete={[str(r) for r in self._incomplete_roots(settings)]}"
-        )
+        self._log_roots_if_needed(settings)
         if self._storage_circuit_until > time.monotonic():
             retry_in = self._storage_circuit_until - time.monotonic()
             logger.warning(
@@ -253,6 +255,37 @@ class SlskdImportMonitor:
         if counters["imported"]:
             await self._save_imported_keys(imported_keys)
         return counters
+
+
+    def _log_roots_if_needed(self, settings: Any) -> None:
+        """Log effective slskd import roots only when the information changes.
+
+        The monitor wakes periodically while Soulseek support is enabled, even
+        when no Soulseek download is active.  Previous builds logged the same
+        completed/incomplete roots on every pass, which looked like Soulseek was
+        doing work or failing while a torrent was downloading.  The monitor still
+        records the root plan for diagnostics, but only on first pass, on change,
+        or as a very low-frequency debug heartbeat.
+        """
+        completed = tuple(str(r) for r in self._download_roots(settings))
+        incomplete = tuple(str(r) for r in self._incomplete_roots(settings))
+        signature = (completed, incomplete)
+        now = time.monotonic()
+        if self._last_roots_signature != signature:
+            verb = "changed" if self._last_roots_signature is not None else "initialized"
+            logger.info(
+                f"Soulseek import monitor roots {verb}: "
+                f"completed={list(completed)} incomplete={list(incomplete)}"
+            )
+            self._last_roots_signature = signature
+            self._last_roots_debug_at = now
+            return
+        if now - self._last_roots_debug_at >= 1800.0:
+            logger.debug(
+                "Soulseek import monitor roots unchanged: "
+                f"completed={list(completed)} incomplete={list(incomplete)}"
+            )
+            self._last_roots_debug_at = now
 
     async def _load_imported_keys(self) -> set[str]:
         try:

@@ -21,7 +21,7 @@ from src.search.base import SearchProvider
 class JackettSearch(SearchProvider):
     """Search Jackett's aggregate JSON API across all configured indexers."""
 
-    def __init__(self, url: str, api_key: str, timeout: float = 30.0) -> None:
+    def __init__(self, url: str, api_key: str, timeout: float = 75.0) -> None:
         """Create a Jackett provider.
 
         Args:
@@ -33,6 +33,12 @@ class JackettSearch(SearchProvider):
         self._url = url.rstrip('/')
         self._api_key = api_key
         self._timeout = timeout
+        # Jackett can legitimately take longer than public scrapers when its
+        # aggregate all-indexer endpoint waits for slow tracker backends. The
+        # aggregator honors this provider-specific cap; otherwise LJS kills the
+        # request at the generic 20s fallback timeout while the same search may
+        # still succeed in the Jackett UI/RSS path.
+        self.timeout_seconds = max(30, int(float(timeout)) + 5)
 
     @property
     def name(self) -> str:
@@ -71,6 +77,9 @@ class JackettSearch(SearchProvider):
             logger.info(f'[Jackett] Found {len(results)} results.')
             self.record_error_category('')
             return results
+        except httpx.TimeoutException as exc:
+            self.record_error_category('timeout')
+            logger.warning(f'[Jackett] Search timed out after {self._timeout}s for query {query!r}; Jackett may be waiting on a slow indexer. Use indexer diagnostics or raise the Jackett/provider timeout.')
         except httpx.ConnectError:
             self.record_error_category('connection')
             logger.error(f'[Jackett] Connection refused — is Jackett running on {self._url}?')

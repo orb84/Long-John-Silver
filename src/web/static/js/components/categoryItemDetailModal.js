@@ -18,6 +18,9 @@ class CategoryItemDetailModal extends Component {
         this.currentCategoryId = null;
         this.currentItemId = null;
         this.manifest = null;
+        this.itemSuggestions = [];
+        this._actionBusy = false;
+        this._actionOverlay = null;
     }
 
     /**
@@ -31,8 +34,13 @@ class CategoryItemDetailModal extends Component {
         this.currentCategoryId = categoryId;
         this.currentItemId = itemId;
         try {
-            this.manifest = await CategoryApiClient.getManifest(categoryId);
-            const itemResponse = await CategoryApiClient.getItem(categoryId, itemId);
+            const [manifest, itemResponse, suggestionResponse] = await Promise.all([
+                CategoryApiClient.getManifest(categoryId),
+                CategoryApiClient.getItem(categoryId, itemId),
+                this._loadSuggestionsForItem(categoryId, itemId)
+            ]);
+            this.manifest = manifest;
+            this.itemSuggestions = suggestionResponse.suggestions || [];
             this.renderItem(itemResponse.item || {});
             if (this.container) this.container.style.display = 'flex';
         } catch (err) {
@@ -73,6 +81,7 @@ class CategoryItemDetailModal extends Component {
         const content = DOM.el('div', { className: 'modal-content glass-panel category-detail-modal' }, [
             this._hero(item),
             this._overview(item),
+            this._suggestionsSection(item),
             this._sections(item),
             DOM.el('div', { className: 'category-detail-footer' }, [
                 DOM.el('button', { className: 'btn btn-secondary category-detail-close-footer', onclick: () => this.close() }, [DOM.el('i', { className: 'fa-solid fa-xmark' }), ' Close'])
@@ -134,6 +143,254 @@ class CategoryItemDetailModal extends Component {
         add('Genres', item.genres);
         return cells.length ? DOM.el('section', { className: 'category-detail-stats' }, cells) : DOM.el('div');
     }
+
+    async _loadSuggestionsForItem(categoryId, itemId) {
+        try {
+            const params = new URLSearchParams();
+            if (categoryId) params.set('category_id', categoryId);
+            if (itemId) params.set('item_id', itemId);
+            const suffix = params.toString() ? `?${params.toString()}` : '';
+            return await APIClient.get(`/api/suggestions${suffix}`);
+        } catch (_) {
+            return { suggestions: [] };
+        }
+    }
+
+    _suggestionsSection(item) {
+        const suggestions = this._sortInspectorSuggestions(this.itemSuggestions || []);
+        const title = 'Suggested next actions';
+        if (!suggestions.length) {
+            return this._panel(title, [
+                DOM.el('p', { className: 'category-detail-suggestions-empty' }, ['No pending suggestions for this item.'])
+            ]);
+        }
+
+        const lead = suggestions.slice(0, 3);
+        const leadIds = new Set(lead.map(s => String(s.id || `${s.action_type}-${s.title}`)));
+        const remaining = suggestions.filter(s => !leadIds.has(String(s.id || `${s.action_type}-${s.title}`)));
+        const counts = this._suggestionCounts(suggestions);
+
+        const children = [
+            DOM.el('div', { className: 'category-detail-suggestion-summary' }, [
+                DOM.el('div', {}, [
+                    DOM.el('strong', {}, [`${suggestions.length} pending suggestion${suggestions.length === 1 ? '' : 's'}`]),
+                    DOM.el('p', { className: 'muted' }, [this._suggestionSummaryText(counts)])
+                ]),
+                DOM.el('button', {
+                    className: 'btn btn-secondary btn-sm',
+                    onclick: () => this._openSuggestionsPanelForCurrentItem(),
+                    title: 'Open the full Suggestions page'
+                }, [DOM.el('i', { className: 'fa-solid fa-list-check' }), ' Full list'])
+            ]),
+            DOM.el('div', { className: 'category-detail-suggestions category-detail-suggestions-lead' }, lead.map(s => this._renderSuggestionAction(s, true)))
+        ];
+
+        if (remaining.length) {
+            children.push(DOM.el('details', { className: 'category-detail-suggestion-overflow' }, [
+                DOM.el('summary', {}, [`More item suggestions (${remaining.length})`]),
+                this._renderSuggestionOverflowGroup('Episode actions', remaining.filter(s => this._isEpisodeSuggestion(s))),
+                this._renderSuggestionOverflowGroup('Upgrade actions', remaining.filter(s => this._isUpgradeSuggestion(s))),
+                this._renderSuggestionOverflowGroup('Other actions', remaining.filter(s => !this._isEpisodeSuggestion(s) && !this._isUpgradeSuggestion(s)))
+            ].filter(Boolean)));
+        }
+
+        return this._panel(title, children);
+    }
+
+    _renderSuggestionOverflowGroup(title, suggestions) {
+        if (!suggestions.length) return null;
+        const shown = suggestions.slice(0, 8);
+        return DOM.el('div', { className: 'category-detail-suggestion-overflow-group' }, [
+            DOM.el('h4', {}, [title]),
+            ...shown.map(s => this._renderSuggestionMiniRow(s)),
+            suggestions.length > shown.length ? DOM.el('p', { className: 'muted' }, [`Showing ${shown.length} of ${suggestions.length}. Use the full Suggestions page for the rest.`]) : null
+        ].filter(Boolean));
+    }
+
+    _renderSuggestionMiniRow(s) {
+        return DOM.el('div', { className: 'category-detail-suggestion-mini-row' }, [
+            DOM.el('div', { className: 'category-detail-suggestion-mini-copy' }, [
+                DOM.el('strong', {}, [s.title || this._suggestionTypeLabel(s.action_type)]),
+                DOM.el('small', { className: 'muted' }, [this._shortSuggestionText(s)])
+            ]),
+            DOM.el('div', { className: 'suggestion-actions' }, [
+                DOM.btn('Approve', 'btn-secondary btn-sm', () => this._approveSuggestion(s)),
+                DOM.btn('Dismiss', 'btn-danger btn-sm', () => this._denySuggestion(s))
+            ])
+        ]);
+    }
+
+    _renderSuggestionAction(s, lead = false) {
+        const evidence = s.evidence || {};
+        const pills = [];
+        if (s.confidence) pills.push(`confidence: ${s.confidence}`);
+        if (evidence.provider_episode_count !== undefined) pills.push(`${evidence.provider_episode_count} aired`);
+        if (evidence.downloaded_episode_count !== undefined) pills.push(`${evidence.downloaded_episode_count} local`);
+        if (evidence.missing_episode_count !== undefined) pills.push(`${evidence.missing_episode_count} missing`);
+        if (evidence.current_quality && evidence.target_quality) pills.push(`${evidence.current_quality} → ${evidence.target_quality}`);
+        const className = lead ? 'suggestion-action-card suggestion-action-card-lead' : 'suggestion-action-card';
+        return DOM.el('div', { className }, [
+            DOM.el('div', { className: 'suggestion-action-copy' }, [
+                DOM.el('strong', {}, [s.title || this._suggestionTypeLabel(s.action_type)]),
+                DOM.el('p', { className: 'muted' }, [s.description || s.explanation || 'Suggested category action.']),
+                pills.length ? DOM.el('div', { className: 'suggestion-evidence-pills' }, pills.slice(0, 5).map(text => DOM.el('span', { className: 'pill pill-subtle' }, [text]))) : null
+            ].filter(Boolean)),
+            DOM.el('div', { className: 'suggestion-actions' }, [
+                DOM.btn('Approve', 'btn-gold btn-sm', () => this._approveSuggestion(s)),
+                DOM.btn('Dismiss', 'btn-danger btn-sm', () => this._denySuggestion(s))
+            ])
+        ]);
+    }
+
+    _sortInspectorSuggestions(suggestions) {
+        const rank = (s) => {
+            const type = String(s.action_type || '');
+            if (type.includes('latest') || type.includes('frontier')) return 0;
+            if (type.includes('next')) return 1;
+            if (type.includes('all') || type.includes('remaining') || type.includes('season')) return 2;
+            if (type.includes('upgrade')) return 3;
+            if (type.includes('missing_episode')) return 4;
+            return 5;
+        };
+        return [...suggestions].sort((a, b) => {
+            const byRank = rank(a) - rank(b);
+            if (byRank !== 0) return byRank;
+            return Number(b.priority || 0) - Number(a.priority || 0);
+        });
+    }
+
+    _suggestionCounts(suggestions) {
+        return suggestions.reduce((acc, s) => {
+            if (this._isEpisodeSuggestion(s)) acc.episodes += 1;
+            else if (this._isUpgradeSuggestion(s)) acc.upgrades += 1;
+            else acc.other += 1;
+            return acc;
+        }, { episodes: 0, upgrades: 0, other: 0 });
+    }
+
+    _suggestionSummaryText(counts) {
+        const parts = [];
+        if (counts.episodes) parts.push(`${counts.episodes} episode action${counts.episodes === 1 ? '' : 's'}`);
+        if (counts.upgrades) parts.push(`${counts.upgrades} upgrade${counts.upgrades === 1 ? '' : 's'}`);
+        if (counts.other) parts.push(`${counts.other} other`);
+        return parts.join(' · ') || 'Pending category actions';
+    }
+
+    _isEpisodeSuggestion(s) {
+        const type = String(s.action_type || '');
+        return type.includes('episode') || type.includes('season') || type.includes('frontier') || type.includes('missing') || type.includes('next');
+    }
+
+    _isUpgradeSuggestion(s) {
+        return String(s.action_type || '').includes('upgrade');
+    }
+
+    _shortSuggestionText(s) {
+        const text = s.description || s.explanation || this._suggestionTypeLabel(s.action_type) || '';
+        return text.length > 120 ? `${text.slice(0, 117).trim()}…` : text;
+    }
+
+    _suggestionTypeLabel(type) {
+        const labels = {
+            download_latest_frontier: 'Download latest episode',
+            download_next: 'Download next episode',
+            download_all_missing: 'Download all missing episodes',
+            download_remaining_next: 'Download remaining episodes',
+            missing_episode: 'Download missing episode',
+            quality_upgrade: 'Upgrade quality',
+            new_season: 'New season available'
+        };
+        return labels[type] || type || 'Suggested action';
+    }
+
+    _openSuggestionsPanelForCurrentItem() {
+        this.close();
+        const target = document.querySelector('[data-view="suggestions"], [data-tab="suggestions"], #nav-suggestions, a[href="#suggestions"]');
+        if (target && typeof target.click === 'function') target.click();
+        else if (window.viewManager && typeof window.viewManager.show === 'function') window.viewManager.show('suggestions');
+    }
+
+    async _approveSuggestion(s) {
+        if (!s || !s.id) return;
+        return this._runLockedItemAction(`Processing “${s.title || s.action_type || 'suggestion'}”…`, async () => {
+            const response = await APIClient.post(`/api/suggestions/${s.id}/approve`);
+            const receipt = response && response.receipt ? response.receipt : null;
+            const message = response?.message || receipt?.user_message || receipt?.message || 'Suggestion action submitted';
+            if (receipt?.status === 'partial' || receipt?.status === 'failed' || response?.queued === false || response?.ok === false) {
+                toast.show(message, receipt?.status === 'failed' || response?.ok === false ? 'err' : 'warning');
+            } else {
+                toast.show(message);
+            }
+            await this._refreshCurrentItem();
+            if (window.suggestionManager) window.suggestionManager.load({ force: true });
+            if (window.downloads) downloads.load();
+        });
+    }
+
+    async _denySuggestion(s) {
+        if (!s || !s.id) return;
+        return this._runLockedItemAction('Dismissing suggestion…', async () => {
+            await APIClient.post(`/api/suggestions/${s.id}/deny`);
+            toast.show('Dismissed');
+            await this._refreshCurrentItem();
+            if (window.suggestionManager) window.suggestionManager.load({ force: true });
+        });
+    }
+
+    async _refreshCurrentItem() {
+        if (!this.currentCategoryId || !this.currentItemId) return;
+        const [itemResponse, suggestionResponse] = await Promise.all([
+            CategoryApiClient.getItem(this.currentCategoryId, this.currentItemId),
+            this._loadSuggestionsForItem(this.currentCategoryId, this.currentItemId)
+        ]);
+        this.itemSuggestions = suggestionResponse.suggestions || [];
+        this.renderItem(itemResponse.item || {});
+    }
+
+    async _runLockedItemAction(message, task) {
+        if (this._actionBusy) {
+            toast.show('An item suggestion action is already running.', 'warning');
+            return null;
+        }
+        this._setItemActionBusy(true, message);
+        try {
+            return await task();
+        } catch (e) {
+            toast.error(e && e.message ? e.message : 'Suggestion action failed');
+            return null;
+        } finally {
+            this._setItemActionBusy(false);
+        }
+    }
+
+    _setItemActionBusy(isBusy, message = 'Processing suggestion action…') {
+        this._actionBusy = Boolean(isBusy);
+        const modal = this.container ? this.container.querySelector('.category-detail-modal') : null;
+        if (this._actionBusy) {
+            if (modal) modal.classList.add('is-action-busy');
+            if (!this._actionOverlay) {
+                this._actionOverlay = DOM.el('div', { className: 'category-detail-action-overlay', role: 'status', 'aria-live': 'polite' }, [
+                    DOM.el('div', { className: 'suggestion-action-overlay-card' }, [
+                        DOM.el('i', { className: 'fa-solid fa-spinner suggestion-action-spinner' }),
+                        DOM.el('strong', { className: 'suggestion-action-overlay-title' }, ['Working on it…']),
+                        DOM.el('p', { className: 'suggestion-action-overlay-message' }, [message]),
+                        DOM.el('small', {}, ['The item inspector is locked until this action finishes.'])
+                    ])
+                ]);
+                document.body.appendChild(this._actionOverlay);
+            } else {
+                const msg = this._actionOverlay.querySelector('.suggestion-action-overlay-message');
+                if (msg) msg.textContent = message;
+            }
+            return;
+        }
+        if (modal) modal.classList.remove('is-action-busy');
+        if (this._actionOverlay) {
+            this._actionOverlay.remove();
+            this._actionOverlay = null;
+        }
+    }
+
 
     _sections(item) {
         const sectionNodes = [];

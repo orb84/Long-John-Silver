@@ -137,46 +137,68 @@ class SearchPipeline:
             preferred_language=target_lang,
         )
 
+        primary_timed_out = False
         if not results:
-            logger.info(f'Search: no results for {query}')
-            return None
+            primary_timed_out = self._last_provider_search_timed_out()
+            if primary_timed_out:
+                logger.warning(
+                    f'Search: provider timed out for {query}; skipping query-ladder fan-out for this attempt so one slow Jackett/indexer backend does not freeze the UI for minutes.'
+                )
+            else:
+                logger.info(f'Search: no primary results for {query}; trying category alternatives when available')
+        else:
+            # Step 1: category-owned pre-filter. The pipeline does not parse the
+            # opaque unit label; it asks the category whether the candidate matches.
+            validated = self._validate_results_for_request(results, category, item, episode_label)
 
-        # Step 1: category-owned pre-filter. The pipeline does not parse the
-        # opaque unit label; it asks the category whether the candidate matches.
-        validated: list[SearchResult] = []
-        for r in results:
-            if r.magnet and r.quality_score >= 0.5:
-                if category and not category.validate_search_result_for_request(r, item, episode_label):
-                    continue
-                validated.append(r)
+            # Step 2: Route to LLM or return based on mode
+            if mode == 'fast' and validated:
+                return validated[0]
 
-        # Step 2: Route to LLM or return based on mode
-        if mode == 'fast':
-            return validated[0] if validated else None
+            if mode == 'llm' and validated:
+                # Return validated candidates for LLM agent to review. If LLM
+                # selection service is available, use it to rank.
+                if self._torrent_selection:
+                    ranked = await self._safe_llm_rank(validated, item, episode_label or '', target_lang)
+                    return ranked or validated
+                return validated
 
-        if mode == 'llm':
-            # Return validated candidates for LLM agent to review
-            # If LLM selection service is available, use it to rank
-            if self._torrent_selection and validated:
-                ranked = await self._safe_llm_rank(validated, item, episode_label or '', target_lang)
-                return ranked or validated
-            return validated if validated else None
+            # mode == 'auto': candidates are structurally relevant, but the
+            # owning category may still prefer LLM evaluation for nuanced
+            # release choice (for example exact TV episodes vs season packs,
+            # language uncertainty, source health, and size tradeoffs).
+            if mode == 'auto' and validated:
+                if self._should_llm_rank_validated(category, item, episode_label, mode, validated):
+                    ranked = await self._safe_llm_rank(validated, item, episode_label or '', target_lang)
+                    if ranked:
+                        return ranked[0]
+                return validated[0]
 
-        # mode == 'auto': return best match, with LLM fallback
-        if validated:
-            return validated[0]
+            # LLM fallback when regex found nothing.  This remains inside the
+            # non-empty branch: if the provider returned zero rows, the useful
+            # next step is the category's query ladder, not asking the LLM to
+            # rank an empty set.
+            if self._torrent_selection and results and mode == 'auto':
+                logger.info(f'Search: regex found no match for {query}, trying LLM selection')
+                ranked = await self._safe_llm_rank(results, item, episode_label or '', target_lang)
+                if ranked:
+                    return ranked[0]
 
-        # LLM fallback when regex found nothing
-        if self._torrent_selection and results:
-            logger.info(f'Search: regex found no match for {query}, trying LLM selection')
-            ranked = await self._safe_llm_rank(results, item, episode_label or '', target_lang)
-            if ranked:
-                return ranked[0]
-
-        # Try alternative queries if primary search failed
-        if category and episode_label:
+        # Try alternative queries after either an empty primary query or a
+        # non-empty primary result set with no category-valid candidate.  This
+        # is important for media categories where language is a preference and
+        # ranking facet: a strict first query such as "Show S05E10 ITA" may
+        # return zero even though the exact episode exists under bare/MULTI
+        # titles that should be presented or require confirmation.
+        if category and episode_label and not primary_timed_out:
             alt_queries = category.build_alternative_search_queries(item, episode_label, target_lang)
+            seen_queries = {query.strip().casefold()}
+            alt_validated: list[SearchResult] = []
             for alt_query in alt_queries:
+                alt_query = str(alt_query or "").strip()
+                if not alt_query or alt_query.casefold() in seen_queries:
+                    continue
+                seen_queries.add(alt_query.casefold())
                 logger.info(f'Search: trying alternative query: {alt_query}')
                 alt_results = await self._aggregator.search(
                     alt_query, category=category_id,
@@ -186,27 +208,47 @@ class SearchPipeline:
                 if not alt_results:
                     continue
 
-                # Regex pre-filter on alternative results
-                for r in alt_results:
-                    if r.magnet and r.quality_score >= 0.5:
-                        if category and not category.validate_search_result_for_request(r, item, episode_label):
-                            continue
-                        logger.info(f'Search: alternative query found match: {r.title}')
-                        return r
-
-                # LLM fallback for alternative results
-                if self._torrent_selection:
+                validated = self._validate_results_for_request(alt_results, category, item, episode_label)
+                if not validated and self._torrent_selection and mode == 'auto':
                     ranked = await self._safe_llm_rank(alt_results, item, episode_label or '', target_lang)
                     if ranked:
+                        logger.info(f'Search: alternative query selected LLM match from {alt_query}')
                         return ranked[0]
+                    continue
 
-        logger.info(f'Search: no suitable results found for {query}')
+                if not validated:
+                    continue
+
+                if mode == 'llm':
+                    alt_validated.extend(validated)
+                    continue
+
+                if self._should_llm_rank_validated(category, item, episode_label, mode, validated):
+                    ranked = await self._safe_llm_rank(validated, item, episode_label or '', target_lang)
+                    if ranked:
+                        logger.info(f'Search: alternative query selected LLM-ranked match from {alt_query}: {ranked[0].title}')
+                        return ranked[0]
+                logger.info(f'Search: alternative query found match: {validated[0].title}')
+                return validated[0]
+
+            if mode == 'llm' and alt_validated:
+                if self._torrent_selection:
+                    ranked = await self._safe_llm_rank(alt_validated, item, episode_label or '', target_lang)
+                    return ranked or alt_validated
+                return alt_validated
+
+        if primary_timed_out:
+            logger.warning(f'Search: no suitable results found for {query} because the primary provider timed out before returning candidates.')
+        else:
+            logger.info(f'Search: no suitable results found for {query}')
         return None
 
     @staticmethod
     def _normalize_category_search_language(category: object | None, language: str | None, *, explicit: bool = False) -> str | None:
         """Return the category-approved search language, if any."""
         value = str(language or "").strip()
+        if "," in value:
+            value = next((part.strip() for part in value.split(",") if part.strip()), "")
         if not value:
             return None
         normalizer = getattr(category, "normalize_search_language", None)
@@ -234,6 +276,66 @@ class SearchPipeline:
         if category and hasattr(category, 'build_alternative_search_queries'):
             return category.build_alternative_search_queries(item, episode_label, language)
         return []
+
+    def _should_llm_rank_validated(
+        self,
+        category: object | None,
+        item: CategoryItem,
+        episode_label: str | None,
+        mode: str,
+        validated: list[SearchResult],
+    ) -> bool:
+        """Ask the category whether structurally valid candidates still need LLM choice.
+
+        The deterministic layer should only prove that candidates are plausible
+        for the requested category unit. It should not pretend to know all
+        release-group, bundle, language, and per-file tradeoffs. Categories can
+        opt in to LLM selection while keeping generic search category-agnostic.
+        """
+        if not self._torrent_selection or len(validated) <= 1:
+            return False
+        decider = getattr(category, "prefer_llm_search_selection", None)
+        if not callable(decider):
+            return False
+        try:
+            return bool(decider(item=item, unit_label=episode_label, mode=mode, candidates=validated))
+        except TypeError:
+            try:
+                return bool(decider(item, episode_label, mode))
+            except Exception:
+                return False
+        except Exception as exc:
+            logger.debug(f"Category LLM search-selection preference failed for {getattr(item, 'key', '?')}: {exc}")
+            return False
+
+    def _last_provider_search_timed_out(self) -> bool:
+        """Return whether the most recent aggregate provider search timed out."""
+        checker = getattr(self._aggregator, "last_search_timed_out", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        diagnostics = getattr(self._aggregator, "provider_diagnostics", {})
+        if callable(diagnostics):
+            try:
+                diagnostics = diagnostics()
+            except Exception:
+                diagnostics = {}
+        return any("timeout" in str(getattr(diag, "error", "") or "").casefold() for diag in (diagnostics or {}).values())
+
+
+    @staticmethod
+    def _validate_results_for_request(results: list[SearchResult], category: object | None, item: CategoryItem, episode_label: str | None) -> list[SearchResult]:
+        """Apply structural and category-owned request validation to provider results."""
+        validated: list[SearchResult] = []
+        for result in results:
+            if not result.magnet or result.quality_score < 0.5:
+                continue
+            if category and not category.validate_search_result_for_request(result, item, episode_label):
+                continue
+            validated.append(result)
+        return validated
 
     def _effective_quality_profile(self, item: CategoryItem) -> QualityProfile | None:
         """Return the item's quality profile with a safe global resolution floor.
@@ -372,6 +474,17 @@ class SearchPipeline:
             logger.info(f'Discovery: no suitable results for {item.key} {episode_label or ""}')
             return False
 
+        if category and hasattr(category, "candidate_requires_user_language_confirmation"):
+            try:
+                if category.candidate_requires_user_language_confirmation(best, item, episode_label, lang):
+                    logger.info(
+                        f'Discovery: refusing to queue {best.title} for {item.key} {episode_label or ""}; '
+                        f'candidate does not match preferred language {lang!r} and needs user approval.'
+                    )
+                    return False
+            except Exception as exc:
+                logger.debug(f"Discovery language-confirmation check failed for {item.key}: {exc}")
+
         logger.info(f'Discovery: triggering download for {best.title}')
 
         descriptor = category.unit_descriptor_from_search_result(best, item, episode_label) if category and hasattr(category, "unit_descriptor_from_search_result") else {}
@@ -384,7 +497,7 @@ class SearchPipeline:
 
         query = _build_query(item, episode_label, getattr(item, 'language', ''), category)
 
-        reason = f"Manual discovery for {query}" if force else f"Auto-discovery for {query}"
+        reason = f"user approved discovery for {query}" if force else f"Auto-discovery for {query}"
         priority = DownloadPriority.HIGH if force else DownloadPriority.NORMAL
         await self._downloader.add_magnet(
             magnet_link=best.magnet,

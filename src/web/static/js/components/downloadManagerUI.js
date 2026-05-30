@@ -20,6 +20,7 @@ class DownloadManager extends Component {
         this.downloads = new Map();
         this._pollTimer = null;
         this._expandedFilePanels = new Set();
+        this._statMemory = new Map();
         
         if (this.gridContainer) {
             this._init();
@@ -72,6 +73,38 @@ class DownloadManager extends Component {
         this.render();
     }
 
+    _smoothIncomingStats(id, current, stats) {
+        const merged = { ...(stats || {}) };
+        const now = Date.now();
+        const mem = this._statMemory.get(id) || {};
+        const status = String((merged.status || current.status || '')).toLowerCase();
+        const rawRate = Number(merged.download_rate || 0);
+        if (rawRate > 0) {
+            mem.lastNonZeroRate = rawRate;
+            mem.lastNonZeroAt = now;
+            merged.display_download_rate = rawRate;
+        } else if (status === 'downloading' && mem.lastNonZeroRate && (now - mem.lastNonZeroAt) < 9000) {
+            // UI-only grace window for libtorrent's bursty zero samples. The
+            // backend still tracks byte progress and true stalls independently.
+            merged.display_download_rate = Math.max(0, mem.lastNonZeroRate * 0.6);
+        } else {
+            merged.display_download_rate = rawRate;
+        }
+        this._statMemory.set(id, mem);
+        return merged;
+    }
+
+    _swarmDisplay(dl) {
+        const liveSeeds = Number(dl.num_seeds || 0);
+        const sourceSeeders = dl.source_seeders != null ? Number(dl.source_seeders || 0) : 0;
+        const scrapeSeeds = Math.max(Number(dl.num_complete || 0), Number(dl.list_seeds || 0));
+        if (dl.display_seeders != null) return { seeds: Number(dl.display_seeders || 0), basis: dl.display_seeders_basis || 'display' };
+        if (liveSeeds > 0) return { seeds: liveSeeds, basis: 'connected' };
+        if (scrapeSeeds > 0) return { seeds: scrapeSeeds, basis: 'tracker' };
+        if (sourceSeeders > 0) return { seeds: sourceSeeders, basis: 'source' };
+        return { seeds: 0, basis: 'none' };
+    }
+
     /**
      * Update progress and speed values in real-time.
      * @private
@@ -81,9 +114,11 @@ class DownloadManager extends Component {
         const dl = this.downloads.get(id);
         const hadFiles = Array.isArray(dl.files) && dl.files.length > 0;
         const oldStatus = dl.status;
+        stats = this._smoothIncomingStats(id, dl, stats);
         Object.assign(dl, stats);
         if (!['downloading', 'seeding'].includes(String(dl.status || '').toLowerCase())) {
             dl.download_rate = 0;
+            dl.display_download_rate = 0;
             dl.upload_rate = 0;
             dl.eta_seconds = 0;
         }
@@ -402,7 +437,7 @@ class DownloadManager extends Component {
         }
         
         // Download rate
-        const speedVal = (dl.download_rate / 1024).toFixed(0);
+        const speedVal = ((dl.display_download_rate != null ? dl.display_download_rate : dl.download_rate) / 1024).toFixed(0);
         meta.appendChild(DOM.el('span', { className: 'dl-speed' }, [
             DOM.el('i', { className: 'fa-solid fa-arrow-down' }),
             ` ${speedVal} kB/s`
@@ -421,17 +456,19 @@ class DownloadManager extends Component {
         const liveSeeds = dl.num_seeds || 0;
         const sourceSeeders = dl.source_seeders;
         const sourceText = sourceSeeders != null ? ` · src ${sourceSeeders}` : '';
+        const swarm = this._swarmDisplay(dl);
+        const basisLabel = swarm.basis === 'source' ? 'source snapshot' : (swarm.basis === 'tracker' ? 'tracker scrape' : 'connected');
         meta.appendChild(DOM.el('span', {
             className: 'dl-peers dl-swarm',
             style: { marginLeft: '8px' },
             title: isSoulseek
                 ? 'Soulseek is peer-to-peer through one remote user/queue, not a torrent swarm.'
                 : (sourceSeeders != null
-                    ? `Live seeds/peers from libtorrent. Source seeders (${sourceSeeders}) were reported by the indexer when selected.`
-                    : 'Live seeds/peers from libtorrent.')
+                    ? `Displayed seeds use ${basisLabel}. Connected seeds: ${liveSeeds}. Source seeders (${sourceSeeders}) were reported by the indexer when selected.`
+                    : `Displayed seeds use ${basisLabel}. Connected seeds: ${liveSeeds}.`)
         }, [
             DOM.el('i', { className: 'fa-solid fa-users' }),
-            isSoulseek ? ` user ${dl.slskd_username || 'unknown'}` : ` seeds ${liveSeeds} · peers ${peers}${sourceText}`
+            isSoulseek ? ` user ${dl.slskd_username || 'unknown'}` : ` seeds ${swarm.seeds} · peers ${peers}${sourceText}`
         ]));
 
         // ETA

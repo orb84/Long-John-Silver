@@ -90,11 +90,14 @@ class TvSuggestionWorkflow:
         audit_payload = {**library_evidence, **provider_evidence}
         self._log_missing_episode_audit(tv_item, audit_payload)
 
+        frontier_keys = set()
         if missing and tv_item.is_episodic:
             missing.sort()
             suggestions.extend(self._download_batch_suggestions(tv_item, missing, downloaded_set, now, audit_payload))
+            frontier_keys = {tuple(row[:2]) for row in self._frontier_missing_episodes(missing, downloaded_set)}
 
         for season, episode, title_hint in missing:
+            is_frontier = (season, episode) in frontier_keys
             metadata = self._missing_episode_metadata(
                 tv_item,
                 missing=[(season, episode, title_hint)],
@@ -111,9 +114,9 @@ class TvSuggestionWorkflow:
                 endpoint=f"/api/categories/tv/items/{tv_item.key}/actions/download_specific_episode",
                 method="POST",
                 body_json=json.dumps({"season": season, "episode": episode}),
-                priority=80,
+                priority=88 if is_frontier else 45,
                 status="pending",
-                metadata_json=json.dumps({**metadata, "season": season, "episode": episode}, ensure_ascii=False),
+                metadata_json=json.dumps({**metadata, "season": season, "episode": episode, "frontier_episode": is_frontier}, ensure_ascii=False),
                 created_at=now,
             ))
 
@@ -155,6 +158,25 @@ class TvSuggestionWorkflow:
             ))
         return suggestions
 
+
+    @staticmethod
+    def _frontier_missing_episodes(
+        missing: list[tuple[int, int, str]],
+        downloaded_set: set[tuple[int, int]],
+    ) -> list[tuple[int, int, str]]:
+        """Return missing episodes after the latest local episode.
+
+        Old historical gaps are still suggestions, but they must not bury the
+        newly aired/current-season frontier that users usually care about.
+        """
+        if not missing or not downloaded_set:
+            return []
+        latest_season = max(season for season, _ in downloaded_set)
+        latest_episode = max(episode for season, episode in downloaded_set if season == latest_season)
+        frontier = [row for row in missing if row[0] > latest_season or (row[0] == latest_season and row[1] > latest_episode)]
+        frontier.sort()
+        return frontier
+
     def _download_batch_suggestions(
         self,
         item: CategoryItem,
@@ -165,28 +187,53 @@ class TvSuggestionWorkflow:
     ) -> list[SuggestedActionRecord]:
         """Build TV missing-episode batch suggestions with explicit rationale."""
         suggestions: list[SuggestedActionRecord] = []
-        next_episode = missing[0]
+        frontier = self._frontier_missing_episodes(missing, downloaded_set)
+        if frontier:
+            latest = frontier[0]
+            latest_metadata = self._missing_episode_metadata(
+                item,
+                missing=[latest],
+                evidence=evidence,
+                reason_code="latest_frontier_episode",
+            )
+            suggestions.append(SuggestedActionRecord(
+                category_id="tv",
+                item_id=item.key,
+                item_name=item.key,
+                action_type="download_latest_frontier",
+                title=f"Download latest: S{latest[0]:02d}E{latest[1]:02d}",
+                description=latest_metadata["explanation"],
+                endpoint=f"/api/categories/tv/items/{item.key}/actions/download_specific_episode",
+                method="POST",
+                body_json=json.dumps({"season": latest[0], "episode": latest[1]}),
+                priority=120,
+                status="pending",
+                metadata_json=json.dumps({**latest_metadata, "frontier_episode": True}, ensure_ascii=False),
+                created_at=now,
+            ))
+        next_episode = frontier[0] if frontier else missing[0]
         next_metadata = self._missing_episode_metadata(
             item,
             missing=[next_episode],
             evidence=evidence,
-            reason_code="next_missing_episode",
+            reason_code="next_missing_episode" if frontier else "oldest_missing_episode",
         )
-        suggestions.append(SuggestedActionRecord(
-            category_id="tv",
-            item_id=item.key,
-            item_name=item.key,
-            action_type="download_next",
-            title=f"Download Next: S{next_episode[0]:02d}E{next_episode[1]:02d}",
-            description=next_metadata["explanation"],
-            endpoint=f"/api/categories/tv/items/{item.key}/actions/download_specific_episode",
-            method="POST",
-            body_json=json.dumps({"season": next_episode[0], "episode": next_episode[1]}),
-            priority=95,
-            status="pending",
-            metadata_json=json.dumps(next_metadata, ensure_ascii=False),
-            created_at=now,
-        ))
+        if not frontier:
+            suggestions.append(SuggestedActionRecord(
+                category_id="tv",
+                item_id=item.key,
+                item_name=item.key,
+                action_type="download_next",
+                title=f"Download oldest missing: S{next_episode[0]:02d}E{next_episode[1]:02d}",
+                description=next_metadata["explanation"],
+                endpoint=f"/api/categories/tv/items/{item.key}/actions/download_specific_episode",
+                method="POST",
+                body_json=json.dumps({"season": next_episode[0], "episode": next_episode[1]}),
+                priority=55,
+                status="pending",
+                metadata_json=json.dumps(next_metadata, ensure_ascii=False),
+                created_at=now,
+            ))
         if len(missing) > 1:
             batch_metadata = self._missing_episode_metadata(
                 item,
@@ -204,7 +251,7 @@ class TvSuggestionWorkflow:
                 endpoint=f"/api/categories/tv/items/{item.key}/actions/download_missing_batch",
                 method="POST",
                 body_json=json.dumps({"episodes": [[row[0], row[1]] for row in missing]}),
-                priority=90,
+                priority=40,
                 status="pending",
                 metadata_json=json.dumps(batch_metadata, ensure_ascii=False),
                 created_at=now,
@@ -229,7 +276,7 @@ class TvSuggestionWorkflow:
                 endpoint=f"/api/categories/tv/items/{item.key}/actions/download_missing_batch",
                 method="POST",
                 body_json=json.dumps({"episodes": [[row[0], row[1]] for row in remaining_next]}),
-                priority=92,
+                priority=105,
                 status="pending",
                 metadata_json=json.dumps(remaining_metadata, ensure_ascii=False),
                 created_at=now,

@@ -138,6 +138,281 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
 
 
 
+    def build_search_query(self, item: Any, unit_label: str | None, language: str | None) -> str:
+        """Return the first TV torrent query for a specific unit.
+
+        For TV episodes, language is mostly a ranking/confirmation facet, not a
+        safe hard search term.  The provider query starts broad enough to find
+        the exact SxxEyy release; language-specific variants live in the TV
+        alternative ladder and final queueing still enforces the preferred
+        media-language policy.
+        """
+        title = str(getattr(item, "key", "") or "").strip()
+        label = str(unit_label or "").strip()
+        return f"{title} {label}".strip() if label else title
+
+    def build_alternative_search_queries(self, item: Any, unit_label: str | None, language: str | None) -> list[str]:
+        """Return TV-owned fallback queries for exact episode searches.
+
+        This deliberately tries bare exact forms before language-tagged forms:
+        indexers often list TV releases as WEB/ATVP/GRACE/Kitsune/EZTV without
+        an ``ITA`` token even when the episode is real.  Preferred language is
+        still passed to ranking and final confirmation checks.
+        """
+        title = str(getattr(item, "key", "") or "").strip()
+        label = str(unit_label or "").strip()
+        if not title or not label:
+            return []
+        season, episode = self._unit_coordinates(label)
+        if not season or not episode:
+            return []
+        dotted_title = re.sub(r"\s+", ".", title)
+        base_queries = [
+            f"{title} S{season:02d}E{episode:02d}",
+            f"{dotted_title}.S{season:02d}E{episode:02d}",
+            f"{title} {season}x{episode:02d}",
+            f"{title} S{season:02d}E{episode:02d} 1080p",
+            f"{title} S{season:02d}E{episode:02d} 720p",
+            # Exact-episode releases are not always published separately. Keep
+            # season-pack schemas in the episode ladder so a single requested
+            # episode can be file-selected from inside a torrent bundle.
+            f"{title} S{season:02d}",
+            f"{dotted_title}.S{season:02d}",
+            f"{title} Season {season}",
+            f"{title} S{season:02d} Complete",
+            f"{title} Season {season} Complete",
+            f"{title} S{season:02d} Pack",
+        ]
+        language_queries: list[str] = []
+        preferred = str(language or "").strip()
+        if preferred:
+            for query in [base_queries[0], base_queries[3]]:
+                tagged = self._append_search_language(query, preferred)
+                if tagged != query:
+                    language_queries.append(tagged)
+            language_queries.append(f"{base_queries[0]} MULTI")
+        seen: set[str] = set()
+        out: list[str] = []
+        for query in [*base_queries, *language_queries]:
+            normalized = query.casefold().strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                out.append(query.strip())
+        return out
+
+    def validate_search_result_for_request(self, result: Any, item: Any, unit_label: str | None) -> bool:
+        """Validate that a TV candidate can satisfy the requested unit.
+
+        Exact SxxEyy files are preferred, but a specific episode may only be
+        available inside a season/series pack.  The TV category therefore treats
+        a pack as structurally valid when its own pack parser says the requested
+        episode could be contained in it.  Selection/downloading then relies on
+        LLM ranking plus selective torrent-file priorities rather than pretending
+        a title regex can fully evaluate the release.
+        """
+        requested_season, requested_episode = self._unit_coordinates(str(unit_label or ""))
+        if not requested_season or not requested_episode:
+            return super().validate_search_result_for_request(result, item, unit_label)
+        title = str(getattr(result, "title", "") or "")
+        if not self._title_matches_requested_series(title, str(getattr(item, "key", "") or "")):
+            return False
+        candidate_season, candidate_episode = self._unit_coordinates(title)
+        if candidate_season == requested_season and candidate_episode == requested_episode:
+            return True
+        return self._bundle_contains_episode(title, requested_season, requested_episode)
+
+    def prefer_llm_search_selection(self, *, item: Any, unit_label: str | None, mode: str, candidates: list[Any]) -> bool:
+        """TV wants the LLM to choose among plausible episode releases.
+
+        Deterministic TV checks only establish structural plausibility: exact
+        episode, candidate season pack, obvious blacklist rejection, and so on.
+        The final choice should consider title nuance, seeders, language
+        evidence, source health, exact-vs-pack tradeoffs, and whether a selective
+        file download is needed.
+        """
+        return bool(unit_label and mode in {"auto", "llm"} and len(candidates or []) > 1)
+
+    def download_coordinates_from_search_result(self, result: Any, item: Any, unit_label: str | None) -> dict[str, Any]:
+        """Return category-owned season/episode coordinates for a selected TV result."""
+        descriptor = self.unit_descriptor_from_search_result(result, item, unit_label)
+        coordinates = descriptor.get("coordinates") if isinstance(descriptor.get("coordinates"), dict) else {}
+        return dict(coordinates or {})
+
+    def unit_descriptor_from_agent_args(self, *, season: int | None = None, episode: int | None = None, **_: Any) -> dict[str, Any]:
+        """Return a TV episode/season descriptor from assistant arguments."""
+        season_i = self._safe_positive_int(season)
+        episode_i = self._safe_positive_int(episode)
+        if season_i and episode_i:
+            label = f"S{season_i:02d}E{episode_i:02d}"
+            return {
+                "granularity": "episode",
+                "label": label,
+                "stable_key": label,
+                "sort_key": [season_i, episode_i],
+                "coordinates": {"season": season_i, "episode": episode_i},
+            }
+        if season_i:
+            label = f"Season {season_i}"
+            return {
+                "granularity": "season",
+                "label": label,
+                "stable_key": f"S{season_i:02d}",
+                "sort_key": [season_i, 0],
+                "coordinates": {"season": season_i},
+            }
+        return {"granularity": "item", "label": "", "coordinates": {}}
+
+    def unit_descriptor_from_search_result(self, result: Any, item: Any, unit_label: str | None) -> dict[str, Any]:
+        """Return the requested TV unit descriptor carried into download/import state."""
+        season, episode = self._unit_coordinates(str(unit_label or ""))
+        if not season or not episode:
+            parsed = self.parse_name(str(getattr(result, "title", "") or ""))
+            season = self._safe_positive_int(parsed.season) or season
+            episode = self._safe_positive_int(parsed.episode) or episode
+        return self.unit_descriptor_from_agent_args(season=season, episode=episode)
+
+    def torrent_bundle_candidate_context(self, result: Any, item: Any | None = None, unit_label: str | None = None) -> dict[str, Any] | None:
+        """Annotate TV candidates that are season/series bundles."""
+        title = str(getattr(result, "title", "") or "")
+        pack = TVBundleKnowledge.detect_season_pack(title)
+        if not pack:
+            return None
+        requested_season, requested_episode = self._unit_coordinates(str(unit_label or ""))
+        context = dict(pack)
+        context["category"] = self.category_id
+        context["is_bundle"] = True
+        context["bundle_type"] = str(pack.get("pack_type") or "tv_pack")
+        context["bundle_kind"] = "tv_season_pack"
+        if requested_season:
+            context["requested_season"] = requested_season
+        if requested_episode:
+            context["requested_episode"] = requested_episode
+            context["contains_requested_unit"] = self._bundle_contains_episode(title, requested_season, requested_episode)
+            context["selective_download_required"] = True
+        count = self._bundle_episode_count_hint(pack, title)
+        if count:
+            context["unit_count"] = count
+        return {key: value for key, value in context.items() if value not in (None, "", [], {})}
+
+    def estimate_bundle_unit_size_mb(
+        self,
+        *,
+        total_size_bytes: int,
+        title: str,
+        bundle_context: dict[str, Any] | None = None,
+        target_descriptor: dict[str, Any] | None = None,
+    ) -> float:
+        """Estimate useful per-episode size for TV pack candidates."""
+        context = bundle_context or {}
+        count = self._safe_positive_int(context.get("unit_count"))
+        if count:
+            return (total_size_bytes / (1024 * 1024)) / count
+        return TVBundleKnowledge.estimate_per_episode_size_mb(total_size_bytes, title)
+
+    def unit_descriptor_from_file(self, file_path: str, parsed: Any | None = None, item_descriptor: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Describe one torrent payload file as a TV episode when possible."""
+        parsed = parsed or self.parse_name(Path(file_path).stem)
+        season = self._safe_positive_int(getattr(parsed, "season", None))
+        episode = self._safe_positive_int(getattr(parsed, "episode", None))
+        if season and episode:
+            return self.unit_descriptor_from_agent_args(season=season, episode=episode)
+        # Torrent file names inside a Season folder often omit Sxx and only keep
+        # Eyy.  Use the category-owned season folder parser as a local hint.
+        folder_season = self._season_from_path(file_path)
+        episode_only = self._episode_from_path(file_path)
+        if folder_season and episode_only:
+            return self.unit_descriptor_from_agent_args(season=folder_season, episode=episode_only)
+        return super().unit_descriptor_from_file(file_path, parsed, item_descriptor)
+
+    def torrent_file_matches_target(
+        self,
+        *,
+        file_path: str,
+        parsed: Any | None,
+        file_descriptor: dict[str, Any],
+        target_descriptors: list[dict[str, Any]],
+    ) -> bool:
+        """Return whether a torrent payload file matches the requested TV episode."""
+        coordinates = file_descriptor.get("coordinates") if isinstance(file_descriptor.get("coordinates"), dict) else {}
+        file_season = self._safe_positive_int(coordinates.get("season"))
+        file_episode = self._safe_positive_int(coordinates.get("episode"))
+        if not file_season or not file_episode:
+            return False
+        suffix = Path(file_path).suffix.lower()
+        if suffix and suffix not in {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".srt", ".ass", ".ssa", ".sub", ".vtt"}:
+            return False
+        lower_path = str(file_path or "").lower()
+        if any(token in lower_path for token in ("sample", "trailer", "extras", "behind.the.scenes", "behind the scenes")):
+            return False
+        for target in target_descriptors or []:
+            target_coords = target.get("coordinates") if isinstance(target.get("coordinates"), dict) else {}
+            if self._safe_positive_int(target_coords.get("season")) == file_season and self._safe_positive_int(target_coords.get("episode")) == file_episode:
+                return True
+        return False
+
+    def torrent_file_priority(self, *, file_path: str, parsed: Any | None, file_descriptor: dict[str, Any], selected: bool) -> int:
+        """Return libtorrent priority for selected TV episode/subtitle files."""
+        if not selected:
+            return 0
+        suffix = Path(file_path).suffix.lower()
+        if suffix in {".srt", ".ass", ".ssa", ".sub", ".vtt"}:
+            return 2
+        return 5
+
+    @staticmethod
+    def _bundle_contains_episode(title: str, season: int, episode: int) -> bool:
+        pack = TVBundleKnowledge.detect_season_pack(title)
+        if not pack or not season or not episode:
+            return False
+        pack_type = str(pack.get("pack_type") or "")
+        if pack_type == "series_complete":
+            return True
+        start = TvShowCategory._safe_positive_int(pack.get("season_start")) or TvShowCategory._safe_positive_int(pack.get("season"))
+        end = TvShowCategory._safe_positive_int(pack.get("season_end")) or start
+        if not start or not end or not (start <= int(season) <= end):
+            return False
+        if str(pack.get("scope")) == "episode_range":
+            ep_start = TvShowCategory._safe_positive_int(pack.get("start"))
+            ep_end = TvShowCategory._safe_positive_int(pack.get("end"))
+            return bool(ep_start and ep_end and ep_start <= int(episode) <= ep_end)
+        return True
+
+    @staticmethod
+    def _bundle_episode_count_hint(pack: dict[str, Any], title: str) -> int | None:
+        if not pack:
+            return None
+        if pack.get("scope") == "episode_range":
+            start = TvShowCategory._safe_positive_int(pack.get("start"))
+            end = TvShowCategory._safe_positive_int(pack.get("end"))
+            if start and end and end >= start:
+                return end - start + 1
+        if pack.get("pack_type") == "multi_season":
+            start = TvShowCategory._safe_positive_int(pack.get("season_start"))
+            end = TvShowCategory._safe_positive_int(pack.get("season_end"))
+            if start and end and end >= start:
+                return TVBundleKnowledge.approximate_episode_count(title, end - start + 1)
+        if pack.get("pack_type") == "series_complete":
+            return 60
+        return TVBundleKnowledge.approximate_episode_count(title, 1)
+
+    @staticmethod
+    def _season_from_path(file_path: str) -> int | None:
+        for part in Path(file_path).parts[:-1]:
+            match = _SEASON_DIR.search(part)
+            if match:
+                return TvShowCategory._safe_positive_int(match.group(1))
+        return None
+
+    @staticmethod
+    def _episode_from_path(file_path: str) -> int | None:
+        name = Path(file_path).stem
+        match = _EPISODE_FILE.search(name)
+        if not match:
+            return None
+        groups = match.groups()
+        value = groups[1] or groups[3] or groups[4]
+        return TvShowCategory._safe_positive_int(value)
+
     def provider_setup_requirements(self, settings: 'Settings') -> list[CategorySetupRequirement]:
         """Return shared media setup requirements plus TV-specific TVMaze."""
         requirements = list(super().provider_setup_requirements(settings))

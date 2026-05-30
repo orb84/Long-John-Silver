@@ -474,8 +474,8 @@ async def main():
 
         if settings.direct_scraper_fallback:
             logger.info(
-                "Direct scraper fallback is enabled. Jackett remains primary; "
-                "fallback providers are used only when the primary search returns no usable results."
+                "Direct scraper fallback is explicitly enabled, but it is treated as an emergency provider set: "
+                "Jackett/Soulseek remain the normal search path and direct scrapers are not queried while a primary torrent provider is configured."
             )
             from src.search.btdigg import BTDiggSearch
             from src.search.search_1337x import Search1337x
@@ -532,7 +532,7 @@ async def main():
             logger.info("TVMaze metadata client disabled by TV category settings.")
 
         # --- Initialize notifications ---
-        notifications = NotificationService()
+        notifications = NotificationService(db=db)
 
         # --- Initialize librarian early enough for recovered torrents. ---
         # Download recovery can immediately reach the ready/completion callbacks;
@@ -895,11 +895,12 @@ async def main():
             ]
             rss_feed_url = f"{settings.jackett_url.rstrip('/')}/api/v2.0/indexers/all/results/torznab/api?apikey={settings.jackett_api_key}&t=search&q="
             if item_names:
-                async def _on_rss_match(name: str, unit_label: str | None = None):
-                    """Log an RSS match; category scheduler workflows decide whether to download."""
+                async def _on_rss_match(name: str, result, unit_label: str | None = None):
+                    """Turn an RSS match into a category-owned release event."""
                     item = next((tracked for tracked in settings_manager.settings.tracked_items if tracked.key.lower() == name.lower()), None)
                     if item:
-                        logger.info(f'RSS: {name} {unit_label or ""} available (category scheduler will check)')
+                        logger.info(f'RSS release event: {name} {unit_label or ""} candidate={getattr(result, "title", "")!r}')
+                        await scheduler.handle_release_event(item, unit_label=unit_label, source_result=result, trigger="rss")
                     else:
                         logger.warning(f"RSS matched '{name}' but it was not found in tracked items.")
 
@@ -907,6 +908,7 @@ async def main():
                     feed_urls=[rss_feed_url], item_names=item_names, supervisor=supervisor,
                     on_match=_on_rss_match,
                     category_registry=cat_registry,
+                    item_categories={item.key: getattr(item, "item_type", "") for item in settings_manager.settings.tracked_items},
                 )
                 rss_monitor.start()
 
