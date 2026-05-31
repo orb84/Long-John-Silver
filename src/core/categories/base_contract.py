@@ -405,6 +405,18 @@ class CategoryContractMixin(CategoryContextMixin):
         size_mode = profile.get("size_limit_mode")
         if quality is not None and size_mode and hasattr(quality, "size_limit_mode"):
             quality.size_limit_mode = str(size_mode)
+        preferred_bitrate = profile.get("preferred_bitrate_kbps")
+        if quality is not None and preferred_bitrate and hasattr(quality, "preferred_bitrate_kbps"):
+            try:
+                quality.preferred_bitrate_kbps = int(preferred_bitrate)
+            except (TypeError, ValueError):
+                pass
+        max_bitrate = profile.get("max_bitrate_kbps")
+        if quality is not None and max_bitrate and hasattr(quality, "max_bitrate_kbps"):
+            try:
+                quality.max_bitrate_kbps = int(max_bitrate)
+            except (TypeError, ValueError):
+                pass
         return item_copy
 
 

@@ -352,10 +352,72 @@ class QueueDownloadService:
             result = await self._scheduler.queue_download(**payload["scheduler_kwargs"])
             if isinstance(result, dict) and result.get("error"):
                 return {"error": result.get("error")}
+            await self._record_candidate_quality_choice(entry, payload)
             return self._queued_entry_receipt(entry, payload["candidate_name"], result, entry["candidate"], payload)
         except Exception as exc:
             logger.error(f"Queue download batch item error for {entry['candidate_id']}: {exc}")
             return {"error": str(exc)}
+
+    async def _record_candidate_quality_choice(self, entry: dict[str, Any], payload: dict[str, Any]) -> None:
+        """Persist a per-item bitrate target when the user queues a chosen candidate.
+
+        Selecting a candidate is an explicit preference signal.  For a new show
+        with no bitrate target yet, store the selected candidate's estimated
+        bitrate on the tracked item so later episodes preserve the same
+        quality/size tradeoff instead of re-asking or defaulting to 720p.
+        """
+        candidate = entry.get("candidate") or {}
+        cache = entry.get("cache_data") or {}
+        try:
+            bitrate = int(candidate.get("estimated_bitrate_kbps") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        if bitrate <= 0:
+            return
+        category_id = str(cache.get("category_id") or candidate.get("category_id") or "")
+        item_id = str(cache.get("item_id") or cache.get("name") or payload.get("candidate_name") or "")
+        if not category_id or not item_id:
+            return
+        settings_manager = getattr(self._scheduler, "_settings_manager", None)
+        settings = getattr(settings_manager, "settings", None) if settings_manager else None
+        if settings is None:
+            return
+        changed = False
+        for item in getattr(settings, "tracked_items", []) or []:
+            item_category = getattr(item, "item_type", getattr(item, "category_id", category_id))
+            if str(item_category) != category_id or str(getattr(item, "key", "")) != item_id:
+                continue
+            quality = getattr(item, "quality", None)
+            if quality is None:
+                break
+            existing = getattr(quality, "preferred_bitrate_kbps", None)
+            if existing:
+                break
+            try:
+                quality.preferred_bitrate_kbps = bitrate
+                max_existing = getattr(quality, "max_bitrate_kbps", None)
+                if not max_existing:
+                    quality.max_bitrate_kbps = int(bitrate * 1.2)
+                changed = True
+            except Exception:
+                changed = False
+            break
+        if not changed:
+            return
+        try:
+            settings_manager.save(settings)
+        except Exception as exc:
+            logger.debug(f"Could not persist selected candidate bitrate preference for {category_id}/{item_id}: {exc}")
+        db = getattr(self._scheduler, "_db", None)
+        if db and getattr(db, "media", None):
+            try:
+                item = next((i for i in getattr(settings, "tracked_items", []) or [] if str(getattr(i, "key", "")) == item_id and str(getattr(i, "item_type", category_id)) == category_id), None)
+                if item and hasattr(item, "model_dump"):
+                    await db.media.upsert_category_item(category_id, item_id, item.model_dump(mode="json"))
+            except Exception as exc:
+                logger.debug(f"Could not persist selected candidate bitrate preference to repository for {category_id}/{item_id}: {exc}")
+        logger.info(f"Recorded selected bitrate preference for {category_id}/{item_id}: {bitrate} kbps")
+
 
     async def _queue_fallback_for_failed_entry(
         self,

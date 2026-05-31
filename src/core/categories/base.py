@@ -76,6 +76,7 @@ class CategoryWorkflowContext:
     user_id: str | None = None
     session_id: str | None = None
     category_registry: object | None = None
+    search_constraints: dict[str, Any] = field(default_factory=dict)
 
 
 class MediaCategory(CategoryContractMixin, ABC):

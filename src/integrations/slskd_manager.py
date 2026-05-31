@@ -228,6 +228,16 @@ class SlskdManager:
             await self._quarantine_reachable_stale_instance(settings, reason="managed configuration/preflight failed")
             return False
 
+        storage_ready = self._probe_payload_storage_ready(settings)
+        if not storage_ready.get("ok"):
+            message = self._format_payload_storage_unavailable_message(storage_ready)
+            settings.soulseek.account_status = "storage_unavailable"
+            settings.soulseek.account_status_message = message
+            settings.soulseek.account_checked_at = self._utc_now()
+            self._last_error = message
+            logger.warning(message)
+            return False
+
         # Do not blindly adopt a process already bound to the managed slskd port.
         # The latest real failures came from a stale slskd instance that was still
         # using an older project-local downloads directory even after LJS wrote a
@@ -547,7 +557,8 @@ class SlskdManager:
             "error": self._last_error,
         }
         if cfg.enabled and cfg.managed and self._last_error and not self.is_running:
-            cfg.account_status = "error"
+            if cfg.account_status != "storage_unavailable":
+                cfg.account_status = "error"
             cfg.account_status_message = self._last_error
             cfg.account_checked_at = self._utc_now()
         result["account_status"] = cfg.account_status
@@ -751,6 +762,96 @@ class SlskdManager:
                 except Exception as unlink_exc:
                     attempts.append({"filename": probe.name, "stage": "cleanup_after_error", "ok": False, "error": repr(unlink_exc)})
         return {"ok": False, "attempts": attempts}
+
+    def _probe_payload_storage_ready(self, settings: Settings) -> dict[str, Any]:
+        """Return whether slskd can use the payload folders right now.
+
+        This is deliberately not the old noisy fsync stress test.  It mirrors
+        what slskd itself does during startup: create a plain temporary file in
+        the completed and incomplete directories.  Torrent downloads can still
+        appear healthy while this fails, because libtorrent may already have an
+        open file handle or may write a specific payload path later, whereas
+        slskd refuses to boot unless it can create its validation/state files at
+        startup.
+        """
+        plan = build_slskd_share_plan(settings)
+        targets = [("downloads", Path(plan.downloads_dir)), ("incomplete", Path(plan.incomplete_dir))]
+        results: list[dict[str, Any]] = []
+        ok = True
+        for label, folder in targets:
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                ok = False
+                results.append({
+                    "label": label,
+                    "path": str(folder),
+                    "ok": False,
+                    "stage": "mkdir",
+                    "error": repr(exc),
+                    "diagnostics": self._path_diagnostics(folder.parent),
+                })
+                continue
+            probe = self._plain_write_probe_directory(folder)
+            probe.update({
+                "label": label,
+                "path": str(folder),
+                "diagnostics": self._path_diagnostics(folder),
+            })
+            if not probe.get("ok"):
+                ok = False
+            results.append(probe)
+        if ok:
+            logger.info(
+                "slskd payload storage readiness ok: "
+                + "; ".join(f"{r.get('label')}={r.get('path')} file={r.get('filename')}" for r in results)
+            )
+        else:
+            logger.warning(
+                "slskd payload storage readiness failed before launch: "
+                f"results={results}. Torrent writes may still work if libtorrent already has an open file or "
+                "if the mount becomes writable later; slskd cannot start until its completed/incomplete "
+                "directories accept new plain files."
+            )
+        return {"ok": ok, "results": results}
+
+    @classmethod
+    def _plain_write_probe_directory(cls, folder: Path) -> dict[str, Any]:
+        """Create/delete a slskd-like plain temp file without fsync."""
+        attempts: list[dict[str, Any]] = []
+        for prefix in ("ljs-slskd-readiness", str(uuid.uuid4())):
+            name = f"{prefix}-{os.getpid()}-{uuid.uuid4().hex}.tmp" if not prefix.count("-") >= 4 else prefix
+            probe = folder / name
+            try:
+                with probe.open("wb") as handle:
+                    handle.write(b"ljs slskd storage readiness\n")
+                    handle.flush()
+                size = probe.stat().st_size if probe.exists() else 0
+                probe.unlink(missing_ok=True)
+                return {"ok": True, "filename": probe.name, "bytes": size, "attempts": attempts}
+            except Exception as exc:
+                attempts.append({"filename": probe.name, "stage": "open_write_or_cleanup", "ok": False, "error": repr(exc)})
+                try:
+                    probe.unlink(missing_ok=True)
+                except Exception as unlink_exc:
+                    attempts.append({"filename": probe.name, "stage": "cleanup_after_error", "ok": False, "error": repr(unlink_exc)})
+        return {"ok": False, "attempts": attempts}
+
+    @staticmethod
+    def _format_payload_storage_unavailable_message(readiness: dict[str, Any]) -> str:
+        failed = [r for r in readiness.get("results", []) if not r.get("ok")]
+        details = []
+        for item in failed[:3]:
+            err = item.get("error") or item.get("attempts") or "unknown error"
+            details.append(f"{item.get('label')}={item.get('path')} error={err}")
+        suffix = "; ".join(details)
+        return (
+            "Soulseek/slskd is waiting for the download storage to become writable. "
+            "The folder may be the same one used by torrents, but slskd must create new startup/"
+            "incomplete files before it can boot; a torrent may keep writing because it already opened "
+            "its payload file or because the mount recovered after slskd tried. "
+            f"Readiness failure: {suffix}"
+        )
 
     @classmethod
     def _path_diagnostics(cls, path: Path) -> str:

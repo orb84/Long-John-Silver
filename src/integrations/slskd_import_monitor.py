@@ -79,19 +79,34 @@ class SlskdImportMonitor:
         # change, and only rarely as a debug heartbeat.
         self._last_roots_signature: tuple[tuple[str, ...], tuple[str, ...]] | None = None
         self._last_roots_debug_at = 0.0
+        self._last_not_ready_signature: tuple[str, str, str, str, str] | None = None
+        self._last_not_ready_debug_at = 0.0
+        self._last_storage_circuit_log_at = 0.0
+        self._last_stale_managed_root_signature: dict[str, tuple[str, str, str]] = {}
 
     async def run_forever(self) -> None:
-        """Run the import loop forever as a supervisor-managed background task."""
+        """Run the import loop forever as a supervisor-managed background task.
+
+        When managed slskd cannot start because its folders are not writable, a
+        one-minute import poll adds noise without doing useful work.  Back off
+        the import monitor while preserving the state-change diagnostics emitted
+        by ``run_once``.  This is not log suppression: it stops repeatedly doing
+        the same impossible storage probe until the configured mount/slskd state
+        has had time to change.
+        """
         while True:
+            sleep_for = self._interval_seconds
             try:
                 counters = await self.run_once()
                 if counters.get("imported"):
                     logger.info(f"Soulseek import monitor: {counters}")
+                if counters.get("not_ready") or counters.get("storage_unavailable"):
+                    sleep_for = max(sleep_for, 900.0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning(f"Soulseek import monitor pass failed: {exc}")
-            await asyncio.sleep(self._interval_seconds)
+            await asyncio.sleep(sleep_for)
 
     async def run_once(self) -> dict[str, int]:
         """Import any completed slskd transfer files that are not yet in the library."""
@@ -100,23 +115,24 @@ class SlskdImportMonitor:
         if cfg is None or not getattr(cfg, "enabled", False) or not getattr(cfg, "api_configured", False):
             return {"seen": 0, "complete": 0, "imported": 0, "missing": 0, "skipped": 0}
         if getattr(cfg, "managed", True) and str(getattr(cfg, "account_status", "") or "").lower() != "ready":
-            logger.info(
-                "Soulseek import monitor skipped because managed slskd is not ready/current: "
-                f"account_status={getattr(cfg, 'account_status', '')!r} "
-                f"message={getattr(cfg, 'account_status_message', '')!r} "
-                f"settings.download_dir={getattr(settings, 'download_dir', '')!r} "
-                f"soulseek.downloads_dir={getattr(cfg, 'downloads_dir', '')!r} "
-                f"soulseek.incomplete_dir={getattr(cfg, 'incomplete_dir', '')!r}"
-            )
-            return {"seen": 0, "complete": 0, "imported": 0, "missing": 0, "skipped": 0}
+            self._log_not_ready_if_needed(settings, cfg)
+            return {"seen": 0, "complete": 0, "imported": 0, "missing": 0, "skipped": 0, "not_ready": 1}
         self._log_roots_if_needed(settings)
         if self._storage_circuit_until > time.monotonic():
             retry_in = self._storage_circuit_until - time.monotonic()
-            logger.warning(
-                "Soulseek import monitor skipped because storage I/O circuit is open: "
-                f"retry_in={retry_in:.0f}s"
-            )
-            return {"seen": 0, "complete": 0, "imported": 0, "missing": 0, "skipped": 0}
+            now = time.monotonic()
+            if not self._last_storage_circuit_log_at or now - self._last_storage_circuit_log_at >= 900.0:
+                logger.warning(
+                    "Soulseek import monitor skipped because storage I/O circuit is open: "
+                    f"retry_in={retry_in:.0f}s"
+                )
+                self._last_storage_circuit_log_at = now
+            else:
+                logger.debug(
+                    "Soulseek import monitor storage I/O circuit still open: "
+                    f"retry_in={retry_in:.0f}s"
+                )
+            return {"seen": 0, "complete": 0, "imported": 0, "missing": 0, "skipped": 0, "storage_unavailable": 1}
 
         rows = await SlskdTransferReadModel(self._settings_manager, self._database).active_download_rows(include_completed=True)
         imported_keys = await self._load_imported_keys()
@@ -256,6 +272,39 @@ class SlskdImportMonitor:
             await self._save_imported_keys(imported_keys)
         return counters
 
+
+    def _log_not_ready_if_needed(self, settings: Any, cfg: Any) -> None:
+        """Log managed slskd-not-ready state only when it changes or rarely repeats.
+
+        A failing managed slskd setup can persist for hours while the importer
+        wakes once per minute.  Repeating the full path/status diagnostic every
+        pass drowns out torrent diagnostics.  Keep the useful signal by logging
+        immediately on status/message/path changes and then only a debug
+        heartbeat.
+        """
+        signature = (
+            str(getattr(cfg, "account_status", "") or ""),
+            str(getattr(cfg, "account_status_message", "") or ""),
+            str(getattr(settings, "download_dir", "") or ""),
+            str(getattr(cfg, "downloads_dir", "") or ""),
+            str(getattr(cfg, "incomplete_dir", "") or ""),
+        )
+        now = time.monotonic()
+        message = (
+            "Soulseek import monitor skipped because managed slskd is not ready/current: "
+            f"account_status={signature[0]!r} message={signature[1]!r} "
+            f"settings.download_dir={signature[2]!r} "
+            f"soulseek.downloads_dir={signature[3]!r} "
+            f"soulseek.incomplete_dir={signature[4]!r}"
+        )
+        if self._last_not_ready_signature != signature:
+            logger.warning(message)
+            self._last_not_ready_signature = signature
+            self._last_not_ready_debug_at = now
+            return
+        if now - self._last_not_ready_debug_at >= 1800.0:
+            logger.debug(message)
+            self._last_not_ready_debug_at = now
 
     def _log_roots_if_needed(self, settings: Any) -> None:
         """Log effective slskd import roots only when the information changes.
@@ -402,14 +451,18 @@ class SlskdImportMonitor:
             raw_downloads = str(getattr(soulseek, "downloads_dir", "") or "") if soulseek is not None else ""
             raw_incomplete = str(getattr(soulseek, "incomplete_dir", "") or "") if soulseek is not None else ""
             if raw_downloads and plan_downloads is not None and self._same_resolved_path(Path(raw_downloads), plan_downloads) is False:
-                logger.warning(
-                    "Ignoring stale managed soulseek.downloads_dir during import scan: "
-                    f"raw={raw_downloads!r} effective={plan_downloads} settings.download_dir={getattr(settings, 'download_dir', '')!r}"
+                self._log_stale_managed_root_once(
+                    "downloads_dir",
+                    raw=raw_downloads,
+                    effective=str(plan_downloads),
+                    download_dir=str(getattr(settings, "download_dir", "") or ""),
                 )
             if raw_incomplete and plan_incomplete is not None and self._same_resolved_path(Path(raw_incomplete), plan_incomplete) is False:
-                logger.warning(
-                    "Ignoring stale managed soulseek.incomplete_dir during import scan: "
-                    f"raw={raw_incomplete!r} effective={plan_incomplete} settings.download_dir={getattr(settings, 'download_dir', '')!r}"
+                self._log_stale_managed_root_once(
+                    "incomplete_dir",
+                    raw=raw_incomplete,
+                    effective=str(plan_incomplete),
+                    download_dir=str(getattr(settings, "download_dir", "") or ""),
                 )
             return roots
 
@@ -422,6 +475,25 @@ class SlskdImportMonitor:
             if raw:
                 roots.append(Path(str(raw)))
         return roots
+
+
+    def _log_stale_managed_root_once(self, field: str, *, raw: str, effective: str, download_dir: str) -> None:
+        """Log stale managed slskd path overrides on change, not every scan.
+
+        Managed slskd derives payload paths from ``settings.download_dir``.  Old
+        values in ``soulseek.downloads_dir``/``incomplete_dir`` are diagnostic
+        evidence, but repeating the same warning for every import-root helper
+        call creates the illusion that Soulseek is actively doing work while it
+        is only ignoring stale config.
+        """
+        signature = (str(raw), str(effective), str(download_dir))
+        if self._last_stale_managed_root_signature.get(field) == signature:
+            return
+        self._last_stale_managed_root_signature[field] = signature
+        logger.warning(
+            "Ignoring stale managed soulseek path during import scan: "
+            f"field={field} raw={raw!r} effective={effective} settings.download_dir={download_dir!r}"
+        )
 
     @staticmethod
     def _same_resolved_path(left: Path, right: Path) -> bool:

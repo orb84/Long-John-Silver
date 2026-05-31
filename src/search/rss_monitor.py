@@ -51,6 +51,7 @@ class RSSMonitor:
         self._on_match = on_match
         self._poll_interval = poll_interval
         self._seen_magnets: set[str] = set()
+        self._fetch_error_log_state: dict[str, tuple[str, float]] = {}
         self._supervisor = supervisor
         self._categories = category_registry or CategoryRegistry.with_defaults()
         self.update_items(item_names, item_categories=item_categories)
@@ -119,6 +120,21 @@ class RSSMonitor:
             except Exception as e:
                 logger.warning(f"RSS feed {redact_url(url)} failed: {e}")
 
+    def _log_fetch_failure(self, url: str, exc: Exception) -> None:
+        """Log repeated RSS fetch failures without flooding the main log."""
+        safe_url = redact_url(url)
+        detail = repr(exc) if not str(exc) else str(exc)
+        key = safe_url
+        now = asyncio.get_event_loop().time()
+        previous = self._fetch_error_log_state.get(key)
+        if previous is None or previous[0] != detail:
+            logger.warning(f"RSS fetch failed for {safe_url}: {detail}")
+            self._fetch_error_log_state[key] = (detail, now)
+            return
+        if now - previous[1] >= 1800.0:
+            logger.debug(f"RSS fetch still failing for {safe_url}: {detail}")
+            self._fetch_error_log_state[key] = (detail, now)
+
     async def _fetch_feed(self, url: str) -> list[SearchResult]:
         """Fetch and parse an RSS feed into SearchResult objects.
 
@@ -130,7 +146,7 @@ class RSSMonitor:
                 response.raise_for_status()
                 xml_text = response.text
         except Exception as e:
-            logger.error(f"RSS fetch failed for {redact_url(url)}: {e}")
+            self._log_fetch_failure(url, e)
             return []
 
         try:

@@ -18,6 +18,7 @@ from src.core.domain_models.enums import SizeLimitMode
 class QualityProfile(BaseModel):
     """Desired quality constraints for media downloads."""
     preferred_resolution: str = "1080p"
+    preferred_bitrate_kbps: Optional[int] = None
     max_bitrate_kbps: Optional[int] = None
     max_file_size_mb: Optional[int] = None
     size_limit_mode: SizeLimitMode = SizeLimitMode.SMART

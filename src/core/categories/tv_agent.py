@@ -658,7 +658,15 @@ class TvAgentSearchMixin:
         episode: int | None = None,
         context: Any | None = None,
     ) -> list[Any]:
-        """Apply TV hard filters and deterministic ranking before LLM prose."""
+        """Apply TV hard filters and bitrate-aware pre-ranking before LLM prose.
+
+        This is not the final semantic choice.  The goal is to keep obviously
+        wrong rows out and present the LLM/user with candidates ordered by the
+        user's existing per-show quality profile: language, exact unit/pack
+        coverage, resolution, bitrate target, seeders.  Smaller replacements
+        must search within the preferred bitrate/resolution band first; they
+        must not implicitly mean "downgrade to 720p".
+        """
         from src.utils.quality import QualityAnalyzer, extract_quality_tags
 
         item_quality = getattr(item, "quality", None)
@@ -671,8 +679,27 @@ class TvAgentSearchMixin:
         ):
             preferred_resolution = global_resolution
         max_file_size_mb = getattr(item_quality, "max_file_size_mb", None)
+        preferred_bitrate_kbps = self._preferred_bitrate_for_agent(item, context)
+        max_bitrate_kbps = self._max_bitrate_for_agent(item, context)
+        constraints = self._search_constraints_from_context(context)
+        if constraints.get("target_bitrate_kbps"):
+            preferred_bitrate_kbps = float(constraints.get("target_bitrate_kbps") or 0) or preferred_bitrate_kbps
+        if constraints.get("preferred_bitrate_kbps"):
+            preferred_bitrate_kbps = float(constraints.get("preferred_bitrate_kbps") or 0) or preferred_bitrate_kbps
+        if constraints.get("current_bitrate_kbps") and not preferred_bitrate_kbps:
+            preferred_bitrate_kbps = float(constraints.get("current_bitrate_kbps") or 0) or preferred_bitrate_kbps
+        if constraints.get("max_bitrate_kbps"):
+            max_bitrate_kbps = float(constraints.get("max_bitrate_kbps") or 0) or max_bitrate_kbps
         preferred = (language or "").lower()
-        target_episode_size_mb = self._target_episode_size_from_context(item, season, context)
+        constraint_resolution = constraints.get("required_resolution") or constraints.get("preferred_resolution")
+        if constraint_resolution:
+            preferred_resolution = str(constraint_resolution).lower()
+        target_episode_size_mb = constraints.get("target_size_mb") or self._target_episode_size_from_context(item, season, context)
+        max_constraint_size_mb = constraints.get("max_size_mb")
+        min_constraint_size_mb = constraints.get("min_size_mb")
+        current_size_mb = constraints.get("current_size_mb")
+        size_mode = str(constraints.get("size_mode") or "").lower()
+        preserve_resolution = bool(constraints.get("preserve_resolution") or constraints.get("prefer_current_resolution") or constraints.get("smaller_than_current"))
 
         eligible: list[tuple[Any, dict[str, Any], int]] = []
         for result in results or []:
@@ -692,10 +719,28 @@ class TvAgentSearchMixin:
             # explicit user confirmation.
             resolution = tags.get("resolution")
             if preferred_resolution and resolution:
-                if QualityAnalyzer.rank_resolution(resolution) > QualityAnalyzer.rank_resolution(preferred_resolution):
+                result_rank = QualityAnalyzer.rank_resolution(resolution)
+                preferred_rank = QualityAnalyzer.rank_resolution(preferred_resolution)
+                if result_rank > preferred_rank:
+                    continue
+                if constraints.get("required_resolution") and result_rank != preferred_rank:
                     continue
             per_ep_bytes = self._per_episode_size_bytes_for_agent(result)
+            size_mb = (per_ep_bytes or 0) / (1024 * 1024) if per_ep_bytes else 0
+            bitrate_kbps = self._estimated_episode_bitrate_kbps_for_agent(result)
             if max_file_size_mb and per_ep_bytes and per_ep_bytes > max_file_size_mb * 1024 * 1024:
+                continue
+            # Bitrate is the user's quality/size preference surface.  Treat an
+            # explicit/profile max as a soft-hard ceiling with modest encoder
+            # variance; never satisfy it by silently lowering resolution in the
+            # query ladder.
+            if max_bitrate_kbps and bitrate_kbps and bitrate_kbps > float(max_bitrate_kbps) * 1.15:
+                continue
+            if max_constraint_size_mb and size_mb and size_mb > float(max_constraint_size_mb):
+                continue
+            if min_constraint_size_mb and size_mb and size_mb < float(min_constraint_size_mb):
+                continue
+            if constraints.get("smaller_than_current") and current_size_mb and size_mb and size_mb >= float(current_size_mb) * 0.98:
                 continue
             if target_episode_size_mb and per_ep_bytes and self._is_season_pack_result(result):
                 size_mb = per_ep_bytes / (1024 * 1024)
@@ -720,25 +765,151 @@ class TvAgentSearchMixin:
             codec = str(tags.get("codec") or "").lower()
             codec_bonus = 1 if codec in {"h265", "x265", "hevc", "av1"} else 0
             size_mb = (per_ep_bytes or 0) / (1024 * 1024) if per_ep_bytes else 0
+            bitrate_kbps = self._estimated_episode_bitrate_kbps_for_agent(result)
             target_score = 0.0
+            bitrate_score = 0.0
             undersized_penalty = 0
-            if target_episode_size_mb and size_mb:
+            if preferred_bitrate_kbps and bitrate_kbps:
+                # Prefer closeness to the learned/explicit bitrate target.  A
+                # smaller replacement is a bitrate tradeoff, not a resolution
+                # downgrade command.
+                bitrate_score = -(abs(float(bitrate_kbps) - float(preferred_bitrate_kbps)) / max(float(preferred_bitrate_kbps), 1.0))
+                if bitrate_kbps < float(preferred_bitrate_kbps) * 0.45:
+                    undersized_penalty = -3
+            elif target_episode_size_mb and size_mb:
                 target_score = -(abs(size_mb - target_episode_size_mb) / max(target_episode_size_mb, 1))
-                if size_mb < target_episode_size_mb * 0.65:
+                if size_mb < target_episode_size_mb * 0.45:
                     undersized_penalty = -2
+            same_resolution_bonus = 0
+            downgrade_penalty = 0
+            if preferred_resolution and resolution:
+                preferred_rank = QualityAnalyzer.rank_resolution(preferred_resolution)
+                result_rank = QualityAnalyzer.rank_resolution(resolution)
+                if result_rank == preferred_rank:
+                    same_resolution_bonus = 4 if preserve_resolution else 2
+                elif preserve_resolution and result_rank < preferred_rank:
+                    downgrade_penalty = -5
+            smaller_bonus = 0
+            if size_mode == "smaller" and current_size_mb and size_mb and size_mb < float(current_size_mb):
+                smaller_bonus = min(3.0, (float(current_size_mb) - size_mb) / max(float(current_size_mb), 1.0) * 3.0)
             return (
                 lang_score,
-                res_rank + (2 if preferred_resolution and resolution == preferred_resolution else 0),
+                same_resolution_bonus + downgrade_penalty,
+                bitrate_score,
                 target_score,
+                smaller_bonus,
+                res_rank,
                 undersized_penalty,
                 codec_bonus,
                 getattr(result, "seeders", None) or 0,
                 getattr(result, "quality_score", 0) or 0,
-                -size_mb if size_mb else 0,
+                -abs(size_mb - target_episode_size_mb) if (target_episode_size_mb and size_mb) else (-size_mb if size_mb else 0),
             )
 
         return [result for result, _, _ in sorted(eligible, key=score, reverse=True)][:60]
 
+
+    def search_candidate_quality_facts(self, result: Any, *, item: Any | None = None, unit_label: str | None = None, context: Any | None = None) -> dict[str, Any]:
+        """Expose TV-owned per-unit size/bitrate facts for tools and UI.
+
+        Torrent totals are often misleading for TV packs.  These facts describe
+        the estimated useful episode payload, so the LLM can compare bitrate and
+        size tradeoffs without inventing a lower-resolution query.
+        """
+        per_ep_bytes = self._per_episode_size_bytes_for_agent(result)
+        facts: dict[str, Any] = {}
+        if per_ep_bytes:
+            facts["per_episode_size_bytes"] = per_ep_bytes
+            facts["per_episode_size_mb"] = round(per_ep_bytes / (1024 * 1024), 1)
+        bitrate = self._estimated_episode_bitrate_kbps_for_agent(result)
+        if bitrate:
+            facts["estimated_bitrate_kbps"] = int(bitrate)
+            facts["bitrate_basis"] = "estimated_from_payload_size_and_tv_runtime"
+        return facts
+
+    def _preferred_bitrate_for_agent(self, item: Any, context: Any | None) -> float | None:
+        """Return the item's saved/learned preferred bitrate target, if any."""
+        quality = getattr(item, "quality", None)
+        for attr in ("preferred_bitrate_kbps", "target_bitrate_kbps"):
+            value = getattr(quality, attr, None) if quality is not None else None
+            try:
+                if value and float(value) > 0:
+                    return float(value)
+            except (TypeError, ValueError):
+                pass
+        settings = getattr(context, "settings", None) if context is not None else None
+        for profile in self._download_profiles_for_agent(settings):
+            for key in ("preferred_bitrate_kbps", "target_bitrate_kbps"):
+                try:
+                    value = profile.get(key) if isinstance(profile, dict) else None
+                    if value and float(value) > 0:
+                        return float(value)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    def _max_bitrate_for_agent(self, item: Any, context: Any | None) -> float | None:
+        quality = getattr(item, "quality", None)
+        value = getattr(quality, "max_bitrate_kbps", None) if quality is not None else None
+        try:
+            if value and float(value) > 0:
+                return float(value)
+        except (TypeError, ValueError):
+            pass
+        settings = getattr(context, "settings", None) if context is not None else None
+        for profile in self._download_profiles_for_agent(settings):
+            try:
+                value = profile.get("max_bitrate_kbps") if isinstance(profile, dict) else None
+                if value and float(value) > 0:
+                    return float(value)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _download_profiles_for_agent(self, settings: Any | None) -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        if settings is None:
+            return profiles
+        try:
+            profile = self.category_download_profile(settings)
+            if isinstance(profile, dict):
+                profiles.append(profile)
+        except Exception:
+            pass
+        category_settings = getattr(settings, "category_settings", {}) or {}
+        if isinstance(category_settings, dict):
+            for key in (self.category_id, "media"):
+                value = category_settings.get(key) or {}
+                if isinstance(value, dict) and isinstance(value.get("download_profile"), dict):
+                    profiles.append(value.get("download_profile") or {})
+        return profiles
+
+    @classmethod
+    def _estimated_episode_bitrate_kbps_for_agent(cls, result: Any) -> int:
+        per_ep_bytes = cls._per_episode_size_bytes_for_agent(result)
+        if not per_ep_bytes:
+            return 0
+        seconds = cls._episode_runtime_seconds_for_agent(str(getattr(result, "title", "") or ""))
+        if seconds <= 0:
+            return 0
+        return int((per_ep_bytes * 8) / 1000 / seconds)
+
+    @staticmethod
+    def _episode_runtime_seconds_for_agent(title: str) -> int:
+        # TV search results rarely carry reliable runtime metadata.  Use a
+        # conservative one-hour-drama default for bitrate comparison.  The goal
+        # is relative comparison between candidates for the same episode/show,
+        # not exact media probing before download.
+        if re.search(r"\b(?:animation|anime|cartoon|sitcom)\b", title or "", re.IGNORECASE):
+            return 24 * 60
+        return 55 * 60
+
+
+    @staticmethod
+    def _search_constraints_from_context(context: Any | None) -> dict[str, Any]:
+        """Return normalized size/resolution constraints attached by the scheduler."""
+        raw = getattr(context, "search_constraints", None) if context is not None else None
+        return raw if isinstance(raw, dict) else {}
 
     @staticmethod
     def _parse_target_episode_size_mb(quality_context: str | None) -> float | None:

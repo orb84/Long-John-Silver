@@ -38,12 +38,17 @@ class SmartQualityInferrer:
             profile.preferred_codecs = list(scanned.codecs)[:3]
 
         if scanned.avg_bitrate_kbps:
+            # Keep two separate concepts: the user's established target bitrate
+            # and a soft ceiling.  Replacement searches should stay close to
+            # the target instead of lazily downgrading resolution to reduce size.
+            profile.preferred_bitrate_kbps = int(scanned.avg_bitrate_kbps)
             profile.max_bitrate_kbps = int(scanned.avg_bitrate_kbps * 1.2)
 
         logger.debug(
             f"Inferred quality for '{scanned.name}': "
             f"res={profile.preferred_resolution}, "
             f"max_size={profile.max_file_size_mb}MB, "
+            f"preferred_bitrate={profile.preferred_bitrate_kbps}, "
             f"codecs={profile.preferred_codecs}"
         )
         return profile
@@ -128,11 +133,15 @@ class SmartQualityInferrer:
                 lines.append(f"  Existing resolutions: {', '.join(scanned.resolutions)}.")
             if scanned.codecs:
                 lines.append(f"  Existing codecs: {', '.join(scanned.codecs)}.")
+            if scanned.avg_bitrate_kbps:
+                lines.append(f"  Established average bitrate: {scanned.avg_bitrate_kbps:.0f} kbps.")
         elif profile.size_limit_mode == SizeLimitMode.BITRATE and profile.max_bitrate_kbps:
             lines.append(f"  Maximum bitrate: {profile.max_bitrate_kbps} kbps.")
         elif profile.size_limit_mode == SizeLimitMode.FILE_SIZE and profile.max_file_size_mb:
             lines.append(f"  Maximum file size: {profile.max_file_size_mb} MB.")
 
+        if getattr(profile, "preferred_bitrate_kbps", None):
+            lines.append(f"  Preferred bitrate target: {profile.preferred_bitrate_kbps} kbps.")
         if profile.preferred_resolution:
             lines.append(f"  Preferred resolution: {profile.preferred_resolution}.")
         if profile.preferred_codecs:

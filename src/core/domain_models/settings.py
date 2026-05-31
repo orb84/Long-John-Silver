@@ -220,7 +220,7 @@ class SoulseekSettings(BaseModel):
     retry_search_max_runs: int = 12
     """Maximum automatic retry runs for one missed-search watch before it retires."""
     account_status: str = "not_checked"
-    """Soulseek network account status: not_checked, needs_credentials, checking, ready, auth_failed, or error."""
+    """Soulseek network account status: not_checked, needs_credentials, checking, ready, auth_failed, storage_unavailable, or error."""
     account_status_message: str = ""
     """Human-readable Soulseek setup/login status for setup and Compass."""
     account_checked_at: str = ""

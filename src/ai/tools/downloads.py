@@ -516,10 +516,10 @@ class SearchTorrentsTool:
 
     name = "search_torrents"
     description = (
-        "Search for torrent downloads for a given query. Returns filtered results "
-        "(non-media content excluded) with magnet links, language tags, resolution, "
-        "and codec info. Check 'languages' field on each result to verify it matches "
-        "the user's preferred language."
+        "Raw fallback torrent search for non-library/general downloads. For tracked media, TV episodes, movies, "
+        "or replacement searches, prefer search_media_torrents so category language, unit, size, Soulseek companion, "
+        "and pack-selection rules are applied. Returns filtered results with magnet links, language tags, resolution, "
+        "and codec info."
     )
     intents = {Intent.DOWNLOAD}
     allow_direct = True
@@ -543,7 +543,7 @@ class SearchTorrentsTool:
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query for finding torrents. Include the language if the user needs a specific language (e.g. 'Italian').",
+                    "description": "Raw query for fallback torrent searches. Do not use this for tracked/category media or replacement searches; call search_media_torrents instead. Do not append language words for category media merely to express configured audio preferences.",
                 },
             },
             "required": ["query"],

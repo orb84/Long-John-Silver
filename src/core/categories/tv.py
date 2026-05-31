@@ -172,7 +172,8 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             f"{dotted_title}.S{season:02d}E{episode:02d}",
             f"{title} {season}x{episode:02d}",
             f"{title} S{season:02d}E{episode:02d} 1080p",
-            f"{title} S{season:02d}E{episode:02d} 720p",
+            f"{title} S{season:02d}E{episode:02d} HEVC",
+            f"{title} S{season:02d}E{episode:02d} x265",
             # Exact-episode releases are not always published separately. Keep
             # season-pack schemas in the episode ladder so a single requested
             # episode can be file-selected from inside a torrent bundle.
@@ -1467,6 +1468,8 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         file_count = 0
         total_size = 0
         first_file: Path | None = None
+        skipped_without_episode = 0
+        skipped_without_episode_examples: list[str] = []
 
         def get_all_files(path: Path) -> list[Path]:
             """Return all regular files below a candidate season/show folder."""
@@ -1500,7 +1503,9 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 if season_num is None:
                     season_num = 1
                 if ep_num is None:
-                    logger.debug(f"[TvShowCategory] Skipping video without episode coordinate: {f}")
+                    skipped_without_episode += 1
+                    if len(skipped_without_episode_examples) < 3:
+                        skipped_without_episode_examples.append(str(f))
                     continue
 
                 file_count += 1
@@ -1528,6 +1533,13 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             except OSError as e:
                 logger.warning(f"[TvShowCategory] Skipping unreadable episode file or attributes: {e}")
                 continue
+
+        if skipped_without_episode:
+            logger.debug(
+                "[TvShowCategory] Skipped videos without episode coordinates while scanning show: "
+                f"show={show_dir.name!r} count={skipped_without_episode} "
+                f"examples={skipped_without_episode_examples}"
+            )
 
         for season, values in list(episodes.items()):
             episodes[season] = sorted(set(values))

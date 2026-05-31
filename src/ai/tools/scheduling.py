@@ -890,6 +890,54 @@ class SearchMediaTorrentsTool:
                     "type": "string",
                     "description": "Optional explicit registered category ID. Pass 'general' only for exact miscellaneous file targets that do not fit richer categories; never use it as a fallback for a failed TV/movie search without user approval.",
                 },
+                "target_size_gb": {
+                    "type": "number",
+                    "description": "Optional target payload size in GB when the user asks for a smaller/larger replacement or a size-constrained result. Use this for requests like 'around 2GB'.",
+                },
+                "max_size_gb": {
+                    "type": "number",
+                    "description": "Optional maximum payload size in GB. Use when the user says 'under XGB' or asks for a smaller replacement after inspecting the current download size.",
+                },
+                "min_size_gb": {
+                    "type": "number",
+                    "description": "Optional minimum payload size in GB. Use only when the user gives a lower bound.",
+                },
+                "current_size_gb": {
+                    "type": "number",
+                    "description": "Current active download size in GB when replacing a queued/downloading item with a smaller/larger version.",
+                },
+                "target_bitrate_kbps": {
+                    "type": "number",
+                    "description": "Target video/audio bitrate in kbps when the user has expressed a preferred bitrate/quality-size tradeoff. Prefer this over resolution downgrades for smaller replacement searches.",
+                },
+                "preferred_bitrate_kbps": {
+                    "type": "number",
+                    "description": "Known per-item or category preferred bitrate in kbps. Use when continuing a show at the user's established bitrate level.",
+                },
+                "max_bitrate_kbps": {
+                    "type": "number",
+                    "description": "Maximum acceptable bitrate in kbps when the user explicitly asks for a cap or when a saved quality profile defines one.",
+                },
+                "current_bitrate_kbps": {
+                    "type": "number",
+                    "description": "Estimated bitrate of the current active download, used when searching for a smaller same-resolution replacement.",
+                },
+                "preferred_resolution": {
+                    "type": "string",
+                    "description": "Preferred/current resolution to preserve for size-optimized replacements, e.g. 1080p. Do not downgrade to 720p unless the user explicitly asked or no same-resolution option exists.",
+                },
+                "required_resolution": {
+                    "type": "string",
+                    "description": "Hard resolution constraint when the user explicitly requires one, e.g. 1080p only.",
+                },
+                "smaller_than_current": {
+                    "type": "boolean",
+                    "description": "True when the user is replacing an active/queued download with a smaller alternative. Prefer same resolution/language first; do not start by searching lower resolution.",
+                },
+                "preserve_resolution": {
+                    "type": "boolean",
+                    "description": "True when a smaller/larger replacement should keep the current/preferred resolution unless the user explicitly approves a downgrade.",
+                },
             },
             "required": ["name"],
         }
@@ -915,6 +963,7 @@ class SearchMediaTorrentsTool:
         if not self._scheduler:
             return {"error": "Scheduler not available"}
         
+        search_constraints = _search_constraints_from_arguments(arguments)
         res = await self._scheduler.search_media_torrents(
             name=name,
             season=season,
@@ -923,6 +972,7 @@ class SearchMediaTorrentsTool:
             language_explicit=language_is_explicit,
             search_scope=search_scope,
             category_id=category_id,
+            search_constraints=search_constraints,
         )
         
         if not isinstance(res, dict) or "candidates" not in res:
@@ -949,6 +999,8 @@ class SearchMediaTorrentsTool:
                 "codec": c.get("codec"),
                 "per_episode_size_bytes": c.get("per_episode_size_bytes"),
                 "estimated_bitrate_kbps": c.get("estimated_bitrate_kbps"),
+                "bitrate_basis": c.get("bitrate_basis"),
+                "per_episode_size_mb": c.get("per_episode_size_mb"),
                 "unit_descriptor": c.get("unit_descriptor") or {},
                 "bundle_context": c.get("bundle_context") or {},
                 "is_bundle": c.get("is_bundle"),
@@ -1032,6 +1084,8 @@ class SearchMediaTorrentsTool:
                 "codec": c.get("codec"),
                 "per_episode_size": _format_size(c.get("per_episode_size_bytes")),
                 "estimated_bitrate_kbps": c.get("estimated_bitrate_kbps"),
+                "bitrate_basis": c.get("bitrate_basis"),
+                "per_episode_size_mb": c.get("per_episode_size_mb"),
                 "unit_descriptor": c.get("unit_descriptor") or {},
                 "bundle_context": c.get("bundle_context") or {},
                 "is_bundle": c.get("is_bundle"),
@@ -1053,6 +1107,22 @@ class SearchMediaTorrentsTool:
                 cache_candidate["auto_queue_allowed"] = clean_match.get("auto_queue_allowed")
                 cache_candidate["auto_queue_blocked_reason"] = clean_match.get("auto_queue_blocked_reason")
 
+        quality_choice_policy = _quality_choice_policy(clean_candidates, search_constraints)
+        if quality_choice_policy.get("requires_user_choice"):
+            # Do not allow the first row to be silently queued when there is no
+            # saved bitrate target and the candidates represent distinct
+            # quality/size choices for the same resolution/language.
+            for candidate in clean_candidates:
+                warnings = list(candidate.get("selection_warnings") or [])
+                if quality_choice_policy.get("message") not in warnings:
+                    warnings.append(quality_choice_policy.get("message"))
+                candidate["selection_warnings"] = warnings
+                candidate["auto_queue_allowed"] = False
+                candidate["auto_queue_blocked_reason"] = "quality/bitrate preference must be chosen first"
+            for cache_candidate in cache_candidates:
+                cache_candidate["auto_queue_allowed"] = False
+                cache_candidate["auto_queue_blocked_reason"] = "quality/bitrate preference must be chosen first"
+
         selected_for_estimate = _candidate_ids_for_estimate(
             clean_candidates,
             batch_recommendation=batch_recommendation,
@@ -1065,6 +1135,8 @@ class SearchMediaTorrentsTool:
         res["candidate_count"] = len(clean_candidates)
         res["estimated_total_size_bytes"] = estimated_total_size_bytes
         res["results_total_size_gb"] = round(estimated_total_size_bytes / (1024 ** 3), 3) if estimated_total_size_bytes else 0
+        if quality_choice_policy:
+            res["quality_choice_policy"] = quality_choice_policy
         res["candidate_picker"] = _candidate_picker_rows(clean_candidates, limit=60)
         res["result_handle"] = {
             "type": "torrent_result_set",
@@ -1078,6 +1150,7 @@ class SearchMediaTorrentsTool:
             search_scope=res.get("search_scope") or search_scope,
             result_set_id=result_set_id,
             has_batch=bool(batch_recommendation),
+            quality_choice_policy=quality_choice_policy,
         )
         companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
         if companion:
@@ -1174,6 +1247,42 @@ class SearchMediaTorrentsTool:
         return res
 
 
+def _search_constraints_from_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Extract optional size/resolution constraints from search_media_torrents arguments."""
+    constraints: dict[str, Any] = {}
+    for key in ("target_size_gb", "max_size_gb", "min_size_gb", "current_size_gb"):
+        value = arguments.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            constraints[key] = parsed
+    for key in ("target_bitrate_kbps", "preferred_bitrate_kbps", "max_bitrate_kbps", "current_bitrate_kbps"):
+        value = arguments.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            constraints[key] = parsed
+    for key in ("preferred_resolution", "required_resolution"):
+        value = str(arguments.get(key) or "").strip()
+        if value:
+            constraints[key] = value
+    for key in ("smaller_than_current", "preserve_resolution"):
+        if arguments.get(key) is not None:
+            constraints[key] = bool(arguments.get(key))
+    if constraints.get("smaller_than_current") and not constraints.get("size_mode"):
+        constraints["size_mode"] = "smaller"
+    if constraints and "preserve_resolution" not in constraints:
+        constraints["preserve_resolution"] = True
+    return constraints
+
 def _annotate_selection_policy(candidates: list[dict[str, Any]], *, preferred_language: str | None = None) -> None:
     """Mark candidates that should not be queued without user confirmation.
 
@@ -1236,7 +1345,59 @@ def _canonical_language_token(value: object) -> str:
     return aliases.get(token, token)
 
 
-def _search_result_next_actions(*, candidates: list[dict[str, Any]], search_scope: str | None, result_set_id: str, has_batch: bool) -> list[dict[str, Any]]:
+def _quality_choice_policy(candidates: list[dict[str, Any]], constraints: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Detect when the user must choose a bitrate/size profile for a new item.
+
+    A materially smaller same-resolution candidate is not automatically better;
+    it represents a different bitrate/quality tradeoff.  When no bitrate target
+    is already supplied by arguments/profile, keep the search result as a
+    choice instead of letting queue_download silently establish a low-quality
+    default.
+    """
+    constraints = constraints or {}
+    if any(constraints.get(k) for k in ("target_bitrate_kbps", "preferred_bitrate_kbps", "max_bitrate_kbps", "current_bitrate_kbps")):
+        return {"requires_user_choice": False, "reason": "bitrate preference already supplied"}
+    viable = [c for c in candidates if c.get("auto_queue_allowed") is not False and c.get("estimated_bitrate_kbps") and c.get("resolution")]
+    if len(viable) < 2:
+        return {"requires_user_choice": False}
+    # Compare within the top same-resolution group; a 720p and 1080p row are
+    # not the same kind of preference choice.
+    resolution = viable[0].get("resolution")
+    group = [c for c in viable if c.get("resolution") == resolution]
+    if len(group) < 2:
+        return {"requires_user_choice": False}
+    bitrates = []
+    for c in group[:6]:
+        try:
+            bitrates.append(float(c.get("estimated_bitrate_kbps") or 0))
+        except (TypeError, ValueError):
+            pass
+    bitrates = [b for b in bitrates if b > 0]
+    if len(bitrates) < 2:
+        return {"requires_user_choice": False}
+    low, high = min(bitrates), max(bitrates)
+    if high < low * 1.25:
+        return {"requires_user_choice": False}
+    choices = []
+    for c in sorted(group[:6], key=lambda row: float(row.get("estimated_bitrate_kbps") or 0))[:6]:
+        choices.append({
+            "candidate_id": c.get("candidate_id"),
+            "title": c.get("title"),
+            "resolution": c.get("resolution"),
+            "size": c.get("size"),
+            "estimated_bitrate_kbps": c.get("estimated_bitrate_kbps"),
+            "seeders": c.get("seeders"),
+        })
+    return {
+        "requires_user_choice": True,
+        "reason": "no_saved_bitrate_preference",
+        "message": "Multiple same-resolution candidates differ materially in bitrate/size; ask the user which quality-size tradeoff to use for this show, then store that bitrate preference when they choose.",
+        "candidate_ids": [c.get("candidate_id") for c in choices if c.get("candidate_id")],
+        "choices": choices,
+    }
+
+
+def _search_result_next_actions(*, candidates: list[dict[str, Any]], search_scope: str | None, result_set_id: str, has_batch: bool, quality_choice_policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Return prompt-safe affordances for a cached torrent result set.
 
     These are not commands that the executor blindly follows; they are valid
@@ -1261,6 +1422,14 @@ def _search_result_next_actions(*, candidates: list[dict[str, Any]], search_scop
                 "args_hint": {"search_scope": "individual_units_only"},
             })
         return actions
+
+    if quality_choice_policy and quality_choice_policy.get("requires_user_choice"):
+        actions.append({
+            "action": "ask_user_to_choose_quality_bitrate",
+            "tool": None,
+            "reason": quality_choice_policy.get("message") or "Multiple viable same-resolution candidates differ materially in bitrate/size and no item bitrate preference is saved yet.",
+            "candidate_ids": quality_choice_policy.get("candidate_ids") or [],
+        })
 
     if has_batch:
         actions.append({
@@ -1329,6 +1498,12 @@ def _candidate_picker_rows(candidates: list[dict[str, Any]], limit: int = 60) ->
             row["languages"] = c.get("languages")
         if c.get("resolution"):
             row["resolution"] = c.get("resolution")
+        if c.get("per_episode_size"):
+            row["per_episode_size"] = c.get("per_episode_size")
+        if c.get("estimated_bitrate_kbps"):
+            row["estimated_bitrate_kbps"] = c.get("estimated_bitrate_kbps")
+        if c.get("bitrate_basis"):
+            row["bitrate_basis"] = c.get("bitrate_basis")
         if c.get("source"):
             row["source"] = c.get("source")
         if c.get("auto_queue_allowed") is False:

@@ -242,6 +242,7 @@ class SchedulerTorrentSearchService:
         language_explicit: bool = False,
         search_scope: str | None = None,
         category_id: str | None = None,
+        search_constraints: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Search for torrents for a specific media item via the unified pipeline."""
         settings = self._context.settings_manager.settings
@@ -288,8 +289,11 @@ class SchedulerTorrentSearchService:
         season = await self._resolve_category_default_season(
             media, category_id, season, episode, normalized_scope, settings,
         )
-        results, query_summary = await self._search(media, category_id, season, episode, target_lang, settings, normalized_scope)
+        constraints = self._normalize_search_constraints(search_constraints)
+        results, query_summary = await self._search(media, category_id, season, episode, target_lang, settings, normalized_scope, constraints)
         response = self._response(media, category_id, season, episode, target_lang, results, query_summary, normalized_scope)
+        if constraints:
+            response["search_constraints"] = constraints
         response["source_strategy"] = self._source_strategy(category_id, normalized_name, normalized_scope, settings)
         response["companion_soulseek"] = await self._soulseek_companion_search(
             query_summary=query_summary,
@@ -299,6 +303,44 @@ class SchedulerTorrentSearchService:
             settings=settings,
         )
         return response
+
+    def _normalize_search_constraints(self, constraints: dict[str, Any] | None) -> dict[str, Any]:
+        """Normalize optional user-facing search constraints for category hooks."""
+        if not isinstance(constraints, dict):
+            return {}
+        normalized: dict[str, Any] = {}
+        for key in ("target_size_gb", "max_size_gb", "min_size_gb", "current_size_gb"):
+            value = constraints.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                gb = float(value)
+            except (TypeError, ValueError):
+                continue
+            if gb > 0:
+                normalized[key] = gb
+                normalized[key.replace("_gb", "_mb")] = gb * 1024.0
+        for key in ("target_bitrate_kbps", "preferred_bitrate_kbps", "max_bitrate_kbps", "current_bitrate_kbps"):
+            value = constraints.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                kbps = float(value)
+            except (TypeError, ValueError):
+                continue
+            if kbps > 0:
+                normalized[key] = kbps
+        for key in ("preferred_resolution", "required_resolution"):
+            value = str(constraints.get(key) or "").strip().lower()
+            if value:
+                normalized[key] = value
+        for key in ("smaller_than_current", "preserve_resolution", "prefer_current_resolution"):
+            if constraints.get(key) is not None:
+                normalized[key] = bool(constraints.get(key))
+        mode = str(constraints.get("size_mode") or "").strip().lower()
+        if mode:
+            normalized["size_mode"] = mode
+        return normalized
 
     def _source_strategy(self, category_id: str, name: str, search_scope: str, settings: object) -> dict[str, Any]:
         """Return the effective source strategy for the current category search."""
@@ -336,16 +378,21 @@ class SchedulerTorrentSearchService:
         """
         cfg = getattr(settings, "soulseek", None)
         if not cfg or not getattr(cfg, "enabled", False):
+            logger.debug(f"Soulseek companion search skipped: disabled category={category_id} query={query_summary!r}")
             return {"enabled": False, "status": "disabled", "candidate_count": 0, "candidates": []}
         enabled_categories = {str(cat).strip().lower() for cat in (getattr(cfg, "search_enabled_categories", []) or []) if str(cat).strip()}
         if enabled_categories and str(category_id or "").lower() not in enabled_categories:
-            return {"enabled": True, "status": "category_disabled", "category_id": category_id, "candidate_count": 0, "candidates": []}
+            logger.info(f"Soulseek companion search skipped: category_disabled category={category_id} enabled_categories={sorted(enabled_categories)} query={query_summary!r}")
+            return {"enabled": True, "status": "category_disabled", "category_id": category_id, "candidate_count": 0, "candidates": [], "enabled_categories": sorted(enabled_categories)}
         if not getattr(cfg, "parallel_search_enabled", True):
+            logger.info(f"Soulseek companion search skipped: parallel_disabled category={category_id} query={query_summary!r}")
             return {"enabled": True, "status": "parallel_disabled", "candidate_count": 0, "candidates": []}
         if not getattr(cfg, "api_configured", False):
+            logger.info(f"Soulseek companion search skipped: not_configured category={category_id} query={query_summary!r}")
             return {"enabled": True, "status": "not_configured", "candidate_count": 0, "candidates": [], "error": "slskd is not configured."}
         if getattr(cfg, "managed", True):
             if not getattr(cfg, "soulseek_credentials_configured", False):
+                logger.info(f"Soulseek companion search skipped: needs_credentials category={category_id} query={query_summary!r}")
                 return {
                     "enabled": True,
                     "status": "needs_credentials",
@@ -355,6 +402,7 @@ class SchedulerTorrentSearchService:
                     "error": "Soulseek username and password are required before searching.",
                 }
             if str(getattr(cfg, "account_status", "")).lower() == "auth_failed":
+                logger.info(f"Soulseek companion search skipped: auth_failed category={category_id} query={query_summary!r}")
                 return {
                     "enabled": True,
                     "status": "auth_failed",
@@ -367,6 +415,7 @@ class SchedulerTorrentSearchService:
         # a single-user queue is rarely the best way to pull huge catalogues.
         queries = self._soulseek_query_variants(query_summary, media)
         if not queries:
+            logger.debug(f"Soulseek companion search skipped: empty_query category={category_id} query={query_summary!r}")
             return {"enabled": True, "status": "empty_query", "candidate_count": 0, "candidates": []}
         result: dict[str, Any] = {}
         candidates: list[dict[str, Any]] = []
@@ -658,7 +707,7 @@ class SchedulerTorrentSearchService:
             logger.debug("Category default season resolution failed for %s: %s", media.key, exc)
             return season
 
-    def _category_workflow_context(self, settings: object):
+    def _category_workflow_context(self, settings: object, search_constraints: dict[str, Any] | None = None):
         """Build the bounded category context used by assistant search hooks."""
         from src.core.categories.base import CategoryWorkflowContext
 
@@ -670,14 +719,15 @@ class SchedulerTorrentSearchService:
             downloader=self._context.downloader,
             metadata_clients={"tvmaze": self._context.tvmaze} if self._context.tvmaze else {},
             metadata_enricher=self._context.metadata_enricher,
+            search_constraints=search_constraints or {},
         )
 
-    async def _search(self, media: CategoryItem, category_id: str, season: int | None, episode: int | None, target_lang: str, settings: object, search_scope: str | None = None) -> tuple[list[SearchResult], str]:
+    async def _search(self, media: CategoryItem, category_id: str, season: int | None, episode: int | None, target_lang: str, settings: object, search_scope: str | None = None, search_constraints: dict[str, Any] | None = None) -> tuple[list[SearchResult], str]:
         """Run category-owned search with safe fallback to the pipeline."""
         category = self._context.categories.get(category_id) if self._context.categories else None
         if category and hasattr(category, "search_agent_candidates"):
             try:
-                context = self._category_workflow_context(settings)
+                context = self._category_workflow_context(settings, search_constraints)
                 return await category.search_agent_candidates(
                     media, season=season, episode=episode, language=target_lang,
                     search_scope=search_scope, context=context,
@@ -749,6 +799,10 @@ class SchedulerTorrentSearchService:
                         payload["bundle_scope"] = bundle_context.get("scope")
                         payload["pack_type"] = bundle_context.get("pack_type")
                         payload["bundle_unit_count"] = bundle_context.get("unit_count")
+                if category and hasattr(category, "search_candidate_quality_facts"):
+                    facts = category.search_candidate_quality_facts(result, item=media, unit_label=request_label, context=None)
+                    if isinstance(facts, dict):
+                        payload.update({k: v for k, v in facts.items() if v not in (None, "", [], {})})
                 candidates.append(payload)
             except RecursionError:
                 logger.exception("Skipping candidate that recursed during payload projection: %s", getattr(result, "title", result))

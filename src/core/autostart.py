@@ -1,10 +1,10 @@
 """Cross-platform operating-system auto-start integration for LJS.
 
 The UI exposes this as a single checkbox, but each OS stores login/startup
-entries differently.  This service hides those platform details behind a small
-API that settings/setup handlers can call safely.  It intentionally writes only
-user-level launch entries so enabling auto-start never requires administrator
-privileges.
+entries differently. This service writes user-level launch entries only. Source
+checkout installs use a generated wrapper script that calls ``run.sh`` instead
+of invoking ``python main.py`` directly, so login startup gets the same venv,
+dependency, PATH, and diagnostics behavior as a manual launch.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import platform
 import stat
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,68 +19,51 @@ from loguru import logger
 
 
 class AutoStartManager:
-    """Installs or removes a user-level launch-at-login entry.
-
-    Maintainers should keep this class free of web/UI concerns.  It answers two
-    questions only: can this platform be configured, and did the user-level boot
-    entry get created/removed?  Future packaged-app support can override
-    ``command`` and ``working_dir`` while preserving the same public contract.
-    """
+    """Installs or removes a user-level launch-at-login entry."""
 
     APP_ID = "com.longjohnsilver.ljs"
     APP_NAME = "Long John Silver"
 
     def __init__(self, working_dir: str | Path | None = None, command: list[str] | None = None) -> None:
-        """Create an auto-start manager for the current application checkout.
-
-        Args:
-            working_dir: Project root containing ``main.py``. Defaults to the
-                source checkout root derived from this module, not the shell
-                current working directory.
-            command: Optional explicit command. Packaged distributions should
-                pass their executable command here; source checkouts use
-                ``sys.executable main.py``.
-        """
         self._working_dir = Path(working_dir).resolve() if working_dir else self._default_project_root()
-        self._command = command or [sys.executable, str(self._working_dir / "main.py")]
+        self._command = command or [str(self._launcher_script_path())]
 
     def status(self) -> dict[str, Any]:
-        """Return the current platform and whether the launch entry exists."""
+        """Return current platform auto-start state and generated target paths."""
         return {
             "platform": self._platform_key(),
             "supported": self.is_supported(),
             "enabled": self.is_enabled(),
             "target": str(self._entry_path()) if self._entry_path() else "",
+            "linux_systemd_target": str(self._linux_systemd_path()) if self._platform_key() == "linux" else "",
             "working_dir": str(self._working_dir),
             "command": " ".join(self._command),
+            "log_path": str(self._log_path()),
         }
 
     def is_supported(self) -> bool:
-        """Return whether this OS has a user-level implementation."""
+        """Return whether this OS has a user-level startup implementation."""
         return self._platform_key() in {"darwin", "windows", "linux"}
 
     def is_enabled(self) -> bool:
-        """Return whether the expected auto-start entry is already present."""
+        """Return whether a current launch entry points at this checkout."""
         try:
-            if self._platform_key() == "windows":
+            key = self._platform_key()
+            if key == "windows":
                 return self._windows_value_matches_current_target()
+            if key == "linux":
+                desktop = self._entry_path()
+                service = self._linux_systemd_path()
+                desktop_ok = bool(desktop and desktop.exists() and self._file_entry_matches_current_target(desktop))
+                service_ok = bool(service.exists() and self._file_entry_matches_current_target(service))
+                return desktop_ok or service_ok
             path = self._entry_path()
-            if not path:
-                return False
-            return path.exists() and self._file_entry_matches_current_target(path)
+            return bool(path and path.exists() and self._file_entry_matches_current_target(path))
         except Exception:
             return False
 
     def set_enabled(self, enabled: bool) -> dict[str, Any]:
-        """Create or remove the auto-start entry and return an operation report.
-
-        Args:
-            enabled: True to start LJS at login/boot, False to remove the entry.
-
-        Returns:
-            JSON-safe dict suitable for API responses.  ``ok`` is false when the
-            OS cannot be configured or the write failed.
-        """
+        """Create or remove the user-level launch entry and return a report."""
         if not self.is_supported():
             return {"ok": False, "enabled": False, "message": "Auto-start is not supported on this platform."}
         try:
@@ -96,38 +78,42 @@ class AutoStartManager:
                 "message": "Auto-start enabled." if actual else "Auto-start disabled.",
                 **self.status(),
             }
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - platform-specific
             logger.warning(f"Failed to update auto-start entry: {exc}")
             return {"ok": False, "enabled": self.is_enabled(), "message": str(exc), **self.status()}
 
     def _enable(self) -> None:
-        """Dispatch auto-start installation to the current platform."""
+        self._write_launcher_script()
         key = self._platform_key()
         if key == "darwin":
             self._write_launch_agent()
+            self._bootstrap_launch_agent()
         elif key == "linux":
             self._write_desktop_entry()
+            self._write_systemd_user_service()
         elif key == "windows":
             self._write_windows_run_key()
         else:
             raise RuntimeError(f"Unsupported platform: {key}")
 
     def _disable(self) -> None:
-        """Remove the current platform's user-level auto-start entry."""
         key = self._platform_key()
         if key == "windows":
             self._remove_windows_run_key()
             return
+        if key == "linux":
+            self._disable_systemd_user_service()
+            service = self._linux_systemd_path()
+            if service.exists():
+                os.remove(service)
+        if key == "darwin":
+            self._bootout_launch_agent()
         path = self._entry_path()
         if path and path.exists():
-            # The path is deterministic and user-level (LaunchAgents/autostart),
-            # not supplied by the web UI or LLM.  Keep deletion local to this
-            # service so startup cleanup never touches library/download data.
             os.remove(path)
 
     @staticmethod
     def _platform_key() -> str:
-        """Return normalized platform key used by the service."""
         system = platform.system().lower()
         if system == "darwin":
             return "darwin"
@@ -137,58 +123,80 @@ class AutoStartManager:
             return "linux"
         return system
 
-
     @staticmethod
     def _default_project_root() -> Path:
-        """Return the source-checkout root containing ``main.py``.
-
-        ``os.getcwd()`` is fragile for login items: the user may enable
-        auto-start from a shell in the project today, then a later launch or
-        packaged wrapper may have a different current directory.  Deriving the
-        root from this module keeps the generated LaunchAgent/.desktop/Run
-        value pointed at the checkout that contains the code.
-        """
         return Path(__file__).resolve().parents[2]
 
     def _entry_path(self) -> Path | None:
-        """Return the platform-specific file path, if the platform uses one."""
         key = self._platform_key()
         home = Path.home()
         if key == "darwin":
             return home / "Library" / "LaunchAgents" / f"{self.APP_ID}.plist"
         if key == "linux":
             return home / ".config" / "autostart" / "long-john-silver.desktop"
-        if key == "windows":
-            return None
         return None
 
+    def _autostart_dir(self) -> Path:
+        return self._working_dir / "data" / "autostart"
+
+    def _launcher_script_path(self) -> Path:
+        return self._autostart_dir() / "start-ljs.sh"
+
+    def _log_path(self) -> Path:
+        return self._autostart_dir() / "autostart.log"
+
+    def _linux_systemd_path(self) -> Path:
+        return Path.home() / ".config" / "systemd" / "user" / "long-john-silver.service"
 
     def _file_entry_matches_current_target(self, path: Path) -> bool:
-        """Return whether an existing launch file points at this checkout.
-
-        A stale LaunchAgent or desktop file from an older project location
-        should not make the UI report "enabled" for the current install.
-        Enabling auto-start rewrites the file, so this check is conservative
-        and intentionally tied to the expected working directory and command.
-        """
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return False
-        return str(self._working_dir) in text and all(str(part) in text for part in self._command)
+        return str(self._working_dir) in text and any(str(part) in text for part in self._command)
 
-    def _quote(self, value: str | Path) -> str:
-        """Shell-quote one command/path component for desktop/plist files."""
+    @staticmethod
+    def _quote(value: str | Path) -> str:
         import shlex
 
         return shlex.quote(str(value))
 
     def _command_line(self) -> str:
-        """Return the command as a shell-safe line for user-level launch files."""
         return " ".join(self._quote(part) for part in self._command)
 
+    def _write_launcher_script(self) -> None:
+        script = self._launcher_script_path()
+        script.parent.mkdir(parents=True, exist_ok=True)
+        run_sh = self._working_dir / "run.sh"
+        log_path = self._log_path()
+        content = f"""#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p {self._quote(log_path.parent)}
+{{
+  echo "===== LJS autostart $(date -Is) ====="
+  echo "project={self._working_dir}"
+  echo "run_sh={run_sh}"
+  echo "user=$(id -un 2>/dev/null || true) uid=$(id -u 2>/dev/null || true)"
+  echo "pwd=$(pwd)"
+  echo "PATH=$PATH"
+}} >> {self._quote(log_path)} 2>&1
+
+for profile in /etc/profile "$HOME/.profile" "$HOME/.zprofile" "$HOME/.bash_profile"; do
+  if [ -r "$profile" ]; then
+    . "$profile" >/dev/null 2>&1 || true
+  fi
+done
+
+cd {self._quote(self._working_dir)}
+export LJS_AUTOSTART=1
+export LJS_ALLOW_INSECURE_DEV="${{LJS_ALLOW_INSECURE_DEV:-1}}"
+export LJS_ACCESS_LOGS="${{LJS_ACCESS_LOGS:-quiet}}"
+exec {self._quote(run_sh)} >> {self._quote(log_path)} 2>&1
+"""
+        script.write_text(content, encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
     def _write_launch_agent(self) -> None:
-        """Write the macOS LaunchAgent plist for login auto-start."""
         path = self._entry_path()
         if path is None:
             raise RuntimeError("No LaunchAgent path available")
@@ -210,13 +218,42 @@ class AutoStartManager:
     <true/>
     <key>KeepAlive</key>
     <false/>
+    <key>StandardOutPath</key>
+    <string>{self._xml_escape(str(self._log_path()))}</string>
+    <key>StandardErrorPath</key>
+    <string>{self._xml_escape(str(self._log_path()))}</string>
 </dict>
 </plist>
 """
         path.write_text(plist, encoding="utf-8")
 
+    def _bootstrap_launch_agent(self) -> None:
+        if self._platform_key() != "darwin":
+            return
+        path = self._entry_path()
+        if not path:
+            return
+        import subprocess
+
+        uid = os.getuid()
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        completed = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if completed.returncode == 0:
+            subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/{self.APP_ID}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        else:
+            logger.info("LaunchAgent written but not bootstrapped in current session; it will run at next GUI login.")
+
+    def _bootout_launch_agent(self) -> None:
+        if self._platform_key() != "darwin":
+            return
+        path = self._entry_path()
+        if not path:
+            return
+        import subprocess
+
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
     def _write_desktop_entry(self) -> None:
-        """Write a freedesktop autostart entry for Linux desktop sessions."""
         path = self._entry_path()
         if path is None:
             raise RuntimeError("No autostart desktop path available")
@@ -233,15 +270,54 @@ X-GNOME-Autostart-enabled=true
         path.write_text(desktop, encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
+    def _write_systemd_user_service(self) -> None:
+        if self._platform_key() != "linux":
+            return
+        path = self._linux_systemd_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        service = f"""[Unit]
+Description=Long John Silver media automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={self._working_dir}
+ExecStart={self._command_line()}
+Restart=on-failure
+RestartSec=10
+Environment=LJS_AUTOSTART=1
+Environment=LJS_ALLOW_INSECURE_DEV=1
+Environment=LJS_ACCESS_LOGS=quiet
+
+[Install]
+WantedBy=default.target
+"""
+        path.write_text(service, encoding="utf-8")
+        import subprocess
+
+        if shutil_which("systemctl"):
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            completed = subprocess.run(["systemctl", "--user", "enable", "long-john-silver.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if completed.returncode != 0:
+                logger.info("systemd user service written but not enabled; XDG autostart entry remains installed.")
+
+    def _disable_systemd_user_service(self) -> None:
+        if self._platform_key() != "linux":
+            return
+        import subprocess
+
+        if shutil_which("systemctl"):
+            subprocess.run(["systemctl", "--user", "disable", "long-john-silver.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
     def _write_windows_run_key(self) -> None:
-        """Create the HKCU Run value used by Windows login auto-start."""
         import winreg  # type: ignore
 
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, self.APP_NAME, 0, winreg.REG_SZ, self._windows_command())
 
     def _remove_windows_run_key(self) -> None:
-        """Remove the HKCU Run value, ignoring already-removed entries."""
         import winreg  # type: ignore
 
         try:
@@ -251,7 +327,6 @@ X-GNOME-Autostart-enabled=true
             return
 
     def _windows_value_matches_current_target(self) -> bool:
-        """Return whether the HKCU Run value points at this checkout."""
         if self._platform_key() != "windows":
             return False
         try:
@@ -264,21 +339,22 @@ X-GNOME-Autostart-enabled=true
             return False
 
     def _windows_command(self) -> str:
-        """Return a Windows Run value command line."""
         return subprocess_quoted(self._command)
 
     @staticmethod
     def _xml_escape(value: str) -> str:
-        """Escape text for the small plist we generate manually."""
         return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def subprocess_quoted(parts: list[str]) -> str:
-    """Return a conservative Windows command line from argument parts.
+def shutil_which(command: str) -> str | None:
+    """Return the resolved executable path for a command, if available."""
+    import shutil
 
-    Python's ``subprocess.list2cmdline`` is exactly the quoting algorithm used
-    for Windows CreateProcess; reusing it avoids hand-rolled quoting bugs.
-    """
+    return shutil.which(command)
+
+
+def subprocess_quoted(parts: list[str]) -> str:
+    """Return a Windows CreateProcess-compatible command line."""
     import subprocess
 
     return subprocess.list2cmdline([str(part) for part in parts])

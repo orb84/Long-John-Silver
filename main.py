@@ -246,10 +246,38 @@ async def _start_managed_soulseek_after_ui(settings_manager: SettingsManager, sl
 
     try:
         logger.info("Soulseek companion enabled — starting managed slskd in the background after web startup...")
-        ok = await slskd_manager.start(settings, login_timeout_seconds=120.0)
-        slskd_manager.save_to_settings(settings)
+        ok = False
+        # External/autofs/USB/NAS mounts can be visible but briefly refuse new
+        # files during login or wake.  That is enough for slskd to abort even if
+        # libtorrent later writes to the same folder.  Retry storage-related
+        # startup failures instead of freezing Soulseek in a permanent error
+        # state until the user restarts LJS.
+        retry_delays = [0, 15, 30, 60, 120, 300]
+        for attempt, delay in enumerate(retry_delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            ok = await slskd_manager.start(settings, login_timeout_seconds=120.0)
+            slskd_manager.save_to_settings(settings)
+            settings_manager.save(settings)
+            if ok:
+                logger.info(f"slskd managed runtime active at {slskd_manager.url} after attempt {attempt}")
+                break
+            message = str(cfg.account_status_message or slskd_manager.last_error or "")
+            storage_related = (
+                cfg.account_status == "storage_unavailable"
+                or "not writeable" in message.lower()
+                or "not writable" in message.lower()
+                or "input/output error" in message.lower()
+                or "read-only file system" in message.lower()
+            )
+            if not storage_related:
+                break
+            logger.warning(
+                "slskd managed runtime is waiting for storage before retrying: "
+                f"attempt={attempt}/{len(retry_delays)} status={cfg.account_status!r} message={message[:500]!r}"
+            )
         if ok:
-            logger.info(f"slskd managed runtime active at {slskd_manager.url}")
+            pass
         elif cfg.account_status == "checking":
             logger.warning(
                 "slskd is running or starting, but LJS has not confirmed Soulseek login yet. "

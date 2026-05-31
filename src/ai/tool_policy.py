@@ -30,6 +30,27 @@ class AgentToolPolicy:
         """Create a policy evaluator with optional live settings."""
         self._settings = settings
 
+    # Tools that must remain visible independently of the selected category.
+    # These are application-control and inspection primitives, not TV/Movie/etc.
+    # semantics.  Category YAML can narrow category/search tools, but it must not
+    # hide the user's ability to inspect storage/download state or control an
+    # existing queue/download from any conversation context.
+    _GLOBAL_ALWAYS_TOOLS = {
+        "list_downloads",
+        "manage_downloads",
+        "set_download_priority",
+        "download_set_priority",
+        "pause_downloads",
+        "resume_downloads",
+        "cancel_downloads",
+        "download_upload",
+        "get_storage_status",
+        "check_storage_capacity",
+        "inspect_torrent_candidate",
+        "suggestions_list",
+        "list_library_shares",
+    }
+
     _GENERIC_READ_TOOLS = {
         "get_category_definitions",
         "get_category_manifest",
@@ -205,11 +226,10 @@ class AgentToolPolicy:
         if requested:
             # Preserve always-safe manifest/status helpers while narrowing the
             # noisy domain/search surface to what the category declared.
-            always = {
+            always = set(self._GLOBAL_ALWAYS_TOOLS) | {
                 "get_category_definitions",
                 "get_category_manifest",
                 "get_library_status",
-                "get_storage_status",
                 # Source companion tools stay globally available for downloadable categories.
                 # Logs from Round 135 showed category YAML narrowing hid search_soulseek
                 # from Music even though the global download policy allowed it.
@@ -222,20 +242,21 @@ class AgentToolPolicy:
 
     def _generic_tools_for_intent(self, intent: Intent) -> set[str]:
         """Return generic tool names for an intent."""
+        always = set(self._GLOBAL_ALWAYS_TOOLS)
         if intent == Intent.SEARCH:
-            return set(self._GENERIC_READ_TOOLS)
+            return set(self._GENERIC_READ_TOOLS) | always
         if intent == Intent.DOWNLOAD:
             # DOWNLOAD used to expose every generic read/research/browser tool.
             # Logs showed this inflated the function schema surface to 30+ tools
             # and encouraged repeated searches after a structured plan already
             # produced candidate IDs. Keep the ordinary download loop on the
             # declared small chain plus compact status/storage context.
-            return set(self._DOWNLOAD_CONTEXT_TOOLS | self._GENERIC_DOWNLOAD_TOOLS)
+            return set(self._DOWNLOAD_CONTEXT_TOOLS | self._GENERIC_DOWNLOAD_TOOLS) | always
         if intent == Intent.CONFIG:
-            return set(self._GENERIC_CONFIG_TOOLS)
+            return set(self._GENERIC_CONFIG_TOOLS) | always
         if intent == Intent.CHAT:
-            return set(self._GENERIC_READ_TOOLS)
-        return {"get_category_definitions", "get_category_manifest"}
+            return set(self._GENERIC_READ_TOOLS) | always
+        return {"get_category_definitions", "get_category_manifest"} | always
 
     def _category_tools_for_intent(
         self,

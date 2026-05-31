@@ -1779,10 +1779,11 @@ class MediaScheduler:
                                      language: str | None = None,
                                      language_explicit: bool = False,
                                      search_scope: str | None = None,
-                                     category_id: str | None = None) -> dict:
+                                     category_id: str | None = None,
+                                     search_constraints: dict | None = None) -> dict:
         """Search for torrents for a specific media item via focused service."""
         return await self._torrent_search_service().search_media_torrents(
-            name, season, episode, language, language_explicit=language_explicit, search_scope=search_scope, category_id=category_id,
+            name, season, episode, language, language_explicit=language_explicit, search_scope=search_scope, category_id=category_id, search_constraints=search_constraints,
         )
 
     async def execute_category_workflow(self, category_id: str, workflow_name: str, arguments: dict) -> object:
