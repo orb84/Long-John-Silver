@@ -91,9 +91,224 @@ class Database:
     Migrations are SQL files in the ``migrations/`` directory, named sequentially
     (e.g., ``001_multi_user.sql``). The runner reads the current version from
     the ``schema_version`` table and applies any migrations with a higher number.
+
+    Schema hardening rule: startup must never assume ``CREATE TABLE IF NOT
+    EXISTS`` upgraded an existing table.  Before creating indexes or wiring
+    repositories, the initializer runs an idempotent legacy-compatibility pass
+    that adds missing columns to already-existing tables, then validates a small
+    contract of columns/unique surfaces the current app requires.
     """
 
     MIGRATIONS_DIR = Path(__file__).parent.parent.parent / "migrations"
+    BASE_SCHEMA_VERSION = 100
+
+    # Columns that may be missing from pre-category or partially migrated DBs.
+    # SQLite cannot alter constraints in-place, so these compatibility columns
+    # deliberately use safe defaults and keep stricter guarantees in repository
+    # code and fresh-schema definitions.
+    LEGACY_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
+        "sessions": {
+            "channel": "TEXT NOT NULL DEFAULT 'web'",
+            "channel_user_id": "TEXT DEFAULT ''",
+            "last_active_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "conversation_history": {
+            "tool_call_id": "TEXT",
+        },
+        "preferences": {
+            "user_id": "TEXT",
+        },
+        "behavior_log": {
+            "category_id": "TEXT DEFAULT ''",
+            "item_id": "TEXT DEFAULT ''",
+            "item_name": "TEXT DEFAULT ''",
+            "resolution": "TEXT",
+            "codec": "TEXT",
+            "release_group": "TEXT",
+            "file_size_mb": "REAL",
+            "quality_score": "REAL",
+        },
+        "downloads": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "item_name": "TEXT NOT NULL DEFAULT ''",
+            "priority": "TEXT NOT NULL DEFAULT 'normal'",
+            "reason": "TEXT NOT NULL DEFAULT ''",
+            "season": "INTEGER",
+            "episode": "INTEGER",
+            "progress": "REAL DEFAULT 0.0",
+            "download_rate": "REAL DEFAULT 0.0",
+            "upload_rate": "REAL DEFAULT 0.0",
+            "num_peers": "INTEGER DEFAULT 0",
+            "num_seeds": "INTEGER DEFAULT 0",
+            "total_size": "INTEGER NOT NULL DEFAULT 0",
+            "downloaded_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "eta_seconds": "REAL NOT NULL DEFAULT 0.0",
+            "file_path": "TEXT",
+            "files": "TEXT NOT NULL DEFAULT '[]'",
+            "language": "TEXT NOT NULL DEFAULT ''",
+            "torrent_title": "TEXT NOT NULL DEFAULT ''",
+            "import_context_json": "TEXT NOT NULL DEFAULT '{}'",
+            "save_path": "TEXT NOT NULL DEFAULT ''",
+            "sharing_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "uploaded_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "seed_ratio": "REAL NOT NULL DEFAULT 0.0",
+            "source_seeders": "INTEGER",
+            "stalled_notified": "INTEGER NOT NULL DEFAULT 0",
+            "stalled_cancel_asked": "INTEGER NOT NULL DEFAULT 0",
+            "user_id": "TEXT",
+            "completed_at": "TEXT",
+        },
+        "upgrade_candidates": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "item_name": "TEXT NOT NULL DEFAULT ''",
+            "current_resolution": "TEXT DEFAULT ''",
+            "current_codecs": "TEXT DEFAULT '[]'",
+            "best_upgrade_resolution": "TEXT DEFAULT ''",
+            "best_upgrade_codecs": "TEXT DEFAULT '[]'",
+            "best_upgrade_title": "TEXT DEFAULT ''",
+            "best_upgrade_magnet": "TEXT DEFAULT ''",
+            "quality_improvement": "TEXT DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "approved_at": "TEXT",
+            "denied_at": "TEXT",
+        },
+        "suggested_actions": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "item_name": "TEXT NOT NULL DEFAULT ''",
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "endpoint": "TEXT NOT NULL DEFAULT ''",
+            "method": "TEXT NOT NULL DEFAULT 'POST'",
+            "body": "TEXT NOT NULL DEFAULT '{}'",
+            "priority": "INTEGER NOT NULL DEFAULT 0",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "metadata": "TEXT NOT NULL DEFAULT '{}'",
+            "approved_at": "TEXT",
+            "denied_at": "TEXT",
+        },
+        "scheduled_tasks": {
+            "task_type": "TEXT NOT NULL DEFAULT 'scheduled_prompt'",
+            "schedule_type": "TEXT NOT NULL DEFAULT 'recurring'",
+            "title": "TEXT NOT NULL DEFAULT ''",
+            "due_at": "TEXT",
+            "next_run_at": "TEXT",
+            "run_count": "INTEGER NOT NULL DEFAULT 0",
+            "max_runs": "INTEGER",
+            "session_id": "TEXT",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+        },
+        "deletion_log": {
+            "category_id": "TEXT DEFAULT ''",
+            "item_id": "TEXT DEFAULT ''",
+            "item_name": "TEXT DEFAULT ''",
+        },
+        "notifications": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "event_type": "TEXT NOT NULL DEFAULT 'general'",
+            "status": "TEXT NOT NULL DEFAULT 'unread'",
+            "actions_json": "TEXT NOT NULL DEFAULT '[]'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+            "read_at": "TEXT",
+        },
+        "notification_deliveries": {
+            "notification_id": "INTEGER NOT NULL DEFAULT 0",
+            "bridge_id": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "delivered_at": "TEXT",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "category_items": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "display_name": "TEXT NOT NULL DEFAULT ''",
+            "item_type": "TEXT NOT NULL DEFAULT ''",
+            "enabled": "INTEGER NOT NULL DEFAULT 1",
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "properties_json": "TEXT NOT NULL DEFAULT '{}'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            "state_json": "TEXT NOT NULL DEFAULT '{}'",
+            "item_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_checked_at": "TEXT",
+            "last_download_at": "TEXT",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "category_item_units": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "unit_key": "TEXT NOT NULL DEFAULT ''",
+            "unit_type": "TEXT NOT NULL DEFAULT ''",
+            "display_name": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "sort_index": "INTEGER NOT NULL DEFAULT 0",
+            "properties_json": "TEXT NOT NULL DEFAULT '{}'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            "state_json": "TEXT NOT NULL DEFAULT '{}'",
+            "unit_json": "TEXT NOT NULL DEFAULT '{}'",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "category_item_processing_state": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "next_check_at": "TEXT",
+            "next_check_reason": "TEXT NOT NULL DEFAULT ''",
+            "invalidated_by": "TEXT NOT NULL DEFAULT '[]'",
+        },
+        "category_item_processing_events": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "category_item_suggestion_state": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "suggestion_key": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'active'",
+            "valid_until": "TEXT",
+        },
+        "category_property_index": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "property_name": "TEXT NOT NULL DEFAULT ''",
+            "value_text": "TEXT",
+            "value_number": "REAL",
+            "value_json": "TEXT NOT NULL DEFAULT 'null'",
+        },
+        "category_item_metadata": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "provider": "TEXT NOT NULL DEFAULT ''",
+            "external_id": "TEXT NOT NULL DEFAULT ''",
+        },
+        "category_metadata_cache": {
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "provider": "TEXT NOT NULL DEFAULT ''",
+            "cache_key": "TEXT NOT NULL DEFAULT ''",
+            "stable_id": "TEXT NOT NULL DEFAULT ''",
+            "expires_at": "TEXT NOT NULL DEFAULT ''",
+        },
+    }
+
+    SCHEMA_CONTRACT: dict[str, tuple[str, ...]] = {
+        "schema_version": ("version",),
+        "downloads": ("id", "status", "priority", "created_at", "category_id", "item_id", "import_context_json"),
+        "suggested_actions": ("id", "category_id", "item_id", "status"),
+        "behavior_log": ("id", "category_id", "item_id", "action"),
+        "category_items": ("category_id", "item_id", "display_name", "enabled"),
+        "category_item_units": ("category_id", "item_id", "unit_key", "status"),
+        "category_item_processing_state": ("category_id", "item_id", "next_check_at"),
+        "category_item_suggestion_state": ("category_id", "item_id", "suggestion_key", "status"),
+        "notifications": ("id", "status", "dedupe_key"),
+        "notification_deliveries": ("notification_id", "bridge_id", "status", "attempts", "updated_at"),
+        "release_watches": ("id", "category_id", "item_id", "unit_key", "next_check_at"),
+    }
 
     def __init__(self, db_path: str = "data/ljs.db"):
         self._db_path = db_path
@@ -121,6 +336,7 @@ class Database:
         await self._create_base_schema()
         current_version = await self._get_schema_version()
         await self._run_migrations(current_version)
+        await self._validate_schema_contract()
 
         # Initialize repositories
         self.media = MediaRepository(self._db)
@@ -145,6 +361,10 @@ class Database:
         Optional index rows make selected dynamic properties searchable when a
         category needs fast filtering.
         """
+        await self._db.execute("PRAGMA foreign_keys = ON")
+        await self._prepare_schema_version_table()
+        await self._repair_legacy_schema_before_base_schema()
+
         await self._db.executescript("""
             PRAGMA foreign_keys = ON;
 
@@ -584,6 +804,22 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_notifications_status
                 ON notifications(status, created_at);
 
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notification_id INTEGER NOT NULL,
+                bridge_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(notification_id, bridge_id),
+                FOREIGN KEY(notification_id) REFERENCES notifications(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_notification_deliveries_bridge
+                ON notification_deliveries(bridge_id, status, updated_at);
+
             CREATE TABLE IF NOT EXISTS release_watches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category_id TEXT NOT NULL,
@@ -615,10 +851,72 @@ class Database:
             );
         """)
         await self._db.execute(
-            "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
-            (100,),
+            "INSERT INTO schema_version (version) "
+            "SELECT ? WHERE NOT EXISTS (SELECT 1 FROM schema_version)",
+            (self.BASE_SCHEMA_VERSION,),
         )
         await self._db.commit()
+
+    async def _prepare_schema_version_table(self) -> None:
+        await self._db.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")
+        await self._db.commit()
+
+    async def _repair_legacy_schema_before_base_schema(self) -> None:
+        """Add missing columns before base indexes/migrations reference them.
+
+        This is intentionally run before the inline base schema creates indexes.
+        Old DBs may already have tables such as ``downloads`` or
+        ``suggested_actions`` without the category-first columns; in SQLite,
+        ``CREATE TABLE IF NOT EXISTS`` would leave those tables unchanged and a
+        later ``CREATE INDEX ... (category_id, item_id)`` would crash startup.
+        """
+        repaired: list[str] = []
+        for table, columns in self.LEGACY_COMPAT_COLUMNS.items():
+            if not await self._table_exists(table):
+                continue
+            existing = await self._table_columns(table)
+            for column, definition in columns.items():
+                if column in existing:
+                    continue
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                repaired.append(f"{table}.{column}")
+        if repaired:
+            await self._db.commit()
+            logger.warning(
+                "Database legacy schema repaired before index creation: added {} missing column(s): {}",
+                len(repaired),
+                ", ".join(repaired[:80]) + (" ..." if len(repaired) > 80 else ""),
+            )
+
+    async def _table_exists(self, table: str) -> bool:
+        cursor = await self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        row = await cursor.fetchone()
+        return bool(row)
+
+    async def _table_columns(self, table: str) -> set[str]:
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        return {str(row[1]) for row in rows}
+
+    async def _validate_schema_contract(self) -> None:
+        """Fail with a precise message if startup schema repair was incomplete."""
+        missing: list[str] = []
+        for table, columns in self.SCHEMA_CONTRACT.items():
+            if not await self._table_exists(table):
+                missing.append(f"{table}.*")
+                continue
+            existing = await self._table_columns(table)
+            for column in columns:
+                if column not in existing:
+                    missing.append(f"{table}.{column}")
+        if missing:
+            raise RuntimeError(
+                "Database schema contract is incomplete after compatibility repair/migrations: "
+                + ", ".join(missing)
+            )
 
     async def _get_schema_version(self) -> int:
         """Return the current schema version from the database."""

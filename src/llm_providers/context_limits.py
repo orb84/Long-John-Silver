@@ -23,6 +23,37 @@ FALLBACK_CONTEXT_LIMIT = 16_384
 MAX_MANUAL_CONTEXT_LIMIT = 1_048_576
 
 
+# Provider/model metadata that some OpenAI-compatible endpoints do not expose
+# through /v1/models. Keep this narrow and sourced from provider/model docs; it
+# is used only when live endpoint probing fails to report a real value.
+_KNOWN_PROVIDER_CONTEXT_LIMITS: dict[tuple[str, str], int] = {
+    ("nvidia_nim", "openai/gpt-oss-120b"): 128_000,
+    ("nvidia_nim", "openai/gpt-oss-20b"): 128_000,
+}
+
+
+def known_provider_context_limit(provider_id: str | None, model_id: str | None) -> int | None:
+    """Return a curated provider/model context limit when endpoint metadata is absent.
+
+    NVIDIA NIM's /v1/models endpoint has been observed not to consistently
+    expose context metadata.  This small map prevents known high-context models
+    from collapsing to the conservative 16k fallback while keeping unknown
+    models on the normal probe/fallback path.
+    """
+    provider = str(provider_id or "").strip().lower()
+    model = str(model_id or "").strip().lower()
+    if not provider or not model:
+        return None
+    candidates = [model]
+    if "/" not in model:
+        candidates.append(f"openai/{model}")
+    for candidate in candidates:
+        value = _KNOWN_PROVIDER_CONTEXT_LIMITS.get((provider, candidate))
+        if value:
+            return int(value)
+    return None
+
+
 @dataclass(frozen=True)
 class ContextLimitProbeResult:
     """Result of probing a provider/model context limit."""
@@ -196,6 +227,21 @@ async def probe_endpoint_context_limit(
                 return result
         except Exception as exc:
             logger.debug(f"Context probe skipped compatible endpoint {compat_url}: {exc}")
+
+    known_limit = known_provider_context_limit(provider_id, model_id)
+    if known_limit:
+        logger.info(
+            "Context probe using built-in provider metadata: provider={} model={} -> {} tokens",
+            provider_id or "unknown", model_id, known_limit,
+        )
+        return ContextLimitProbeResult(
+            provider=provider_id or "known_provider_metadata",
+            model_id=model_id,
+            usable_context_tokens=max(MIN_USER_CONTEXT_LIMIT, int(known_limit)),
+            max_context_tokens=int(known_limit),
+            source="built-in provider/model metadata",
+            endpoint_reported=True,
+        )
 
     return ContextLimitProbeResult(
         provider=provider_id or "fallback",

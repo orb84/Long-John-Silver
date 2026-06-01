@@ -219,41 +219,48 @@ class _TelegramNotificationBridge:
         raw_value = vars(self._bridge).get("_chat_id")
         return raw_value if raw_value is not None else value
 
+    @property
+    def delivery_id(self) -> str:
+        """Stable delivery-ledger key for the current Telegram chat target."""
+        return f"telegram:{self.chat_id() or 'unconfigured'}"
+
     def session_id(self) -> str:
         """Return the assistant session id for the current Telegram chat."""
         return f"telegram_{self.chat_id()}"
 
-    async def send_notification(self, message: NotificationMessage) -> None:
+    async def send_notification(self, message: NotificationMessage) -> bool:
         """Send a notification through Telegram.
 
         Attempts to format as Markdown first, falling back to plain text if Telegram's
         strict Markdown parser rejects the payload syntax.
         """
-        if self._bridge.application and self.chat_id():
-            text = f"*{message.title}*: {message.body}"
-            recorded_successfully = False
+        if not (self._bridge.application and self.chat_id()):
+            return False
+        text = f"*{message.title}*: {message.body}"
+        recorded_successfully = False
+        try:
+            await self._bridge.application.bot.send_message(
+                chat_id=self.chat_id(),
+                text=text,
+                parse_mode="Markdown",
+            )
+            recorded_successfully = True
+        except Exception as e:
+            logger.warning(f"Telegram notification Markdown parse failed: {e}. Falling back to plain text.")
             try:
                 await self._bridge.application.bot.send_message(
                     chat_id=self.chat_id(),
-                    text=text,
-                    parse_mode="Markdown",
+                    text=f"{message.title}: {message.body}",
                 )
+                text = f"{message.title}: {message.body}"
                 recorded_successfully = True
-            except Exception as e:
-                logger.warning(f"Telegram notification Markdown parse failed: {e}. Falling back to plain text.")
-                try:
-                    await self._bridge.application.bot.send_message(
-                        chat_id=self.chat_id(),
-                        text=f"{message.title}: {message.body}",
-                    )
-                    text = f"{message.title}: {message.body}"
-                    recorded_successfully = True
-                except Exception as ex:
-                    logger.error(f"Telegram notification fallback failed: {ex}")
+            except Exception as ex:
+                logger.error(f"Telegram notification fallback failed: {ex}")
 
-            if recorded_successfully and hasattr(self._bridge, "assistant") and self._bridge.assistant:
-                session_id = self.session_id()
-                coro = self._bridge.assistant.record_external_turn(session_id, "assistant", text)
-                import inspect
-                if inspect.isawaitable(coro):
-                    await coro
+        if recorded_successfully and hasattr(self._bridge, "assistant") and self._bridge.assistant:
+            session_id = self.session_id()
+            coro = self._bridge.assistant.record_external_turn(session_id, "assistant", text)
+            import inspect
+            if inspect.isawaitable(coro):
+                await coro
+        return recorded_successfully

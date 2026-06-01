@@ -306,6 +306,199 @@ class DefinitionBackedCategory(CategoryMedia):
             f"Download preferences: {profile}. Reject unrelated categories and dangerous executable payloads."
         )
 
+    def build_soulseek_search_queries(
+        self,
+        query_summary: str,
+        item: Any,
+        *,
+        unit_label: str | None = None,
+        language: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[str]:
+        """Build definition-owned Soulseek queries from item identity.
+
+        Definition-backed categories such as Music/Ebooks/Audiobooks own their
+        own format vocabulary.  Generic Soulseek code must not decide that an
+        album wants artist/title permutations or that ebooks want file formats;
+        this hook keeps that behavior inside the category runtime.
+        """
+        raw_values = [
+            str(query_summary or "").strip(),
+            str(getattr(item, "key", "") or "").strip(),
+            str(getattr(item, "display_name", "") or "").strip(),
+        ]
+        queries: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            cleaned = self._clean_soulseek_query(value)
+            key = cleaned.casefold()
+            if cleaned and key not in seen:
+                seen.add(key)
+                queries.append(cleaned)
+
+        for value in raw_values:
+            cleaned = self._clean_soulseek_query(value)
+            natural = re.search(r"(?P<title>.+?)\s+(?:by|from|di|da)\s+(?P<creator>.+)$", cleaned, re.IGNORECASE)
+            if natural:
+                title = natural.group("title")
+                creator = natural.group("creator")
+                add(f"{creator} {title}")
+                add(f"{title} {creator}")
+                add(title)
+                add(creator)
+            add(cleaned)
+            if " - " in cleaned:
+                left, right = [part.strip() for part in cleaned.split(" - ", 1)]
+                add(f"{left} {right}")
+                add(f"{right} {left}")
+                add(left)
+                add(right)
+            tokens = cleaned.split()
+            if len(tokens) >= 4:
+                mid = len(tokens) // 2
+                add(" ".join(tokens[mid:] + tokens[:mid]))
+            elif len(tokens) == 3:
+                add(" ".join(tokens[1:] + tokens[:1]))
+        return queries[:8]
+
+    def soulseek_search_limit(
+        self,
+        *,
+        item: Any,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> int:
+        """Collect enough Soulseek rows for category filtering/ranking."""
+        return 160
+
+    async def rank_soulseek_search_results(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        item: Any,
+        language: str | None = None,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Filter Soulseek rows using this category's accepted formats and identity."""
+        requested = f"{getattr(item, 'key', '')} {unit_label or ''}".strip()
+        accepted = self._accepted_extensions_for_soulseek()
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for cand in candidates or []:
+            extensions = self._candidate_extensions(cand)
+            if accepted and not (extensions & accepted):
+                continue
+            titleish = self._candidate_text(cand)
+            if any(titleish.lower().endswith(suffix) for suffix in DANGEROUS_FILE_SUFFIXES):
+                continue
+            score = self._soulseek_text_overlap(requested, titleish)
+            if requested and score <= 0:
+                continue
+            payload = dict(cand)
+            payload.update(self.soulseek_candidate_context(payload, item=item, language=language, unit_label=unit_label, search_scope=search_scope))
+            payload["category_id"] = self.category_id
+            payload["category_match_status"] = "accepted"
+            ranked.append((score, payload))
+        ranked.sort(key=lambda row: (-row[0], self._soulseek_queue_rank(row[1]), str(row[1].get("filename") or "").casefold()))
+        return [row for _, row in ranked]
+
+    def soulseek_candidate_context(
+        self,
+        candidate: dict[str, Any],
+        *,
+        item: Any,
+        language: str | None = None,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+    ) -> dict[str, Any]:
+        """Return definition-owned context attached to accepted Soulseek rows."""
+        return {
+            "category_expected_extensions": sorted(self._accepted_extensions_for_soulseek()),
+            "category_quality_note": self.quality_reference_for_search(item, unit_label, context=None),
+        }
+
+    def soulseek_source_strategy(
+        self,
+        *,
+        item_name: str,
+        search_scope: str | None = None,
+        settings: Any | None = None,
+        default_preference: str = "torrent_first",
+    ) -> dict[str, Any]:
+        """Return this definition-backed category's preferred Soulseek strategy."""
+        preference = default_preference
+        profile = self._section("download_profile")
+        if self.category_id == "music":
+            text = str(item_name or "").lower()
+            is_large_bundle = any(term in text for term in ("discography", "complete", "catalog", "catalogue", "collection"))
+            if not is_large_bundle and search_scope in {None, "", "default"}:
+                preference = "soulseek_first"
+        return {"download_preference": preference, "download_profile": profile}
+
+    def _clean_soulseek_query(self, value: str) -> str:
+        text = str(value or "")
+        reject_terms = set(self._string_list(self._search_policy().get("reject_query_terms")))
+        generic_terms = {"download", "torrent", "torrents", "grab", "please"}
+        for term in sorted(reject_terms | generic_terms, key=len, reverse=True):
+            if term:
+                text = re.sub(rf"\b{re.escape(term)}\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"[\[\]{}()]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip(" -_.,")
+
+    def _accepted_extensions_for_soulseek(self) -> set[str]:
+        patterns = self._string_list(self._section("formats").get("accepted_file_patterns"))
+        out: set[str] = set()
+        for pattern in patterns:
+            match = re.search(r"\.([A-Za-z0-9]+)$", str(pattern or ""))
+            if match:
+                out.add(match.group(1).lower())
+        return out
+
+    def _candidate_extensions(self, candidate: dict[str, Any]) -> set[str]:
+        values = [candidate.get("extension"), candidate.get("filename"), candidate.get("folder")]
+        values.extend(candidate.get("filenames") or []) if isinstance(candidate.get("filenames"), list) else None
+        extensions: set[str] = set()
+        for value in values:
+            if not value:
+                continue
+            suffix = Path(str(value)).suffix.lstrip(".").lower()
+            if suffix:
+                extensions.add(suffix)
+            ext = str(value).strip().lower().lstrip(".")
+            if ext and len(ext) <= 6 and "/" not in ext and "\\" not in ext:
+                extensions.add(ext)
+        return extensions
+
+    def _candidate_text(self, candidate: dict[str, Any]) -> str:
+        parts = [candidate.get("filename"), candidate.get("folder")]
+        if isinstance(candidate.get("filenames"), list):
+            parts.extend(candidate.get("filenames")[:8])
+        return " ".join(str(part) for part in parts if part)
+
+    @staticmethod
+    def _soulseek_text_overlap(requested: str, candidate_text: str) -> float:
+        req = {tok for tok in re.findall(r"[a-z0-9]+", requested.lower()) if len(tok) > 2}
+        cand = {tok for tok in re.findall(r"[a-z0-9]+", candidate_text.lower()) if len(tok) > 2}
+        if not req:
+            return 0.1
+        if not cand:
+            return 0.0
+        return len(req & cand) / max(1, len(req))
+
+    @staticmethod
+    def _soulseek_queue_rank(candidate: dict[str, Any]) -> tuple[int, int]:
+        free = candidate.get("has_free_upload_slot")
+        free_rank = 0 if free is True else (1 if free is None else 2)
+        try:
+            queue = int(candidate.get("queue_length") if candidate.get("queue_length") is not None else 999999)
+        except (TypeError, ValueError):
+            queue = 999999
+        return (free_rank, queue)
+
     def build_torrent_selection_guidance(self) -> str:
         """Return category-owned torrent selection guidance without TV/movie leakage."""
         profile = self.llm_profile()

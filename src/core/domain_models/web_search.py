@@ -199,7 +199,12 @@ class TorrentScrapeResult(BaseModel):
 
 
 class ProviderSearchDiagnostics(BaseModel):
-    """Diagnostics for one provider search."""
+    """Diagnostics for one provider search.
+
+    ``outcome`` is intentionally coarse and stable for orchestration: callers
+    need to distinguish a credible empty result from a provider failure.  The
+    older fields remain for UI compatibility.
+    """
 
     provider: str
     ok: bool
@@ -209,6 +214,7 @@ class ProviderSearchDiagnostics(BaseModel):
     error: str | None = None
     used_browser: bool = False
     elapsed_ms: int = 0
+    outcome: str = "ok_empty"
 
 
 class SearchAggregateResult(BaseModel):

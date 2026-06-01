@@ -20,21 +20,11 @@ data/api_keys.json
 data/*.db
 data/*.sqlite*
 data/*.jsonl
-data/jackett/
-data/slskd/
 data/logs/
 data/cache/
-data/categories/*/metadata/
 data/embedding_models/
 diagnostics/
 *.log
-
-# Local download/library directories
-downloads/
-library/
-
-# macOS resource forks
-._*
 
 # Python runtime/build artifacts
 __pycache__/
@@ -61,6 +51,3 @@ yarn-error.log*
 
 # Working-session history, generated reliability notes, and review scratchpads
 /docs/project-history/
-
-# Temporary archives
-logs.zip

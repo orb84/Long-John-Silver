@@ -338,6 +338,7 @@ class DownloadToolProvider:
         database: Optional[Database] = None,
         search_aggregator: Optional[SearchAggregator] = None,
         settings_manager: Optional[SettingsManager] = None,
+        category_registry: object | None = None,
     ) -> None:
         """Initialize with optional dependencies.
 
@@ -353,6 +354,7 @@ class DownloadToolProvider:
         self._database = database
         self._search_aggregator = search_aggregator
         self._settings_manager = settings_manager
+        self._category_registry = category_registry
 
     def get_tools(self) -> list:
         """Return instantiated download tool instances.
@@ -369,7 +371,7 @@ class DownloadToolProvider:
             ManageDownloadsTool(downloader=self._downloader),
             GetUpgradesTool(database=self._database),
             SearchTorrentsTool(search_aggregator=self._search_aggregator, database=self._database),
-            *SoulseekToolProvider(settings_manager=self._settings_manager, database=self._database).get_tools(),
+            *SoulseekToolProvider(settings_manager=self._settings_manager, database=self._database, category_registry=self._category_registry).get_tools(),
         ]
 
 

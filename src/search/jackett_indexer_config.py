@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
+import xml.etree.ElementTree as ET
 
 from loguru import logger
 import httpx
@@ -79,6 +80,7 @@ class JackettIndexerInfo:
     language: str = ""
     categories: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    link: str = ""
 
 
 class JackettIndexerConfigurer:
@@ -193,23 +195,150 @@ class JackettIndexerConfigurer:
                 )
                 if self._is_login_redirect(response):
                     self._last_catalogue_error = (
-                        "Jackett indexer administration redirected to the UI login. "
-                        "Search may still work for already configured indexers, but LJS cannot "
-                        "auto-configure indexers until Jackett admin auth is cleared or handled."
+                        "Jackett admin indexer API redirected to the UI login. Falling back to "
+                        "Torznab t=indexers because Jackett search endpoints still accept API-key auth."
                     )
                     logger.info("Jackett: {}", self._last_catalogue_error)
+                    fallback = await self._fetch_indexer_catalogue_via_torznab()
+                    if fallback:
+                        return fallback
                     return []
                 response.raise_for_status()
             data = response.json()
         except Exception as exc:
             self._last_catalogue_error = f"Jackett indexer catalogue unavailable: {exc}"
             logger.info("Jackett: {}", self._last_catalogue_error)
+            fallback = await self._fetch_indexer_catalogue_via_torznab()
+            if fallback:
+                return fallback
             return []
         if not isinstance(data, list):
             self._last_catalogue_error = "Jackett indexer catalogue returned an unexpected payload."
             logger.info("Jackett: {}", self._last_catalogue_error)
+            fallback = await self._fetch_indexer_catalogue_via_torznab()
+            if fallback:
+                return fallback
             return []
         return [self._normalize_indexer(raw) for raw in data if isinstance(raw, dict)]
+
+    async def _fetch_indexer_catalogue_via_torznab(self) -> list[JackettIndexerInfo]:
+        """Fetch indexer info through Jackett's Torznab t=indexers endpoint.
+
+        Recent Jackett builds can protect /api/v2.0/indexers behind the admin UI
+        login even for localhost+API-key clients.  Jackett documents
+        ``.../indexers/all/results/torznab/api?t=indexers`` as the API-key
+        compatible way to get indexer information, so use it for diagnostics.
+        """
+        configured = await self._fetch_torznab_indexers(configured=True)
+        unconfigured = await self._fetch_torznab_indexers(configured=False)
+        merged: dict[str, JackettIndexerInfo] = {}
+        for entry in unconfigured:
+            if entry.id:
+                merged[entry.id] = entry
+        for entry in configured:
+            if entry.id:
+                merged[entry.id] = entry
+        if merged:
+            logger.info(
+                "Jackett: indexer diagnostics recovered through Torznab t=indexers "
+                f"(configured={len(configured)}, unconfigured={len(unconfigured)})"
+            )
+            return list(merged.values())
+        return []
+
+    async def _fetch_torznab_indexers(self, *, configured: bool) -> list[JackettIndexerInfo]:
+        try:
+            async with httpx.AsyncClient(timeout=_CONFIG_TIMEOUT, verify=False, follow_redirects=False) as client:
+                response = await client.get(
+                    f"{self._url}/api/v2.0/indexers/all/results/torznab/api",
+                    params={
+                        "apikey": self._api_key,
+                        "t": "indexers",
+                        "configured": str(bool(configured)).lower(),
+                    },
+                    headers={"Accept": "application/xml,text/xml,*/*"},
+                )
+                if self._is_login_redirect(response):
+                    logger.info(
+                        "Jackett: Torznab t=indexers configured={} also redirected to UI login",
+                        configured,
+                    )
+                    return []
+                response.raise_for_status()
+            text = response.text or ""
+            parsed = self._parse_torznab_indexers(text, configured=configured)
+            if not parsed:
+                logger.info(
+                    "Jackett: Torznab t=indexers configured={} returned no parseable indexers (status={}, content_type={!r}, body_prefix={!r})",
+                    configured,
+                    response.status_code,
+                    response.headers.get("content-type") or "",
+                    self._safe_body_prefix(response, limit=180),
+                )
+            return parsed
+        except Exception as exc:
+            logger.info(f"Jackett: Torznab t=indexers configured={configured} unavailable: {exc}")
+            return []
+
+    def _parse_torznab_indexers(self, xml_text: str, *, configured: bool) -> list[JackettIndexerInfo]:
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            return []
+        entries: list[JackettIndexerInfo] = []
+        # Jackett has used multiple shapes here.  Be liberal: either
+        # <indexer id="..."> nodes or RSS <item> entries with id/name attrs.
+        for node in root.iter():
+            tag = self._strip_xml_ns(node.tag).lower()
+            if tag not in {"indexer", "item"}:
+                continue
+            raw_id = node.get("id") or node.get("ID") or node.get("tracker")
+            raw_name = node.get("name") or node.get("Name")
+            if not raw_name:
+                title = node.findtext("title") or node.findtext("name")
+                raw_name = title
+            if not raw_id:
+                raw_id = node.findtext("id") or node.findtext("tracker") or raw_name
+            idx = str(raw_id or "").strip()
+            name = str(raw_name or idx).strip()
+            if not idx:
+                continue
+            idx_type = str(node.get("type") or node.get("Type") or node.findtext("type") or "unknown").strip().lower()
+            language = str(node.get("language") or node.get("Language") or node.findtext("language") or "").strip()
+            link = str(node.get("link") or node.get("site_link") or node.findtext("link") or node.findtext("site") or "").strip()
+            tags = []
+            cats = []
+            for child in list(node):
+                child_tag = self._strip_xml_ns(child.tag).lower()
+                raw_value = (child.text or "").strip()
+                value = raw_value.lower()
+                if child_tag == "link" and raw_value:
+                    link = raw_value
+                elif child_tag == "language" and raw_value and not language:
+                    language = raw_value
+                elif child_tag == "type" and raw_value and (not idx_type or idx_type == "unknown"):
+                    idx_type = raw_value.lower()
+                elif child_tag in {"tag", "tags"} and value:
+                    tags.append(value)
+                elif child_tag in {"category", "categories"} and value:
+                    cats.append(value)
+            entries.append(JackettIndexerInfo(
+                id=idx,
+                name=name,
+                configured=configured,
+                type=idx_type,
+                language=language,
+                categories=tuple(cats),
+                tags=tuple(tags),
+                link=link,
+            ))
+        return entries
+
+    @staticmethod
+    def _strip_xml_ns(tag: str) -> str:
+        if "}" in tag:
+            return tag.rsplit("}", 1)[-1]
+        return tag
 
     def summarize_catalogue(self, catalogue: list[JackettIndexerInfo]) -> dict[str, Any]:
         """Return a compact summary of Jackett catalogue utilization."""
@@ -243,7 +372,10 @@ class JackettIndexerConfigurer:
         catalogue = await self.fetch_indexer_catalogue()
         return {
             "status": "ok" if catalogue else ("degraded" if self._last_catalogue_error else "unknown"),
-            "error": self._last_catalogue_error,
+            # Do not use a top-level key named "error" here: diagnostics are a
+            # readable status payload, and the unified UI action gateway treats
+            # any returned dict containing "error" as a failed action.
+            "admin_error": self._last_catalogue_error,
             "summary": self.summarize_catalogue(catalogue),
             "configured": [entry.__dict__ for entry in catalogue if entry.configured][:500],
             "unconfigured": [entry.__dict__ for entry in catalogue if not entry.configured][:500],
@@ -301,19 +433,93 @@ class JackettIndexerConfigurer:
                 verify=False,
                 follow_redirects=False,
             ) as client:
-                response = await client.get(f"{self._url}/UI/Dashboard")
-                if self._is_login_redirect(response):
+                api_probe = await client.get(
+                    f"{self._url}/api/v2.0/indexers",
+                    params={"apikey": self._api_key},
+                    headers={"Accept": "application/json"},
+                )
+                self._log_probe("admin_api_indexers", api_probe)
+                if api_probe.status_code == 200 and not self._is_login_redirect(api_probe):
+                    self._cookies = dict(client.cookies)
+                    return True
+
+                # Newer Jackett builds may redirect admin/API calls to
+                # /UI/Login even when AdminPassword is unset. In no-password
+                # mode, GET /UI/Login issues the local auth cookie; if a real
+                # password exists the retry still redirects and we fail closed.
+                if self._is_login_redirect(api_probe):
+                    if await self._bootstrap_login_cookie(client, api_probe.headers.get("location")):
+                        retry = await client.get(
+                            f"{self._url}/api/v2.0/indexers",
+                            params={"apikey": self._api_key},
+                            headers={"Accept": "application/json"},
+                        )
+                        self._log_probe("admin_api_indexers_after_login_cookie", retry)
+                        if retry.status_code == 200 and not self._is_login_redirect(retry):
+                            self._cookies = dict(client.cookies)
+                            return True
+
+                dashboard = await client.get(f"{self._url}/UI/Dashboard")
+                self._log_probe("ui_dashboard", dashboard)
+                if self._is_login_redirect(dashboard):
+                    if await self._bootstrap_login_cookie(client, dashboard.headers.get("location")):
+                        dashboard_retry = await client.get(f"{self._url}/UI/Dashboard")
+                        self._log_probe("ui_dashboard_after_login_cookie", dashboard_retry)
+                        if dashboard_retry.status_code < 400 and not self._is_login_redirect(dashboard_retry):
+                            self._cookies = dict(client.cookies)
+                            return True
                     self._last_catalogue_error = (
-                        "Jackett admin UI requires login; automatic indexer configuration is unavailable."
+                        "Jackett admin UI requires login and the API-key admin probe did not succeed; automatic indexer configuration is unavailable for this runtime."
                     )
                     logger.info("Jackett: {}", self._last_catalogue_error)
                     return False
                 self._cookies = dict(client.cookies)
-                return response.status_code < 400 and "Jackett" in self._cookies
+                return dashboard.status_code < 400
         except Exception as e:
             self._last_catalogue_error = f"Jackett auth failed: {e}"
             logger.info("Jackett: {}", self._last_catalogue_error)
             return False
+
+    async def _bootstrap_login_cookie(self, client: httpx.AsyncClient, location: str | None) -> bool:
+        """Try Jackett's no-password UI login-cookie bootstrap."""
+        try:
+            target = str(location or "/UI/Login?ReturnUrl=%2FUI%2FDashboard")
+            if not target.lower().startswith("http"):
+                target = self._url + (target if target.startswith("/") else "/" + target)
+            login = await client.get(target)
+            self._log_probe("ui_login_cookie_bootstrap", login)
+            if login.status_code in {301, 302, 303, 307, 308}:
+                redirected = str(login.headers.get("location") or "")
+                if redirected:
+                    if not redirected.lower().startswith("http"):
+                        redirected = self._url + (redirected if redirected.startswith("/") else "/" + redirected)
+                    follow = await client.get(redirected)
+                    self._log_probe("ui_login_cookie_bootstrap_follow", follow)
+            return bool(client.cookies)
+        except Exception as exc:
+            logger.info(f"Jackett: login-cookie bootstrap failed: {exc}")
+            return False
+
+    @staticmethod
+    def _safe_body_prefix(response: httpx.Response, limit: int = 120) -> str:
+        try:
+            text = response.text.replace("\n", " ").replace("\r", " ")
+            return text[:limit]
+        except Exception:
+            return ""
+
+    def _log_probe(self, label: str, response: httpx.Response) -> None:
+        location = response.headers.get("location") or ""
+        content_type = response.headers.get("content-type") or ""
+        logger.info(
+            "Jackett admin probe {}: status={} location={!r} content_type={!r} login_redirect={} body_prefix={!r}",
+            label,
+            response.status_code,
+            location[:160],
+            content_type[:120],
+            self._is_login_redirect(response),
+            self._safe_body_prefix(response),
+        )
 
     @staticmethod
     def _is_login_redirect(response: httpx.Response) -> bool:
@@ -345,10 +551,18 @@ class JackettIndexerConfigurer:
         ) as client:
             response = await client.get(
                 f"{self._url}/api/v2.0/indexers/{indexer_id}/config",
+                params={"apikey": self._api_key},
                 headers={"Accept": "application/json"},
             )
             if response.status_code != 200:
-                logger.debug(f"Jackett: indexer '{indexer_id}' config fetch returned {response.status_code}")
+                logger.info(
+                    "Jackett: indexer '{}' config fetch returned status={} location={!r} content_type={!r} body_prefix={!r}",
+                    indexer_id,
+                    response.status_code,
+                    (response.headers.get("location") or "")[:160],
+                    (response.headers.get("content-type") or "")[:120],
+                    self._safe_body_prefix(response),
+                )
                 return None
             return response.json()
 
@@ -360,13 +574,21 @@ class JackettIndexerConfigurer:
         ) as client:
             response = await client.post(
                 f"{self._url}/api/v2.0/indexers/{indexer_id}/config",
+                params={"apikey": self._api_key},
                 headers={"Content-Type": "application/json"},
                 json=config,
             )
             if response.status_code == 204:
                 logger.debug(f"Jackett: configured indexer '{indexer_id}'")
                 return True
-            logger.debug(f"Jackett: indexer '{indexer_id}' config POST returned {response.status_code}")
+            logger.info(
+                "Jackett: indexer '{}' config POST returned status={} location={!r} content_type={!r} body_prefix={!r}",
+                indexer_id,
+                response.status_code,
+                (response.headers.get("location") or "")[:160],
+                (response.headers.get("content-type") or "")[:120],
+                self._safe_body_prefix(response),
+            )
             return False
 
     @staticmethod
@@ -433,6 +655,7 @@ class JackettIndexerConfigurer:
             language=str(raw.get("language") or raw.get("Language") or "").strip(),
             categories=tuple(str(cat).lower() for cat in categories if cat is not None),
             tags=tuple(str(tag).lower() for tag in tags if tag is not None),
+            link=str(raw.get("link") or raw.get("Link") or raw.get("site_link") or raw.get("SiteLink") or raw.get("website") or "").strip(),
         )
 
     @staticmethod

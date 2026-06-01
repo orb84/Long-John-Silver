@@ -103,15 +103,16 @@ class SearchAggregator:
         )
 
         fallback_used = False
-        if not ranked and self._fallback_providers and not active_providers:
+        if not ranked and self._fallback_providers and (not active_providers or self._should_use_emergency_fallback(diagnostics)):
             fallback_providers = [
                 provider for provider in self._fallback_providers
                 if self._provider_supports_category(provider, category)
             ]
             if fallback_providers:
+                reason = "no primary provider" if not active_providers else self._fallback_reason(diagnostics)
                 logger.warning(
-                    f"No primary torrent provider is available for '{query}'. "
-                    "Trying explicitly enabled direct-scraper emergency providers."
+                    f"Primary torrent search produced no usable results for '{query}' ({reason}). "
+                    "Trying explicitly configured direct-scraper emergency providers."
                 )
                 fallback_results, fallback_diagnostics = await self._search_providers_with_diagnostics(
                     query, providers=fallback_providers, category=category,
@@ -122,10 +123,7 @@ class SearchAggregator:
                 )
                 fallback_used = True
         elif not ranked and self._fallback_providers and active_providers:
-            logger.info(
-                f"Primary torrent search returned no usable results for '{query}', "
-                "but direct-scraper fallback is not used while a primary provider is configured."
-            )
+            logger.info(f"Primary torrent search returned no usable results for '{query}', and emergency fallback policy did not trigger.")
 
         self._provider_diagnostics = diagnostics
         logger.info(
@@ -178,7 +176,7 @@ class SearchAggregator:
         ranked, quality_filtered, filtered, deduped = await self._prepare_results(
             all_results, preferred_language=preferred_language, quality_profile=profile,
         )
-        if not ranked and self._fallback_providers and not active_providers:
+        if not ranked and self._fallback_providers and (not active_providers or self._should_use_emergency_fallback(diagnostics)):
             fallback_providers = [
                 provider for provider in self._fallback_providers
                 if self._provider_supports_category(provider, category)
@@ -191,10 +189,7 @@ class SearchAggregator:
                 fallback_results, preferred_language=preferred_language, quality_profile=profile,
             )
         elif not ranked and self._fallback_providers and active_providers:
-            logger.info(
-                f"Primary torrent diagnostics returned no usable results for '{query}', "
-                "but direct-scraper fallback is not used while a primary provider is configured."
-            )
+            logger.info(f"Primary torrent diagnostics returned no usable results for '{query}', and emergency fallback policy did not trigger.")
         self._provider_diagnostics = diagnostics
         if ranked:
             self._last_successful_search_at = datetime.now(timezone.utc).isoformat()
@@ -244,7 +239,71 @@ class SearchAggregator:
     def last_search_timed_out(self) -> bool:
         """Return whether the most recent provider call was killed by timeout."""
         diagnostics = getattr(self, "_provider_diagnostics", {}) or {}
-        return any("timeout" in str(getattr(diag, "error", "") or "").casefold() for diag in diagnostics.values())
+        return any(getattr(diag, "outcome", "") == "timeout" or "timeout" in str(getattr(diag, "error", "") or "").casefold() for diag in diagnostics.values())
+
+    def last_search_degraded(self) -> bool:
+        """Return whether the latest search ended in provider failure/degradation.
+
+        Empty-but-successful results are not degradation.  Timeouts, auth
+        redirects, parse failures, and provider exceptions are.
+        """
+        diagnostics = getattr(self, "_provider_diagnostics", {}) or {}
+        degraded = {"timeout", "auth_error", "parse_error", "provider_error", "no_configured_indexers"}
+        return any(getattr(diag, "outcome", "") in degraded or (not getattr(diag, "ok", True) and getattr(diag, "result_count", 0) == 0) for diag in diagnostics.values())
+
+    @staticmethod
+    def _diagnostic_outcome(ok: bool, result_count: int, error: str | None, blocked_reason: str | None) -> str:
+        marker = " ".join(str(value or "") for value in (error, blocked_reason)).casefold()
+        if "timeout" in marker:
+            return "timeout"
+        if any(token in marker for token in ("auth", "login", "redirect", "invalid_api_key", "forbidden", "401", "403")):
+            return "auth_error"
+        if any(token in marker for token in ("parse", "invalid_json", "xml")):
+            return "parse_error"
+        if "no_configured" in marker:
+            return "no_configured_indexers"
+        if not ok:
+            return "provider_error"
+        return "ok_with_results" if result_count > 0 else "ok_empty"
+
+    def _should_use_emergency_fallback(self, diagnostics: dict[str, ProviderSearchDiagnostics]) -> bool:
+        """Return whether direct-scraper fallback should run despite a primary.
+
+        Direct scrapers are still fallbacks, not normal routing.  But a primary
+        provider that returns zero after timing out/degrading must not block all
+        other avenues; the Boys S01 logs showed exactly that failure mode.
+        """
+        if not diagnostics:
+            return True
+        for diag in diagnostics.values():
+            marker = " ".join(
+                str(value or "") for value in (diag.error, diag.blocked_reason)
+            ).casefold()
+            if getattr(diag, "outcome", "") in {"timeout", "auth_error", "parse_error", "provider_error", "no_configured_indexers"}:
+                return True
+            if not diag.ok or any(token in marker for token in (
+                "timeout", "auth", "invalid_api_key", "connection", "no_configured", "redirect",
+            )):
+                return True
+            # Provider completed but found nothing. For interactive user searches
+            # this is enough to try emergency scrapers because public Jackett
+            # indexers often have uneven coverage and the fallback cost is now
+            # bounded by per-provider timeouts.
+            if diag.result_count == 0:
+                return True
+        return False
+
+    @staticmethod
+    def _fallback_reason(diagnostics: dict[str, ProviderSearchDiagnostics]) -> str:
+        parts: list[str] = []
+        for diag in diagnostics.values():
+            if diag.error:
+                parts.append(f"{diag.provider}: {diag.error}")
+            elif diag.blocked_reason:
+                parts.append(f"{diag.provider}: {diag.blocked_reason}")
+            else:
+                parts.append(f"{diag.provider}: {diag.result_count} result(s)")
+        return "; ".join(parts) or "primary empty/degraded"
 
 
 
@@ -331,25 +390,32 @@ class SearchAggregator:
                         self._call_provider_search(provider, query, category),
                         timeout=self._provider_timeout_for(provider),
                     )
+                blocked = getattr(provider, "latest_error_category", None)
+                outcome = self._diagnostic_outcome(ok=True, result_count=len(results), error=None, blocked_reason=blocked)
                 diagnostics[provider.name] = ProviderSearchDiagnostics(
                     provider=provider.name,
-                    ok=True,
+                    ok=outcome not in {"timeout", "auth_error", "provider_error"},
                     result_count=len(results),
                     magnet_count=sum(1 for result in results if result.magnet),
+                    blocked_reason=blocked,
                     used_browser=False,
                     elapsed_ms=int((time.monotonic() - started) * 1000),
+                    outcome=outcome,
                 )
                 return results
             except asyncio.TimeoutError:
                 diagnostics[provider.name] = ProviderSearchDiagnostics(
                     provider=provider.name, ok=False, error=f"provider timeout after {self._provider_timeout_for(provider)}s",
                     elapsed_ms=int((time.monotonic() - started) * 1000),
+                    outcome="timeout",
                 )
             except Exception as exc:
+                blocked = getattr(provider, "latest_error_category", None)
                 diagnostics[provider.name] = ProviderSearchDiagnostics(
                     provider=provider.name, ok=False, error=str(exc),
-                    blocked_reason=getattr(provider, "latest_error_category", None),
+                    blocked_reason=blocked,
                     elapsed_ms=int((time.monotonic() - started) * 1000),
+                    outcome=self._diagnostic_outcome(ok=False, result_count=0, error=str(exc), blocked_reason=blocked),
                 )
             return []
 

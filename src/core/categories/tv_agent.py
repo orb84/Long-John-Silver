@@ -378,6 +378,17 @@ class TvAgentSearchMixin:
                     continue
                 seen.add(identity)
                 merged.append(result)
+            if not results and self._aggregator_degraded(context):
+                logger.warning(
+                    f"TV episode-pack fallback degraded after query {query!r}; stopping torrent ladder so fallback sources can answer."
+                )
+                break
+            if len(merged) >= 25:
+                logger.info(
+                    f"TV pack query ladder stopping early for {item.key} season={season}: "
+                    f"{len(merged)} structurally relevant candidate(s) collected."
+                )
+                break
         ranked = await self.rank_agent_search_results(
             merged, item=item, language=language, season=season, episode=episode, context=context,
         )
@@ -405,7 +416,10 @@ class TvAgentSearchMixin:
         merged: list[Any] = []
         seen: set[str] = set()
         quality_profile = getattr(item, "quality", None)
+        attempted_language_query = False
         for query in queries:
+            if self._query_has_language_token(query, language):
+                attempted_language_query = True
             try:
                 results = await context.aggregator.search(
                     query,
@@ -416,6 +430,7 @@ class TvAgentSearchMixin:
             except Exception as exc:
                 logger.debug(f"TV pack query failed for {item.key}: {query}: {exc}")
                 continue
+            before = len(merged)
             for result in results or []:
                 if not getattr(result, "magnet", None):
                     continue
@@ -426,6 +441,23 @@ class TvAgentSearchMixin:
                     continue
                 seen.add(identity)
                 merged.append(result)
+            added = len(merged) - before
+            if added:
+                logger.info(
+                    "TV pack query %r added %d structurally relevant candidate(s) for %s S%02d (total=%d, preferred_language=%r)",
+                    query, added, getattr(item, "key", ""), int(season), len(merged), language,
+                )
+            if len(merged) >= 40 and (not language or attempted_language_query or self._has_preferred_language_result(merged, language)):
+                logger.info(
+                    "TV pack query plan stopping early for %s S%02d after %d candidate(s); enough precise/language-aware results collected.",
+                    getattr(item, "key", ""), int(season), len(merged),
+                )
+                break
+            if not results and self._aggregator_degraded(context):
+                logger.warning(
+                    f"TV pack query plan degraded after query {query!r}; stopping torrent ladder so fallback sources can answer."
+                )
+                break
         ranked = await self.rank_agent_search_results(
             merged, item=item, language=language, season=season, episode=None, context=context,
         )
@@ -433,6 +465,23 @@ class TvAgentSearchMixin:
         if summary_suffix:
             summary = f"{summary} ({summary_suffix})"
         return ranked, summary
+
+    @staticmethod
+    def _aggregator_degraded(context: Any) -> bool:
+        """Return true when the last torrent provider attempt was degraded.
+
+        TV owns the query ladder, but the provider layer owns outage/timeout
+        state.  Once the provider reports degradation, continuing to serially
+        try "Complete", "Pack", and similar variants only repeats the same
+        failure and delays Soulseek/direct fallbacks.
+        """
+        checker = getattr(getattr(context, "aggregator", None), "last_search_degraded", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return False
 
     async def resolve_agent_pack_season(self, item: Any, context: Any | None) -> int | None:
         """Resolve the season implied by a latest/last-season pack request.
@@ -522,15 +571,29 @@ class TvAgentSearchMixin:
         s = int(season)
         episode_count = await self._expected_episode_count(title, s, {}, context) if context is not None else None
         latest_season = await self.resolve_agent_pack_season(item, context) if context is not None else None
-        raw: list[str] = [
-            f"{title} S{s:02d}",
-            f"{title} Season {s}",
+        language_tokens = self._language_query_tokens(language)
+        exact = f"{title} S{s:02d}"
+        season_words = f"{title} Season {s}"
+        raw: list[str] = [exact]
+        # Preferred media language is not a hard recall gate, but it must be
+        # visible in the category-owned plan.  Add a small number of language
+        # variants after the literal manual-equivalent query so Jackett can find
+        # releases that are indexed primarily by ``ITA``/``Italian`` tags.
+        for token in language_tokens[:2]:
+            raw.append(f"{exact} {token}")
+        raw.append(season_words)
+        for token in language_tokens[:1]:
+            raw.append(f"{season_words} {token}")
+        raw.extend([
             f"{title} S{s:02d} Complete",
             f"{title} Season {s} Complete",
             f"{title} S{s:02d} Pack",
             f"{title} Season {s} Pack",
             f"{title} S{s:02d} Full",
-        ]
+            # Broad title is now a late recovery query.  Putting it early flooded
+            # the Season 1 workspace with S04/S05 and unrelated "... Boys" rows.
+            f"{title}",
+        ])
         if episode_count and episode_count > 1:
             raw.extend([
                 f"{title} S{s:02d}E01-E{int(episode_count):02d}",
@@ -546,13 +609,50 @@ class TvAgentSearchMixin:
         seen: set[str] = set()
         queries: list[str] = []
         for query in raw:
-            query = self.search._append_language(query, language)
             normalized = query.strip().lower()
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
             queries.append(query.strip())
-        return queries[:12]
+        # Keep the interactive ladder bounded. Each query can fan out across
+        # many configured Jackett indexers.  Language variants are deliberately
+        # early, while broad title fallback is deliberately late.
+        return queries[:8]
+
+
+    @classmethod
+    def _language_query_tokens(cls, language: str | None) -> list[str]:
+        """Return short TV release-search language tokens for optional fanout.
+
+        These tokens supplement the literal query; they do not replace ranking
+        and confirmation rules.  The user noticed that configured Italian never
+        appeared in the actual provider queries, which hid the language facet
+        from Jackett/indexer-side search.
+        """
+        token = cls._canonical_language_token(language) if language else ""
+        if token == "italian":
+            return ["ITA", "Italian"]
+        if token == "english":
+            return ["ENG", "English"]
+        return [str(language).strip()] if str(language or "").strip() else []
+
+    @classmethod
+    def _query_has_language_token(cls, query: str, language: str | None) -> bool:
+        token = cls._canonical_language_token(language) if language else ""
+        if not token:
+            return False
+        return cls._title_has_language_token(str(query or "").lower(), token)
+
+    @classmethod
+    def _has_preferred_language_result(cls, rows: list[Any], language: str | None) -> bool:
+        token = cls._canonical_language_token(language) if language else ""
+        if not token:
+            return True
+        for row in rows or []:
+            title = str(getattr(row, "title", "") or "")
+            if cls._title_has_language_token(title.lower(), token):
+                return True
+        return False
 
     def _is_relevant_season_pack_result(self, result: Any, season: int, item: Any | None = None) -> bool:
         """Return whether a detected TV bundle can contain the requested season."""
@@ -755,6 +855,21 @@ class TvAgentSearchMixin:
         def score(item_tuple: tuple[Any, dict[str, Any], int]) -> tuple:
             """Rank eligible TV candidates by language, quality, pack shape, and health."""
             result, tags, per_ep_bytes = item_tuple
+            from src.core.categories.tv_bundle import TVBundleKnowledge
+            title = str(getattr(result, "title", "") or "")
+            pack = TVBundleKnowledge.detect_season_pack(title)
+            pack_fit = 0
+            if season is not None and pack:
+                start = self._safe_positive_int(pack.get("season_start")) or self._safe_positive_int(pack.get("season"))
+                end = self._safe_positive_int(pack.get("season_end")) or start
+                if pack.get("pack_type") == "series_complete":
+                    pack_fit = -8
+                elif start == int(season) and end == int(season):
+                    pack_fit = 8
+                elif start and end and start <= int(season) <= end:
+                    pack_fit = -5
+                else:
+                    pack_fit = -20
             languages = {self._canonical_language_token(lang) for lang in (tags.get("languages") or [])}
             preferred_token = self._canonical_language_token(preferred) if preferred else ""
             title_has_preferred = bool(preferred_token and self._title_has_language_token((getattr(result, "title", "") or "").lower(), preferred_token))
@@ -793,6 +908,7 @@ class TvAgentSearchMixin:
             if size_mode == "smaller" and current_size_mb and size_mb and size_mb < float(current_size_mb):
                 smaller_bonus = min(3.0, (float(current_size_mb) - size_mb) / max(float(current_size_mb), 1.0) * 3.0)
             return (
+                pack_fit,
                 lang_score,
                 same_resolution_bonus + downgrade_penalty,
                 bitrate_score,

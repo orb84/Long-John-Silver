@@ -27,8 +27,8 @@ class SearchSoulseekTool:
 
     name = "search_soulseek"
     description = (
-        "Search Soulseek through slskd as a companion source for music, audiobooks, ebooks, and rare files. "
-        "Use this when torrents fail, when a user explicitly asks to use Soulseek, or when music/book material is likely better on Soulseek. "
+        "Search Soulseek through slskd as a category-aware companion source. "
+        "Use the active category_id so Movie/TV/Music/Book rules can filter formats, language, resolution, bitrate, and unit coverage. "
         "Do not pass these candidates to queue_download; use enqueue_soulseek_download for selected Soulseek files."
     )
     intents = {Intent.SEARCH, Intent.DOWNLOAD}
@@ -37,9 +37,10 @@ class SearchSoulseekTool:
     destructive = False
     required_dependencies = ["settings_manager"]
 
-    def __init__(self, settings_manager: Optional["SettingsManager"] = None, database: Optional["Database"] = None) -> None:
+    def __init__(self, settings_manager: Optional["SettingsManager"] = None, database: Optional["Database"] = None, category_registry: Any | None = None) -> None:
         self._settings_manager = settings_manager
         self._database = database
+        self._category_registry = category_registry
 
     def parameters(self) -> dict:
         """Return the JSON schema for Soulseek search arguments."""
@@ -47,7 +48,7 @@ class SearchSoulseekTool:
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Soulseek search text."},
-                "category_id": {"type": "string", "description": "Optional category such as music, audiobooks, or ebooks."},
+                "category_id": {"type": "string", "description": "Optional category such as movie, tv, music, audiobooks, or ebooks. If omitted, LJS uses the active category from the current turn."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum normalized files to return."},
             },
             "required": ["query"],
@@ -59,7 +60,7 @@ class SearchSoulseekTool:
             return self._not_configured("Settings manager is not available.")
         settings = self._settings_manager.settings
         cfg = settings.soulseek
-        category_id = str(arguments.get("category_id") or "").strip().lower()
+        category_id = str(arguments.get("category_id") or getattr(context, "category_id", None) or "").strip().lower()
         if category_id and cfg.search_enabled_categories and category_id not in set(cfg.search_enabled_categories):
             return {
                 "ok": False,
@@ -77,39 +78,65 @@ class SearchSoulseekTool:
                 return self._not_configured(cfg.account_status_message or "Soulseek rejected these credentials.", error_code="SLSKD_AUTH_FAILED")
         client = SlskdClient(cfg)
         original_query_text = str(arguments.get("query") or "")
-        query_variants = _soulseek_query_variants(original_query_text) if category_id == "music" else []
-        query_text = query_variants[0] if query_variants else original_query_text
-        max_results = arguments.get("max_results")
-        result = await client.search(query_text, max_results=max_results)
-        # Direct Soulseek retries should behave like the companion search: music
-        # album/track requests often need concise artist/title permutations, and
-        # the first wording from the LLM may still contain request-shape words.
-        if (
-            category_id == "music"
-            and isinstance(result, dict)
-            and result.get("ok") is True
-            and not result.get("candidates")
-        ):
-            tried = [query_text]
-            for variant in (query_variants or _soulseek_query_variants(query_text)):
-                if variant.casefold() in {str(q).casefold() for q in tried}:
-                    continue
-                tried.append(variant)
-                retry = await client.search(variant, max_results=max_results)
-                if isinstance(retry, dict) and retry.get("ok") is True and retry.get("candidates"):
-                    retry["query"] = variant
-                    retry["queries_tried"] = tried
-                    result = retry
-                    break
-            if isinstance(result, dict):
-                result.setdefault("queries_tried", tried)
+        category = self._category_registry.get(category_id) if self._category_registry and category_id else None
+        item = category.create_item(original_query_text, language=getattr(settings, "language", None)) if category else None
+        if category and hasattr(category, "build_soulseek_search_queries"):
+            query_variants = category.build_soulseek_search_queries(
+                original_query_text,
+                item,
+                language=getattr(item, "language", None),
+                search_scope="direct",
+                context=None,
+            )
+        else:
+            query_variants = [original_query_text]
+        query_variants = [str(q).strip() for q in (query_variants or []) if str(q).strip()] or [original_query_text]
+        max_results_arg = arguments.get("max_results")
+        if max_results_arg:
+            raw_limit = int(max_results_arg)
+        elif category and hasattr(category, "soulseek_search_limit"):
+            try:
+                raw_limit = int(category.soulseek_search_limit(item=item, search_scope="direct", context=None) or 80)
+            except Exception:
+                raw_limit = 80
+        else:
+            raw_limit = 80
+        raw_limit = max(10, min(raw_limit, 300))
+        result: dict[str, Any] = {}
+        tried: list[str] = []
+        for query_text in query_variants:
+            tried.append(query_text)
+            result = await client.search(query_text, max_results=raw_limit)
+            if not isinstance(result, dict) or result.get("ok") is False:
+                break
+            raw_candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+            if category and hasattr(category, "rank_soulseek_search_results"):
+                ranked = await category.rank_soulseek_search_results(
+                    raw_candidates,
+                    item=item,
+                    language=getattr(item, "language", None),
+                    search_scope="direct",
+                    context=None,
+                )
+            else:
+                ranked = raw_candidates
+            result["raw_candidate_count"] = len(raw_candidates)
+            result["category_filtered_count"] = max(0, len(raw_candidates) - len(ranked))
+            result["category_id"] = category_id or None
+            result["candidates"] = ranked[: int(max_results_arg or 12)]
+            result["candidate_count"] = len(result["candidates"])
+            result["queries_tried"] = list(tried)
+            if ranked:
+                break
         if isinstance(result, dict) and result.get("ok") is False:
             await self._record_runtime_result(cfg, result)
             result.setdefault("next_actions", ["Use torrent search fallback", "Open Settings > Shared Search & Indexers > Soulseek/slskd"])
         elif isinstance(result, dict):
             await self._mark_account_ready(cfg)
-            result["queueing_note"] = "Use enqueue_soulseek_download with candidate_id and result_set_id when available. For direct raw candidates without an id, pass username plus filename or filenames; do not use queue_download for Soulseek candidates."
+            result["queueing_note"] = "Use enqueue_soulseek_download with candidate_id and result_set_id when available. These candidates are category-filtered when category_id is supplied; do not use queue_download for Soulseek candidates."
             result.setdefault("search_notes", []).append("Private/locked Soulseek files are filtered out before candidates are shown.")
+            if result.get("raw_candidate_count") and not result.get("candidate_count") and category_id:
+                result.setdefault("search_notes", []).append("Soulseek returned raw rows, but none matched the selected category's file/quality/language rules.")
         return result
 
     async def _mark_account_ready(self, cfg: Any) -> None:
@@ -153,57 +180,6 @@ class SearchSoulseekTool:
                 "Configure Soulseek credentials and slskd API key in Settings",
             ],
         }
-
-
-def _clean_soulseek_query(value: str) -> str:
-    text = str(value or "")
-    text = re.sub(r"\b(?:album|track|song|single|ep|music|release|download|torrent|torrents|grab|get|please)\b", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b(?:flac|mp3|aac|alac|m4a|lossless|bitrate|kbps)\b", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"[\[\]{}()]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip(" -_.,")
-    return text
-
-
-def _soulseek_query_variants(query: str) -> list[str]:
-    queries: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: str) -> None:
-        cleaned = _clean_soulseek_query(value)
-        cleaned = re.sub(r"\b(?:from|by|di|da)\b", " ", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.,")
-        if cleaned and cleaned.casefold() not in seen:
-            seen.add(cleaned.casefold())
-            queries.append(cleaned)
-
-    raw = str(query or "").strip()
-    natural = re.search(r"(?P<title>.+?)\s+(?:by|from|di|da)\s+(?P<artist>.+)$", _clean_soulseek_query(raw), re.IGNORECASE)
-    if natural:
-        title = natural.group("title")
-        artist = natural.group("artist")
-        add(f"{title} {artist}")
-        add(f"{artist} {title}")
-        add(title)
-        add(artist)
-    add(raw)
-    cleaned = _clean_soulseek_query(raw)
-    if " - " in cleaned:
-        left, right = [part.strip() for part in cleaned.split(" - ", 1)]
-        add(f"{left} {right}")
-        add(f"{right} {left}")
-        add(left)
-        add(right)
-    tokens = re.sub(r"\b(?:from|by|di|da)\b", " ", cleaned, flags=re.IGNORECASE).split()
-    if len(tokens) >= 4:
-        mid = len(tokens) // 2
-        first = " ".join(tokens[:mid])
-        second = " ".join(tokens[mid:])
-        add(f"{second} {first}")
-        add(first)
-        add(second)
-    elif len(tokens) == 3:
-        add(" ".join(tokens[1:] + tokens[:1]))
-    return queries[:8]
 
 
 class EnqueueSoulseekDownloadTool:
@@ -445,14 +421,15 @@ class GetSoulseekSharePlanTool:
 class SoulseekToolProvider:
     """Tool provider for the slskd/Soulseek companion source."""
 
-    def __init__(self, settings_manager: Optional["SettingsManager"] = None, database: Optional["Database"] = None) -> None:
+    def __init__(self, settings_manager: Optional["SettingsManager"] = None, database: Optional["Database"] = None, category_registry: Any | None = None) -> None:
         self._settings_manager = settings_manager
         self._database = database
+        self._category_registry = category_registry
 
     def get_tools(self) -> list:
         """Return Soulseek/slskd tools for the agent registry."""
         return [
-            SearchSoulseekTool(settings_manager=self._settings_manager),
+            SearchSoulseekTool(settings_manager=self._settings_manager, database=self._database, category_registry=self._category_registry),
             EnqueueSoulseekDownloadTool(settings_manager=self._settings_manager, database=self._database),
             GetSoulseekSharePlanTool(settings_manager=self._settings_manager),
         ]

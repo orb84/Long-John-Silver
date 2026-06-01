@@ -84,6 +84,18 @@ class SystemActionHandler:
         self._jackett.save_to_settings(self._sm.settings)
         self._sm.save(self._sm.settings)
         indexers = await self._jackett.configure_default_indexers()
+        if (
+            isinstance(indexers, dict)
+            and (indexers.get("status") == "degraded" or (int(indexers.get("added", 0) or 0) + int(indexers.get("skipped", 0) or 0)) == 0)
+        ):
+            # First-run Jackett can create ServerConfig.json only after the
+            # process starts.  If that config contains an admin password, the
+            # indexer admin API redirects to /UI/Login and default indexer
+            # configuration fails.  Repair the managed localhost config, restart,
+            # and retry once instead of returning a "running but useless" Jackett.
+            repair = await self._jackett.repair_admin_auth_and_restart()
+            retry = await self._jackett.configure_default_indexers() if repair.get("running") else indexers
+            indexers = {"first_attempt": indexers, "repair": repair, "retry": retry}
         return {
             "status": "installed",
             "url": self._jackett.url,

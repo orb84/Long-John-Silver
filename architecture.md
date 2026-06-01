@@ -789,3 +789,11 @@ Jackett search and Jackett indexer administration are separate health surfaces. 
 
 Soulseek is modeled as a companion source provider through slskd, not as a Jackett/torrent fallback. `SoulseekSettings` stores the endpoint, API key, Soulseek credentials, and sharing policy. `slskd_config.py` computes the effective share plan, and `slskd_client.py` owns API/search/queue calls. Agent tools use `search_soulseek` and `enqueue_soulseek_download`; they must not pass Soulseek candidates to `queue_download`. A future transfer-monitor boundary should import completed slskd downloads through category hooks.
 
+
+## Round 193 macOS Jackett readiness rule
+
+Managed Jackett must be treated as search-ready only after LJS has verified real configured indexers. The `all` aggregate endpoint queries configured indexers, and Jackett filter/virtual indexers also query configured indexers; therefore filter selectors are not an acceptable substitute for a working configured-indexer setup.
+
+On macOS, managed Jackett configuration must probe and repair every LJS-owned path Jackett may use (`data/jackett_state/config/Jackett`, lowercase variants, and the managed `Library/Application Support/Jackett` compatibility path). Password repair must set `AdminPassword` to JSON `null`, not an empty string. LJS must pre-create a localhost-only managed `ServerConfig.json` before first start when none exists, then log a compact config-path diagnostic matrix before and after startup.
+
+If the admin/indexer API remains login-gated or indexer configuration still produces zero configured indexers, LJS must not register Jackett as a torrent provider and must not hide the problem behind filter-indexer mode or direct-scraper fallback. The UI/settings diagnostics should show the exact managed config paths, admin probe status, and configure-indexer failure state so the next action is visible. Private tracker support remains the normal Jackett schema/config path; it is not replaced by direct scrapers or category code.

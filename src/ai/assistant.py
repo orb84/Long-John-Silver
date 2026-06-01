@@ -526,6 +526,7 @@ class AIAssistant:
             "search" if intent == Intent.SEARCH else "chat"
         )
 
+        await self._llm_runtime.ensure_context_metadata_for_task(task)
         context_budget = self._llm_runtime.context_budget_for_task(task)
         messages = [{"role": "system", "content": system_prompt}]
         if goal_context:
@@ -801,6 +802,7 @@ class AIAssistant:
             plan_executor=plan_exec,
             plan_trace_store=plan_trace_store,
             session_id=session_id,
+            active_category_id=ctx.category_id,
         ):
             yield token
 

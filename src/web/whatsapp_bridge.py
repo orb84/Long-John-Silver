@@ -208,7 +208,7 @@ class WhatsAppBridge(CommsBridge):
         """
         self._last_notification_phone = phone
 
-    async def send_notification(self, message: NotificationMessage) -> None:
+    async def send_notification(self, message: NotificationMessage) -> bool:
         """Send a notification through WhatsApp to the last active chat.
 
         WhatsApp requires a phone number to send to, unlike Discord/Telegram
@@ -227,6 +227,8 @@ class WhatsAppBridge(CommsBridge):
                 import inspect
                 if inspect.isawaitable(coro):
                     await coro
+            return bool(success)
+        return False
 
     def verify_webhook(self, mode: str, challenge: str, verify_token: str) -> str | None:
         """Verify a WhatsApp webhook subscription challenge.
@@ -256,11 +258,17 @@ class _WhatsAppNotificationBridge:
     def __init__(self, bridge: WhatsAppBridge):
         self._bridge = bridge
 
-    async def send_notification(self, message: NotificationMessage) -> None:
+    @property
+    def delivery_id(self) -> str:
+        """Stable delivery-ledger key for the last WhatsApp notification target."""
+        phone = getattr(self._bridge, "_last_notification_phone", None)
+        return f"whatsapp:{phone or 'unconfigured'}"
+
+    async def send_notification(self, message: NotificationMessage) -> bool:
         """Execute the public _WhatsAppNotificationBridge.send_notification behavior.
 
         This method is a supported extension point for callers outside the
         class.  Keep its input/output contract stable and move specialized
         logic into collaborators or protected helpers as the feature grows.
         """
-        await self._bridge.send_notification(message)
+        return await self._bridge.send_notification(message)

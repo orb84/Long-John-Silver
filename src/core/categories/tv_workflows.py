@@ -296,12 +296,26 @@ class TvWorkflowMixin:
 
     @staticmethod
     def _unit_coordinates(text: str) -> tuple[int, int]:
-        match = re.search(r"S(\d{1,2})E(\d{1,3})", str(text or ""), flags=re.IGNORECASE)
+        """Parse a TV unit label into ``(season, episode)`` coordinates.
+
+        Older code only understood episode labels such as ``S01E03``.  Agent
+        season-pack requests, however, pass labels like ``Season 1`` or
+        ``S01`` into category hooks.  Treat those as season-only descriptors
+        instead of falling back to whatever season happens to be present in a
+        broad torrent title such as ``S01-S02``.
+        """
+        value = str(text or "")
+        match = re.search(r"S(\d{1,2})E(\d{1,3})", value, flags=re.IGNORECASE)
         if not match:
-            match = re.search(r"(\d{1,2})x(\d{1,3})", str(text or ""), flags=re.IGNORECASE)
-        if not match:
-            return 0, 0
-        return int(match.group(1)), int(match.group(2))
+            match = re.search(r"(\d{1,2})x(\d{1,3})", value, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        season_only = re.search(r"\b(?:Season|Stagione)\s*0*(\d{1,2})\b", value, flags=re.IGNORECASE)
+        if not season_only:
+            season_only = re.search(r"(?:^|[^A-Za-z0-9])S0*(\d{1,2})(?:$|[^A-Za-z0-9])", value, flags=re.IGNORECASE)
+        if season_only:
+            return int(season_only.group(1)), 0
+        return 0, 0
 
     @staticmethod
     def _is_frontier_episode(downloaded: set[tuple[int, int]], season: int, episode: int) -> bool:

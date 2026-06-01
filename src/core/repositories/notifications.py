@@ -49,8 +49,7 @@ class NotificationRepository(BaseRepository):
                 await self._db.execute(
                     """UPDATE notifications
                        SET title = ?, body = ?, level = ?, category_id = ?, item_id = ?,
-                           event_type = ?, status = 'unread', read_at = NULL,
-                           actions_json = ?, metadata_json = ?, updated_at = ?
+                           event_type = ?, actions_json = ?, metadata_json = ?, updated_at = ?
                        WHERE id = ?""",
                     (title, body, level, category_id, item_id, event_type, actions_json, metadata_json, now, row["id"]),
                 )
@@ -67,6 +66,87 @@ class NotificationRepository(BaseRepository):
         await self._db.commit()
         notification_id = int(cursor.lastrowid or 0)
         return (notification_id, True) if return_status else notification_id
+
+    async def should_deliver_to_bridge(self, notification_id: int, bridge_id: str) -> bool:
+        """Return whether a bridge should receive this notification.
+
+        The notification row is the durable web-inbox event; delivery to each
+        external bridge is tracked separately.  This prevents app startup from
+        replaying every unread web notification to Discord/Telegram/WhatsApp on
+        every launch while still allowing retries for bridges that were offline
+        or failed previously.
+        """
+        cursor = await self._db.execute(
+            """SELECT status FROM notification_deliveries
+               WHERE notification_id = ? AND bridge_id = ?""",
+            (int(notification_id), str(bridge_id)),
+        )
+        row = await cursor.fetchone()
+        return not row or str(row["status"] or "") != "delivered"
+
+    async def record_bridge_delivery_attempt(self, notification_id: int, bridge_id: str) -> None:
+        """Create/update the bridge-delivery row before attempting send."""
+        now = self._now()
+        await self._db.execute(
+            """INSERT INTO notification_deliveries
+               (notification_id, bridge_id, status, attempts, created_at, updated_at)
+               VALUES (?, ?, 'pending', 1, ?, ?)
+               ON CONFLICT(notification_id, bridge_id) DO UPDATE SET
+                   status = CASE
+                       WHEN notification_deliveries.status = 'delivered' THEN notification_deliveries.status
+                       ELSE 'pending'
+                   END,
+                   attempts = CASE
+                       WHEN notification_deliveries.status = 'delivered' THEN notification_deliveries.attempts
+                       ELSE notification_deliveries.attempts + 1
+                   END,
+                   updated_at = CASE
+                       WHEN notification_deliveries.status = 'delivered' THEN notification_deliveries.updated_at
+                       ELSE excluded.updated_at
+                   END""",
+            (int(notification_id), str(bridge_id), now, now),
+        )
+        await self._db.commit()
+
+    async def record_bridge_delivery_success(self, notification_id: int, bridge_id: str) -> None:
+        """Mark a notification as delivered to one external bridge target."""
+        now = self._now()
+        await self._db.execute(
+            """INSERT INTO notification_deliveries
+               (notification_id, bridge_id, status, attempts, delivered_at, last_error, created_at, updated_at)
+               VALUES (?, ?, 'delivered', 1, ?, '', ?, ?)
+               ON CONFLICT(notification_id, bridge_id) DO UPDATE SET
+                   status = 'delivered',
+                   delivered_at = excluded.delivered_at,
+                   last_error = '',
+                   updated_at = excluded.updated_at""",
+            (int(notification_id), str(bridge_id), now, now, now),
+        )
+        await self._db.commit()
+
+    async def record_bridge_delivery_failure(self, notification_id: int, bridge_id: str, error: str) -> None:
+        """Record a failed bridge delivery without suppressing future retry."""
+        now = self._now()
+        await self._db.execute(
+            """INSERT INTO notification_deliveries
+               (notification_id, bridge_id, status, attempts, last_error, created_at, updated_at)
+               VALUES (?, ?, 'failed', 1, ?, ?, ?)
+               ON CONFLICT(notification_id, bridge_id) DO UPDATE SET
+                   status = CASE
+                       WHEN notification_deliveries.status = 'delivered' THEN notification_deliveries.status
+                       ELSE 'failed'
+                   END,
+                   last_error = CASE
+                       WHEN notification_deliveries.status = 'delivered' THEN notification_deliveries.last_error
+                       ELSE excluded.last_error
+                   END,
+                   updated_at = CASE
+                       WHEN notification_deliveries.status = 'delivered' THEN notification_deliveries.updated_at
+                       ELSE excluded.updated_at
+                   END""",
+            (int(notification_id), str(bridge_id), str(error or "")[:1000], now, now),
+        )
+        await self._db.commit()
 
     async def list(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         """Return recent notifications."""

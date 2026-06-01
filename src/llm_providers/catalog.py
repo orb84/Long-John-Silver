@@ -10,7 +10,7 @@ from loguru import logger
 from typing import Optional
 from datetime import datetime, timedelta
 from src.llm_providers.models import ModelInfo, PricingInfo, ContextInfo, ProviderPreset, ProviderStatus
-from src.llm_providers.context_limits import extract_context_limit, iter_model_records
+from src.llm_providers.context_limits import extract_context_limit, iter_model_records, known_provider_context_limit
 from src.llm_providers.key_store import KeyStore
 
 
@@ -124,7 +124,7 @@ class ModelCatalog:
                 continue
 
             pricing = self._extract_pricing(m)
-            context = self._extract_context(m)
+            context = self._extract_context(m, provider_id)
 
             models.append(ModelInfo(
                 id=model_id,
@@ -154,7 +154,7 @@ class ModelCatalog:
         return PricingInfo()
 
     @staticmethod
-    def _extract_context(model_data: dict) -> ContextInfo:
+    def _extract_context(model_data: dict, provider_id: str = "") -> ContextInfo:
         """Extract context info from provider model metadata.
 
         Providers expose context-window fields with different names.  Prefer
@@ -163,6 +163,8 @@ class ModelCatalog:
         output rather than the full prompt window.
         """
         context_length = extract_context_limit(model_data)
+        if not context_length:
+            context_length = known_provider_context_limit(provider_id, model_data.get("id"))
 
         return ContextInfo(
             max_context_tokens=context_length,

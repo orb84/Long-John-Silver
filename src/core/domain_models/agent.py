@@ -91,6 +91,7 @@ class ToolExecutionContext(BaseModel):
     session_id: str | None = None
     source: str = "chat"
     actor: str = "user"
+    category_id: str | None = None
 
 
 class AgentStreamEvent(BaseModel):

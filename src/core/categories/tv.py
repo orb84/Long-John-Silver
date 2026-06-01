@@ -222,6 +222,148 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             return True
         return self._bundle_contains_episode(title, requested_season, requested_episode)
 
+    def build_soulseek_search_queries(
+        self,
+        query_summary: str,
+        item: Any,
+        *,
+        unit_label: str | None = None,
+        language: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[str]:
+        """Build TV-owned Soulseek queries for exact episodes or packs."""
+        title = str(getattr(item, "key", "") or query_summary or "").strip()
+        label = str(unit_label or "").strip()
+        queries = [f"{title} {label}".strip() if label else title]
+        season, episode = self._unit_coordinates(label)
+        if season and episode:
+            queries.extend([
+                f"{title} S{season:02d}E{episode:02d}",
+                f"{title} {season}x{episode:02d}",
+                f"{title} S{season:02d}",
+                f"{title} Season {season}",
+            ])
+        seen: set[str] = set()
+        out: list[str] = []
+        for query in queries:
+            cleaned = re.sub(r"\b(?:download|torrent|please|grab|get)\b", " ", query, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.,")
+            key = cleaned.casefold()
+            if cleaned and key not in seen:
+                seen.add(key)
+                out.append(cleaned)
+        return out[:6]
+
+    def soulseek_search_limit(
+        self,
+        *,
+        item: Any,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> int:
+        """Return a larger raw Soulseek pool for TV episode/pack filtering."""
+        return 220
+
+    async def rank_soulseek_search_results(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        item: Any,
+        language: str | None = None,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Filter/rank Soulseek rows as TV episode/season candidates."""
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        requested_season, requested_episode = self._unit_coordinates(str(unit_label or ""))
+        for cand in candidates or []:
+            text = self._soulseek_candidate_text(cand)
+            if not self._soulseek_has_video_payload(cand):
+                continue
+            probe = type("SoulseekTVCandidate", (), {"title": text})()
+            if unit_label and not self.validate_search_result_for_request(probe, item, unit_label):
+                continue
+            if not unit_label and not self._title_matches_requested_series(text, str(getattr(item, "key", "") or "")):
+                continue
+            season, episode = self._unit_coordinates(text)
+            score = 0.0
+            if requested_season and season == requested_season:
+                score += 1.0
+            if requested_episode and episode == requested_episode:
+                score += 1.0
+            if requested_season and requested_episode and self._bundle_contains_episode(text, requested_season, requested_episode):
+                score += 0.65
+            resolution = self._extract_resolution(text)
+            if resolution == "1080p":
+                score += 0.25
+            language_status = self._tv_language_status(text, language)
+            if language_status == "preferred":
+                score += 0.3
+            payload = dict(cand)
+            payload.update({
+                "category_id": self.category_id,
+                "category_match_status": "accepted",
+                "resolution": resolution,
+                "language_status": language_status,
+                "unit_descriptor": self.unit_descriptor_from_agent_args(season=requested_season or season, episode=requested_episode or episode),
+                "category_evidence": {
+                    "requested_season": requested_season,
+                    "requested_episode": requested_episode,
+                    "candidate_season": season,
+                    "candidate_episode": episode,
+                    "video_payload": True,
+                },
+            })
+            ranked.append((score, payload))
+        ranked.sort(key=lambda row: (-row[0], self._soulseek_queue_rank(row[1]), str(row[1].get("filename") or "").casefold()))
+        return [row for _, row in ranked]
+
+    @staticmethod
+    def _soulseek_candidate_text(candidate: dict[str, Any]) -> str:
+        parts: list[Any] = [candidate.get("filename"), candidate.get("folder")]
+        if isinstance(candidate.get("filenames"), list):
+            parts.extend(candidate.get("filenames")[:12])
+        return " ".join(str(part) for part in parts if part)
+
+    @staticmethod
+    def _soulseek_has_video_payload(candidate: dict[str, Any]) -> bool:
+        values: list[Any] = [candidate.get("extension"), candidate.get("filename"), candidate.get("folder")]
+        if isinstance(candidate.get("filenames"), list):
+            values.extend(candidate.get("filenames") or [])
+        for value in values:
+            if not value:
+                continue
+            text = str(value).lower()
+            ext = Path(text).suffix.lstrip(".") or text.lstrip(".")
+            if ext in {"mkv", "mp4", "avi", "m4v", "mov", "webm"}:
+                return True
+        return False
+
+    @staticmethod
+    def _tv_language_status(text: str, preferred_language: str | None) -> str:
+        preferred = str(preferred_language or "").lower()
+        lowered = str(text or "").lower()
+        if preferred and preferred in {"italian", "ita", "it"} and re.search(r"\b(ita|italian|italiano)\b", lowered):
+            return "preferred"
+        if preferred and preferred in {"english", "eng", "en"} and re.search(r"\b(eng|english)\b", lowered):
+            return "preferred"
+        if re.search(r"\b(multi|dual|ita|eng|english|italian)\b", lowered):
+            return "other_or_multi"
+        return "unknown"
+
+    @staticmethod
+    def _soulseek_queue_rank(candidate: dict[str, Any]) -> tuple[int, int]:
+        free = candidate.get("has_free_upload_slot")
+        free_rank = 0 if free is True else (1 if free is None else 2)
+        try:
+            queue = int(candidate.get("queue_length") if candidate.get("queue_length") is not None else 999999)
+        except (TypeError, ValueError):
+            queue = 999999
+        return (free_rank, queue)
+
     def prefer_llm_search_selection(self, *, item: Any, unit_label: str | None, mode: str, candidates: list[Any]) -> bool:
         """TV wants the LLM to choose among plausible episode releases.
 
@@ -266,6 +408,15 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
     def unit_descriptor_from_search_result(self, result: Any, item: Any, unit_label: str | None) -> dict[str, Any]:
         """Return the requested TV unit descriptor carried into download/import state."""
         season, episode = self._unit_coordinates(str(unit_label or ""))
+        parsed = None
+        # A season-only request (``Season 1``/``S01``) should keep the requested
+        # season as the candidate's target unit for season-pack workflows.  The
+        # old fallback reparsed broad results such as ``S01-S02`` and created
+        # bogus Season 2 batch recommendations for a Season 1 request.
+        if season and not episode:
+            title = str(getattr(result, "title", "") or "")
+            if TVBundleKnowledge.detect_season_pack(title):
+                return self.unit_descriptor_from_agent_args(season=season)
         if not season or not episode:
             parsed = self.parse_name(str(getattr(result, "title", "") or ""))
             season = self._safe_positive_int(parsed.season) or season
@@ -290,6 +441,15 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             context["requested_episode"] = requested_episode
             context["contains_requested_unit"] = self._bundle_contains_episode(title, requested_season, requested_episode)
             context["selective_download_required"] = True
+        elif requested_season:
+            pack_type = str(pack.get("pack_type") or "")
+            start = self._safe_positive_int(pack.get("season_start")) or self._safe_positive_int(pack.get("season"))
+            end = self._safe_positive_int(pack.get("season_end")) or start
+            if pack_type == "series_complete" or (start and end and (start < requested_season or end > requested_season)):
+                context["contains_requested_unit"] = True
+                context["selective_download_required"] = True
+                context["selection_scope"] = "requested_season_only"
+                context["selected_unit_episode_count_hint"] = 10
         count = self._bundle_episode_count_hint(pack, title)
         if count:
             context["unit_count"] = count

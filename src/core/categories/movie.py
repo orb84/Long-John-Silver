@@ -568,6 +568,209 @@ class MovieCategory(CategoryMedia):
         )
 
 
+    def build_soulseek_search_queries(
+        self,
+        query_summary: str,
+        item: Any,
+        *,
+        unit_label: str | None = None,
+        language: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[str]:
+        """Build movie-owned Soulseek queries.
+
+        Movies need title/year identity, not generic Soulseek keyword spam.
+        The provider layer passes raw rows back here for movie filtering.
+        """
+        title = str(getattr(item, "display_name", None) or getattr(item, "key", "") or query_summary or "").strip()
+        metadata = getattr(item, "metadata", {}) or {}
+        year = getattr(item, "year", None) or metadata.get("year") or metadata.get("release_year")
+        candidates = [str(query_summary or "").strip(), title]
+        if year:
+            candidates.insert(0, f"{title} {year}")
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in candidates:
+            cleaned = re.sub(r"\b(?:download|torrent|movie|film|please|grab|get)\b", " ", str(value), flags=re.IGNORECASE)
+            cleaned = re.sub(r"[\[\]{}()]+", " ", cleaned)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.,")
+            key = cleaned.casefold()
+            if cleaned and key not in seen:
+                seen.add(key)
+                out.append(cleaned)
+        return out[:4]
+
+    def soulseek_search_limit(
+        self,
+        *,
+        item: Any,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> int:
+        """Movie Soulseek searches need enough rows for video releases without overwhelming slskd on macOS.
+
+        Recent macOS slskd builds can report thousands of raw files but delay or
+        hide materialized response rows when LJS asks for too large a result
+        pool.  Keep the raw pool category-owned and moderate; the provider
+        still has count-only recovery, and movie ranking remains here.
+        """
+        return 100
+
+    async def rank_soulseek_search_results(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        item: Any,
+        language: str | None = None,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Filter/rank Soulseek rows as movie candidates.
+
+        This intentionally rejects audiobook/ebook/music-looking Project Hail
+        Mary rows even if Soulseek returned thousands of them.  A movie request
+        needs video payload evidence, title/year match, language/quality facts,
+        and then LLM/user choice over the survivors.
+        """
+        requested_title = str(getattr(item, "display_name", None) or getattr(item, "key", "") or "").strip()
+        metadata = getattr(item, "metadata", {}) or {}
+        requested_year = self._safe_year(getattr(item, "year", None) or metadata.get("year") or metadata.get("release_year"))
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for cand in candidates or []:
+            extensions = self._soulseek_candidate_extensions(cand)
+            if not extensions.intersection({"mkv", "mp4", "m4v", "avi", "mov", "webm"}):
+                continue
+            text = self._soulseek_candidate_text(cand)
+            if not self._movie_title_overlap(requested_title, text):
+                continue
+            cand_year = extract_release_year(text)
+            year_score = 0.0
+            if requested_year and cand_year:
+                if int(requested_year) != int(cand_year):
+                    continue
+                year_score = 1.0
+            resolution = self._extract_resolution(text)
+            language_status = self._movie_language_status(text, language)
+            score = self._movie_title_score(requested_title, text) + year_score
+            if resolution == "1080p":
+                score += 0.35
+            elif resolution in {"2160p", "4k"}:
+                score += 0.25
+            elif resolution == "720p":
+                score += 0.1
+            if language_status == "preferred":
+                score += 0.3
+            elif language_status == "unknown":
+                score += 0.05
+            payload = dict(cand)
+            payload.update({
+                "category_id": self.category_id,
+                "category_match_status": "accepted",
+                "resolution": resolution,
+                "language_status": language_status,
+                "category_evidence": {
+                    "movie_title_match": round(self._movie_title_score(requested_title, text), 3),
+                    "requested_year": requested_year,
+                    "candidate_year": cand_year,
+                    "accepted_video_extensions": sorted(extensions),
+                },
+                "category_quality_note": self.quality_reference_for_search(item, unit_label, context=context),
+            })
+            ranked.append((score, payload))
+        ranked.sort(key=lambda row: (-row[0], self._soulseek_queue_rank(row[1]), str(row[1].get("filename") or "").casefold()))
+        return [row for _, row in ranked]
+
+    def soulseek_candidate_context(
+        self,
+        candidate: dict[str, Any],
+        *,
+        item: Any,
+        language: str | None = None,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+    ) -> dict[str, Any]:
+        """Return movie-specific context attached to accepted Soulseek candidates."""
+        return {
+            "category_id": self.category_id,
+            "category_quality_note": self.quality_reference_for_search(item, unit_label, context=None),
+        }
+
+    @staticmethod
+    def _safe_year(value: Any) -> int | None:
+        try:
+            year = int(value)
+            return year if 1900 <= year <= 2100 else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _soulseek_candidate_extensions(candidate: dict[str, Any]) -> set[str]:
+        values: list[Any] = [candidate.get("extension"), candidate.get("filename"), candidate.get("folder")]
+        if isinstance(candidate.get("filenames"), list):
+            values.extend(candidate.get("filenames") or [])
+        out: set[str] = set()
+        for value in values:
+            if not value:
+                continue
+            text = str(value)
+            suffix = Path(text).suffix.lstrip(".").lower()
+            if suffix:
+                out.add(suffix)
+            ext = text.strip().lower().lstrip(".")
+            if ext and len(ext) <= 6 and "/" not in ext and "\\" not in ext:
+                out.add(ext)
+        return out
+
+    @staticmethod
+    def _soulseek_candidate_text(candidate: dict[str, Any]) -> str:
+        parts: list[Any] = [candidate.get("filename"), candidate.get("folder")]
+        if isinstance(candidate.get("filenames"), list):
+            parts.extend(candidate.get("filenames")[:12])
+        return " ".join(str(part) for part in parts if part)
+
+    @staticmethod
+    def _movie_tokens(text: str) -> set[str]:
+        stop = {"the", "and", "movie", "film", "1080p", "720p", "2160p", "web", "webdl", "webrip", "bluray", "brrip"}
+        return {tok for tok in re.findall(r"[a-z0-9]+", str(text).lower()) if len(tok) > 2 and tok not in stop}
+
+    @classmethod
+    def _movie_title_score(cls, requested_title: str, candidate_text: str) -> float:
+        req = cls._movie_tokens(requested_title)
+        cand = cls._movie_tokens(candidate_text)
+        if not req or not cand:
+            return 0.0
+        return len(req & cand) / max(1, len(req))
+
+    @classmethod
+    def _movie_title_overlap(cls, requested_title: str, candidate_text: str) -> bool:
+        return cls._movie_title_score(requested_title, candidate_text) >= 0.6
+
+    @staticmethod
+    def _movie_language_status(text: str, preferred_language: str | None) -> str:
+        preferred = str(preferred_language or "").lower()
+        lowered = str(text or "").lower()
+        if preferred and preferred in {"italian", "ita", "it"} and re.search(r"\b(ita|italian|italiano)\b", lowered):
+            return "preferred"
+        if preferred and preferred in {"english", "eng", "en"} and re.search(r"\b(eng|english)\b", lowered):
+            return "preferred"
+        if re.search(r"\b(multi|dual|ita|eng|english|italian)\b", lowered):
+            return "other_or_multi"
+        return "unknown"
+
+    @staticmethod
+    def _soulseek_queue_rank(candidate: dict[str, Any]) -> tuple[int, int]:
+        free = candidate.get("has_free_upload_slot")
+        free_rank = 0 if free is True else (1 if free is None else 2)
+        try:
+            queue = int(candidate.get("queue_length") if candidate.get("queue_length") is not None else 999999)
+        except (TypeError, ValueError):
+            queue = 999999
+        return (free_rank, queue)
+
+
     def get_properties(self, settings: 'Settings') -> list[CategoryProperty]:
         """Return the requested get properties value.
 

@@ -138,9 +138,23 @@ class SettingsRouter:
 
             try:
                 preset = self._deps.llm_manager.registry.get_preset(provider_id)
-                api_base = llm.api_base or self._deps.llm_manager.registry.get_resolved_api_base(provider_id) or (preset.api_base if preset else None)
+                selected_is_active = provider_id == llm.active_provider
+                # When the UI previews a provider/model different from the saved
+                # active provider, do not reuse the saved api_base/api_key from
+                # the old provider.  That made the context probe hit the wrong
+                # endpoint and fall back to 16k until restart/save.
+                api_base = (
+                    llm.api_base
+                    if selected_is_active and llm.api_base
+                    else self._deps.llm_manager.registry.get_resolved_api_base(provider_id)
+                    or (preset.api_base if preset else None)
+                )
                 active_key = self._deps.llm_manager.keys.get_active_key(provider_id)
-                api_key = llm.api_key or (active_key.key if active_key else None)
+                api_key = (
+                    llm.api_key
+                    if selected_is_active and llm.api_key
+                    else (active_key.key if active_key else None)
+                )
                 probe = await probe_endpoint_context_limit(
                     base_url=api_base,
                     model_id=model_id,

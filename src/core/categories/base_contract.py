@@ -1326,6 +1326,89 @@ class CategoryContractMixin(CategoryContextMixin):
         }
 
 
+    # ── Soulseek candidate handling ────────────────────────────────
+
+    def build_soulseek_search_queries(
+        self,
+        query_summary: str,
+        item: Any,
+        *,
+        unit_label: str | None = None,
+        language: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[str]:
+        """Return category-owned Soulseek query text.
+
+        Soulseek is a provider, not a category.  Generic callers may ask a
+        category for query strings, but must not insert movie/TV/music words,
+        format tokens, or language fallbacks themselves.
+        """
+        values = [str(query_summary or "").strip(), str(getattr(item, "key", "") or "").strip(), str(getattr(item, "display_name", "") or "").strip()]
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            cleaned = " ".join(value.split()).strip(" -_.,")
+            key = cleaned.casefold()
+            if cleaned and key not in seen:
+                seen.add(key)
+                out.append(cleaned)
+        return out[:4]
+
+    def soulseek_search_limit(
+        self,
+        *,
+        item: Any,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> int:
+        """Return how many raw normalized Soulseek rows to collect before category filtering."""
+        return 80
+
+    async def rank_soulseek_search_results(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        item: Any,
+        language: str | None = None,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return category-owned filtering/ranking for Soulseek candidates.
+
+        Default behavior is conservative and source-neutral: keep rows as the
+        provider normalized them.  Concrete categories decide which extensions,
+        formats, language evidence, unit coverage, bitrate, and folder shapes
+        are acceptable.
+        """
+        return list(candidates or [])
+
+    def soulseek_candidate_context(
+        self,
+        candidate: dict[str, Any],
+        *,
+        item: Any,
+        language: str | None = None,
+        unit_label: str | None = None,
+        search_scope: str | None = None,
+    ) -> dict[str, Any]:
+        """Return optional category evidence to attach to one Soulseek row."""
+        return {}
+
+    def soulseek_source_strategy(
+        self,
+        *,
+        item_name: str,
+        search_scope: str | None = None,
+        settings: Any | None = None,
+        default_preference: str = "torrent_first",
+    ) -> dict[str, Any]:
+        """Return category-owned provider preference notes for Soulseek/torrent search."""
+        return {"download_preference": default_preference}
+
+
     # ── Torrent bundle / multi-payload handling ────────────────────
 
     def torrent_bundle_candidate_context(self, result: Any, item: Any | None = None, unit_label: str | None = None) -> dict[str, Any] | None:

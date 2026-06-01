@@ -75,6 +75,7 @@ class StreamingAgentLoopExecutor:
         plan_executor: PlanExecutor | None = None,
         plan_trace_store: Any | None = None,
         session_id: str | None = None,
+        active_category_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Execute the streaming agent tool loop, yielding tokens.
 
@@ -95,6 +96,7 @@ class StreamingAgentLoopExecutor:
             plan_trace_store: Optional PlanTraceStore to persist
                 plan execution traces after execution.
             session_id: Optional session ID for trace attribution.
+            active_category_id: Active category selected by intent routing; passed to tools as execution context.
 
         Yields:
             String chunks (tokens) as they arrive from the LLM, including
@@ -202,7 +204,7 @@ class StreamingAgentLoopExecutor:
                         arguments_raw=recovered.arguments,
                         tool_call_id=recovered.call_id,
                         allowed_tool_names=allowed_tool_names,
-                        tool_context=self._tool_context(session_id),
+                        tool_context=self._tool_context(session_id, active_category_id=active_category_id),
                     )
                     messages.append(result_message)
                     continue
@@ -237,7 +239,7 @@ class StreamingAgentLoopExecutor:
                         arguments_raw=tc.arguments,
                         tool_call_id=tc.id,
                         allowed_tool_names=allowed_tool_names,
-                        tool_context=self._tool_context(session_id),
+                        tool_context=self._tool_context(session_id, active_category_id=active_category_id),
                     )
                     messages.append(result_message)
 
@@ -297,14 +299,14 @@ class StreamingAgentLoopExecutor:
 
 
     @staticmethod
-    def _tool_context(session_id: str | None) -> ToolExecutionContext:
+    def _tool_context(session_id: str | None, *, active_category_id: str | None = None) -> ToolExecutionContext:
         """Build lightweight invocation context for declarative tools."""
         source = "web"
         if session_id and ":" in session_id:
             source = session_id.split(":", 1)[0] or "web"
         elif session_id and "_" in session_id:
             source = session_id.split("_", 1)[0] or "web"
-        return ToolExecutionContext(session_id=session_id, source=source)
+        return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id)
 
     async def _execute_plan_steps(
         self=None,
@@ -322,6 +324,7 @@ class StreamingAgentLoopExecutor:
             messages: Message list (mutated in place with step results).
             plan_trace_store: Optional PlanTraceStore for persistence.
             session_id: Optional session ID for trace attribution.
+            active_category_id: Active category selected by intent routing; passed to tools as execution context.
 
         Returns:
             An error string if execution failed, or None if successful.

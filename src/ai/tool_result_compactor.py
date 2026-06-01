@@ -96,7 +96,14 @@ class ToolResultCompactor:
             "search_scope": result.get("search_scope"),
             "search_summary": result.get("search_summary"),
             "next_actions": result.get("next_actions"),
+            "agent_instruction": result.get("agent_instruction"),
+            "llm_next_action": result.get("llm_next_action"),
+            "source_result_status": result.get("source_result_status"),
+            "torrent_candidate_count": result.get("torrent_candidate_count", len(candidates)),
+            "soulseek_candidate_count": result.get("soulseek_candidate_count", 0),
+            "downloadable_candidate_count": result.get("downloadable_candidate_count", len(candidates)),
             "candidate_count": len(candidates),
+            "candidate_count_note": "candidate_count is torrent-only for search_media_torrents; use downloadable_candidate_count and soulseek_candidate_count before concluding nothing was found.",
             "estimated_total_size_bytes": result.get("estimated_total_size_bytes"),
             "results_total_size_gb": result.get("results_total_size_gb"),
             "candidate_picker": self._compact_candidate_picker(result.get("candidate_picker")),
@@ -112,7 +119,10 @@ class ToolResultCompactor:
                 "queries": companion.get("queries"),
                 "candidates": list(companion.get("candidates") or [])[:self._SEARCH_CANDIDATE_LIMIT],
                 "queueing_note": companion.get("queueing_note"),
+                "recommended_candidate_id": companion.get("recommended_candidate_id"),
             }
+            if result.get("soulseek_candidate_picker"):
+                compact["soulseek_candidate_picker"] = result.get("soulseek_candidate_picker")
         omitted = max(0, len(candidates) - len(selected))
         if omitted:
             compact["omitted_candidates_count"] = omitted

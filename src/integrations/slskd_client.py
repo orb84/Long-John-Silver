@@ -660,13 +660,35 @@ class SlskdClient:
                         break
 
             complete = self._search_complete(state)
-            # Do not stop just because slskd marks the search complete if it
-            # also reports files but has not materialized response details yet.
+            # Do not wait the full grace window forever when slskd reports
+            # counts but keeps returning empty response arrays.  On macOS this
+            # exact count-only shape has been observed until the caller starts a
+            # second plain search.  Break early into provider recovery after a
+            # few endpoint attempts; category filtering will still happen later.
+            if complete and raw_file_count > 0 and raw_response_count > 0 and len(endpoint_shapes) >= 4:
+                break
             if complete and not (raw_file_count > 0 and asyncio.get_event_loop().time() < grace_deadline):
                 break
             if asyncio.get_event_loop().time() >= deadline and raw_file_count <= 0 and raw_response_count <= 0:
                 break
             await asyncio.sleep(0.75)
+
+        if not candidates and (raw_file_count > 0 or raw_response_count > 0):
+            recovery_candidates, recovery_stats, recovery_shapes, recovery_raw_responses, recovery_raw_files = await self._recover_materialized_search(
+                text,
+                timeout_seconds=timeout,
+                max_results=min(limit, 80),
+            )
+            if recovery_shapes:
+                endpoint_shapes.extend(recovery_shapes)
+            raw_response_count = max(raw_response_count, recovery_raw_responses)
+            raw_file_count = max(raw_file_count, recovery_raw_files)
+            if recovery_candidates:
+                candidates, stats = recovery_candidates, recovery_stats
+                logger.info(
+                    f"slskd search recovered materialized responses after count-only state: query={text!r} "
+                    f"candidates={len(candidates)} total_file_rows={stats.total_file_rows}"
+                )
 
         shape_summary = {
             "state": self._payload_shape_summary(last_state),
@@ -714,6 +736,68 @@ class SlskdClient:
             },
             "notes": notes,
         }
+
+    async def _recover_materialized_search(
+        self,
+        query: str,
+        *,
+        timeout_seconds: float,
+        max_results: int,
+    ) -> tuple[list[SoulseekCandidate], SearchNormalizationStats, list[dict[str, Any]], int, int]:
+        """Recover from slskd states that report counts but hide response rows.
+
+        On macOS with recent slskd builds, the first search endpoint can report
+        hundreds of responses/thousands of files while returning empty
+        ``responses`` arrays for the UUID/token LJS polls. A second, plain
+        search request often materializes the response endpoint immediately.
+        This is provider-shape recovery only: category filtering remains in the
+        owning category hooks after raw candidates are parsed.
+        """
+        limit = max(10, min(int(max_results or 80), 120))
+        timeout = max(6.0, min(float(timeout_seconds or 12.0), 25.0))
+        search_timeout_ms = int(max(timeout, 8.0) * 1000)
+        payload = {
+            "searchText": str(query or "").strip(),
+            "filterResponses": False,
+            "fileLimit": max(500, min(limit * 80, 6000)),
+            "responseLimit": max(100, min(limit * 4, 300)),
+            "searchTimeout": search_timeout_ms,
+        }
+        shapes: list[dict[str, Any]] = []
+        raw_response_count = 0
+        raw_file_count = 0
+        empty_stats = SearchNormalizationStats()
+        created = await self._request("POST", "/api/v0/searches", json=payload, timeout=timeout)
+        if isinstance(created, dict) and created.get("ok") is False:
+            shapes.append({"endpoint": "recovery_create", "shape": self._payload_shape_summary(created)})
+            return [], empty_stats, shapes, raw_response_count, raw_file_count
+        rest_id = self._search_rest_id(created)
+        protocol_token = self._search_protocol_token(created)
+        logger.info(f"slskd recovery search started: query={query!r} id={rest_id!r} token={protocol_token!r}")
+        deadline = asyncio.get_event_loop().time() + timeout
+        await asyncio.sleep(1.0)
+        while asyncio.get_event_loop().time() < deadline:
+            payloads: list[tuple[str, Any]] = []
+            for response_payload in await self._search_response_payloads(rest_id, protocol_token):
+                payloads.append(("recovery_responses", response_payload))
+            state = await self._search_state(rest_id, include_responses=True)
+            payloads.append(("recovery_state", state))
+            if raw_file_count > 0 or raw_response_count > 0:
+                all_payload = await self._matching_search_from_all(rest_id, protocol_token, query)
+                if all_payload:
+                    payloads.append(("recovery_searches_list_match", all_payload))
+            for endpoint, response_payload in payloads:
+                raw_response_count = max(raw_response_count, _payload_count(response_payload, "responseCount"), _top_level_len(response_payload))
+                raw_file_count = max(raw_file_count, _payload_count(response_payload, "fileCount"), _deep_file_count(response_payload))
+                shapes.append({"endpoint": endpoint, "shape": self._payload_shape_summary(response_payload)})
+                parsed, parsed_stats = self.normalize_search_payload_detailed(response_payload)
+                if parsed:
+                    return parsed, parsed_stats, shapes, raw_response_count, raw_file_count
+            complete = self._search_complete(state)
+            if complete and raw_file_count <= 0 and raw_response_count <= 0:
+                break
+            await asyncio.sleep(0.75)
+        return [], empty_stats, shapes, raw_response_count, raw_file_count
 
     async def _search_state(self, token: str | None, *, include_responses: bool = False) -> Any:
         if not token:

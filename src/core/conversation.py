@@ -59,6 +59,21 @@ class ConversationManager:
         """Check whether a functional vector store is available."""
         return self._vector_store is not None and self._vector_store.is_initialized
 
+    async def ensure_session(self, session_id: str, user_id: str | None = None, channel: str = "web") -> dict:
+        """Ensure the session row exists before any conversation FK write.
+
+        This is the single conversation-layer invariant used by web and future
+        bridge callers.  Reconnected browsers may present a UUID-like session id
+        that has never gone through login; upgraded databases can legitimately
+        enforce a foreign key from conversation_history to sessions.  Creating a
+        reserved local user/session here prevents chat from crashing before the
+        agent can even call tools, while preserving referential integrity.
+        """
+        channel_user_id = str(session_id or "")
+        if isinstance(session_id, str) and "_" in session_id:
+            channel = session_id.split("_", 1)[0] or channel
+        return await self._db.users.ensure_session(session_id, user_id=user_id, channel=channel, channel_user_id=channel_user_id)
+
     async def add_turn(self, session_id: str, role: str, content: str,
                        tool_call_id: str | None = None) -> int:
         """Add a conversation turn to the session history.
@@ -72,6 +87,7 @@ class ConversationManager:
         Returns:
             The auto-incremented ID of the new turn.
         """
+        await self.ensure_session(session_id)
         turn_id = await self._db.system.add_conversation_turn(
             session_id, role, content, tool_call_id
         )
@@ -118,6 +134,8 @@ class ConversationManager:
         """
         if max_tokens <= 0:
             return []
+
+        await self.ensure_session(session_id)
 
         raw_budget = raw_recent_tokens
         compressed_budget = compressed_history_tokens

@@ -353,14 +353,19 @@ class _DiscordNotificationBridge:
         self._bot = bot
         self._channel_id = channel_id
 
-    async def send_notification(self, message: NotificationMessage) -> None:
+    @property
+    def delivery_id(self) -> str:
+        """Stable delivery-ledger key for this Discord notification target."""
+        return f"discord:{self._channel_id or 'unconfigured'}"
+
+    async def send_notification(self, message: NotificationMessage) -> bool:
         """Send a notification to the configured Discord channel."""
         if self._channel_id is None or not self._bot.is_ready():
-            return
+            return False
         channel = self._bot.get_channel(self._channel_id)
         if not channel:
             logger.warning(f"Discord notification channel not found or not cached: {self._channel_id}")
-            return
+            return False
         content = f"**{message.title}**\n{message.body}"
         for chunk in _split_discord_content(content, 2000):
             await channel.send(chunk)
@@ -368,3 +373,4 @@ class _DiscordNotificationBridge:
         session_id = f"discord_{self._channel_id}"
         if hasattr(self._bot, "assistant") and self._bot.assistant:
             await self._bot.assistant.record_external_turn(session_id, "assistant", content)
+        return True

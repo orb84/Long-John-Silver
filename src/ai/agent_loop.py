@@ -250,14 +250,14 @@ class AgentLoopExecutor:
         )
 
     @staticmethod
-    def _tool_context(session_id: str | None) -> ToolExecutionContext:
+    def _tool_context(session_id: str | None, *, active_category_id: str | None = None) -> ToolExecutionContext:
         """Build lightweight invocation context for declarative tools."""
         source = "web"
         if session_id and ":" in session_id:
             source = session_id.split(":", 1)[0] or "web"
         elif session_id and "_" in session_id:
             source = session_id.split("_", 1)[0] or "web"
-        return ToolExecutionContext(session_id=session_id, source=source)
+        return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id)
 
     async def _execute_plan_steps(
         self,

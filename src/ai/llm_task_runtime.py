@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from loguru import logger
+
 from src.ai.tool_registry import ToolRegistry
 from src.core.models import Intent, Settings
 from src.ai.token_budget import TokenBudgetManager
@@ -59,6 +61,18 @@ class LLMTaskRuntime:
             tool_registry: The new tool registry.
         """
         self._tool_registry = tool_registry
+
+    async def ensure_context_metadata_for_task(self, task: str, *, force_refresh: bool = False) -> None:
+        """Warm provider/model metadata before building prompt history budgets.
+
+        The completion wrapper already warms metadata immediately before a call,
+        but the assistant builds conversation/category context earlier.  Without
+        this pre-warm, the first turn after a model/provider/context-settings
+        change can size history against the 16k fallback even when the actual
+        call later uses a larger endpoint/user cap.
+        """
+        if self._llm_client and hasattr(self._llm_client, "ensure_model_metadata_for_task"):
+            await self._llm_client.ensure_model_metadata_for_task(task, force_refresh=force_refresh)
 
 
     def context_budget_for_task(self, task: str) -> dict:
@@ -116,7 +130,7 @@ class LLMTaskRuntime:
         raw_recent_conversation_tokens = 0 if conversation_tokens <= 0 else int(conversation_tokens * (raw_recent_percent / 100.0))
         compressed_history_tokens = 0 if conversation_tokens <= 0 else max(0, conversation_tokens - raw_recent_conversation_tokens)
         max_recent_turns = 0 if conversation_tokens <= 0 else int(getattr(llm, "max_recent_conversation_turns", 24) or 24)
-        return {
+        budget = {
             "endpoint_context_tokens": endpoint_limit,
             "endpoint_context_source": endpoint_source,
             "endpoint_context_reported": endpoint_reported,
@@ -133,6 +147,18 @@ class LLMTaskRuntime:
             "compressed_history_tokens": compressed_history_tokens,
             "max_recent_turns": max_recent_turns,
         }
+        logger.debug(
+            "LLM context budget: task={} model_context={} effective={} prompt={} source={} endpoint_reported={} user_cap={} reserved_output={}",
+            task,
+            budget["model_context_tokens"],
+            budget["effective_context_tokens"],
+            budget["available_prompt_tokens"],
+            budget["context_cap_source"],
+            budget["endpoint_context_reported"],
+            user_cap if user_cap is not None else "auto",
+            budget["reserved_output_tokens"],
+        )
+        return budget
 
     def get_llm_config(self, task: str) -> dict:
         """Get the LLM configuration for a specific task.

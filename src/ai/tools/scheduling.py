@@ -1035,6 +1035,7 @@ class SearchMediaTorrentsTool:
             category_id=res.get("category_id"),
             season=res.get("season", season),
             episode=res.get("episode", episode),
+            search_scope=res.get("search_scope") or search_scope,
             result_set_id=result_set_id,
             candidates=cache_candidates,
             category=category,
@@ -1182,17 +1183,39 @@ class SearchMediaTorrentsTool:
             search_scope=res.get("search_scope") or search_scope,
             context=context,
         )
-        if companion.get("candidate_count"):
+        soulseek_candidate_count = int(companion.get("candidate_count") or 0) if isinstance(companion, dict) else 0
+        torrent_candidate_count = len(clean_candidates)
+        res["torrent_candidate_count"] = torrent_candidate_count
+        res["soulseek_candidate_count"] = soulseek_candidate_count
+        res["downloadable_candidate_count"] = torrent_candidate_count + soulseek_candidate_count
+        if soulseek_candidate_count and not torrent_candidate_count:
+            res["source_result_status"] = "soulseek_only_candidates_found"
+            res["agent_instruction"] = (
+                "No torrent candidate matched, but Soulseek returned queueable candidates. "
+                "Do not tell the user that nothing was found. Present the Soulseek options or, after user confirmation, "
+                "call enqueue_soulseek_download with a candidate_id and result_set_id from soulseek_candidate_picker."
+            )
+            res["llm_next_action"] = res.get("llm_next_action") or res["agent_instruction"]
+        elif soulseek_candidate_count:
+            res["source_result_status"] = "torrent_and_soulseek_candidates_found"
+        elif torrent_candidate_count:
+            res["source_result_status"] = "torrent_candidates_found"
+        else:
+            res["source_result_status"] = "no_candidates_found"
+
+        if soulseek_candidate_count:
             res["next_actions"].append({
                 "action": "evaluate_soulseek_candidates",
                 "tool": "enqueue_soulseek_download",
-                "reason": "Soulseek companion search returned queueable candidates in parallel with torrent search.",
+                "reason": "Soulseek companion search returned queueable candidates." + (" Torrent search returned none." if not torrent_candidate_count else ""),
                 "args_hint": {"candidate_id": companion.get("recommended_candidate_id") or "<soulseek candidate_id>", "result_set_id": result_set_id},
             })
             res["llm_source_note"] = (
-                "Torrent and Soulseek candidates are both available. Follow source_strategy.download_preference; "
-                "use queue_download only for torrent candidate_id values and enqueue_soulseek_download with Soulseek candidate_id/result_set_id. "
-                "Do not copy long filename arrays into tool arguments; the tool resolves them from the cached result set."
+                "Torrent and Soulseek results are source-specific. torrent_candidate_count counts torrent rows only; "
+                "soulseek_candidate_count counts queueable slskd rows. If torrent_candidate_count is 0 but soulseek_candidate_count is > 0, "
+                "the search DID find Soulseek candidates. Use queue_download only for torrent candidate_id values and "
+                "enqueue_soulseek_download with Soulseek candidate_id/result_set_id. Do not copy long filename arrays into tool arguments; "
+                "the tool resolves them from the cached result set."
             )
         elif companion.get("status") == "account_not_ready":
             res["next_actions"].append({
@@ -1202,6 +1225,10 @@ class SearchMediaTorrentsTool:
             })
         res["search_summary"] = {
             "query": res.get("query"),
+            "torrent_candidate_count": torrent_candidate_count,
+            "soulseek_candidate_count": soulseek_candidate_count,
+            "downloadable_candidate_count": torrent_candidate_count + soulseek_candidate_count,
+            "source_result_status": res.get("source_result_status"),
             "candidate_count": len(clean_candidates),
             "search_scope": res.get("search_scope") or search_scope,
             "pack_first_fallback": "pack unavailable" in str(res.get("query") or "").lower(),
@@ -1314,6 +1341,11 @@ def _annotate_selection_policy(candidates: list[dict[str, Any]], *, preferred_la
                 blockers.append(f"does not advertise preferred media language {preferred_language}")
             elif not normalized and not title_has_preferred:
                 warnings.append(f"language not advertised; preferred media language is {preferred_language}")
+
+        bundle_context = candidate.get("bundle_context") or {}
+        if isinstance(bundle_context, dict) and bundle_context.get("selective_download_required"):
+            warnings.append("contains extra TV units; inspect/select only the requested season files before queueing")
+            blockers.append("requires selective file inspection before queueing")
 
         candidate["selection_warnings"] = warnings
         candidate["selection_blockers"] = blockers
@@ -1537,7 +1569,7 @@ def _candidate_ids_for_estimate(candidates: list[dict[str, Any]], *, batch_recom
 
 
 def _estimated_total_size_bytes(candidates: list[dict[str, Any]], selected_ids: list[str]) -> int:
-    """Sum selected candidate sizes for storage preflight placeholders."""
+    """Estimate selected download footprint, respecting selective TV bundles."""
     if not selected_ids:
         return 0
     wanted = {str(cid) for cid in selected_ids}
@@ -1546,13 +1578,18 @@ def _estimated_total_size_bytes(candidates: list[dict[str, Any]], selected_ids: 
         if str(c.get("candidate_id")) not in wanted:
             continue
         try:
-            total += int(c.get("size_bytes") or 0)
+            bundle_context = c.get("bundle_context") or {}
+            if isinstance(bundle_context, dict) and bundle_context.get("selective_download_required") and c.get("per_episode_size_bytes"):
+                count = _safe_int(bundle_context.get("selected_unit_episode_count_hint")) or 10
+                total += int(c.get("per_episode_size_bytes") or 0) * max(1, count)
+            else:
+                total += int(c.get("size_bytes") or 0)
         except (TypeError, ValueError):
             pass
     return total
 
 
-def _build_batch_recommendation(*, name: str, category_id: str | None, season: int | None, episode: int | None, result_set_id: str, candidates: list[dict[str, Any]], category: object | None = None, preferred_language: str | None = None) -> dict[str, Any] | None:
+def _build_batch_recommendation(*, name: str, category_id: str | None, season: int | None, episode: int | None, search_scope: str | None = None, result_set_id: str, candidates: list[dict[str, Any]], category: object | None = None, preferred_language: str | None = None) -> dict[str, Any] | None:
     """Build a category-owned multi-unit batch recommendation.
 
     Shared tooling no longer groups candidates by hard-coded ``season``/
@@ -1568,11 +1605,16 @@ def _build_batch_recommendation(*, name: str, category_id: str | None, season: i
     """
     if episode is not None:
         return None
+    # Bundle/season-pack searches return alternatives for one requested unit.
+    # They must not be converted into a multi-unit batch merely because a broad
+    # query also found S02/S03 rows or a multi-season pack.
+    if str(search_scope or "").lower() in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
+        return None
     if not category or not hasattr(category, "batch_group_for_candidate"):
         return None
 
     unit_groups: dict[str, dict[str, Any]] = {}
-    request_context = {"season": season, "episode": episode, "category_id": category_id}
+    request_context = {"season": season, "episode": episode, "category_id": category_id, "search_scope": search_scope}
     for c in candidates or []:
         group = category.batch_group_for_candidate(c, request_context)
         if not group:

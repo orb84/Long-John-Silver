@@ -1034,7 +1034,13 @@ class DownloadCompletionHandler:
         if item.sharing_enabled and getattr(settings, "sharing", None) and settings.sharing.mode == "seed_in_place":
             logger.info(f"Seed-in-place complete: retaining library payload for '{item.item_name}'")
             if send_notification:
-                await self._notifications.send_download_complete(item.item_name, item.season, item.episode)
+                await self._notifications.send_download_complete(
+                    item.item_name,
+                    item.season,
+                    item.episode,
+                    download_id=item.id,
+                    category_id=item.category_id,
+                )
             return
 
         # If ready-time exposure failed, do a final move now before cleaning up
@@ -1066,7 +1072,13 @@ class DownloadCompletionHandler:
                 self._cleanup_empty_download_parents(deleted_sources, item=item)
 
         if send_notification:
-            await self._notifications.send_download_complete(item.item_name, item.season, item.episode)
+            await self._notifications.send_download_complete(
+                item.item_name,
+                item.season,
+                item.episode,
+                download_id=item.id,
+                category_id=item.category_id,
+            )
 
     async def reconcile_completed_imports(self, limit: int = 200) -> int:
         """Repair completed downloads that missed their library import callback.

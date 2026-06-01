@@ -483,12 +483,40 @@ async def main():
             await jackett_manager.start()
 
         if jackett_manager.is_running and jackett_manager.api_key:
+            configured_count = 0
+            try:
+                configured_count = await jackett_manager.configured_indexer_count()
+                if configured_count <= 0:
+                    logger.warning(
+                        "Jackett is running but has no configured indexers; repairing managed auth and configuring default open/public indexers."
+                    )
+                    repair = await jackett_manager.repair_admin_auth_and_restart()
+                    logger.info(f"Jackett managed auth repair result: {repair}")
+                    indexers = await jackett_manager.configure_default_indexers()
+                    logger.info(f"Jackett default indexer configuration result: {indexers}")
+                    configured_count = await jackett_manager.configured_indexer_count()
+            except Exception as exc:
+                logger.warning(f"Jackett first-run indexer readiness check failed: {exc}")
             from src.search.jackett import JackettSearch
-            providers.append(JackettSearch(
-                jackett_manager.url,
-                jackett_manager.api_key,
-            ))
-            logger.info("Jackett search provider active (native JSON API)")
+            if configured_count > 0:
+                # The manager may have adopted the API key actually accepted by
+                # the running Jackett process during readiness probing. Persist it
+                # now so the next launch does not reuse a rejected stale key.
+                jackett_manager.save_to_settings(settings)
+                settings_manager.save(settings)
+                providers.append(JackettSearch(
+                    jackett_manager.url,
+                    jackett_manager.api_key,
+                    configured_indexers=configured_count,
+                    allow_filter_indexers=False,
+                ))
+                logger.info(f"Jackett search provider active (native JSON API, configured_indexers={configured_count})")
+            else:
+                logger.error(
+                    "Jackett is running but still has zero configured indexers after managed repair. "
+                    "Not registering Jackett as a torrent provider: full Jackett functionality requires real configured indexers. "
+                    "Open Search settings diagnostics; LJS has logged the managed config paths and admin API probe state."
+                )
         elif settings.jackett_url and settings.jackett_api_key:
             from src.search.jackett import JackettSearch
             providers.append(JackettSearch(settings.jackett_url, settings.jackett_api_key))
@@ -502,8 +530,9 @@ async def main():
 
         if settings.direct_scraper_fallback:
             logger.info(
-                "Direct scraper fallback is explicitly enabled, but it is treated as an emergency provider set: "
-                "Jackett/Soulseek remain the normal search path and direct scrapers are not queried while a primary torrent provider is configured."
+                "Direct scraper fallback is enabled as an emergency provider set. "
+                "Jackett remains the primary provider when available; direct scrapers are used only when no primary provider exists "
+                "or the primary search is empty/degraded."
             )
             from src.search.btdigg import BTDiggSearch
             from src.search.search_1337x import Search1337x
@@ -751,6 +780,7 @@ async def main():
                 database=db,
                 search_aggregator=aggregator,
                 settings_manager=settings_manager,
+                category_registry=cat_registry,
             ),
             LibraryToolProvider(
                 settings_manager=settings_manager,
