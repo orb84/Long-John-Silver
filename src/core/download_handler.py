@@ -52,7 +52,8 @@ class DownloadCompletionHandler:
                  settings: Optional[Settings] = None,
                  download_dir: Optional[Path] = None,
                  release_group_tracker: Optional["ReleaseGroupTracker"] = None,
-                 settings_manager: Optional[Any] = None):
+                 settings_manager: Optional[Any] = None,
+                 db: Optional[Any] = None):
         """Initialize the handler with its service dependencies.
 
         Args:
@@ -65,6 +66,8 @@ class DownloadCompletionHandler:
             release_group_tracker: Optional release-group reputation sink.
             settings_manager: Live SettingsManager; preferred for callbacks that
                 can run long after startup.
+            db: Optional Database object used only for generic release-watch
+                completion bookkeeping after a category unit is imported.
         """
         self._downloader = downloader
         self._librarian = librarian
@@ -74,6 +77,7 @@ class DownloadCompletionHandler:
         self._settings_manager = settings_manager
         self._dl_dir = (download_dir or Path()).resolve()
         self._release_group_tracker = release_group_tracker
+        self._db = db
         self._library_reconciler: Any | None = None
 
     def set_library_reconciler(self, reconciler: Any | None) -> None:
@@ -745,6 +749,7 @@ class DownloadCompletionHandler:
                     imported=safe_target,
                     file_info=file_info,
                 )
+                await self._complete_release_watches_for_imported_unit(item, file_info=file_info)
                 return safe_target
 
             result = await asyncio.to_thread(
@@ -773,6 +778,7 @@ class DownloadCompletionHandler:
                     imported=result,
                     file_info=file_info,
                 )
+                await self._complete_release_watches_for_imported_unit(item, file_info=file_info)
             return result
         finally:
             if mutation_marked and reconciler is not None and hasattr(reconciler, "end_managed_library_mutation"):
@@ -780,6 +786,60 @@ class DownloadCompletionHandler:
                     reconciler.end_managed_library_mutation(category_id=category_id, item_id=item_id)
                 except Exception:
                     pass
+
+
+    async def _complete_release_watches_for_imported_unit(
+        self,
+        item: DownloadItem,
+        *,
+        file_info: object | None = None,
+    ) -> None:
+        """Mark matching release watches complete after library exposure/import.
+
+        Release watches are generic rows keyed by ``category_id/item_id`` and a
+        category-provided unit key.  The download/import layer is allowed to read
+        the conventional ``unit_descriptor.stable_key`` that categories attach to
+        downloads/files, but it does not interpret TV seasons, sports events, or
+        any future category-specific coordinates.
+        """
+        repo = getattr(self._db, "release_watches", None) if self._db is not None else None
+        if not repo or not getattr(item, "category_id", ""):
+            return
+        item_id = str(getattr(item, "item_id", "") or getattr(item, "item_name", "") or "")
+        if not item_id:
+            return
+        unit_keys: set[str] = set()
+        for descriptor in (
+            getattr(file_info, "unit_descriptor", None) if file_info is not None else None,
+            getattr(item, "unit_descriptor", None),
+            getattr(getattr(item, "import_context", None), "unit_descriptor", None),
+        ):
+            if callable(descriptor):
+                try:
+                    descriptor = descriptor()
+                except Exception:
+                    descriptor = None
+            if isinstance(descriptor, dict):
+                key = str(descriptor.get("stable_key") or descriptor.get("label") or "").strip()
+                if key:
+                    unit_keys.add(key)
+        # Compatibility for old rows that predate unit descriptors. This still
+        # stays category-neutral: it uses fields already present on DownloadItem
+        # rather than category-specific parsing.
+        season = getattr(file_info, "season", None) if file_info is not None else None
+        episode = getattr(file_info, "episode", None) if file_info is not None else None
+        season = season if season is not None else getattr(item, "season", None)
+        episode = episode if episode is not None else getattr(item, "episode", None)
+        if season and episode:
+            try:
+                unit_keys.add(f"S{int(season):02d}E{int(episode):02d}")
+            except Exception:
+                pass
+        for unit_key in sorted(unit_keys):
+            try:
+                await repo.complete(str(item.category_id), item_id, unit_key)
+            except Exception as exc:
+                logger.debug(f"Release-watch completion bookkeeping failed for {item.category_id}/{item_id}/{unit_key}: {exc}")
 
     async def on_download_ready(self, download_id: str) -> None:
         """Expose completed files in the library when a torrent reaches 100%.
@@ -821,6 +881,7 @@ class DownloadCompletionHandler:
                             imported=source,
                             file_info=df,
                         )
+                        await self._complete_release_watches_for_imported_unit(item, file_info=df)
             if not item.files and item.file_path:
                 source = Path(item.file_path).resolve()
                 item.file_path = str(source)
@@ -834,6 +895,7 @@ class DownloadCompletionHandler:
                         imported=source,
                         file_info=None,
                     )
+                    await self._complete_release_watches_for_imported_unit(item, file_info=None)
             if changed:
                 await self._downloader.update_download(item)
             logger.info(f"Seed-in-place ready: leaving '{item.item_name}' torrent payload in library for sharing")
@@ -968,6 +1030,7 @@ class DownloadCompletionHandler:
                             imported=target,
                             file_info=df,
                         )
+                        await self._complete_release_watches_for_imported_unit(item, file_info=df)
                     df.organized_path = str(target)
                     df.status = "organized"
                     moved_sources.append(source)
@@ -1002,6 +1065,7 @@ class DownloadCompletionHandler:
                             imported=target,
                             file_info=None,
                         )
+                        await self._complete_release_watches_for_imported_unit(item, file_info=None)
                     item.file_path = str(target)
                     self._cleanup_empty_download_parents(moved_sources, item=item)
                     await self._downloader.update_download(item)

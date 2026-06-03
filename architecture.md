@@ -18,6 +18,54 @@ The library core does not know what a TV show, movie, game, book, episode, chapt
 
 When tempted to write logic such as “if category is tv” or “episode means missing content” in core code, stop. Add or improve a category hook instead.
 
+## Category Item Mutation Coordinator
+
+`CategoryItemCoordinator` (`src/core/category_item_coordinator.py`) is the
+authoritative write path for durable category-item mutations. UI routes,
+assistant tools, automation, import/discovery paths, and future bridge actions
+must call this coordinator, either directly or through `ActionGateway` actions
+such as `category_item_add`, `category_item_update`, and
+`category_item_remove`.
+
+The coordinator owns the mutation ordering invariant:
+
+```text
+normalize mutation intent
+        ↓
+ask owning category to create/update the item model
+        ↓
+ask owning category to enrich metadata when the mutation source allows provider I/O
+        ↓
+persist settings + category_items repository envelope
+        ↓
+invalidate lifecycle ledgers
+        ↓
+ask scheduler to resync category watch policy / RSS / release watches
+```
+
+The coordinator is generic. It must not know what a season, episode, sports
+fixture, book edition, album, or DLC is. Categories expose hooks such as
+`create_item()`, `enrich_item_on_add()`, and `build_watch_plan()`; the
+coordinator simply calls those hooks and persists the returned generic
+envelope.
+
+Direct writes to `settings.tracked_items` are allowed only in:
+
+- `CategoryItemCoordinator` itself;
+- startup compatibility/identity repair (`StateCoordinator`);
+- explicitly documented low-level migrations or repair scripts.
+
+New UI, agent, scheduled-task, import, scanner-discovery, or bridge code must
+not append/remove tracked items by hand. Bypassing the coordinator risks exactly
+the class of bugs this project has repeatedly hit: item added in one interface
+but no metadata enrichment, stale RSS feeds until restart, missing release
+watches, lifecycle ledgers not invalidated, or repository/settings drift.
+
+For cheap background discovery, callers may pass mutation context such as
+`source="library_scan"` and `enrich_metadata=False`. This still centralizes
+persistence and watch-policy synchronization while avoiding provider storms
+during startup or filesystem scans.
+
 ## Category-First Data Flow
 
 ```text
@@ -797,3 +845,61 @@ Managed Jackett must be treated as search-ready only after LJS has verified real
 On macOS, managed Jackett configuration must probe and repair every LJS-owned path Jackett may use (`data/jackett_state/config/Jackett`, lowercase variants, and the managed `Library/Application Support/Jackett` compatibility path). Password repair must set `AdminPassword` to JSON `null`, not an empty string. LJS must pre-create a localhost-only managed `ServerConfig.json` before first start when none exists, then log a compact config-path diagnostic matrix before and after startup.
 
 If the admin/indexer API remains login-gated or indexer configuration still produces zero configured indexers, LJS must not register Jackett as a torrent provider and must not hide the problem behind filter-indexer mode or direct-scraper fallback. The UI/settings diagnostics should show the exact managed config paths, admin probe status, and configure-indexer failure state so the next action is visible. Private tracker support remains the normal Jackett schema/config path; it is not replaced by direct scrapers or category code.
+
+## Category-owned release watches
+
+`ReleaseWatchRepository` and the scheduler provide only category-neutral retry
+plumbing.  A release watch is a durable request to keep looking for one concrete
+category unit until it is queued, completed, cancelled, or expired.  The base
+schema stores generic fields such as `unit_key`, `next_check_at`,
+`watch_start_at`, `expires_at`, `cadence_profile`, `requirements_json`, and
+`payload_json`; it does not interpret TV episodes, sports matches, books, albums,
+or any future category domain.
+
+The owning category computes the watch semantics through its watch-policy hook.
+For TV, `TvShowCategory.build_watch_plan()` derives the next episode, expected
+air time, cadence profile, retry interval, RSS window, and requirement snapshot
+from TMDB/TVMaze metadata plus the item/user settings.  The scheduler persists
+that plan and later calls the normal category-aware search/discovery pipeline. A
+retry timeout or missing candidate is recorded as a retryable state, not as a
+successful empty result.
+
+Important invariants:
+
+- Category-specific concepts such as `S01E02`, air dates, season packs, and
+  selective torrent-file download remain in the TV category extension.
+- Generic services may store and retry watches but must not hardcode TV rules.
+- Future categories such as sports events should implement their own watch-policy
+  hook and reuse the same release-watch plumbing for replay availability windows.
+- A watch with a future `watch_start_at` must not poll frequently until that
+  release window opens.
+- A queued watch is not completed until a category/import/library path confirms
+  the requested unit is actually present.
+
+## Round 217 coordinator/watch-policy review and UI boundary
+
+Round 217 rechecked the Round 213-216 category-item/watch-policy work against the
+intended category-centric architecture.  The resulting rule is that the browser
+may display release-watch state, but it must not interpret category semantics.
+The `/api/release-watches` endpoint and `ReleaseWatchPanel` therefore expose and
+render the generic row state (`category_id`, `item_id`, `unit_key`, `status`,
+`next_check_at`, `requirements`, `payload`, `last_outcome`) without adding TV
+branches in the frontend shell.
+
+Architecture responsibilities remain:
+
+- `CategoryItemCoordinator` is the only normal write path for UI, assistant,
+  automation, and library-discovery category item mutations.
+- Categories own metadata enrichment and watch-plan semantics through
+  `enrich_item_on_add()` and `build_watch_plan()`.
+- The scheduler/RSS/release-watch services own generic persistence, retry,
+  status, and sync plumbing only.
+- UI surfaces may show category-provided watch state and payloads, but must not
+  decide that an `SxxEyy` string is a TV episode or that a match replay belongs
+  to sports. Those decisions remain in category extensions.
+
+The mobile shell is also an architecture boundary: panel components should render
+semantic sections that can be reflowed by CSS.  Components should avoid fixed
+pixel widths and viewport assumptions.  The shell uses width and aspect-ratio
+breakpoints because mobile browser/device emulation can report a wider CSS
+viewport than the visible frame.

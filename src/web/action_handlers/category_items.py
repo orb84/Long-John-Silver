@@ -12,6 +12,7 @@ from typing import Any
 from loguru import logger
 
 from src.core.models import ActionReceipt
+from src.core.category_item_coordinator import CategoryItemCoordinator
 
 
 class CategoryItemActionHandler:
@@ -22,65 +23,51 @@ class CategoryItemActionHandler:
     conditionals while still allowing categories to create rich item models.
     """
 
-    def __init__(self, settings_manager: Any, category_registry: Any, database: Any = None, scheduler: Any = None) -> None:
+    def __init__(
+        self,
+        settings_manager: Any,
+        category_registry: Any,
+        database: Any = None,
+        scheduler: Any = None,
+        metadata_enricher: Any = None,
+        metadata_clients: dict[str, Any] | None = None,
+        artwork_manager: Any = None,
+    ) -> None:
         """Initialize with settings, categories, database, and optional scheduler."""
         self._settings_manager = settings_manager
         self._category_registry = category_registry
         self._db = database
         self._scheduler = scheduler
+        self._coordinator = CategoryItemCoordinator(
+            settings_manager=settings_manager,
+            category_registry=category_registry,
+            db=database,
+            scheduler=scheduler,
+            metadata_enricher=metadata_enricher,
+            metadata_clients=metadata_clients or {},
+            artwork_manager=artwork_manager,
+        )
 
     async def add(self, category_id: str, name: str, **kwargs: Any) -> dict[str, Any]:
         """Add a tracked item under the selected category."""
-        category = self._require_category(category_id)
-        settings = self._settings_manager.settings
-        item = category.create_item(name, **kwargs)
-        self._replace_settings_item(settings, category_id, name, item)
-        self._settings_manager.save(settings)
-        await self._upsert_repo_item(category_id, name, item)
+        self._require_category(category_id)
+        item = await self._coordinator.add_or_update_item(category_id, name, **kwargs)
         logger.info(f"Added category item {category_id}:{name}")
         return {"status": "ok", "category_id": category_id, "item_id": name, "item": item.model_dump(mode="json")}
 
     async def remove(self, category_id: str, item_id: str) -> dict[str, Any]:
         """Remove a tracked item from the selected category."""
-        self._require_category(category_id)
-        settings = self._settings_manager.settings
-        if hasattr(settings, "tracked_items"):
-            settings.tracked_items.items = [
-                item for item in settings.tracked_items.items
-                if not self._item_matches(item, category_id, item_id)
-            ]
-            self._settings_manager.save(settings)
-        if self._repo_available() and hasattr(self._db.media, "delete_category_item"):
-            await self._db.media.delete_category_item(category_id, item_id)
+        await self._coordinator.remove_item(category_id, item_id)
         logger.info(f"Removed category item {category_id}:{item_id}")
         return {"status": "ok", "category_id": category_id, "item_id": item_id}
 
     async def update(self, category_id: str, item_id: str, **kwargs: Any) -> dict[str, Any]:
         """Update fields on a tracked category item."""
-        self._require_category(category_id)
-        settings = self._settings_manager.settings
-        item = self._find_item(settings, category_id, item_id)
+        ignored = {"category_id", "item_id", "name", "key"}
+        changed = {key: value for key, value in kwargs.items() if key not in ignored}
+        item = await self._coordinator.update_item(category_id, item_id, **kwargs)
         if not item:
             return {"status": "not_found", "category_id": category_id, "item_id": item_id}
-
-        changed: dict[str, Any] = {}
-        ignored = {"category_id", "item_id", "name", "key"}
-        for key, value in kwargs.items():
-            if key in ignored:
-                continue
-            if hasattr(item, key):
-                setattr(item, key, value)
-                changed[key] = value
-                continue
-
-            # Unknown fields are not discarded. They are custom properties owned
-            # by user-defined categories and validated by the category contract.
-            if not hasattr(item, "properties") or getattr(item, "properties") is None:
-                setattr(item, "properties", {})
-            item.properties[key] = value
-            changed[f"properties.{key}"] = value
-        self._settings_manager.save(settings)
-        await self._upsert_repo_item(category_id, item_id, item)
         return {"status": "ok", "category_id": category_id, "item_id": item_id, "updated": changed}
 
     async def pause(self, category_id: str, item_id: str) -> dict[str, Any]:
@@ -130,32 +117,9 @@ class CategoryItemActionHandler:
             raise ValueError(f"Unknown category: {category_id}")
         return category
 
-    def _find_item(self, settings: Any, category_id: str, item_id: str) -> Any:
-        """Find a tracked item by category and key."""
-        for item in getattr(settings, "tracked_items", []):
-            if self._item_matches(item, category_id, item_id):
-                return item
-        return None
-
-    def _replace_settings_item(self, settings: Any, category_id: str, item_id: str, item: Any) -> None:
-        """Insert an item in settings, replacing an existing one with the same identity."""
-        if not hasattr(settings, "tracked_items"):
-            return
-        settings.tracked_items.items = [
-            existing for existing in settings.tracked_items.items
-            if not self._item_matches(existing, category_id, item_id)
-        ]
-        settings.tracked_items.append(item)
-
-    def _item_matches(self, item: Any, category_id: str, item_id: str) -> bool:
-        """Return whether a settings item matches a category/item identity."""
-        item_category = getattr(item, "item_type", getattr(item, "category_id", category_id))
-        return getattr(item, "key", None) == item_id and item_category == category_id
-
-    async def _upsert_repo_item(self, category_id: str, item_id: str, item: Any) -> None:
-        """Persist a category item to the repository when available."""
-        if self._repo_available() and hasattr(self._db.media, "upsert_category_item"):
-            await self._db.media.upsert_category_item(category_id, item_id, item.model_dump(mode="json"))
+    # Category item mutations are intentionally not implemented here.  The web
+    # action handler delegates to CategoryItemCoordinator so UI, assistant tools,
+    # automation, and library discovery share one add/update/remove pipeline.
 
     def _repo_available(self) -> bool:
         """Return whether the injected database exposes the media repository."""

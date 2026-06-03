@@ -190,6 +190,11 @@ class MediaScheduler:
         self._library_item_reconcile_lock = asyncio.Lock()
         self._managed_library_mutation_count = 0
         self._check_semaphore = asyncio.Semaphore(2)
+        self._rss_monitor: object | None = None
+
+    def set_rss_monitor(self, rss_monitor: object | None) -> None:
+        """Attach the runtime RSS monitor managed by the composition root."""
+        self._rss_monitor = rss_monitor
 
     def set_event_bus(self, event_bus: object | None) -> None:
         """Attach the web event bus once the FastAPI app has been composed."""
@@ -238,6 +243,25 @@ class MediaScheduler:
         accessor rather than reaching into scheduler internals such as ``_db``.
         """
         return self._db
+
+    def category_item_coordinator(self):
+        """Return the shared category-item mutation coordinator.
+
+        Scheduler/import paths use the same coordinator as UI and assistant
+        actions.  The method imports lazily to avoid making the composition root
+        depend on category mutation machinery during module import.
+        """
+        from src.core.category_item_coordinator import CategoryItemCoordinator
+
+        return CategoryItemCoordinator(
+            settings_manager=self._settings_manager,
+            category_registry=self._categories,
+            db=self._db,
+            scheduler=self,
+            metadata_enricher=self._metadata_enricher,
+            metadata_clients={"tvmaze": self._tvmaze} if self._tvmaze else {},
+            artwork_manager=self._artwork_manager,
+        )
 
     async def initialize(self) -> None:
         """Register all jobs and start the scheduler."""
@@ -1345,7 +1369,13 @@ class MediaScheduler:
 
 
     async def _discover_new_items(self, result: LibraryScanResult) -> None:
-        """Add newly scanned category items to tracked settings."""
+        """Add newly scanned category items through the shared coordinator.
+
+        Library discovery is a category item mutation too, but it must remain
+        cheap: scanner reconciliation should not trigger provider storms.  The
+        coordinator is therefore called with ``enrich_metadata=False`` and a
+        single watch-policy sync is run after all new items are persisted.
+        """
         settings = self._settings_manager.settings
         existing_by_category_key = {
             (
@@ -1354,22 +1384,41 @@ class MediaScheduler:
             ): item
             for item in settings.tracked_items
         }
+        added = False
+        coordinator = self.category_item_coordinator()
         for scanned in result.items:
             canonical_name = clean_category_item_name(scanned.name, scanned.category_id)
             scan_key = (scanned.category_id, canonical_item_key(canonical_name))
-            if scan_key not in existing_by_category_key:
-                scanned.name = canonical_name
-                item = self._tracked_item_from_scan(scanned)
-                settings.tracked_items.append(item)
-                existing_by_category_key[scan_key] = item
-            # NOTE: Scanner does NOT overwrite existing item's language.
-            # User's explicit language setting takes precedence.
-            # Language is only set for newly discovered items (above).
+            if scan_key in existing_by_category_key:
+                # NOTE: Scanner does NOT overwrite existing item's language.
+                # User's explicit language setting takes precedence.
+                continue
+            scanned.name = canonical_name
+            quality = self._quality_inferrer.infer_for_item(scanned)
+            kwargs = {
+                "discovered": True,
+                "language": scanned.detected_language or settings.language,
+                "quality": quality,
+                "auto_download": None,
+            }
+            if scanned.year is not None:
+                kwargs["year"] = scanned.year
+            item = await coordinator.add_or_update_item(
+                scanned.category_id,
+                canonical_name,
+                source="library_scan",
+                enrich_metadata=False,
+                sync_watch=False,
+                **kwargs,
+            )
+            existing_by_category_key[scan_key] = item
+            added = True
 
         # Scanned category is authoritative.  Provider metadata may improve the
         # display name/poster inside that category later, but it must never move
         # a file discovered under one category root into another category.
-        await asyncio.to_thread(self._settings_manager.save, settings)
+        if added:
+            await self.sync_all_category_watch_policies(reason="library_auto_discover")
 
     def _tracked_item_from_scan(self, scanned: ScannedLibraryItem) -> CategoryItem:
         """Create a tracked item by delegating model ownership to the category."""
@@ -1637,6 +1686,116 @@ class MediaScheduler:
         return SchedulerTorrentSearchService(self._service_context())
 
 
+    async def invalidate_item_lifecycle(self, category_id: str, item_id: str, *, reason: str = "category_item_changed") -> None:
+        """Invalidate category lifecycle ledger after a durable item mutation."""
+        if self._lifecycle:
+            await self._lifecycle.invalidate_item(category_id, item_id, reason=reason)
+
+    async def sync_all_category_watch_policies(self, *, reason: str = "startup") -> None:
+        """Rebuild RSS/release-watch state for all enabled tracked items.
+
+        Generic orchestration lives here; category-specific decisions live in
+        ``category.build_watch_plan``.
+        """
+        settings = self._settings_manager.settings
+        feed_urls: list[str] = []
+        feed_targets: dict[str, list[str]] = {}
+        item_names: list[str] = []
+        item_categories: dict[str, str] = {}
+        for item in getattr(settings, "tracked_items", []) or []:
+            category_id = getattr(item, "item_type", getattr(item, "category_id", "")) or ""
+            if not getattr(item, "enabled", True):
+                continue
+            category = self._categories.get(category_id) if self._categories else None
+            if not category:
+                continue
+            plan = await self._build_category_watch_plan(category, item)
+            item_name = str(getattr(item, "key", "") or "")
+            if item_name:
+                item_names.append(item_name)
+                item_categories[item_name] = category_id
+            await self._apply_release_watches_from_plan(plan, item)
+            for feed in getattr(plan, "rss_feeds", []) or []:
+                url = self._rss_url_for_query(str(getattr(feed, "query", "") or ""))
+                target = str(getattr(feed, "target_name", "") or item_name).strip()
+                if url and target:
+                    feed_urls.append(url)
+                    feed_targets.setdefault(url, []).append(target)
+        self._update_rss_monitor(feed_urls, feed_targets, item_names, item_categories)
+        logger.info(f"Category watch policy sync complete ({reason}): {len(feed_urls)} RSS feed(s)")
+
+    async def sync_category_watch_policy(
+        self, category_id: str, item_id: str, *, item: object | None = None, reason: str = "item_changed"
+    ) -> None:
+        """Synchronize watch policies after one item add/update/remove.
+
+        Simplicity and correctness beat incremental bookkeeping here: tracked
+        item counts are small, and rebuilding all feed URLs avoids stale RSS
+        after category changes without teaching the generic scheduler TV rules.
+        """
+        await self.sync_all_category_watch_policies(reason=f"{reason}:{category_id}:{item_id}")
+
+    async def _build_category_watch_plan(self, category: object, item: object) -> object:
+        from src.core.categories.base import CategoryWorkflowContext
+        context = CategoryWorkflowContext(
+            db=self._db,
+            pipeline=self._pipeline,
+            aggregator=self._aggregator,
+            settings=self._settings_manager.settings,
+            downloader=self._downloader,
+            category_registry=self._categories,
+            metadata_clients={"tvmaze": self._tvmaze} if self._tvmaze else {},
+            metadata_enricher=self._metadata_enricher,
+            artwork_manager=self._artwork_manager,
+        )
+        return await category.build_watch_plan(item, context)
+
+    async def _apply_release_watches_from_plan(self, plan: object, item: object) -> None:
+        repo = getattr(self._db, "release_watches", None)
+        if not repo:
+            return
+        category_id = str(getattr(plan, "category_id", "") or getattr(item, "item_type", "") or "")
+        item_id = str(getattr(plan, "item_id", "") or getattr(item, "key", "") or "")
+        for watch in getattr(plan, "release_watches", []) or []:
+            unit_key = str(getattr(watch, "unit_key", "") or "").strip()
+            if not unit_key:
+                continue
+            await repo.upsert(
+                category_id=category_id,
+                item_id=item_id,
+                unit_key=unit_key,
+                preferred_language=str(getattr(watch, "preferred_language", "") or getattr(item, "language", "") or ""),
+                interval_hours=float(getattr(watch, "interval_hours", 2.0) or 2.0),
+                expected_air_at=str(getattr(watch, "expected_air_at", "") or ""),
+                watch_start_at=str(getattr(watch, "watch_start_at", "") or ""),
+                expires_at=str(getattr(watch, "expires_at", "") or ""),
+                cadence_profile=str(getattr(watch, "cadence_profile", "unknown") or "unknown"),
+                requirements=dict(getattr(watch, "requirements", {}) or {}),
+                payload=dict(getattr(watch, "payload", {}) or {}),
+            )
+
+    def _rss_url_for_query(self, query: str) -> str:
+        query = str(query or "").strip()
+        settings = self._settings_manager.settings
+        if not query or not getattr(settings, "jackett_url", "") or not getattr(settings, "jackett_api_key", ""):
+            return ""
+        base = f"{settings.jackett_url.rstrip('/')}/api/v2.0/indexers/all/results/torznab/api"
+        return f"{base}?apikey={quote_plus(settings.jackett_api_key)}&t=search&q={quote_plus(query)}"
+
+    def _update_rss_monitor(
+        self, feed_urls: list[str], feed_targets: dict[str, list[str]], item_names: list[str], item_categories: dict[str, str]
+    ) -> None:
+        if not self._rss_monitor:
+            return
+        if hasattr(self._rss_monitor, "update_feeds"):
+            self._rss_monitor.update_feeds(
+                feed_urls,
+                feed_targets=feed_targets,
+                item_categories=item_categories,
+                item_names=item_names,
+            )
+
+
     async def handle_release_event(
         self,
         item: CategoryItem,
@@ -1671,7 +1830,7 @@ class MediaScheduler:
         event = {
             "trigger": trigger,
             "unit_label": unit_label or "",
-            "source_result": source_result.model_dump() if hasattr(source_result, "model_dump") else dict(source_result or {}),
+            "source_result": self._serialize_source_result(source_result),
         }
         result = await category.handle_release_event(item, event, context, notifications=self._notifications, lifecycle=self._lifecycle)
         try:
@@ -1682,15 +1841,143 @@ class MediaScheduler:
             self._event_bus.emit_system("release_event", {"category_id": category_id, "item_id": getattr(item, "key", ""), "result": result})
         return result if isinstance(result, dict) else {"status": "ok"}
 
+
+    @staticmethod
+    def _serialize_source_result(source_result: Any) -> dict[str, Any]:
+        """Serialize a provider/RSS result without assuming it is dict-like.
+
+        RSS callbacks previously passed a plain string by mistake. Calling
+        ``dict("S03E05")`` raised ``ValueError`` and prevented release events
+        from reaching category handlers. This boundary now accepts Pydantic
+        models, mappings, plain titles, and ``None`` safely.
+        """
+        if source_result is None:
+            return {}
+        if hasattr(source_result, "model_dump"):
+            dumped = source_result.model_dump()
+            return dumped if isinstance(dumped, dict) else {"value": dumped}
+        if isinstance(source_result, dict):
+            return dict(source_result)
+        title = getattr(source_result, "title", None)
+        if title is not None and not callable(title):
+            payload: dict[str, Any] = {"title": str(title)}
+            for attr in ("magnet", "size", "size_bytes", "seeders", "source"):
+                value = getattr(source_result, attr, None)
+                if value is not None and not callable(value):
+                    payload[attr] = value
+            return payload
+        return {"value": str(source_result)}
+
+
+    @staticmethod
+    def _download_unit_keys(download: Any) -> set[str]:
+        """Return category-neutral unit keys carried by a download row."""
+        keys: set[str] = set()
+        for descriptor in (
+            getattr(download, "unit_descriptor", None),
+            getattr(getattr(download, "import_context", None), "unit_descriptor", None),
+        ):
+            if callable(descriptor):
+                try:
+                    descriptor = descriptor()
+                except Exception:
+                    descriptor = None
+            if isinstance(descriptor, dict):
+                for field in ("stable_key", "label"):
+                    value = str(descriptor.get(field) or "").strip()
+                    if value:
+                        keys.add(value)
+        season = getattr(download, "season", None)
+        episode = getattr(download, "episode", None)
+        if season and episode:
+            try:
+                keys.add(f"S{int(season):02d}E{int(episode):02d}")
+            except Exception:
+                pass
+        label = str(getattr(download, "unit_label", "") or "").strip()
+        if label:
+            keys.add(label)
+        return keys
+
+    @classmethod
+    def _download_matches_release_watch(cls, download: Any, watch: dict[str, Any]) -> bool:
+        """Return whether a download row corresponds to a release-watch unit."""
+        if str(getattr(download, "category_id", "") or "") != str(watch.get("category_id") or ""):
+            return False
+        wanted_item = str(watch.get("item_id") or "")
+        download_item = str(getattr(download, "item_id", "") or getattr(download, "item_name", "") or "")
+        if wanted_item and download_item != wanted_item:
+            return False
+        wanted_unit = str(watch.get("unit_key") or "").strip()
+        if not wanted_unit:
+            return True
+        return wanted_unit in cls._download_unit_keys(download)
+
+    async def _recover_stale_queued_release_watches(self, repo: Any) -> None:
+        """Move dormant queued watches back to retryable when the queued download vanished.
+
+        A release watch becomes ``queued`` when LJS successfully queues a
+        matching download. It should become ``completed`` only after the import
+        layer confirms the category unit is present. If the queued/active
+        download disappears, fails, or is cancelled before that, the watch must
+        resume retrying instead of getting stuck forever.
+        """
+        if not hasattr(repo, "stale_queued") or not hasattr(repo, "reset_to_retryable"):
+            return
+        queued_watches = await repo.stale_queued(older_than_minutes=30, limit=50)
+        if not queued_watches:
+            return
+        try:
+            active = await self._downloader.get_active_downloads()
+            recent = await self._downloader.get_recent_downloads(limit=250)
+        except Exception as exc:
+            logger.debug("Release-watch queued reconciliation skipped; downloads unavailable: {}", exc)
+            return
+        active_statuses = {DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED, DownloadStatus.SEEDING, DownloadStatus.STALLED}
+        terminal_bad_statuses = {DownloadStatus.FAILED, DownloadStatus.CANCELLED}
+        for watch in queued_watches:
+            matching_active = [download for download in active if MediaScheduler._download_matches_release_watch(download, watch)]
+            if matching_active:
+                continue
+            matching_recent = [download for download in recent if MediaScheduler._download_matches_release_watch(download, watch)]
+            if any(getattr(download, "status", None) == DownloadStatus.COMPLETE for download in matching_recent):
+                await repo.complete(str(watch.get("category_id") or ""), str(watch.get("item_id") or ""), str(watch.get("unit_key") or ""))
+                continue
+            bad = next((download for download in matching_recent if getattr(download, "status", None) in terminal_bad_statuses), None)
+            reason = f"queued download ended as {getattr(getattr(bad, 'status', None), 'value', getattr(bad, 'status', 'missing'))}" if bad else "queued download is no longer active"
+            await repo.reset_to_retryable(
+                str(watch.get("category_id") or ""),
+                str(watch.get("item_id") or ""),
+                str(watch.get("unit_key") or ""),
+                error=reason,
+                interval_hours=float(watch.get("interval_hours") or 2.0),
+                outcome={"status": "queued_recovered_to_retryable", "reason": reason},
+            )
+            logger.info(
+                "Release watch returned to retryable after queued download disappeared: {}/{}/{} ({})",
+                watch.get("category_id"), watch.get("item_id"), watch.get("unit_key"), reason,
+            )
+
     async def process_release_watches(self) -> None:
-        """Retry pending release watches until a category queues or resolves them."""
+        """Retry due category release watches until queued/completed/expired.
+
+        This is intentionally category-neutral.  It does not know that a TV
+        watch is an episode; it only passes the category-provided unit key and
+        requirements through the existing pipeline, then records a typed watch
+        outcome.  Categories decide what counts as a valid candidate.
+        """
         repo = getattr(self._db, "release_watches", None)
         if not repo:
             return
+        if hasattr(repo, "expire_overdue"):
+            expired = await repo.expire_overdue(limit=100)
+            if expired:
+                logger.info("Expired {} overdue release watch(es).", expired)
+        await MediaScheduler._recover_stale_queued_release_watches(self, repo)
         watches = await repo.due(limit=20)
         if not watches:
             return
-        logger.info("Processing %s due release watch(es).", len(watches))
+        logger.info("Processing {} due release watch(es).", len(watches))
         for watch in watches:
             category_id = str(watch.get("category_id") or "")
             item_id = str(watch.get("item_id") or "")
@@ -1705,16 +1992,22 @@ class MediaScheduler:
                 await repo.record_attempt(int(watch["id"]), status="cancelled", error="tracked item disappeared")
                 continue
             try:
-                preferred_language = str(watch.get("preferred_language") or getattr(item, "language", "") or self._settings_manager.settings.language)
+                requirements = dict(watch.get("requirements") or {})
+                preferred_language = str(
+                    requirements.get("preferred_language")
+                    or watch.get("preferred_language")
+                    or getattr(item, "language", "")
+                    or self._settings_manager.settings.language
+                )
                 item_auto = getattr(item, "auto_download", None)
-                can_auto_download = bool(item_auto if item_auto is not None else self._settings_manager.settings.auto_download)
+                can_auto_download = bool(
+                    requirements.get("auto_download")
+                    if "auto_download" in requirements
+                    else (item_auto if item_auto is not None else self._settings_manager.settings.auto_download)
+                )
+                interval = float(watch.get("interval_hours") or 2.0)
 
                 if not can_auto_download:
-                    # Auto-download-disabled watches are still useful: run a
-                    # non-queueing category search and notify the web inbox when
-                    # an acceptable candidate exists.  The action remains a
-                    # category workflow so the scheduler does not learn TV/movie
-                    # unit semantics.
                     candidate = await self._pipeline.run_search(
                         item, episode_label=unit_key, mode="auto", language=preferred_language,
                     )
@@ -1725,6 +2018,7 @@ class MediaScheduler:
                         except Exception:
                             pass
                     if candidate:
+                        candidate_summary = self._release_candidate_summary(candidate)
                         if self._notifications:
                             from src.core.models import NotificationMessage
                             action_builder = getattr(category, "release_watch_notification_action", None)
@@ -1733,7 +2027,7 @@ class MediaScheduler:
                                 try:
                                     actions = [action_builder(item_id, unit_key, candidate, preferred_language)]
                                 except Exception as exc:
-                                    logger.debug("Category release-watch action build failed for %s/%s/%s: %s", category_id, item_id, unit_key, exc)
+                                    logger.debug("Category release-watch action build failed for {}/{}/{}: {}", category_id, item_id, unit_key, exc)
                             await self._notifications.notify(
                                 NotificationMessage(
                                     title=f"{item_id} {unit_key}",
@@ -1747,9 +2041,20 @@ class MediaScheduler:
                                 metadata={"unit_key": unit_key, "preferred_language": preferred_language, "watch_id": watch.get("id")},
                                 dedupe_key=f"release_watch_found:{category_id}:{item_id}:{unit_key}",
                             )
-                        await repo.record_attempt(int(watch["id"]), status="completed")
+                        await repo.record_attempt(
+                            int(watch["id"]),
+                            status="candidate_found",
+                            candidate_summary=candidate_summary,
+                            outcome={"status": "candidate_found", "auto_download": False},
+                        )
                     else:
-                        await repo.record_attempt(int(watch["id"]), status="pending", error="no acceptable candidate", interval_hours=float(watch.get("interval_hours") or 2.0))
+                        await repo.record_attempt(
+                            int(watch["id"]),
+                            status="failed_retryable",
+                            error="no acceptable candidate",
+                            interval_hours=interval,
+                            outcome={"status": "no_candidate"},
+                        )
                     continue
 
                 ok = await self._pipeline.run_discovery(
@@ -1759,7 +2064,10 @@ class MediaScheduler:
                     language=preferred_language,
                 )
                 if ok:
-                    await repo.record_attempt(int(watch["id"]), status="completed")
+                    if hasattr(repo, "mark_queued"):
+                        await repo.mark_queued(category_id, item_id, unit_key, outcome={"status": "queued_by_release_watch"})
+                    else:
+                        await repo.record_attempt(int(watch["id"]), status="queued", outcome={"status": "queued_by_release_watch"})
                     if self._notifications:
                         await self._notifications.send_message(
                             f"Queued {item_id} {unit_key} after a release-watch retry.",
@@ -1767,10 +2075,33 @@ class MediaScheduler:
                             level="success",
                         )
                 else:
-                    await repo.record_attempt(int(watch["id"]), status="pending", error="no acceptable candidate", interval_hours=float(watch.get("interval_hours") or 2.0))
+                    await repo.record_attempt(
+                        int(watch["id"]),
+                        status="failed_retryable",
+                        error="no acceptable candidate",
+                        interval_hours=interval,
+                        outcome={"status": "no_candidate"},
+                    )
             except Exception as exc:
-                logger.warning("Release watch retry failed for %s/%s/%s: %s", category_id, item_id, unit_key, exc)
-                await repo.record_attempt(int(watch["id"]), status="pending", error=str(exc), interval_hours=float(watch.get("interval_hours") or 2.0))
+                logger.warning("Release watch retry failed for {}/{}/{}: {}", category_id, item_id, unit_key, exc)
+                await repo.record_attempt(
+                    int(watch["id"]),
+                    status="failed_retryable",
+                    error=str(exc),
+                    interval_hours=float(watch.get("interval_hours") or 2.0),
+                    outcome={"status": "error", "error": str(exc)},
+                )
+
+    @staticmethod
+    def _release_candidate_summary(candidate: Any) -> dict[str, Any]:
+        """Return a compact, serializable release-watch candidate summary."""
+        return {
+            "title": str(getattr(candidate, "title", "") or ""),
+            "size_bytes": getattr(candidate, "size_bytes", None),
+            "seeders": getattr(candidate, "seeders", None),
+            "source": str(getattr(candidate, "source", "") or ""),
+            "magnet_present": bool(str(getattr(candidate, "magnet", "") or "")),
+        }
 
     async def list_media(self) -> dict:
         """Return tracked media rows with category-neutral progress fields."""

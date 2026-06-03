@@ -225,6 +225,15 @@ class Database:
             "created_at": "TEXT NOT NULL DEFAULT ''",
             "updated_at": "TEXT NOT NULL DEFAULT ''",
         },
+        "release_watches": {
+            "expected_air_at": "TEXT NOT NULL DEFAULT ''",
+            "watch_start_at": "TEXT NOT NULL DEFAULT ''",
+            "expires_at": "TEXT NOT NULL DEFAULT ''",
+            "cadence_profile": "TEXT NOT NULL DEFAULT 'unknown'",
+            "requirements_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_candidate_summary_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_outcome_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
         "category_items": {
             "category_id": "TEXT NOT NULL DEFAULT ''",
             "item_id": "TEXT NOT NULL DEFAULT ''",
@@ -307,7 +316,7 @@ class Database:
         "category_item_suggestion_state": ("category_id", "item_id", "suggestion_key", "status"),
         "notifications": ("id", "status", "dedupe_key"),
         "notification_deliveries": ("notification_id", "bridge_id", "status", "attempts", "updated_at"),
-        "release_watches": ("id", "category_id", "item_id", "unit_key", "next_check_at"),
+        "release_watches": ("id", "category_id", "item_id", "unit_key", "next_check_at", "expected_air_at", "watch_start_at", "requirements_json"),
     }
 
     def __init__(self, db_path: str = "data/ljs.db"):
@@ -829,9 +838,16 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'pending',
                 next_check_at TEXT NOT NULL DEFAULT '',
                 interval_hours REAL NOT NULL DEFAULT 2.0,
+                expected_air_at TEXT NOT NULL DEFAULT '',
+                watch_start_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                cadence_profile TEXT NOT NULL DEFAULT 'unknown',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL DEFAULT '{}',
+                requirements_json TEXT NOT NULL DEFAULT '{}',
+                last_candidate_summary_json TEXT NOT NULL DEFAULT '{}',
+                last_outcome_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(category_id, item_id, unit_key)

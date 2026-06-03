@@ -405,17 +405,13 @@ class QueueDownloadService:
         if not changed:
             return
         try:
-            settings_manager.save(settings)
+            coordinator_factory = getattr(self._scheduler, "category_item_coordinator", None)
+            if callable(coordinator_factory):
+                await coordinator_factory().update_item(category_id, item_id, quality=quality)
+            else:
+                settings_manager.save(settings)
         except Exception as exc:
             logger.debug(f"Could not persist selected candidate bitrate preference for {category_id}/{item_id}: {exc}")
-        db = getattr(self._scheduler, "_db", None)
-        if db and getattr(db, "media", None):
-            try:
-                item = next((i for i in getattr(settings, "tracked_items", []) or [] if str(getattr(i, "key", "")) == item_id and str(getattr(i, "item_type", category_id)) == category_id), None)
-                if item and hasattr(item, "model_dump"):
-                    await db.media.upsert_category_item(category_id, item_id, item.model_dump(mode="json"))
-            except Exception as exc:
-                logger.debug(f"Could not persist selected candidate bitrate preference to repository for {category_id}/{item_id}: {exc}")
         logger.info(f"Recorded selected bitrate preference for {category_id}/{item_id}: {bitrate} kbps")
 
 

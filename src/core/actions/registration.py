@@ -74,6 +74,9 @@ class ActionRegistrationService:
             deps.category_registry,
             deps.db,
             deps.scheduler,
+            metadata_enricher=deps.metadata_enricher,
+            metadata_clients={"tvmaze": deps.tvmaze_client} if deps.tvmaze_client else {},
+            artwork_manager=deps.artwork_manager,
         )
         gw = self._gateway
         for action_name, method in (

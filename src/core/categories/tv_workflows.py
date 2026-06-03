@@ -107,8 +107,17 @@ class TvWorkflowMixin:
         if can_auto:
             ok = await context.pipeline.run_discovery(item, episode_label=unit_key, force=False, language=preferred_language)
             if ok:
+                # Queueing is not completion. The generic download/import layer
+                # marks the watch completed only after the requested category
+                # unit has been exposed in the library. This keeps failed or
+                # cancelled queued downloads retryable.
                 if getattr(context.db, "release_watches", None):
-                    await context.db.release_watches.complete(self.category_id, title, unit_key)
+                    await context.db.release_watches.mark_queued(
+                        self.category_id,
+                        title,
+                        unit_key,
+                        outcome={"status": "queued_by_tv_release_event", "trigger": metadata.get("trigger")},
+                    )
                 return {"status": "queued", "reason": "frontier_auto_download", **metadata}
             # Auto was allowed but no acceptable candidate could be queued; keep watching.
             await self._watch_release(context, title, unit_key, preferred_language, metadata)

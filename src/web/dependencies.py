@@ -50,6 +50,7 @@ class WebDependencies:
     storage_monitor: Any = None
     artwork_manager: Any = None
     metadata_enricher: Any = None
+    tvmaze_client: Any = None
     event_bus: Any = None
     action_gateway: Any = None
     action_event_store: Any = None

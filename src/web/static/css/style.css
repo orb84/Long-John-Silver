@@ -2617,3 +2617,596 @@ button.is-loading i {
     justify-content: flex-start;
   }
 }
+
+/* ─── Round 211: mobile shell responsiveness ────────────────────
+   The main UI is a fixed-height app shell on desktop.  Mobile browsers have
+   dynamic toolbars and narrower frames, so the shell needs to use dynamic
+   viewport units, wrap the header, and keep chat input pinned while only the
+   active view/feed scrolls. */
+html,
+body {
+  width: 100%;
+  min-height: 100%;
+}
+
+@supports (height: 100dvh) {
+  body { height: 100dvh; }
+  .app-layout { height: 100dvh; }
+}
+
+@media (max-width: 900px) {
+  body {
+    overflow: hidden;
+  }
+  .app-layout {
+    width: 100%;
+    max-width: none;
+    padding: 14px;
+    gap: 14px;
+  }
+  .app-header {
+    height: auto;
+    min-height: 0;
+    padding: 12px 14px;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+  }
+  .brand {
+    gap: 12px;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .persona-avatar {
+    width: 74px;
+    height: 74px;
+    flex-basis: 74px;
+    margin: 0;
+    transform: none;
+    animation: none;
+  }
+  .brand-text {
+    min-width: 0;
+  }
+  .brand-text h1 {
+    font-size: 1rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 58vw;
+  }
+  .status {
+    font-size: 0.72rem;
+  }
+  .nav-dock {
+    order: 3;
+    flex: 1 0 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    justify-content: flex-start;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+  .nav-btn {
+    flex: 0 0 auto;
+    padding: 9px 13px;
+    font-size: 0.83rem;
+    white-space: nowrap;
+  }
+  .user-actions {
+    flex: 0 0 auto;
+  }
+  .view-container {
+    min-height: 0;
+  }
+  .view {
+    padding-bottom: 12px;
+  }
+  .glass-panel {
+    border-radius: 16px;
+  }
+}
+
+@media (max-width: 720px) {
+  .app-layout {
+    padding: 10px;
+    gap: 10px;
+  }
+  .app-header {
+    padding: 10px;
+  }
+  .persona-avatar {
+    width: 56px;
+    height: 56px;
+    flex-basis: 56px;
+  }
+  .brand-text h1 {
+    font-size: 0.92rem;
+    max-width: 54vw;
+  }
+  .bg-status {
+    display: none;
+  }
+  .nav-btn span,
+  .nav-btn .label {
+    display: none;
+  }
+  .nav-btn {
+    gap: 0;
+    padding: 10px 12px;
+  }
+  .helm-grid {
+    height: 100%;
+    min-height: 0;
+  }
+  .chat-container {
+    min-height: 0;
+  }
+  .chat-header {
+    padding: 12px 14px;
+    gap: 10px;
+    align-items: flex-start;
+  }
+  .chat-header h2 {
+    font-size: 0.98rem;
+  }
+  .chat-header .header-tools {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .chat-feed {
+    padding: 14px;
+    gap: 12px;
+  }
+  .message {
+    max-width: 96%;
+  }
+  .msg-bubble {
+    font-size: 0.9rem;
+    padding: 11px 14px;
+  }
+  .chat-input-area {
+    padding: 10px;
+    gap: 10px;
+    align-items: flex-end;
+    border-bottom-left-radius: 16px;
+    border-bottom-right-radius: 16px;
+  }
+  .chat-input-area textarea {
+    min-height: 42px;
+    padding: 10px 14px;
+    border-radius: 18px;
+    font-size: 16px; /* avoid iOS zoom */
+  }
+  .chat-input-area button {
+    width: 42px;
+    height: 42px;
+    flex: 0 0 42px;
+  }
+  .widgets-container {
+    display: none !important;
+  }
+  .modal-content,
+  .lib-modal-content {
+    width: calc(100vw - 20px) !important;
+    max-width: calc(100vw - 20px) !important;
+    max-height: calc(100dvh - 20px);
+    overflow: auto;
+  }
+  .page-header,
+  .suggestions-hero,
+  .download-card,
+  .detail-header-info {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .filter-controls,
+  .batch-btns,
+  .suggestion-actions {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 520px) {
+  .brand-text h1 {
+    max-width: 46vw;
+  }
+  .badge,
+  .btn-clear-chat {
+    font-size: 0.7rem;
+  }
+  .fidget-compass {
+    display: none;
+  }
+  .chat-header {
+    flex-direction: column;
+  }
+  .chat-header .header-tools {
+    width: 100%;
+    justify-content: space-between;
+  }
+}
+
+/* ─── Round 217: release-watch UI and tall-mobile shell cleanup ─────────────
+   The release-watch surface is generic: it displays category-provided watch
+   state without teaching the frontend TV episode rules.  Mobile shell rules use
+   aspect ratio as well as width because browser/device emulation can report a
+   wider CSS viewport than the screenshot frame while still being physically
+   narrow and tall. */
+.release-watch-page {
+  margin-top: 24px;
+  padding: 22px 24px;
+  display: grid;
+  gap: 16px;
+}
+.release-watch-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+}
+.release-watch-header h2 {
+  font-family: var(--font-display);
+  font-size: 1.18rem;
+  margin: 2px 0 6px;
+}
+.release-watch-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.release-watch-summary {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.release-watch-pill,
+.release-watch-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,.1);
+  background: rgba(255,255,255,.055);
+  color: var(--text-main);
+  font-size: .78rem;
+  font-weight: 700;
+}
+.release-watch-status.is-pending,
+.release-watch-pill.is-pending,
+.release-watch-status.is-failed_retryable,
+.release-watch-pill.is-failed_retryable {
+  border-color: rgba(244,162,97,.3);
+  color: var(--accent-gold);
+  background: rgba(244,162,97,.08);
+}
+.release-watch-status.is-candidate_found,
+.release-watch-pill.is-candidate_found {
+  border-color: rgba(72,202,228,.3);
+  color: #48cae4;
+  background: rgba(72,202,228,.08);
+}
+.release-watch-status.is-queued,
+.release-watch-pill.is-queued {
+  border-color: rgba(42,157,143,.3);
+  color: var(--accent-teal);
+  background: rgba(42,157,143,.09);
+}
+.release-watch-status.is-completed,
+.release-watch-pill.is-completed {
+  border-color: rgba(42,157,143,.45);
+  color: #7bffd8;
+}
+.release-watch-status.is-expired,
+.release-watch-pill.is-expired,
+.release-watch-status.is-cancelled,
+.release-watch-pill.is-cancelled {
+  border-color: rgba(231,111,81,.26);
+  color: var(--accent-red);
+  background: rgba(231,111,81,.08);
+}
+.release-watch-list {
+  display: grid;
+  gap: 12px;
+}
+.release-watch-card {
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(0,0,0,.18);
+  border: 1px solid rgba(255,255,255,.075);
+  display: grid;
+  gap: 12px;
+}
+.release-watch-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+}
+.release-watch-title {
+  display: block;
+  font-family: var(--font-display);
+  font-size: .98rem;
+  margin-bottom: 3px;
+}
+.release-watch-card small {
+  color: var(--text-dim);
+}
+.release-watch-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+.release-watch-meta > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255,255,255,.035);
+}
+.release-watch-meta span,
+.release-watch-detail-row span {
+  color: var(--text-dim);
+  font-size: .72rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.release-watch-meta b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: .85rem;
+}
+.release-watch-details {
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,.07);
+  background: rgba(255,255,255,.025);
+  overflow: hidden;
+}
+.release-watch-details summary {
+  cursor: pointer;
+  padding: 9px 11px;
+  color: var(--text-main);
+  font-weight: 700;
+}
+.release-watch-details[open] summary {
+  border-bottom: 1px solid rgba(255,255,255,.07);
+}
+.release-watch-detail-row {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr);
+  gap: 10px;
+  padding: 9px 11px;
+}
+.release-watch-detail-row + .release-watch-detail-row {
+  border-top: 1px solid rgba(255,255,255,.055);
+}
+.release-watch-detail-row code {
+  min-width: 0;
+  overflow: auto;
+  white-space: nowrap;
+  color: var(--text-main);
+  font-size: .78rem;
+}
+.release-watch-error {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(231,111,81,.08);
+  border: 1px solid rgba(231,111,81,.22);
+  color: var(--accent-red);
+}
+
+@media (max-width: 1120px), (max-aspect-ratio: 3/4) {
+  html, body {
+    width: 100%;
+    height: 100%;
+    min-height: 100%;
+    overflow: hidden;
+  }
+  body {
+    min-width: 0;
+  }
+  .app-layout {
+    width: 100%;
+    max-width: none;
+    height: 100vh;
+    height: 100dvh;
+    padding: clamp(8px, 2.6vmin, 14px);
+    gap: clamp(8px, 2vmin, 14px);
+    overflow: hidden;
+  }
+  .app-header {
+    height: auto;
+    min-height: 0;
+    padding: 10px 12px;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+  }
+  .brand {
+    min-width: 0;
+    flex: 1 1 min(360px, 64vw);
+    gap: 10px;
+  }
+  .persona-avatar {
+    width: clamp(50px, 12vmin, 74px);
+    height: clamp(50px, 12vmin, 74px);
+    flex: 0 0 clamp(50px, 12vmin, 74px);
+    margin: 0;
+    animation: none;
+    transform: none;
+  }
+  .brand-text {
+    min-width: 0;
+  }
+  .brand-text h1 {
+    max-width: min(54vw, 360px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: clamp(.88rem, 2.6vmin, 1rem);
+  }
+  .status {
+    font-size: .7rem;
+    min-width: 0;
+  }
+  .bg-status {
+    display: none;
+  }
+  .user-actions {
+    flex: 0 0 auto;
+  }
+  .nav-dock {
+    order: 3;
+    flex: 1 0 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    justify-content: flex-start;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    border-radius: 14px;
+  }
+  .nav-dock::-webkit-scrollbar { display: none; }
+  .nav-btn {
+    flex: 0 0 auto;
+    padding: 9px 12px;
+    font-size: .82rem;
+    white-space: nowrap;
+  }
+  .nav-label {
+    display: none;
+  }
+  .view-container {
+    min-height: 0;
+    overflow: hidden;
+  }
+  .view {
+    min-height: 0;
+    padding-bottom: 0;
+  }
+  #helm.view {
+    overflow: hidden;
+  }
+  .helm-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+    height: 100%;
+    min-height: 0;
+    gap: 0;
+  }
+  .chat-container {
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+  }
+  .chat-header {
+    padding: 11px 13px;
+    gap: 10px;
+    align-items: flex-start;
+  }
+  .chat-header h2 {
+    font-size: .98rem;
+  }
+  .chat-header .header-tools {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .chat-feed {
+    padding: 12px;
+    gap: 12px;
+  }
+  .message {
+    max-width: 96%;
+  }
+  .msg-bubble {
+    font-size: .9rem;
+    padding: 10px 13px;
+  }
+  .chat-input-area {
+    padding: 10px;
+    gap: 9px;
+    align-items: flex-end;
+  }
+  .chat-input-area textarea {
+    min-height: 42px;
+    padding: 10px 14px;
+    border-radius: 18px;
+    font-size: 16px;
+  }
+  .chat-input-area button {
+    width: 42px;
+    height: 42px;
+    flex: 0 0 42px;
+  }
+  .widgets-container {
+    display: none !important;
+  }
+  .fidget-compass {
+    display: none;
+  }
+  .page-header,
+  .suggestions-hero,
+  .release-watch-header,
+  .download-card,
+  .detail-header-info {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .suggestions-page,
+  .release-watch-page {
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .release-watch-actions {
+    justify-content: flex-start;
+  }
+  .release-watch-card-top,
+  .category-detail-suggestion-summary,
+  .category-detail-suggestions-lead .suggestion-action-card,
+  .category-detail-suggestion-mini-row {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  .release-watch-detail-row {
+    grid-template-columns: 1fr;
+  }
+  .modal-content,
+  .lib-modal-content {
+    width: calc(100vw - 20px) !important;
+    max-width: calc(100vw - 20px) !important;
+    max-height: calc(100dvh - 20px);
+    overflow: auto;
+  }
+}
+
+@media (max-width: 540px), (max-aspect-ratio: 2/3) {
+  .app-layout {
+    padding: 8px;
+    gap: 8px;
+  }
+  .app-header {
+    padding: 8px;
+  }
+  .icon-btn {
+    width: 34px;
+    height: 34px;
+  }
+  .chat-header {
+    flex-direction: column;
+  }
+  .chat-header .header-tools {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .btn-clear-chat,
+  .badge {
+    font-size: .68rem;
+  }
+}

@@ -651,6 +651,7 @@ async def main():
             settings=settings,
             download_dir=Path(settings.download_dir).resolve(),
             settings_manager=settings_manager,
+            db=db,
         )
         downloader.set_ready_callback(completion_handler.on_download_ready)
         downloader.set_completion_callback(completion_handler.on_download_complete)
@@ -865,6 +866,7 @@ async def main():
             storage_monitor=storage_monitor,
             artwork_manager=artwork_manager,
             metadata_enricher=metadata_enricher,
+            tvmaze_client=tvmaze_client,
         )
 
         # --- Start the web server first and wait for the socket to bind. ---
@@ -943,32 +945,39 @@ async def main():
         )
 
         # RSS monitor and chat bridges are useful, but they must not delay web
-        # availability.  Start them after the UI is confirmed live.
+        # availability.  Start RSS with an empty feed set and let the category
+        # watch-policy sync populate it.  The generic composition root does not
+        # decide which TV/movie/music items are active enough to monitor.
         if settings.jackett_url and settings.jackett_api_key:
             from src.search.rss_monitor import RSSMonitor
-            item_names = [
-                item.key
-                for item in settings_manager.settings.tracked_items
-                if item.enabled and getattr(item, "is_episodic", False) and len(str(item.key).strip()) >= 3
-            ]
-            rss_feed_url = f"{settings.jackett_url.rstrip('/')}/api/v2.0/indexers/all/results/torznab/api?apikey={settings.jackett_api_key}&t=search&q="
-            if item_names:
-                async def _on_rss_match(name: str, result, unit_label: str | None = None):
-                    """Turn an RSS match into a category-owned release event."""
-                    item = next((tracked for tracked in settings_manager.settings.tracked_items if tracked.key.lower() == name.lower()), None)
-                    if item:
-                        logger.info(f'RSS release event: {name} {unit_label or ""} candidate={getattr(result, "title", "")!r}')
-                        await scheduler.handle_release_event(item, unit_label=unit_label, source_result=result, trigger="rss")
-                    else:
-                        logger.warning(f"RSS matched '{name}' but it was not found in tracked items.")
 
-                rss_monitor = RSSMonitor(
-                    feed_urls=[rss_feed_url], item_names=item_names, supervisor=supervisor,
-                    on_match=_on_rss_match,
-                    category_registry=cat_registry,
-                    item_categories={item.key: getattr(item, "item_type", "") for item in settings_manager.settings.tracked_items},
-                )
-                rss_monitor.start()
+            async def _on_rss_match(name: str, result, unit_label: str | None = None):
+                """Turn an RSS match into a category-owned release event."""
+                item = next((tracked for tracked in settings_manager.settings.tracked_items if tracked.key.lower() == name.lower()), None)
+                if item:
+                    candidate_title = getattr(result, "title", None)
+                    if callable(candidate_title):
+                        candidate_title = candidate_title()
+                    if candidate_title is None:
+                        candidate_title = str(result) if result is not None else ""
+                    logger.info(f'RSS release event: {name} {unit_label or ""} candidate={candidate_title!r}')
+                    await scheduler.handle_release_event(item, unit_label=unit_label, source_result=result, trigger="rss")
+                else:
+                    logger.warning(f"RSS matched '{name}' but it was not found in tracked items.")
+
+            rss_monitor = RSSMonitor(
+                feed_urls=[],
+                item_names=[],
+                supervisor=supervisor,
+                on_match=_on_rss_match,
+                category_registry=cat_registry,
+                item_categories={},
+                feed_targets={},
+                max_feeds_per_cycle=8,
+            )
+            scheduler.set_rss_monitor(rss_monitor)
+            rss_monitor.start()
+            supervisor.spawn_one_shot("sync_category_watch_policies", scheduler.sync_all_category_watch_policies(reason="startup"))
 
         async def _start_comms_bridges() -> None:
             for bridge_info in comms_registry.list_bridges():

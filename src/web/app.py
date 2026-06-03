@@ -30,6 +30,7 @@ from src.web.routers.downloads import DownloadsRouter
 from src.web.routers.health import HealthRouter
 from src.web.routers.library import LibraryRouter
 from src.web.routers.notifications import NotificationsRouter
+from src.web.routers.release_watches import ReleaseWatchesRouter
 from src.web.routers.pages import PagesRouter
 from src.web.routers.personas import PersonasRouter
 from src.web.routers.providers import ProvidersRouter
@@ -201,7 +202,7 @@ def create_app(**kwargs: Any) -> FastAPI:
         DownloadsRouter, ActionsRouter, HealthRouter,
         PagesRouter, PersonasRouter, ProvidersRouter, SetupRouter, CategoriesRouter,
         SettingsRouter, CategoryItemsRouter, LibraryRouter, NotificationsRouter,
-        UpgradesRouter, SuggestionsRouter, SystemRouter, StorageRouter, SharingRouter,
+        UpgradesRouter, SuggestionsRouter, SystemRouter, StorageRouter, SharingRouter, ReleaseWatchesRouter,
     ):
         app.include_router(router_cls(deps).get_router())
 

@@ -27,6 +27,7 @@ class AppDeck {
         this._bootyPanel = null;
         this._settingsPanel = null;
         this._sharingPanel = null;
+        this._releaseWatchPanel = null;
         this._hydrateTimer = null;
         this._lastHydrateAt = 0;
         this._voyageLogLineLimit = 160;
@@ -69,6 +70,10 @@ class AppDeck {
         }
         if (window.NotificationInbox) {
             window.notificationInbox = new NotificationInbox();
+        }
+        if (window.ReleaseWatchPanel) {
+            this._releaseWatchPanel = new ReleaseWatchPanel('release-watch-panel', this._eventBus);
+            window.releaseWatchPanel = this._releaseWatchPanel;
         }
 
         // Trigger active downloads UI load since DownloadManager is now fully defined
@@ -166,6 +171,7 @@ class AppDeck {
             if (window.downloads && typeof window.downloads.load === 'function') jobs.push(window.downloads.load());
             if (window.holdPanel && typeof window.holdPanel.loadRecentPlunder === 'function') jobs.push(window.holdPanel.loadRecentPlunder());
             if (window.suggestionManager && typeof window.suggestionManager.load === 'function') jobs.push(window.suggestionManager.load({ force: true }));
+            if (window.releaseWatchPanel && typeof window.releaseWatchPanel.load === 'function') jobs.push(window.releaseWatchPanel.load({ quiet: true }));
             if (window.sharingPanel && typeof window.sharingPanel.load === 'function') jobs.push(window.sharingPanel.load());
             if (window.helmPanel && typeof window.helmPanel.updateStats === 'function') jobs.push(window.helmPanel.updateStats());
             if (window.helmPanel && typeof window.helmPanel.updateStorageStatus === 'function') jobs.push(window.helmPanel.updateStorageStatus());

@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 from src.core.categories.base import CategoryMedia
@@ -137,6 +137,353 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
     _default_naming_template = '{title} ({year})/Season {season}/{title} - S{season:02d}E{episode:02d}'
 
 
+
+    def create_item(self, key: str, **kwargs: Any) -> Any:
+        """Create a TV-specific tracked item.
+
+        TV must own the model choice. The web/API layer should not need to know
+        that TV has episode progress, TVMaze IDs, or active-airing lifecycle
+        state.
+        """
+        from src.core.models import TvShowItem
+
+        return TvShowItem(
+            key=key,
+            display_name=kwargs.get("display_name"),
+            language=str(kwargs.get("language") or "English"),
+            enabled=bool(kwargs.get("enabled", True)),
+            check_interval_days=int(kwargs.get("check_interval_days") or 7),
+            auto_download=kwargs.get("auto_download"),
+            last_season=kwargs.get("last_season"),
+            last_episode=kwargs.get("last_episode"),
+            tvmaze_id=kwargs.get("tvmaze_id"),
+            tmdb_id=kwargs.get("tmdb_id"),
+            properties=dict(kwargs.get("properties") or {}),
+            metadata=dict(kwargs.get("metadata") or {}),
+            state=dict(kwargs.get("state") or {}),
+        )
+
+    async def enrich_item_on_add(self, item: Any, context: Any) -> Any:
+        """Enrich a TV item when it is added/updated through the coordinator.
+
+        Metadata provider choice and field mapping are TV-owned.  The generic
+        category item coordinator only calls this hook and persists the returned
+        item.
+        """
+        metadata: dict[str, Any] = dict(getattr(item, "metadata", {}) or {})
+        title = str(getattr(item, "key", "") or "").strip()
+        db = getattr(context, "db", None)
+
+        enrich_metadata = bool(getattr(context, "enrich_metadata", True))
+        enricher = getattr(context, "metadata_enricher", None) if enrich_metadata else None
+        if enricher and title:
+            try:
+                record = await enricher.enrich_series(title)
+            except Exception as exc:
+                logger.warning("TV metadata enrichment failed for %s: %s", title, exc)
+                record = None
+            if record is not None:
+                payload = record.model_dump() if hasattr(record, "model_dump") else dict(record)
+                payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
+                metadata.update(payload)
+                if payload.get("display_name"):
+                    item.display_name = str(payload["display_name"])
+                if payload.get("tmdb_id") and hasattr(item, "tmdb_id"):
+                    item.tmdb_id = int(payload["tmdb_id"])
+                if db and getattr(db, "media", None):
+                    try:
+                        await db.media.upsert_category_metadata(
+                            self.category_id,
+                            title,
+                            "tmdb_tv",
+                            payload,
+                            external_id=str(payload.get("tmdb_id") or ""),
+                        )
+                    except Exception as exc:
+                        logger.debug("TV metadata cache write failed for %s: %s", title, exc)
+
+        tvmaze = (getattr(context, "metadata_clients", {}) or {}).get("tvmaze") if enrich_metadata else None
+        if tvmaze and title:
+            try:
+                tvmaze_id = getattr(item, "tvmaze_id", None)
+                if not tvmaze_id:
+                    hits = await tvmaze.search(title)
+                    if hits:
+                        # Prefer exact normalized title matches, otherwise take TVMaze's top score.
+                        wanted = self._canonical_title(title)
+                        best = next((hit for hit in hits if self._canonical_title(hit.get("name") or "") == wanted), hits[0])
+                        tvmaze_id = best.get("id")
+                        if tvmaze_id and hasattr(item, "tvmaze_id"):
+                            item.tvmaze_id = int(tvmaze_id)
+                if tvmaze_id:
+                    details = await tvmaze.get_show_details(int(tvmaze_id))
+                    if details:
+                        metadata["tvmaze"] = details
+                        metadata["tvmaze_id"] = tvmaze_id
+                        if details.get("status") and not metadata.get("lifecycle_status"):
+                            metadata["lifecycle_status"] = details.get("status")
+                        if db and getattr(db, "media", None):
+                            await db.media.upsert_category_metadata(
+                                self.category_id, title, "tvmaze", details, external_id=str(tvmaze_id)
+                            )
+            except Exception as exc:
+                logger.debug("TVMaze enrichment failed for %s: %s", title, exc)
+
+        item.metadata = metadata
+        return item
+
+    async def build_watch_plan(self, item: Any, context: Any) -> Any:
+        """Build a TV-owned watch plan.
+
+        The generic scheduler stores and retries watches, but TV owns the
+        semantics: next-episode metadata, airing cadence, RSS windows, release
+        retry start/expiry, and download requirements.  Ended/inactive shows do
+        not get near-real-time RSS simply because they are episodic.
+        """
+        from src.core.categories.watch import CategoryReleaseWatchSpec, CategoryRssFeedSpec, CategoryWatchPlan
+
+        title = str(getattr(item, "key", "") or "").strip()
+        if not title or not getattr(item, "enabled", True):
+            return CategoryWatchPlan(self.category_id, title, mode="none", reason="disabled or missing title")
+
+        metadata = await self._watch_metadata_for_item(item, context)
+        lifecycle = self._tv_lifecycle_status(metadata)
+        next_ep = self._next_episode_from_metadata(metadata)
+        preferred_language = str(getattr(item, "language", "") or getattr(getattr(context, "settings", None), "language", "") or "")
+
+        if next_ep:
+            season = self._safe_positive_int(next_ep.get("season") or next_ep.get("season_number"))
+            episode = self._safe_positive_int(next_ep.get("episode") or next_ep.get("number") or next_ep.get("episode_number"))
+            if season and episode:
+                unit_key = f"S{season:02d}E{episode:02d}"
+                expected_air_at = self._episode_air_datetime(next_ep, metadata)
+                cadence = self._tv_cadence_profile(metadata, next_ep)
+                interval_hours = self._release_watch_interval_hours(metadata, cadence_profile=cadence, default=2.0)
+                watch_start_at = self._watch_start_for_air_datetime(expected_air_at)
+                expires_at = self._watch_expiry_for_air_datetime(expected_air_at, cadence)
+                requirements = self._release_watch_requirements(item, context)
+                payload = {
+                    "expected_air_at": expected_air_at,
+                    "expected_air_date": next_ep.get("air_date") or next_ep.get("airdate") or "",
+                    "lifecycle": lifecycle,
+                    "cadence_profile": cadence,
+                    "season": season,
+                    "episode": episode,
+                }
+                rss_feeds: list[CategoryRssFeedSpec] = []
+                if self._rss_window_is_open(watch_start_at, expires_at):
+                    rss_feeds = [
+                        CategoryRssFeedSpec(query=f"{title} {unit_key}", target_name=title, reason="next episode release window"),
+                        CategoryRssFeedSpec(query=f"{title} S{season:02d}", target_name=title, reason="season pack containing next episode"),
+                    ]
+                return CategoryWatchPlan(
+                    self.category_id,
+                    title,
+                    mode="release_watch",
+                    reason=f"next episode known from TV metadata; cadence={cadence}; start={watch_start_at or 'now'}",
+                    rss_feeds=rss_feeds,
+                    release_watches=[
+                        CategoryReleaseWatchSpec(
+                            unit_key=unit_key,
+                            preferred_language=preferred_language,
+                            interval_hours=interval_hours,
+                            expected_air_at=expected_air_at,
+                            watch_start_at=watch_start_at,
+                            expires_at=expires_at,
+                            cadence_profile=cadence,
+                            requirements=requirements,
+                            payload=payload,
+                        )
+                    ],
+                )
+
+        if lifecycle in {"returning series", "in production", "running", "to be determined", "active_airing"}:
+            return CategoryWatchPlan(
+                self.category_id,
+                title,
+                mode="periodic_metadata",
+                reason=f"TV lifecycle is active but no concrete next episode is known ({lifecycle or 'unknown active'}); refresh metadata instead of broad RSS",
+            )
+
+        return CategoryWatchPlan(
+            self.category_id,
+            title,
+            mode="periodic_metadata",
+            reason=f"TV lifecycle is not actively airing ({lifecycle or 'unknown'}); use scheduled lifecycle checks, not RSS",
+        )
+
+    async def _watch_metadata_for_item(self, item: Any, context: Any) -> dict[str, Any]:
+        metadata = dict(getattr(item, "metadata", {}) or {})
+        db = getattr(context, "db", None)
+        if db and getattr(db, "media", None):
+            try:
+                rows = await db.media.get_category_metadata(self.category_id, getattr(item, "key", ""))
+            except Exception:
+                rows = []
+            for row in rows or []:
+                provider = str(row.get("provider") or "")
+                payload = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                if provider == "tvmaze":
+                    metadata.setdefault("tvmaze", payload)
+                elif provider == "tmdb_tv":
+                    metadata.update({k: v for k, v in payload.items() if k not in metadata})
+        return metadata
+
+    @staticmethod
+    def _canonical_title(value: str) -> str:
+        text = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+        if text.startswith("the "):
+            text = text[4:]
+        return re.sub(r"\s+", " ", text)
+
+    def _tv_lifecycle_status(self, metadata: dict[str, Any]) -> str:
+        tvmaze = metadata.get("tvmaze") if isinstance(metadata.get("tvmaze"), dict) else {}
+        value = metadata.get("lifecycle_status") or metadata.get("status") or tvmaze.get("status") or ""
+        return str(value).strip().lower()
+
+    def _next_episode_from_metadata(self, metadata: dict[str, Any]) -> dict[str, Any] | None:
+        tvmaze = metadata.get("tvmaze") if isinstance(metadata.get("tvmaze"), dict) else {}
+        next_ep = metadata.get("next_episode_to_air") or metadata.get("next_episode") or tvmaze.get("next_episode")
+        return next_ep if isinstance(next_ep, dict) and next_ep else None
+
+    @staticmethod
+    def _parse_datetimeish(value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(text[:10])
+            except ValueError:
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _iso(value: datetime | None) -> str:
+        return value.astimezone(timezone.utc).isoformat() if value else ""
+
+    def _episode_air_datetime(self, next_ep: dict[str, Any], metadata: dict[str, Any]) -> str:
+        """Return the best UTC-ish airing timestamp available for a TV episode."""
+        candidates = [
+            next_ep.get("airstamp"),
+            next_ep.get("air_datetime"),
+            next_ep.get("air_date"),
+            next_ep.get("airdate"),
+        ]
+        airdate = next_ep.get("airdate") or next_ep.get("air_date")
+        airtime = next_ep.get("airtime") or next_ep.get("air_time")
+        tvmaze = metadata.get("tvmaze") if isinstance(metadata.get("tvmaze"), dict) else {}
+        schedule = tvmaze.get("schedule") if isinstance(tvmaze.get("schedule"), dict) else {}
+        schedule_time = schedule.get("time") if isinstance(schedule, dict) else None
+        if airdate and (airtime or schedule_time):
+            candidates.insert(0, f"{airdate}T{airtime or schedule_time}:00")
+        for value in candidates:
+            parsed = self._parse_datetimeish(value)
+            if parsed:
+                return self._iso(parsed)
+        return ""
+
+    def _watch_start_for_air_datetime(self, expected_air_at: str) -> str:
+        """Start frequent checks around the expected release window, not at add time."""
+        air = self._parse_datetimeish(expected_air_at)
+        if not air:
+            return ""
+        # Start at the reported air time/date.  Date-only provider values become
+        # midnight UTC, which satisfies the category rule: once the air date has
+        # arrived, retry every few hours until a valid candidate is found.
+        return self._iso(air)
+
+    def _watch_expiry_for_air_datetime(self, expected_air_at: str, cadence_profile: str) -> str:
+        air = self._parse_datetimeish(expected_air_at)
+        if not air:
+            return ""
+        if cadence_profile == "daily":
+            days = 7
+        elif cadence_profile == "weekly":
+            days = 21
+        else:
+            days = 30
+        return self._iso(air + timedelta(days=days))
+
+    def _rss_window_is_open(self, watch_start_at: str, expires_at: str) -> bool:
+        start = self._parse_datetimeish(watch_start_at)
+        expiry = self._parse_datetimeish(expires_at)
+        now = datetime.now(timezone.utc)
+        if expiry and now > expiry:
+            return False
+        if not start:
+            return True
+        # RSS is useful close to/inside the release window, not weeks before an
+        # episode airs. Release watches still persist and will retry on schedule.
+        return now >= start - timedelta(hours=12)
+
+    def _tv_cadence_profile(self, metadata: dict[str, Any], next_ep: dict[str, Any] | None = None) -> str:
+        tvmaze = metadata.get("tvmaze") if isinstance(metadata.get("tvmaze"), dict) else {}
+        schedule = tvmaze.get("schedule") if isinstance(tvmaze.get("schedule"), dict) else {}
+        days = schedule.get("days") if isinstance(schedule, dict) else None
+        if isinstance(days, list):
+            if len(days) >= 4:
+                return "daily"
+            if len(days) == 1:
+                return "weekly"
+            if len(days) > 1:
+                return "multi_weekly"
+        # Provider payloads sometimes include recent episode dates.  Use them if
+        # available, but keep this heuristic generic and conservative.
+        dates: list[datetime] = []
+        for key in ("episodes", "recent_episodes", "episode_history"):
+            rows = metadata.get(key)
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        parsed = self._parse_datetimeish(row.get("airdate") or row.get("air_date") or row.get("airstamp"))
+                        if parsed:
+                            dates.append(parsed)
+        dates = sorted(set(dates))
+        if len(dates) >= 2:
+            gaps = [(b - a).days for a, b in zip(dates, dates[1:]) if (b - a).days >= 0]
+            if gaps:
+                median = sorted(gaps)[len(gaps) // 2]
+                if median <= 2:
+                    return "daily"
+                if 5 <= median <= 9:
+                    return "weekly"
+                if 25 <= median <= 35:
+                    return "monthly"
+        return "irregular"
+
+    def _release_watch_interval_hours(self, metadata: dict[str, Any], *, cadence_profile: str | None = None, default: float = 2.0) -> float:
+        """Infer a retry cadence from TV schedule hints, clamped to a sane range."""
+        cadence = cadence_profile or self._tv_cadence_profile(metadata)
+        if cadence == "daily":
+            return 1.0
+        if cadence in {"weekly", "multi_weekly"}:
+            return 2.0
+        if cadence == "monthly":
+            return 4.0
+        return max(1.0, min(float(default), 6.0))
+
+    def _release_watch_requirements(self, item: Any, context: Any) -> dict[str, Any]:
+        settings = getattr(context, "settings", None)
+        quality = getattr(item, "quality", None)
+        return {
+            "preferred_language": str(getattr(item, "language", "") or getattr(settings, "language", "") or ""),
+            "subtitle_languages": list(getattr(item, "subtitle_languages", []) or []),
+            "preferred_resolution": str(getattr(quality, "preferred_resolution", "") or ""),
+            "preferred_bitrate_kbps": getattr(quality, "preferred_bitrate_kbps", None),
+            "max_bitrate_kbps": getattr(quality, "max_bitrate_kbps", None),
+            "max_file_size_mb": getattr(quality, "max_file_size_mb", None),
+            "preferred_codecs": list(getattr(quality, "preferred_codecs", []) or []),
+            "auto_download": bool(getattr(item, "auto_download", None) if getattr(item, "auto_download", None) is not None else getattr(settings, "auto_download", False)),
+            "language_fallback_requires_approval": True,
+            "selective_pack_download_allowed": True,
+        }
 
     def build_search_query(self, item: Any, unit_label: str | None, language: str | None) -> str:
         """Return the first TV torrent query for a specific unit.
@@ -1271,7 +1618,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         """
         from src.core.models import TvShowItem, UpgradeRecord
         from src.utils.quality import QualityAnalyzer
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
         
         if not isinstance(item, TvShowItem):
             return

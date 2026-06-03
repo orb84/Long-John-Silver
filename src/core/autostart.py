@@ -1,10 +1,14 @@
 """Cross-platform operating-system auto-start integration for LJS.
 
-The UI exposes this as a single checkbox, but each OS stores login/startup
-entries differently. This service writes user-level launch entries only. Source
-checkout installs use a generated wrapper script that calls ``run.sh`` instead
-of invoking ``python main.py`` directly, so login startup gets the same venv,
-dependency, PATH, and diagnostics behavior as a manual launch.
+The UI exposes this as a single checkbox, but macOS, Linux desktop sessions,
+Linux systemd user sessions, and Windows all store login/startup entries
+differently.  The OS-specific entries written here intentionally stay small:
+they all delegate to one generated wrapper script under ``data/autostart``.
+
+That wrapper is the single authority for profile loading, diagnostics, duplicate
+process protection, and finally invoking ``run.sh``.  Keeping the runtime logic
+in one script avoids the drift that previously made launchd, XDG autostart, and
+systemd disagree about quoting, PATH, and working directory behavior.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ class AutoStartManager:
 
     def __init__(self, working_dir: str | Path | None = None, command: list[str] | None = None) -> None:
         self._working_dir = Path(working_dir).resolve() if working_dir else self._default_project_root()
-        self._command = command or [str(self._launcher_script_path())]
+        self._command = command or self._default_entry_command()
 
     def status(self) -> dict[str, Any]:
         """Return current platform auto-start state and generated target paths."""
@@ -37,7 +41,9 @@ class AutoStartManager:
             "target": str(self._entry_path()) if self._entry_path() else "",
             "linux_systemd_target": str(self._linux_systemd_path()) if self._platform_key() == "linux" else "",
             "working_dir": str(self._working_dir),
-            "command": " ".join(self._command),
+            "command": " ".join(str(part) for part in self._command),
+            "launcher": str(self._launcher_script_path()),
+            "lock_path": str(self._lock_path()),
             "log_path": str(self._log_path()),
         }
 
@@ -89,6 +95,10 @@ class AutoStartManager:
             self._write_launch_agent()
             self._bootstrap_launch_agent()
         elif key == "linux":
+            # Install both common user-level mechanisms.  Some Linux desktop
+            # sessions start XDG autostart but not user systemd; some headless
+            # user sessions only honor systemd.  The generated wrapper has a
+            # lock, so installing both cannot create duplicate LJS processes.
             self._write_desktop_entry()
             self._write_systemd_user_service()
         elif key == "windows":
@@ -142,18 +152,28 @@ class AutoStartManager:
     def _launcher_script_path(self) -> Path:
         return self._autostart_dir() / "start-ljs.sh"
 
+    def _lock_path(self) -> Path:
+        return self._autostart_dir() / "autostart.lock"
+
     def _log_path(self) -> Path:
         return self._autostart_dir() / "autostart.log"
 
     def _linux_systemd_path(self) -> Path:
         return Path.home() / ".config" / "systemd" / "user" / "long-john-silver.service"
 
+    def _default_entry_command(self) -> list[str]:
+        """Return argv used by the OS login manager to execute the wrapper."""
+        if self._platform_key() == "windows":
+            return [str(self._launcher_script_path())]
+        shell = "/bin/bash" if Path("/bin/bash").exists() else "/bin/sh"
+        return [shell, str(self._launcher_script_path())]
+
     def _file_entry_matches_current_target(self, path: Path) -> bool:
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return False
-        return str(self._working_dir) in text and any(str(part) in text for part in self._command)
+        return str(self._working_dir) in text and str(self._launcher_script_path()) in text
 
     @staticmethod
     def _quote(value: str | Path) -> str:
@@ -161,38 +181,67 @@ class AutoStartManager:
 
         return shlex.quote(str(value))
 
-    def _command_line(self) -> str:
-        return " ".join(self._quote(part) for part in self._command)
-
     def _write_launcher_script(self) -> None:
+        """Write the single cross-platform login wrapper."""
         script = self._launcher_script_path()
         script.parent.mkdir(parents=True, exist_ok=True)
         run_sh = self._working_dir / "run.sh"
         log_path = self._log_path()
-        content = f"""#!/usr/bin/env bash
-set -euo pipefail
+        lock_path = self._lock_path()
+        lock_dir = str(lock_path) + ".d"
+        content = f'''#!/usr/bin/env bash
+set -u
 mkdir -p {self._quote(log_path.parent)}
-{{
-  echo "===== LJS autostart $(date -Is) ====="
-  echo "project={self._working_dir}"
-  echo "run_sh={run_sh}"
-  echo "user=$(id -un 2>/dev/null || true) uid=$(id -u 2>/dev/null || true)"
-  echo "pwd=$(pwd)"
-  echo "PATH=$PATH"
-}} >> {self._quote(log_path)} 2>&1
+
+log() {{
+  printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$*" >> {self._quote(log_path)} 2>&1
+}}
+
+log "===== LJS autostart ====="
+log "project={self._working_dir}"
+log "run_sh={run_sh}"
+log "user=$(id -un 2>/dev/null || true) uid=$(id -u 2>/dev/null || true)"
+log "pwd=$(pwd)"
+log "PATH=$PATH"
+
+if command -v flock >/dev/null 2>&1; then
+  exec 9>{self._quote(lock_path)}
+  if ! flock -n 9; then
+    log "another LJS autostart wrapper already holds the lock; exiting"
+    exit 0
+  fi
+else
+  lock_dir={self._quote(lock_dir)}
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    log "another LJS autostart wrapper appears active; exiting"
+    exit 0
+  fi
+  trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT INT TERM
+fi
 
 for profile in /etc/profile "$HOME/.profile" "$HOME/.zprofile" "$HOME/.bash_profile"; do
   if [ -r "$profile" ]; then
+    # shellcheck disable=SC1090
     . "$profile" >/dev/null 2>&1 || true
   fi
 done
 
-cd {self._quote(self._working_dir)}
+cd {self._quote(self._working_dir)} || {{ log "cannot cd into project"; exit 1; }}
+if [ ! -x {self._quote(run_sh)} ]; then
+  chmod +x {self._quote(run_sh)} >/dev/null 2>&1 || true
+fi
+if [ ! -x {self._quote(run_sh)} ]; then
+  log "run.sh is missing or not executable: {run_sh}"
+  exit 1
+fi
+
 export LJS_AUTOSTART=1
 export LJS_ALLOW_INSECURE_DEV="${{LJS_ALLOW_INSECURE_DEV:-1}}"
 export LJS_ACCESS_LOGS="${{LJS_ACCESS_LOGS:-quiet}}"
-exec {self._quote(run_sh)} >> {self._quote(log_path)} 2>&1
-"""
+export LJS_PORT="${{LJS_PORT:-8088}}"
+log "launching LJS via run.sh on port $LJS_PORT"
+exec {self._quote(run_sh)} "$LJS_PORT" >> {self._quote(log_path)} 2>&1
+'''
         script.write_text(content, encoding="utf-8")
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -202,9 +251,9 @@ exec {self._quote(run_sh)} >> {self._quote(log_path)} 2>&1
             raise RuntimeError("No LaunchAgent path available")
         path.parent.mkdir(parents=True, exist_ok=True)
         program_args = "\n".join(f"        <string>{self._xml_escape(str(part))}</string>" for part in self._command)
-        plist = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
+        plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
     <key>Label</key>
     <string>{self.APP_ID}</string>
@@ -218,13 +267,22 @@ exec {self._quote(run_sh)} >> {self._quote(log_path)} 2>&1
     <true/>
     <key>KeepAlive</key>
     <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LJS_AUTOSTART</key>
+        <string>1</string>
+        <key>LJS_ACCESS_LOGS</key>
+        <string>quiet</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>{self._xml_escape(str(self._log_path()))}</string>
     <key>StandardErrorPath</key>
     <string>{self._xml_escape(str(self._log_path()))}</string>
 </dict>
 </plist>
-"""
+'''
         path.write_text(plist, encoding="utf-8")
 
     def _bootstrap_launch_agent(self) -> None:
@@ -239,6 +297,9 @@ exec {self._quote(run_sh)} >> {self._quote(log_path)} 2>&1
         subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         completed = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         if completed.returncode == 0:
+            # RunAtLoad fires at bootstrap.  The wrapper lock prevents duplicate
+            # launches if LJS is already running because the user toggled this
+            # from the UI.
             subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/{self.APP_ID}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         else:
             logger.info("LaunchAgent written but not bootstrapped in current session; it will run at next GUI login.")
@@ -253,37 +314,58 @@ exec {self._quote(run_sh)} >> {self._quote(log_path)} 2>&1
 
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
+    def _desktop_exec_value(self) -> str:
+        return " ".join(self._desktop_quote(part) for part in self._command)
+
+    @staticmethod
+    def _desktop_quote(value: str | Path) -> str:
+        text = str(value)
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
+        return f'"{escaped}"'
+
+    def _systemd_exec_value(self) -> str:
+        return " ".join(self._systemd_quote(part) for part in self._command)
+
+    @staticmethod
+    def _systemd_quote(value: str | Path) -> str:
+        text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{text}"'
+
     def _write_desktop_entry(self) -> None:
         path = self._entry_path()
         if path is None:
             raise RuntimeError("No autostart desktop path available")
         path.parent.mkdir(parents=True, exist_ok=True)
-        desktop = f"""[Desktop Entry]
+        desktop = f'''[Desktop Entry]
 Type=Application
+Version=1.0
 Name={self.APP_NAME}
 Comment=Start LJS media automation at login
-Exec={self._command_line()}
+Exec={self._desktop_exec_value()}
 Path={self._working_dir}
 Terminal=false
+StartupNotify=false
+DBusActivatable=false
 X-GNOME-Autostart-enabled=true
-"""
+X-GNOME-Autostart-Delay=8
+'''
         path.write_text(desktop, encoding="utf-8")
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
 
     def _write_systemd_user_service(self) -> None:
         if self._platform_key() != "linux":
             return
         path = self._linux_systemd_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        service = f"""[Unit]
+        service = f'''[Unit]
 Description=Long John Silver media automation
-After=network-online.target
+After=network-online.target graphical-session.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory={self._working_dir}
-ExecStart={self._command_line()}
+WorkingDirectory={self._systemd_quote(self._working_dir)}
+ExecStart={self._systemd_exec_value()}
 Restart=on-failure
 RestartSec=10
 Environment=LJS_AUTOSTART=1
@@ -292,7 +374,7 @@ Environment=LJS_ACCESS_LOGS=quiet
 
 [Install]
 WantedBy=default.target
-"""
+'''
         path.write_text(service, encoding="utf-8")
         import subprocess
 

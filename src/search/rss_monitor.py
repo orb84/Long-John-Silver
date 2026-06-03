@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 from loguru import logger
 from src.utils.log_sanitizer import redact_url
 from typing import Optional, Callable
+from collections.abc import Sequence
 import httpx
 
 from src.core.models import SearchResult, TaskCriticality
@@ -32,7 +33,9 @@ class RSSMonitor:
                  on_match: Optional[Callable] = None,
                  poll_interval: int = DEFAULT_POLL_INTERVAL,
                  category_registry: CategoryRegistry | None = None,
-                 item_categories: dict[str, str] | None = None):
+                 item_categories: dict[str, str] | None = None,
+                 feed_targets: dict[str, Sequence[str]] | None = None,
+                 max_feeds_per_cycle: int = 8):
         """Initialize RSS monitoring for tracked items.
 
         Args:
@@ -43,6 +46,11 @@ class RSSMonitor:
             poll_interval: Seconds between feed polling cycles.
             category_registry: Registry used for parsing feed item titles.
             item_categories: Optional map of item name to registry category ID.
+            feed_targets: Optional map limiting which tracked names may match each feed URL.
+                This prevents broad Jackett RSS feeds from matching unrelated releases.
+            max_feeds_per_cycle: Maximum number of feed URLs to poll each cycle.
+                Per-item Jackett feeds are rotated across cycles so startup does not hammer
+                every configured indexer for every tracked show at once.
         """
         self._feed_urls = feed_urls
         self._item_names: list[str] = []
@@ -54,7 +62,15 @@ class RSSMonitor:
         self._fetch_error_log_state: dict[str, tuple[str, float]] = {}
         self._supervisor = supervisor
         self._categories = category_registry or CategoryRegistry.with_defaults()
+        self._feed_targets: dict[str, list[str]] = {}
+        self._poll_cursor = 0
+        self._max_feeds_per_cycle = max(1, int(max_feeds_per_cycle or 1))
         self.update_items(item_names, item_categories=item_categories)
+        if feed_targets:
+            self._feed_targets = {
+                str(url): [str(name).lower() for name in names if str(name).strip()]
+                for url, names in feed_targets.items()
+            }
 
     def update_items(self, item_names: list[str], item_categories: dict[str, str] | None = None) -> None:
         """Update the list of tracked item names."""
@@ -66,6 +82,36 @@ class RSSMonitor:
             for name, category_id in categories.items()
             if name and category_id
         }
+
+
+    def update_feeds(
+        self,
+        feed_urls: list[str],
+        *,
+        feed_targets: dict[str, Sequence[str]] | None = None,
+        item_categories: dict[str, str] | None = None,
+        item_names: list[str] | None = None,
+    ) -> None:
+        """Replace RSS feed targets at runtime.
+
+        Category item changes must not require an app restart.  The owning
+        scheduler recomputes category watch policies and calls this method with
+        the new provider feed set.
+        """
+        self._feed_urls = list(feed_urls or [])
+        if item_names is not None:
+            self.update_items(item_names, item_categories=item_categories)
+        elif item_categories is not None:
+            self.update_items([self._item_display_names.get(name, name) for name in self._item_names], item_categories=item_categories)
+        self._feed_targets = {
+            str(url): [str(name).lower() for name in names if str(name).strip()]
+            for url, names in (feed_targets or {}).items()
+        }
+        self._poll_cursor = 0
+        logger.info(
+            "RSS monitor feed set updated: %s feeds, %s tracked item names",
+            len(self._feed_urls), len(self._item_names),
+        )
 
     def start(self) -> None:
         """Start the RSS monitor as a background task."""
@@ -94,13 +140,23 @@ class RSSMonitor:
             raise
 
     async def _poll_all_feeds(self) -> None:
-        """Fetch all RSS feeds and process new items."""
-        for url in self._feed_urls:
+        """Fetch a bounded rotating slice of RSS feeds and process new items.
+
+        Earlier versions polled Jackett's ``/all`` RSS endpoint with an empty
+        query, then substring-matched every returned release against every
+        tracked show. That produced false positives (for example a title ending
+        in "Beyond the Wire" matching the show "The Wire") and heavy event-loop
+        stalls. Feeds are now expected to be item-scoped, and matching is limited
+        to the names associated with the feed being polled.
+        """
+        urls = self._feeds_for_cycle()
+        for url in urls:
             try:
                 # Check for cancellation between feeds
                 await asyncio.sleep(0)
                 items = await self._fetch_feed(url)
-                matched = self._match_items(items)
+                target_names = self._feed_targets.get(url)
+                matched = self._match_items(items, candidate_names=target_names)
                 for item_name, result, unit_label in matched:
                     logger.info(
                         f"RSS match: '{result.title}' -> item '{item_name}' (unit={unit_label})"
@@ -108,7 +164,7 @@ class RSSMonitor:
                     if self._on_match:
                         try:
                             await asyncio.wait_for(
-                                self._on_match(item_name, unit_label), timeout=60,
+                                self._on_match(item_name, result, unit_label=unit_label), timeout=60,
                             )
                         except asyncio.TimeoutError:
                             logger.warning(f"RSS match callback timed out for {item_name}")
@@ -119,6 +175,22 @@ class RSSMonitor:
                 raise
             except Exception as e:
                 logger.warning(f"RSS feed {redact_url(url)} failed: {e}")
+
+    def _feeds_for_cycle(self) -> list[str]:
+        """Return a rotating bounded feed slice for the current poll cycle."""
+        feeds = list(self._feed_urls)
+        if len(feeds) <= self._max_feeds_per_cycle:
+            return feeds
+        start = self._poll_cursor % len(feeds)
+        end = start + self._max_feeds_per_cycle
+        selected = feeds[start:end]
+        if len(selected) < self._max_feeds_per_cycle:
+            selected.extend(feeds[: self._max_feeds_per_cycle - len(selected)])
+        self._poll_cursor = (start + self._max_feeds_per_cycle) % len(feeds)
+        logger.debug(
+            f"RSS monitor polling bounded feed slice: {len(selected)}/{len(feeds)} feeds (cursor={self._poll_cursor})"
+        )
+        return selected
 
     def _log_fetch_failure(self, url: str, exc: Exception) -> None:
         """Log repeated RSS fetch failures without flooding the main log."""
@@ -202,7 +274,7 @@ class RSSMonitor:
 
         return results
 
-    def _match_items(self, items: list[SearchResult]) -> list[tuple[str, SearchResult, str | None]]:
+    def _match_items(self, items: list[SearchResult], candidate_names: Sequence[str] | None = None) -> list[tuple[str, SearchResult, str | None]]:
         """Match RSS items against tracked item names.
 
         Returns list of (item_name, result, unit_label) tuples for matches that
@@ -210,22 +282,41 @@ class RSSMonitor:
         absent when the feed item cannot be mapped to a concrete unit.
         """
         matched = []
+        names = [str(name).lower() for name in (candidate_names or self._item_names) if str(name).strip()]
         for item in items:
             magnet_key = item.magnet or item.title
             if magnet_key in self._seen_magnets:
                 continue
 
-            for name in self._item_names:
+            for name in names:
                 category_id = self._item_categories.get(name, "")
                 parsed_name, unit_label = self._parse_match_candidate(item.title, category_id)
-                match_haystacks = [parsed_name.lower(), item.title.lower()]
-                if any(re.search(r'\b' + re.escape(name) + r'\b', haystack) for haystack in match_haystacks):
+                if self._is_item_match(name, parsed_name, item.title, bool(category_id)):
                     self._seen_magnets.add(magnet_key)
                     original_name = self._item_display_names.get(name, name)
                     matched.append((original_name, item, unit_label))
                     break
 
         return matched
+
+    def _is_item_match(self, name: str, parsed_name: str, raw_title: str, category_scoped: bool) -> bool:
+        """Return whether a parsed RSS title belongs to a tracked item.
+
+        Category-scoped feeds must match the parser's extracted title, not an
+        arbitrary substring in the full release title. This avoids false
+        positives such as "Wicked Attraction ... Beyond the Wire" matching the
+        show "The Wire".
+        """
+        if category_scoped:
+            return self._canonical_title(parsed_name) == self._canonical_title(name)
+        return re.search(r'\b' + re.escape(name) + r'\b', raw_title.lower()) is not None
+
+    @staticmethod
+    def _canonical_title(value: str) -> str:
+        text = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+        if text.startswith("the "):
+            text = text[4:]
+        return re.sub(r"\s+", " ", text)
 
     def _parse_match_candidate(self, title: str, category_id: str = "") -> tuple[str, str | None]:
         """Return a category-parsed title and optional category-owned unit label."""

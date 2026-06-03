@@ -199,6 +199,29 @@ class MediaCategory(CategoryContractMixin, ABC):
         clean_kwargs = {k: v for k, v in kwargs.items() if k not in {"key", "name", "category_id", "item_id"}}
         return GenericMediaItem(category_id=self.category_id, key=key, **clean_kwargs)
 
+    async def enrich_item_on_add(self, item: "CategoryItem", context: Any) -> "CategoryItem":
+        """Return ``item`` after optional category-owned metadata enrichment.
+
+        The base category deliberately does nothing. Rich categories override
+        this hook to query their own metadata providers and persist/cache the
+        resulting payload through the dependencies exposed in ``context``.
+        Generic UI, assistant, and library-import code must call the category
+        item coordinator rather than importing category-specific metadata code.
+        """
+        return item
+
+    async def build_watch_plan(self, item: "CategoryItem", context: Any) -> Any:
+        """Return a category-owned watch policy for ``item``.
+
+        The generic scheduler/RSS runtime does not know about seasons, episodes,
+        album releases, sport fixtures, or book editions. Categories translate
+        their domain metadata into a neutral watch plan; the base category opts
+        out of ongoing monitoring.
+        """
+        from src.core.categories.watch import CategoryWatchPlan
+
+        return CategoryWatchPlan(category_id=self.category_id, item_id=getattr(item, "key", ""), mode="none", reason="category has no watch policy")
+
     def supports_capability(self, capability: str) -> bool:
         """Return whether this category advertises a manifest capability."""
         return capability in set(self.capabilities)
