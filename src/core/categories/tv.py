@@ -191,7 +191,10 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 tagged = self._append_search_language(query, preferred)
                 if tagged != query:
                     language_queries.append(tagged)
-            language_queries.append(f"{base_queries[0]} MULTI")
+        # Do not add MULTI as a query term. Multi/dual-audio releases remain
+        # acceptable candidates when discovered naturally, but query generation
+        # must only reflect the requested/preferred language and must never
+        # inject unrelated language tokens.
         seen: set[str] = set()
         out: list[str] = []
         for query in [*base_queries, *language_queries]:
@@ -212,9 +215,19 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         a title regex can fully evaluate the release.
         """
         requested_season, requested_episode = self._unit_coordinates(str(unit_label or ""))
+        title = str(getattr(result, "title", "") or "")
+        if requested_season and not requested_episode:
+            # Season-only requests must not fall back to generic title matching.
+            # Generic matching admitted S04/S05 rows and unrelated "... Boys"
+            # titles into the Season 1 candidate set, forcing the LLM to rank
+            # noise and triggering slow per-episode fanout.  TV owns the pack
+            # semantics here: a result is structurally valid only when it is a
+            # season/series bundle that can contain the requested season.
+            if not self._title_matches_requested_series(title, str(getattr(item, "key", "") or "")):
+                return False
+            return self._is_relevant_season_pack_result(result, int(requested_season), item=item)
         if not requested_season or not requested_episode:
             return super().validate_search_result_for_request(result, item, unit_label)
-        title = str(getattr(result, "title", "") or "")
         if not self._title_matches_requested_series(title, str(getattr(item, "key", "") or "")):
             return False
         candidate_season, candidate_episode = self._unit_coordinates(title)

@@ -26,6 +26,13 @@ _SEASON_WORD_RANGE_RE = re.compile(
     r"\bSeasons?[\s._-]*(\d{1,2})[\s._-]*(?:-|to|thru|through)[\s._-]*(\d{1,2})\b",
     re.IGNORECASE,
 )
+_SEASON_WORD_ADJACENT_LIST_RE = re.compile(
+    # Examples: "Season 01 02 [COMPLETE]", "Season 1.2 Complete".
+    # The COMPLETE guard keeps this from misreading random title numbers as a
+    # season range.
+    r"\bSeason[\s._-]+(\d{1,2})[\s._-]+(\d{1,2})\b(?=.*\b(?:Complete|COMPLETE)\b)",
+    re.IGNORECASE,
+)
 _SERIES_COMPLETE_RE = re.compile(
     r"\b(?:Complete[\s._-]*(?:Series|Show|Collection)|(?:Series|Show)[\s._-]*Complete|All[\s._-]*Seasons)\b",
     re.IGNORECASE,
@@ -69,13 +76,15 @@ class TVBundleKnowledge:
                 "end": int(m.group(3)),
             }
 
-        for pattern in (_SEASON_RANGE_RE, _SEASON_WORD_RANGE_RE):
+        for pattern in (_SEASON_RANGE_RE, _SEASON_WORD_RANGE_RE, _SEASON_WORD_ADJACENT_LIST_RE):
             m = pattern.search(title)
             if m:
                 start = int(m.group(1))
                 end = int(m.group(2))
                 if end < start:
                     start, end = end, start
+                if start == end:
+                    continue
                 return {
                     "season": start,
                     "season_start": start,

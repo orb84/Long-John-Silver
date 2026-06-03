@@ -265,21 +265,27 @@ class TvAgentSearchMixin:
             if resolved is not None:
                 season = int(resolved)
 
-        if scope in {"bundle_preferred", "season_pack_preferred"} and season is not None and episode is None:
+        # Season-only TV requests are bundle-first by default.  A user asking for
+        # "Season 1" wants a season/series pack if one exists; fanning out into
+        # S01E01..S01E08 before pack search floods Jackett/Soulseek and makes
+        # the LLM rank individual episodes unnecessarily.  Episode fanout remains
+        # available as a bounded fallback, and callers can still force it with
+        # ``individual_units_only``.
+        if season is not None and episode is None and scope != "individual_units_only":
+            pack_suffix = "pack only" if scope in {"bundle_only", "season_pack_only"} else "season pack first"
             pack_results, pack_summary = await self._run_agent_pack_queries(
-                item, int(season), language=language, context=context, summary_suffix="pack preferred",
+                item, int(season), language=language, context=context, summary_suffix=pack_suffix,
             )
-            if pack_results:
+            if pack_results or scope in {"bundle_only", "season_pack_only"}:
                 return pack_results, pack_summary
             episode_labels = []
             for ep in await self._infer_missing_or_likely_episodes_for_agent(item, int(season), context):
                 episode_labels.append(f"S{int(season):02d}E{int(ep):02d}")
             if not episode_labels:
                 return [], f"Season {int(season)} pack (no acceptable pack; no episode fallback targets)"
-            return await self._run_agent_labels(item, episode_labels, language=language, season=season, episode=episode, context=context, summary_suffix="pack unavailable; individual episodes")
-        if scope in {"bundle_only", "season_pack_only"} and season is not None and episode is None:
-            return await self._run_agent_pack_queries(
-                item, int(season), language=language, context=context, summary_suffix="pack only",
+            return await self._run_agent_labels(
+                item, episode_labels, language=language, season=season, episode=episode,
+                context=context, summary_suffix="pack unavailable; individual episodes",
             )
         if season is not None and episode is not None:
             exact_label = f"S{int(season):02d}E{int(episode):02d}"
@@ -563,9 +569,11 @@ class TvAgentSearchMixin:
     ) -> list[str]:
         """Return TV-owned pack search schemas for a season request.
 
-        Episode-range schemas are derived from provider metadata for that
-        particular season.  If metadata cannot tell us the terminal episode,
-        only broad season/series schemas are emitted.
+        Keep the ladder short and pack-first.  Language-specific terms are only
+        emitted for the configured/requested language; MULTI/dual-audio remains
+        candidate evidence, not a query token.  Complete-series queries are
+        useful for ended shows because the downloader can select only the
+        requested season folder/files from the pack.
         """
         title = getattr(item, "key", "")
         s = int(season)
@@ -574,38 +582,41 @@ class TvAgentSearchMixin:
         language_tokens = self._language_query_tokens(language)
         exact = f"{title} S{s:02d}"
         season_words = f"{title} Season {s}"
+
         raw: list[str] = [exact]
-        # Preferred media language is not a hard recall gate, but it must be
-        # visible in the category-owned plan.  Add a small number of language
-        # variants after the literal manual-equivalent query so Jackett can find
-        # releases that are indexed primarily by ``ITA``/``Italian`` tags.
         for token in language_tokens[:2]:
             raw.append(f"{exact} {token}")
         raw.append(season_words)
-        for token in language_tokens[:1]:
+        for token in language_tokens[:2]:
             raw.append(f"{season_words} {token}")
+
+        # Pack-first recall.  Season pack forms beat per-episode fanout for a
+        # season-only request because selecting files from one torrent is often
+        # faster and cleaner than issuing N episode searches.
         raw.extend([
             f"{title} S{s:02d} Complete",
             f"{title} Season {s} Complete",
             f"{title} S{s:02d} Pack",
             f"{title} Season {s} Pack",
             f"{title} S{s:02d} Full",
-            # Broad title is now a late recovery query.  Putting it early flooded
-            # the Season 1 workspace with S04/S05 and unrelated "... Boys" rows.
-            f"{title}",
         ])
+        if latest_season and int(latest_season) >= s:
+            raw.extend([
+                f"{title} S{s:02d}-S{int(latest_season):02d}",
+                f"{title} S01-S{int(latest_season):02d}",
+                f"{title} Complete Series",
+                f"{title} All Seasons",
+            ])
         if episode_count and episode_count > 1:
             raw.extend([
                 f"{title} S{s:02d}E01-E{int(episode_count):02d}",
                 f"{title} S{s:02d}E01-{int(episode_count):02d}",
                 f"{title} {s}x01-{int(episode_count):02d}",
             ])
-        if latest_season and int(latest_season) >= s:
-            raw.extend([
-                f"{title} S01-S{int(latest_season):02d}",
-                f"{title} Complete Series",
-                f"{title} All Seasons",
-            ])
+        # Broad title is only a final recall fallback and is included only if it
+        # fits in the bounded interactive ladder.
+        raw.append(f"{title}")
+
         seen: set[str] = set()
         queries: list[str] = []
         for query in raw:
@@ -614,27 +625,41 @@ class TvAgentSearchMixin:
                 continue
             seen.add(normalized)
             queries.append(query.strip())
-        # Keep the interactive ladder bounded. Each query can fan out across
-        # many configured Jackett indexers.  Language variants are deliberately
-        # early, while broad title fallback is deliberately late.
         return queries[:8]
 
 
     @classmethod
     def _language_query_tokens(cls, language: str | None) -> list[str]:
-        """Return short TV release-search language tokens for optional fanout.
+        """Return optional TV release-search tokens for the *same* language.
 
-        These tokens supplement the literal query; they do not replace ranking
-        and confirmation rules.  The user noticed that configured Italian never
-        appeared in the actual provider queries, which hid the language facet
-        from Jackett/indexer-side search.
+        Query fanout may add a compact release tag for the configured media
+        language, but it must never leak another language from historical user
+        preferences or fixtures.  English is intentionally not emitted because
+        public releases often omit ENG/English and those terms over-constrain
+        recall.  MULTI is also not emitted as a query token: dual/multi-audio
+        releases are acceptable candidates when found naturally, not a language
+        preference to search for.
         """
-        token = cls._canonical_language_token(language) if language else ""
-        if token == "italian":
-            return ["ITA", "Italian"]
-        if token == "english":
-            return ["ENG", "English"]
-        return [str(language).strip()] if str(language or "").strip() else []
+        value = str(language or "").strip()
+        token = cls._canonical_language_token(value) if value else ""
+        if not token or token in {"english", "multi"}:
+            return []
+        from src.core.categories.language import LanguageSearchTagger
+
+        tag = LanguageSearchTagger.search_tag(value)
+        raw_tokens = [tag, value]
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_tokens:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            marker = text.casefold()
+            if marker in seen:
+                continue
+            seen.add(marker)
+            out.append(text)
+        return out[:2]
 
     @classmethod
     def _query_has_language_token(cls, query: str, language: str | None) -> bool:
@@ -863,18 +888,36 @@ class TvAgentSearchMixin:
                 start = self._safe_positive_int(pack.get("season_start")) or self._safe_positive_int(pack.get("season"))
                 end = self._safe_positive_int(pack.get("season_end")) or start
                 if pack.get("pack_type") == "series_complete":
-                    pack_fit = -8
+                    # Complete-series packs are good Season N sources when the
+                    # downloader can select only the requested season files.
+                    # Rank them behind exact season packs but ahead of episode
+                    # fanout/noisy broad results.
+                    pack_fit = 5
                 elif start == int(season) and end == int(season):
-                    pack_fit = 8
+                    pack_fit = 10
                 elif start and end and start <= int(season) <= end:
-                    pack_fit = -5
+                    pack_fit = 6
                 else:
                     pack_fit = -20
             languages = {self._canonical_language_token(lang) for lang in (tags.get("languages") or [])}
             preferred_token = self._canonical_language_token(preferred) if preferred else ""
             title_has_preferred = bool(preferred_token and self._title_has_language_token((getattr(result, "title", "") or "").lower(), preferred_token))
+            has_preferred = bool(preferred_token and (preferred_token in languages or title_has_preferred))
+            has_extra_languages = bool(languages - {preferred_token}) if preferred_token else False
             known_language_mismatch = bool(preferred_token and languages and preferred_token not in languages and not tags.get("is_multi_language") and not title_has_preferred)
-            lang_score = 3 if preferred_token and (preferred_token in languages or title_has_preferred) else 2 if tags.get("is_multi_language") else -2 if known_language_mismatch else 0
+            if has_preferred and not has_extra_languages and not tags.get("is_multi_language"):
+                lang_score = 4
+            elif has_preferred:
+                # Dual/MULTI with the preferred language is acceptable, not
+                # ideal.  Do not let ITA+ENG beat a clean English pack solely
+                # because it advertises more language tags.
+                lang_score = 2
+            elif known_language_mismatch:
+                lang_score = -4
+            elif tags.get("is_multi_language"):
+                lang_score = 0
+            else:
+                lang_score = 0
             resolution = tags.get("resolution")
             res_rank = QualityAnalyzer.rank_resolution(resolution or "") if resolution else 0
             codec = str(tags.get("codec") or "").lower()

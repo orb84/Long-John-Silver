@@ -69,7 +69,12 @@ class JackettSearch(SearchProvider):
         self._api_key = str(api_key or "")
         self._timeout = max(10.0, float(timeout or 75.0))
         self._direct_timeout = max(4.0, min(8.0, self._timeout / 10.0))
-        self._direct_total_timeout = max(12.0, min(24.0, self._timeout / 3.0))
+        # Direct configured-indexer probes are an interactive recovery lane,
+        # not a second full /all search.  Return a useful first batch quickly
+        # instead of waiting for every slow public indexer to finish.
+        self._direct_total_timeout = max(8.0, min(18.0, self._timeout / 4.0))
+        self._direct_early_result_threshold = 40
+        self._direct_early_batch_threshold = 2
         self._configured_indexers = configured_indexers
         self._enable_direct_recovery = bool(enable_direct_recovery)
         self._configured_selectors_cache: tuple[str, ...] | None = None
@@ -295,6 +300,7 @@ class JackettSearch(SearchProvider):
 
         tasks = [asyncio.create_task(one(selector, variant)) for variant in variants for selector in selectors]
         rows: list[SearchResult] = []
+        successful_batches = 0
         try:
             for future in asyncio.as_completed(tasks, timeout=self._direct_total_timeout):
                 try:
@@ -304,9 +310,14 @@ class JackettSearch(SearchProvider):
                     continue
                 if not batch:
                     continue
+                successful_batches += 1
                 rows.extend(batch)
-                if len(rows) >= 250:
-                    logger.info("[Jackett] Manual-parity fallback stopping early after {} raw row(s).", len(rows))
+                unique_count = len(self._dedupe(rows))
+                if unique_count >= self._direct_early_result_threshold or (successful_batches >= self._direct_early_batch_threshold and unique_count >= 20):
+                    logger.info(
+                        "[Jackett] Manual-parity fallback returning early with {} unique row(s) from {} productive selector batch(es); cancelling remaining probes for interactive response.",
+                        unique_count, successful_batches,
+                    )
                     break
         except asyncio.TimeoutError:
             logger.warning(

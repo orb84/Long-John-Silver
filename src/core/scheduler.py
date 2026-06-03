@@ -1569,15 +1569,27 @@ class MediaScheduler:
             items = list(getattr(raw_items, "items") or [])
         else:
             items = list(raw_items)
-        self._emit_status("Compiling suggestions", phase="running")
+        if not items:
+            logger.debug("Suggestion compilation skipped: no tracked/library items.")
+            if self._event_bus and force:
+                self._event_bus.emit_system("suggestions_updated", {"count": 0})
+            return
+        # Scheduled suggestion compilation is background maintenance.  Do not
+        # flicker the global status header between Idle/Processing Suggestions
+        # on an empty or quiet library; reserve visible status for user-forced
+        # runs or meaningful results.
+        if force:
+            self._emit_status("Compiling suggestions", phase="running")
         try:
             total = await self._suggestion_compiler.compile_all(items, force=force)
-            self._emit_status(f"Suggestions ready: {total} action(s)", phase="done")
-            if self._event_bus:
+            if force or total > 0:
+                self._emit_status(f"Suggestions ready: {total} action(s)", phase="done")
+            if self._event_bus and (force or total > 0):
                 self._event_bus.emit_system("suggestions_updated", {"count": total})
         except Exception as exc:
             logger.warning(f"Suggestion compilation failed: {exc}")
-            self._emit_status("Suggestion compilation failed", phase="error")
+            if force:
+                self._emit_status("Suggestion compilation failed", phase="error")
 
     async def _send_recommendations(self):
         if self._recommender: await self._recommender.send_recommendations()

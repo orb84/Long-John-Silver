@@ -126,9 +126,9 @@ class TorrentSelectionPromptBuilder:
             parts.extend([
                 "Language rules:",
                 f"  - Preferred language: {preferred_language}",
-                "  - MULTI-language releases are acceptable (they include multiple audio tracks)",
-                f"  - Dual-audio with {preferred_language} + another language is ideal",
-                f"  - Single-language releases in {preferred_language} are preferred",
+                "  - MULTI-language releases are acceptable when they include the preferred audio/subtitle track, but they are not automatically better than a clean preferred-language release",
+                f"  - Dual-audio with {preferred_language} + another language is acceptable, not ideal",
+                f"  - Single-language releases in {preferred_language} are preferred when quality/coverage are otherwise comparable",
                 "  - Single-language releases in a DIFFERENT language → REJECT",
                 "  - No language tag: UNKNOWN risk; prefer confirmed language matches",
                 "  - If ALL candidates have unknown language, pick the best quality one",

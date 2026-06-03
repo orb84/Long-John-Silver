@@ -214,7 +214,37 @@ class SchedulerCatalogService:
 
     @classmethod
     def _extract_season_pattern(cls, cleaned: str, season: int | None, episode: int | None) -> tuple[str, int | None]:
-        """Extract first-coordinate references from free text."""
+        """Extract first-coordinate references from free text.
+
+        Keep this parser intentionally small and category-neutral: it only
+        extracts a numeric coordinate and removes the human season phrase from
+        the title.  TV owns what the coordinate means later.  Natural requests
+        such as "the first season of The Boys" must not be left as a literal
+        title because that bypasses TV's season-pack workflow.
+        """
+        ordinal_map = {
+            "first": 1, "1st": 1,
+            "second": 2, "2nd": 2,
+            "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4,
+            "fifth": 5, "5th": 5,
+            "sixth": 6, "6th": 6,
+            "seventh": 7, "7th": 7,
+            "eighth": 8, "8th": 8,
+            "ninth": 9, "9th": 9,
+            "tenth": 10, "10th": 10,
+        }
+        ordinal_pattern = re.compile(
+            r"\b(?:the\s+)?("
+            + "|".join(re.escape(key) for key in sorted(ordinal_map, key=len, reverse=True))
+            + r")\s+(?:season|stagione)\s*(?:of\s+)?\b",
+            re.IGNORECASE,
+        )
+        ordinal = ordinal_pattern.search(cleaned)
+        if ordinal:
+            season = season or ordinal_map.get(ordinal.group(1).lower())
+            cleaned = ordinal_pattern.sub(" ", cleaned, count=1)
+
         match = re.search(r"\b(?:season|stagione)\s*0*(\d{1,2})\b", cleaned, re.IGNORECASE)
         if match:
             season = season or int(match.group(1))
@@ -223,6 +253,7 @@ class SchedulerCatalogService:
         if compact and episode is None:
             season = season or int(compact.group(1))
             cleaned = re.sub(r"\bS0*\d{1,2}\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bof\s+(?=(?:the\s+)?[A-Za-z0-9])", " ", cleaned, flags=re.IGNORECASE)
         return cleaned, season
 
 
