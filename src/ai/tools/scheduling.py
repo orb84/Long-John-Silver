@@ -89,9 +89,9 @@ class CreateScheduledTaskTool:
     name = "create_scheduled_task"
     description = (
         "Create a user reminder, one-off scheduled assistant task, or recurring "
-        "condition check. Use for requests such as 'remind me in 7 days', "
-        "'check whether this torrent exists in 3 weeks and report back', or "
-        "'send me a weekly report'."
+        "condition check. Use for simple reminders and generic future checks. "
+        "For recurring public news/rumour/patch/release tracking with evidence/provenance, prefer "
+        "create_web_information_watch instead."
     )
     intents = {Intent.CONFIG}
     allow_direct = True
@@ -186,8 +186,8 @@ class CreateScheduledTaskTool:
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "The instruction/reminder text. For condition checks, include the exact "
-                        "thing to check and what to report. Do not include secrets."
+                        "The instruction/reminder text. For condition checks, preserve the user's exact objective, "
+                        "target item, source preference, success condition, and what should trigger a notification. Do not include secrets."
                     ),
                 },
                 "title": {
@@ -210,7 +210,7 @@ class CreateScheduledTaskTool:
                 },
                 "due_at": {
                     "type": "string",
-                    "description": "Optional absolute first run time as ISO-8601 datetime, with timezone when known.",
+                    "description": "Optional absolute first run time as ISO-8601 datetime, with timezone when known. Use runtime date context from the prompt; do not guess past dates.",
                 },
                 "delay_minutes": {
                     "type": "integer",
@@ -218,7 +218,7 @@ class CreateScheduledTaskTool:
                 },
                 "interval_minutes": {
                     "type": "integer",
-                    "description": "Recurring interval in minutes. 1440=daily, 10080=weekly. Ignored for one_off.",
+                    "description": "Recurring interval in minutes. 1440=daily, 10080=weekly. Choose the least noisy cadence that still satisfies the user. Ignored for one_off.",
                 },
                 "max_runs": {
                     "type": "integer",

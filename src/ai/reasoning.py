@@ -16,6 +16,8 @@ from loguru import logger
 from src.core.models import Intent, PlanStep, AgentPlan
 from src.utils.circuit_breaker import CircuitBreaker
 from src.utils.json_parser import LLMResponseParser
+from src.search.web.research_guidance import WebResearchPromptGuidance
+from src.ai.task_prompt_guidance import TaskPromptGuidance
 
 
 class ReasoningPlanner:
@@ -30,18 +32,17 @@ class ReasoningPlanner:
 
     _INTENT_GUIDES: dict[Intent, str] = {
         Intent.SEARCH: (
-            "1. If the user asks a factual media question about a TV show, movie, episode, actor, cast, creator, release date, season count, rating, or artwork, FIRST call `metadata_lookup` with the best media_type (tv/movie/auto). Do not start with `web_search` for facts that metadata services can answer.\n"
-            "2. Use the CATEGORY LIBRARY CONTEXT PACKET when present. If it is absent or stale, call `enquire_about_media` for local library/tracked-item state. Do not invent category-specific read-only tools.\n"
-            "3. Use generic web/review research only when metadata_lookup/enquire_about_media cannot answer, when the user asks for current news/articles/reviews, or when metadata_lookup returns no useful result.\n"
-            "4. Synthesize findings into a direct answer grounded in tool results. If tools fail, report the failure honestly and try the next sensible read-only source rather than inventing facts.\n"
+            "For SEARCH: stable catalogue facts can start with metadata_lookup. "
+            "For current public information, metadata alone is insufficient; include category_web_research for category items or web_research otherwise. "
+            "Preserve the user's exact query/focus. Use category context or enquire_about_media for local state. "
+            "If evidence is degraded, stale, snippet-only, or conflicting, plan further read-only evidence or report limits.\n"
+            + TaskPromptGuidance.planner_contract()
         ),
         Intent.DOWNLOAD: (
-            "1. TOOL PHILOSOPHY: use the small generic chain only: CATEGORY LIBRARY CONTEXT PACKET and/or `enquire_about_media` to understand state, `search_media_torrents` to discover candidates, and `queue_download` to queue chosen candidate IDs. Do not call or invent category-specific download/read micro-tools.\n"
-            "2. Check the RECENT CONVERSATION HISTORY. If the user has just replied to a list of torrent options and those options include `candidate_id`/`result_set_id`, generate a plan with one `queue_download` step containing the tracked media `name`, `candidate_id`, and `result_set_id`. Use legacy `option_index` only when no stable IDs are available.\n"
-            "3. Otherwise, for fresh searches, generate a plan with a single `search_media_torrents` step for the requested category item or unit. DO NOT pre-schedule `queue_download` unless the user is confirming a previous candidate recommendation. The model must inspect search_media_torrents candidate_picker/batch_recommendation IDs and queue by candidate_id/result_set_id, not raw magnets or invented placeholders.\n"
-            "4. Pass the exact tracked item name, structured unit arguments when relevant, and the item configured language unless the user explicitly overrides it. Use local episode/file language data from context to avoid mixing languages silently.\n"
-            "5. Evaluate search results with hard filters first: exact unit/pack coverage, required language or acceptable multi-audio, magnet availability, resolution, per-unit size/bitrate, seeders, codecs, and release groups. Seeders are a first-class availability metric: equivalent candidates should be ordered by higher seed count. Queue with candidate_id/result_set_id only when the choice is clear; otherwise ask the user.\n"
-            "6. If the user asked for all/remaining/missing/multiple units and search_media_torrents returns batch_recommendation, use it as evidence and queue every recommended candidate only after checking it against the context and language rules. Do not generate another identical search step just to see the same result_set again.\n"
+            "For DOWNLOAD: use the small generic chain: category context/enquire_about_media, search_media_torrents, then queue_download only by stable candidate_id/result_set_id. "
+            "For current/future release tracking, research first, track through track_category_item if requested, and create a web-information watch when repeated checks are needed. "
+            "Do not pre-queue after fresh discovery; inspect/ask when candidate coverage, language, quality, size, or seeders are ambiguous.\n"
+            + TaskPromptGuidance.planner_contract()
         ),
     }
 
@@ -59,6 +60,8 @@ class ReasoningPlanner:
         "webSearch": "web_search",
         "web_search_tool": "web_search",
         "SearchWeb": "web_search",
+        "WebResearch": "web_research",
+        "ResearchWeb": "web_research",
         "MetadataLookup": "metadata_lookup",
         "TMDBLookup": "metadata_lookup",
         "ExtractMetadata": "browser_extract",
@@ -253,6 +256,8 @@ class ReasoningPlanner:
         prompt = (
             "You are a planning assistant that produces structured plans "
             "for media automation. The plan is advisory only; the live tool-calling agent will decide and execute. Return ONLY valid JSON — no other text.\n\n"
+            f"{WebResearchPromptGuidance.runtime_context()}\n"
+            f"{TaskPromptGuidance.operating_rules()}\n\n"
             f"Request: {user_prompt}\n"
             f"Type of task: {intent.value}\n"
             f"Recommended approach:\n{intent_guide}\n"
@@ -302,6 +307,9 @@ class ReasoningPlanner:
             "- TOOL PHILOSOPHY RULE: Prefer a small chain of generic tools. Category state and rules arrive through context/enquire_about_media/metadata_lookup; category-specific micro-tools must not be invented or called for ordinary download decisions.\n"
             "- DEPENDENCY OUTPUT RULE: Do not write prose placeholders like '<URL from the first search result>'. When one step needs data from a previous step, use ${step_id.path.to.field}; for example ${search_event.results.0.url} or ${lookup_show.latest_season}.\n"
             "- Do not call read_web_page/browser_open/browser_extract with a URL unless the argument is either a literal http(s) URL or a ${step_id.results.0.url}-style placeholder.\n"
+            "- For SEARCH plans involving current public information, include category_web_research or web_research when those tools are available; metadata-only plans are insufficient for rumours/news/future schedules.\n"
+            "- When using category_web_research or web_research, pass the user's concrete wording as query and set time_range/categories when exposed by the tool schema.\n"
+            f"{WebResearchPromptGuidance.planner_rules()}\n"
             "JSON:"
         )
         return prompt

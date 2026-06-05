@@ -18,6 +18,7 @@ from typing import Any, Optional, TYPE_CHECKING
 from loguru import logger
 
 from src.core.models import Intent, ToolExecutionContext
+from src.ai.public_web_requirements import PublicWebEvidencePolicy
 from src.ai.tools.metadata_lookup_support import (
     LibraryMetadataSnapshotLookup,
     MetadataClientResolver,
@@ -431,6 +432,36 @@ class MetadataLookupTool:
             answer_hints["requested_episode"] = requested_episode
             payload["requested_episode"] = requested_episode
             payload["episode"] = requested_episode
+        if PublicWebEvidencePolicy.requires_public_web_evidence(request.question, request.query):
+            public_intent = PublicWebEvidencePolicy.category_research_intent(request.question, request.query)
+            payload["requires_public_web_evidence"] = True
+            payload["source_sufficiency_warning"] = (
+                "Structured metadata is not sufficient for this question because the user asked for "
+                "current public information such as news, rumours, reports, leaks, or patch notes. "
+                "Use category_web_research for category items when available, otherwise web_research."
+            )
+            payload["next_actions"] = [
+                {
+                    "tool": "category_web_research",
+                    "when": "the item belongs to an LJS category",
+                    "arguments_hint": {
+                        "item_id": request.query,
+                        "item_name": request.query,
+                        "intent": public_intent,
+                        "query": PublicWebEvidencePolicy.web_research_query(request.query, request.question),
+                    },
+                },
+                {
+                    "tool": "web_research",
+                    "when": "no category-specific research hook is available",
+                    "arguments_hint": {
+                        "query": PublicWebEvidencePolicy.web_research_query(request.query, request.question),
+                        "intent": public_intent,
+                        "categories": ["news", "general"],
+                        "time_range": "year",
+                    },
+                },
+            ]
         return payload
 
     @staticmethod

@@ -27,6 +27,8 @@ _TOOL_NAME_ALIASES = {
     "WebSearch": "web_search",
     "webSearch": "web_search",
     "SearchWeb": "web_search",
+    "WebResearch": "web_research",
+    "ResearchWeb": "web_research",
     "MetadataLookup": "metadata_lookup",
     "TMDBLookup": "metadata_lookup",
     "ExtractMetadata": "browser_extract",
@@ -35,6 +37,7 @@ _TOOL_NAME_ALIASES = {
 
 _READ_ONLY_RETRYABLE_TOOLS = {
     "web_search",
+    "web_research",
     "read_web_page",
     "browse_page",
     "browser_open",

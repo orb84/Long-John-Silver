@@ -140,13 +140,20 @@ class ActionRegistrationService:
         handler = SystemActionHandler(
             deps.settings_manager, deps.browser_runtime,
             deps.jackett_manager, deps.slskd_manager, deps.comms_registry, deps.db,
-            deps.auth_service,
+            deps.auth_service, searxng_manager=deps.searxng_manager,
         )
         gw = self._gateway
         for action_name, method in (
             ("system_install_playwright", handler.install_playwright),
             ("system_install_jackett", handler.install_jackett),
             ("system_start_jackett", handler.start_jackett),
+            ("system_install_searxng", handler.install_searxng),
+            ("system_start_searxng", handler.start_searxng),
+            ("system_repair_searxng", handler.repair_searxng),
+            ("system_upgrade_searxng", handler.upgrade_searxng),
+            ("system_rollback_searxng", handler.rollback_searxng),
+            ("system_uninstall_searxng", handler.uninstall_searxng),
+            ("system_stop_searxng", handler.stop_searxng),
             ("system_install_soulseek", handler.install_soulseek),
             ("system_start_soulseek", handler.start_soulseek),
             ("system_check_soulseek_login", handler.check_soulseek_login),

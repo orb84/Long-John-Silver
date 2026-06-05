@@ -383,6 +383,59 @@ class CategoryContractMixin(CategoryContextMixin):
             for provider in self.metadata_provider_names
         ]
 
+    def web_research_contract(self, settings: Optional['Settings'] = None) -> dict[str, Any]:
+        """Describe category-owned public web-research support.
+
+        Core web research stays generic: it can search, fetch, cache, and store
+        evidence, but it cannot know what counts as a TV air date, a book
+        edition, a music release, or a sports schedule. Categories that can use
+        public web research override this method and the planning/interpreting
+        hooks below.
+        """
+        return {
+            "enabled": False,
+            "intents": [],
+            "notes": [
+                "This category has no category-owned public web-research plan.",
+            ],
+        }
+
+    def build_web_research_plan(self, research_input: Any) -> Any:
+        """Return a category-owned public web-research plan.
+
+        The default deliberately performs no searches.  Generic services may
+        invoke this hook without branching on category ids; concrete categories
+        decide whether public web research is useful for the requested intent.
+        """
+        from src.core.models import CategoryWebResearchPlan
+
+        return CategoryWebResearchPlan(
+            category_id=self.category_id,
+            item_id=getattr(research_input, "item_id", ""),
+            intent=getattr(research_input, "intent", "general_research"),
+            searches=[],
+            notes=["No category-owned public web-research plan is defined."],
+        )
+
+    async def interpret_web_evidence(self, bundle: Any, research_input: Any) -> Any:
+        """Interpret a web evidence bundle using category-specific semantics.
+
+        The default returns a non-mutating interpretation.  Category code may
+        persist provenance facts through the generic repository, but durable item
+        mutations still have to go through CategoryItemCoordinator or another
+        explicit category-owned workflow.
+        """
+        from src.core.models import CategoryResearchInterpretation
+
+        return CategoryResearchInterpretation(
+            category_id=self.category_id,
+            item_id=getattr(research_input, "item_id", ""),
+            intent=getattr(research_input, "intent", "general_research"),
+            summary="No category-specific interpretation is available for this evidence bundle.",
+            unresolved_questions=["The category did not define an evidence interpreter."],
+            can_mutate_item=False,
+        )
+
     async def prepare_search_item(self, item: Any, *, settings: Any, scan_result: Any | None = None) -> Any:
         """Return a category-adjusted copy of an item before torrent search.
 

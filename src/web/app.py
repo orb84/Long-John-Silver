@@ -117,8 +117,8 @@ def create_app(**kwargs: Any) -> FastAPI:
         if deps.settings_manager.settings.setup_complete:
             return await call_next(request)
         allowed = ("/setup", "/api/setup", "/static", "/ws", "/api/providers",
-                   "/api/comms", "/api/health", "/api/live", "/api/browser", "/api/jackett", "/api/soulseek", "/api/storage",
-                   "/api/settings", "/api/personas", "/api/setup/language", "/api/trakt", "/category-data")
+                   "/api/comms", "/api/health", "/api/live", "/api/browser", "/api/jackett", "/api/soulseek", "/api/searxng", "/api/storage",
+                   "/api/settings", "/api/web-search", "/api/web-research", "/api/personas", "/api/setup/language", "/api/trakt", "/category-data")
         if any(request.url.path == p or request.url.path.startswith(p + "/") for p in allowed):
             return await call_next(request)
         return RedirectResponse(url="/setup", status_code=302)

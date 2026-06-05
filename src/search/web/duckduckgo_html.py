@@ -38,25 +38,34 @@ class DuckDuckGoHtmlSearchProvider(WebSearchProvider):
 
     async def search(self, query: str, max_results: int = 5) -> WebSearchResult:
         """Search DuckDuckGo HTML and normalize result cards."""
+        query_preview = self._query_preview(query)
         if not self._enabled:
+            logger.info("DuckDuckGoHtmlSearchProvider: fallback disabled query='{}'", query_preview)
             return WebSearchResult(
                 query=query,
                 provider=self.provider_name,
                 ok=False,
                 error="DuckDuckGo HTML fallback is disabled in settings.",
+                error_code="FALLBACK_DISABLED",
             )
         try:
             url = f"{self._api_base}?{urlencode({'q': query})}"
+            logger.warning("DuckDuckGoHtmlSearchProvider: degraded fallback search query='{}' endpoint={}", query_preview, self._api_base)
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 response = await client.get(url, headers={"User-Agent": "LJS/1.0"})
                 response.raise_for_status()
             hits = self.parse_html(response.text, max_results)
             self._last_error = None if hits else "No results parsed from DuckDuckGo HTML."
-            return WebSearchResult(query=query, provider=self.provider_name, ok=bool(hits), hits=hits, error=self._last_error)
+            logger.warning(
+                "DuckDuckGoHtmlSearchProvider: degraded fallback returned {} hit(s) query='{}'",
+                len(hits),
+                query_preview,
+            )
+            return WebSearchResult(query=query, provider=self.provider_name, ok=bool(hits), hits=hits, error=self._last_error, error_code="" if hits else "NO_RESULTS")
         except Exception as exc:
             self._last_error = str(exc)
-            logger.debug(f"DuckDuckGo HTML search failed: {exc}")
-            return WebSearchResult(query=query, provider=self.provider_name, ok=False, error=self._last_error)
+            logger.warning("DuckDuckGoHtmlSearchProvider: degraded fallback failed query='{}' error={}", query_preview, exc)
+            return WebSearchResult(query=query, provider=self.provider_name, ok=False, error=self._last_error, error_code="FALLBACK_FAILED")
 
     async def health_check(self) -> WebSearchHealth:
         """Return fallback configuration health without making a network call."""
@@ -93,5 +102,12 @@ class DuckDuckGoHtmlSearchProvider(WebSearchProvider):
             if len(hits) >= max_results:
                 break
         return hits
+
+    @staticmethod
+    def _query_preview(query: str, *, max_chars: int = 120) -> str:
+        cleaned = " ".join(str(query or "").split())
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[: max_chars - 1].rstrip() + "…"
 
     _parse_html = parse_html

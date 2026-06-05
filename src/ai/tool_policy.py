@@ -67,6 +67,11 @@ class AgentToolPolicy:
         "read_web_page",
         "browse_page",
         "web_search",
+        "web_research",
+        "category_web_research",
+        "create_web_information_watch",
+        "list_web_information_watches",
+        "track_category_item",
         "browser_open",
         "browser_read_selected",
         "browser_find_links",
@@ -111,6 +116,8 @@ class AgentToolPolicy:
         "manage_downloads",
         "check_storage_capacity",
         "record_category_taste_signal",
+        "track_category_item",
+        "create_web_information_watch",
     }
 
     _GENERIC_CONFIG_TOOLS = {
@@ -134,6 +141,10 @@ class AgentToolPolicy:
         "create_scheduled_task",
         "list_scheduled_tasks",
         "remove_scheduled_task",
+        "create_web_information_watch",
+        "list_web_information_watches",
+        "disable_web_information_watch",
+        "track_category_item",
     }
 
     def allowed_tool_names(
@@ -230,6 +241,20 @@ class AgentToolPolicy:
                 "get_category_definitions",
                 "get_category_manifest",
                 "get_library_status",
+                # Public web/source-discovery tools stay available even when a
+                # category narrows its ordinary media/download tool surface.
+                # Category YAML should not hide the user's explicit ability to
+                # ask for current public news, rumours, patch notes, or fetched
+                # source evidence.
+                "web_search",
+                "web_research",
+                "category_web_research",
+                "read_web_page",
+                "browse_page",
+                "browser_extract",
+                "create_web_information_watch",
+                "list_web_information_watches",
+                "track_category_item",
                 # Source companion tools stay globally available for downloadable categories.
                 # Logs from Round 135 showed category YAML narrowing hid search_soulseek
                 # from Music even though the global download policy allowed it.

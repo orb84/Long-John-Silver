@@ -21,6 +21,7 @@ from src.ai.tool_executor import ToolCallExecutor
 from src.core.models import Intent, AgentPlan, PlanStep
 from src.utils.item_matcher import ItemMatcher
 from src.ai.tools.metadata_lookup_support import MetadataLookupRequest
+from src.ai.public_web_requirements import PublicWebEvidencePolicy
 
 if TYPE_CHECKING:
     from src.core.models import Settings
@@ -80,6 +81,10 @@ class PlanCoordinator:
             "WebSearch": "web_search",
             "webSearch": "web_search",
             "SearchWeb": "web_search",
+        "WebResearch": "web_research",
+        "ResearchWeb": "web_research",
+        "CategoryWebResearch": "category_web_research",
+        "CategoryResearch": "category_web_research",
             "MetadataLookup": "metadata_lookup",
             "TMDBLookup": "metadata_lookup",
             "ExtractMetadata": "browser_extract",
@@ -246,7 +251,7 @@ class PlanCoordinator:
         for step in agent_plan.steps:
             step.tool_name = self._canonical_plan_tool_name(step.tool_name, allowed_tool_names)
         first_tool = agent_plan.steps[0].tool_name
-        web_like_tools = {"web_search", "read_web_page", "browser_extract", "browse_page", "browser_open"}
+        web_like_tools = {"web_search", "web_research", "read_web_page", "browser_extract", "browse_page", "browser_open"}
         if first_tool not in web_like_tools and first_tool in allowed_tool_names:
             return agent_plan
         media_type = self._metadata_media_type_from_context(context)
@@ -271,7 +276,7 @@ class PlanCoordinator:
             return agent_plan
         if matched_item is not None:
             for step in agent_plan.steps:
-                if step.tool_name not in {"web_search", "read_web_page", "browser_extract"} or not isinstance(step.arguments, dict):
+                if step.tool_name not in {"web_search", "web_research", "read_web_page", "browser_extract"} or not isinstance(step.arguments, dict):
                     continue
                 original_query = str(step.arguments.get("query") or step.arguments.get("url") or "").strip()
                 if original_query and not self._metadata_query_has_title(original_query, matched_item):
@@ -765,6 +770,105 @@ class PlanCoordinator:
         ep_part = f" episode {episode}" if episode is not None else " episodes"
         return f"{title}{ep_part} air date official Apple TV press".strip()
 
+    @staticmethod
+    def _metadata_step_title(agent_plan: AgentPlan, fallback: str) -> str:
+        """Return the best title/query from metadata steps without category semantics."""
+        for step in agent_plan.steps:
+            if step.tool_name != "metadata_lookup" or not isinstance(step.arguments, dict):
+                continue
+            for key in ("query", "title", "name", "item_name"):
+                value = step.arguments.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return str(fallback or "").strip()
+
+    def _append_public_web_evidence_step(
+        self,
+        agent_plan: AgentPlan,
+        user_prompt: str,
+        allowed_tool_names: set[str],
+        context: str | None,
+        recent_name: str | None,
+    ) -> bool:
+        """Append a non-mutating public evidence step when metadata is insufficient.
+
+        This is a source-sufficiency guard, not intent routing.  The turn has
+        already been routed as SEARCH and has already selected metadata.  For
+        live public questions such as rumours, news, reports, or patch notes,
+        catalogue metadata cannot be the final source even if it succeeds.
+        """
+        if any(step.tool_name in {"category_web_research", "web_research", "web_search"} for step in agent_plan.steps):
+            return False
+        if not PublicWebEvidencePolicy.requires_public_web_evidence(user_prompt, agent_plan.user_goal):
+            return False
+
+        title = recent_name or self._metadata_step_title(agent_plan, user_prompt)
+        category_id = self._metadata_media_type_from_context(context)
+        public_intent = PublicWebEvidencePolicy.category_research_intent(user_prompt, agent_plan.user_goal)
+        if (
+            "category_web_research" in allowed_tool_names
+            and category_id
+            and category_id not in {"auto", "general", "multi", "person"}
+        ):
+            agent_plan.steps.append(
+                PlanStep(
+                    id="public_category_web_evidence",
+                    tool_name="category_web_research",
+                    arguments={
+                        "category_id": category_id,
+                        "item_id": title,
+                        "item_name": title,
+                        "intent": public_intent,
+                        "query": PublicWebEvidencePolicy.web_research_query(title, user_prompt),
+                        "time_range": "year",
+                    },
+                    depends_on=[],
+                    success_condition="Fetched public web evidence addresses the requested current news/rumour/report question.",
+                )
+            )
+            agent_plan.constraints["public_web_source_policy"] = "metadata_plus_category_web_research"
+            return True
+
+        if "web_research" in allowed_tool_names:
+            agent_plan.steps.append(
+                PlanStep(
+                    id="public_web_evidence",
+                    tool_name="web_research",
+                    arguments={
+                        "query": PublicWebEvidencePolicy.web_research_query(title, user_prompt),
+                        "intent": public_intent,
+                        "categories": ["news", "general"],
+                        "time_range": "year",
+                        "max_urls_to_fetch": 4,
+                    },
+                    depends_on=[],
+                    success_condition="Fetched public web evidence addresses the requested current news/rumour/report question.",
+                )
+            )
+            agent_plan.constraints["public_web_source_policy"] = "metadata_plus_web_research"
+            return True
+
+        if "web_search" in allowed_tool_names:
+            agent_plan.steps.append(
+                PlanStep(
+                    id="public_web_search",
+                    tool_name="web_search",
+                    arguments={
+                        "query": PublicWebEvidencePolicy.web_research_query(title, user_prompt),
+                        "max_results": 6,
+                        "categories": ["news", "general"],
+                        "time_range": "year",
+                    },
+                    depends_on=[],
+                    success_condition="Search results provide candidate public sources for the requested current news/rumour/report question.",
+                )
+            )
+            agent_plan.constraints["public_web_source_policy"] = "metadata_plus_web_search_candidates"
+            return True
+
+        agent_plan.constraints["public_web_source_policy"] = "required_but_no_public_web_tool_available"
+        return False
+
     async def prepare_plan(
         self,
         user_prompt: str,
@@ -866,13 +970,16 @@ class PlanCoordinator:
         recent_item = self._recently_mentioned_tracked_item(self._recent_history_context(context))
         recent_name = getattr(recent_item, "key", None) if recent_item is not None else self._recent_media_name_from_context(context)
         recent_coords = self._recent_media_coordinates(user_prompt, context)
-        metadata_step_ids: set[str] = set()
+        metadata_step_ids: set[str] = {
+            step.id
+            for step in agent_plan.steps
+            if step.tool_name == "metadata_lookup" and isinstance(step.arguments, dict)
+        }
         if recent_name:
             media_type = self._metadata_media_type_from_context(context)
             for step in agent_plan.steps:
                 if step.tool_name != "metadata_lookup" or not isinstance(step.arguments, dict):
                     continue
-                metadata_step_ids.add(step.id)
                 q = str(step.arguments.get("query") or "").strip()
                 query_binds_to_recent = False
                 if not q or q.isdigit() or self._is_dependency_placeholder(q):
@@ -899,8 +1006,9 @@ class PlanCoordinator:
                     step.arguments.setdefault(coord_name, coord_value)
                 if step.arguments.get("episode") is not None or step.arguments.get("season") is not None:
                     step.arguments["include_episodes"] = True
-        if metadata_step_ids and self._needs_future_airdate_crosscheck(user_prompt, agent_plan) and "web_search" in allowed_tool_names:
-            if not any(step.tool_name == "web_search" for step in agent_plan.steps):
+        crosscheck_tool = "web_research" if "web_research" in allowed_tool_names else "web_search"
+        if metadata_step_ids and self._needs_future_airdate_crosscheck(user_prompt, agent_plan) and crosscheck_tool in allowed_tool_names:
+            if not any(step.tool_name in {"web_search", "web_research"} for step in agent_plan.steps):
                 title = None
                 if recent_name:
                     title = recent_name
@@ -909,11 +1017,14 @@ class PlanCoordinator:
                         title = title or step.arguments.get("query")
                         break
                 query = self._official_airdate_query(str(title or user_prompt), user_prompt)
+                arguments = {"query": query, "max_results": 5}
+                if crosscheck_tool == "web_research":
+                    arguments.update({"intent": "airdate_source_crosscheck", "categories": ["general", "news"], "max_urls_to_fetch": 3})
                 agent_plan.steps.append(
                     PlanStep(
                         id="official_airdate_crosscheck",
-                        tool_name="web_search",
-                        arguments={"query": query, "max_results": 5},
+                        tool_name=crosscheck_tool,
+                        arguments=arguments,
                         depends_on=[],
                         success_condition="Official or high-confidence source confirms upcoming episode air/release date.",
                     )
@@ -921,10 +1032,19 @@ class PlanCoordinator:
                 agent_plan.constraints["future_airdate_source_policy"] = "metadata_plus_official_web_crosscheck"
 
         if metadata_step_ids:
+            self._append_public_web_evidence_step(
+                agent_plan=agent_plan,
+                user_prompt=user_prompt,
+                allowed_tool_names=allowed_tool_names,
+                context=context,
+                recent_name=recent_name,
+            )
+
+        if metadata_step_ids:
             kept_steps: list[PlanStep] = []
             removed_fallback = False
             for step in agent_plan.steps:
-                if step.tool_name in {"web_search", "read_web_page", "browse_page", "browser_extract"} and set(step.depends_on or []) & metadata_step_ids:
+                if step.tool_name in {"web_search", "web_research", "read_web_page", "browse_page", "browser_extract"} and set(step.depends_on or []) & metadata_step_ids:
                     removed_fallback = True
                     continue
                 kept_steps.append(step)

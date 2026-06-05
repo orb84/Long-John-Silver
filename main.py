@@ -51,6 +51,7 @@ from src.web.access_logs import install_quiet_polling_access_log_filter
 from src.web.comms import create_registry
 from src.core.state_coordinator import StateCoordinator
 from src.search.jackett_manager import JackettManager
+from src.search.web.searxng_manager import SearXNGManager
 from src.integrations.slskd_manager import SlskdManager
 from src.integrations.slskd_import_monitor import SlskdImportMonitor
 from src.core.categories.artwork import CategoryArtworkManager
@@ -220,6 +221,55 @@ async def _event_loop_watchdog(interval_seconds: float = 1.0, warn_after_seconds
         expected = now + interval_seconds
 
 
+async def _start_managed_searxng_after_ui(settings_manager: SettingsManager, searxng_manager: SearXNGManager) -> None:
+    """Best-effort managed SearXNG startup after the web UI is reachable.
+
+    Managed web research is useful immediately after launch, but a previous LJS
+    run may have installed the runtime while the sidecar process is stopped.
+    Starting it here prevents the assistant from silently degrading to the
+    DuckDuckGo fallback on the first research turn after an app restart.
+    """
+    settings = settings_manager.settings
+    cfg = getattr(settings, "web_search", None)
+    if cfg is None:
+        return
+    if not getattr(cfg, "enabled", True):
+        logger.info("Managed SearXNG startup skipped because web search is disabled.")
+        return
+    if getattr(cfg, "provider", "") != "searxng" or getattr(cfg, "mode", "managed") != "managed":
+        logger.info(
+            "Managed SearXNG startup skipped for provider={} mode={}",
+            getattr(cfg, "provider", ""),
+            getattr(cfg, "mode", ""),
+        )
+        return
+    if not getattr(cfg, "auto_install", True) and not searxng_manager.is_installed:
+        logger.info("Managed SearXNG startup skipped because auto_install is disabled and runtime is absent.")
+        return
+
+    cfg.status = "starting"
+    cfg.status_message = "Starting managed SearXNG in the background."
+    settings_manager.save(settings)
+    try:
+        logger.info("Web research provider is managed SearXNG — starting sidecar after web startup...")
+        ok = await searxng_manager.start(settings, health_timeout_seconds=45.0)
+        searxng_manager.save_to_settings(settings)
+        if ok:
+            cfg.status = "ready"
+            cfg.status_message = "Managed SearXNG is running and JSON search is available."
+            logger.info("Managed SearXNG startup ready at {}", searxng_manager.url)
+        else:
+            cfg.status = "error"
+            cfg.status_message = searxng_manager.last_error or "Managed SearXNG did not become ready."
+            logger.warning("Managed SearXNG startup failed: {}", cfg.status_message)
+        settings_manager.save(settings)
+    except Exception as exc:  # noqa: BLE001 - startup sidecar must not crash LJS.
+        cfg.status = "error"
+        cfg.status_message = f"Managed SearXNG startup failed: {exc}"
+        settings_manager.save(settings)
+        logger.exception("Managed SearXNG background startup crashed: {}", exc)
+
+
 async def _start_managed_soulseek_after_ui(settings_manager: SettingsManager, slskd_manager: SlskdManager) -> None:
     """Best-effort managed slskd startup after the web UI is already reachable.
 
@@ -364,6 +414,7 @@ async def main():
     downloader = None
     jackett_manager = JackettManager()
     slskd_manager = SlskdManager()
+    searxng_manager = SearXNGManager()
     plex_client = None
     tmdb_client = None
     tvmaze_client = None
@@ -813,6 +864,11 @@ async def main():
                 web_reader=WebReader(),
                 browser_runtime=browser_runtime,
                 settings_manager=settings_manager,
+                database=db,
+                category_registry=cat_registry,
+                prompt_scheduler=prompt_scheduler,
+                searxng_manager=searxng_manager,
+                llm_client=task_llm_client,
             ),
             CategoryToolProvider(
                 category_registry=cat_registry,
@@ -852,6 +908,7 @@ async def main():
             release_group_tracker=release_group_tracker,
             category_registry=cat_registry,
             scheduler=scheduler,
+            prompt_scheduler=prompt_scheduler,
             supervisor=supervisor,
             action_event_store=action_event_store,
             llm_manager=llm_manager,
@@ -863,6 +920,7 @@ async def main():
             browser_runtime=browser_runtime,
             jackett_manager=jackett_manager,
             slskd_manager=slskd_manager,
+            searxng_manager=searxng_manager,
             storage_monitor=storage_monitor,
             artwork_manager=artwork_manager,
             metadata_enricher=metadata_enricher,
@@ -903,6 +961,15 @@ async def main():
 
         access_urls = _format_access_urls(web_host, port)
         logger.info("LJS web UI answered /api/live. Try: " + ", ".join(access_urls))
+        if (
+            getattr(settings.web_search, "enabled", True)
+            and getattr(settings.web_search, "provider", "") == "searxng"
+            and getattr(settings.web_search, "mode", "managed") == "managed"
+        ):
+            supervisor.spawn_one_shot(
+                "searxng_managed_startup",
+                _start_managed_searxng_after_ui(settings_manager, searxng_manager),
+            )
         if getattr(settings.soulseek, "enabled", False) and getattr(settings.soulseek, "managed", True):
             supervisor.spawn_one_shot(
                 "soulseek_managed_startup",

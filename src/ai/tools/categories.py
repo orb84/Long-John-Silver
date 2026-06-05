@@ -236,6 +236,108 @@ class ExecuteCategoryActionTool:
 
 
 
+class TrackCategoryItemTool:
+    """Add or update a tracked category item through the coordinator."""
+
+    name = "track_category_item"
+    description = (
+        "Add or update a category item through the generic CategoryItemCoordinator. "
+        "Use this only when the user explicitly asks to track/add/follow an item. "
+        "It may enrich metadata and synchronize category watch policy, but it does not queue downloads."
+    )
+    intents = {Intent.CONFIG, Intent.SEARCH, Intent.DOWNLOAD}
+    allow_direct = True
+    requires_confirmation = True
+    destructive = False
+    required_dependencies = ["category_registry", "settings_manager"]
+
+    def __init__(
+        self,
+        *,
+        category_registry: Optional[CategoryRegistry] = None,
+        settings_manager: Optional[SettingsManager] = None,
+        database: Any = None,
+        scheduler: Any = None,
+        metadata_enricher: Any = None,
+        artwork_manager: Any = None,
+    ) -> None:
+        self._registry = category_registry
+        self._sm = settings_manager
+        self._db = database
+        self._scheduler = scheduler
+        self._metadata_enricher = metadata_enricher
+        self._artwork_manager = artwork_manager
+
+    def parameters(self) -> dict:
+        """Return the public tool parameter schema."""
+        return {
+            "type": "object",
+            "properties": {
+                "category_id": {"type": "string", "description": "Target category identifier."},
+                "name": {"type": "string", "description": "Item name/title to track."},
+                "item_id": {"type": "string", "description": "Optional stable item id/title when different from name."},
+                "enrich_metadata": {"type": "boolean", "description": "Whether category metadata enrichment may run. Default true."},
+                "sync_watch": {"type": "boolean", "description": "Whether category watch policy should be synchronized. Default true."},
+                "metadata": {"type": "object", "description": "Optional generic metadata/properties supplied by the assistant or UI."},
+                "properties": {"type": "object", "description": "Optional generic item properties."},
+            },
+            "required": ["category_id", "name"],
+        }
+
+    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
+        """Create/update a category item through the architecture-approved coordinator."""
+        if not self._registry or not self._sm:
+            return {"ok": False, "error": "Category registry or settings manager is not configured."}
+        from src.core.category_item_coordinator import CategoryItemCoordinator
+
+        category_id = str(arguments.get("category_id") or context.category_id or "").strip()
+        name = str(arguments.get("name") or arguments.get("item_id") or "").strip()
+        if not category_id or not name:
+            return {"ok": False, "error": "category_id and name are required."}
+        coordinator = CategoryItemCoordinator(
+            settings_manager=self._sm,
+            category_registry=self._registry,
+            db=self._db,
+            scheduler=self._scheduler,
+            metadata_enricher=self._metadata_enricher,
+            metadata_clients={},
+            artwork_manager=self._artwork_manager,
+        )
+        kwargs: dict[str, Any] = {}
+        for key in ("metadata", "properties"):
+            if isinstance(arguments.get(key), dict):
+                kwargs[key] = dict(arguments[key])
+        if arguments.get("item_id") and str(arguments.get("item_id")) != name:
+            kwargs["item_id"] = str(arguments.get("item_id"))
+        item = await coordinator.add_or_update_item(
+            category_id,
+            name,
+            source="assistant",
+            enrich_metadata=bool(arguments.get("enrich_metadata", True)),
+            sync_watch=bool(arguments.get("sync_watch", True)),
+            **kwargs,
+        )
+        payload = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) if isinstance(item, dict) else {
+            "key": getattr(item, "key", name),
+            "display_name": getattr(item, "display_name", name),
+            "category_id": getattr(item, "category_id", getattr(item, "item_type", category_id)),
+        }
+        item_key = str(payload.get("key") or name)
+        logger.info("TrackCategoryItemTool: tracked category={} item={} source=assistant", category_id, item_key)
+        return {
+            "ok": True,
+            "category_id": category_id,
+            "item_id": item_key,
+            "item": payload,
+            "message": (
+                "Tracked item added or updated through CategoryItemCoordinator. "
+                "No download was queued by this tool."
+            ),
+            "next_actions": ["category_web_research", "create_web_information_watch", "search_media_torrents"],
+        }
+
+
+
 
 class CategoryDesignHelpers:
     """Public helper methods shared by category design tools."""
@@ -955,6 +1057,14 @@ class CategoryToolProvider:
             GetCategoryManifestTool(category_registry=self._registry, settings_manager=self._sm),
             ConfigureCategoryPropertyTool(category_registry=self._registry, settings_manager=self._sm),
             ExecuteCategoryActionTool(category_registry=self._registry, settings_manager=self._sm),
+            TrackCategoryItemTool(
+                category_registry=self._registry,
+                settings_manager=self._sm,
+                database=self._db,
+                scheduler=self._scheduler,
+                metadata_enricher=self._metadata_enricher,
+                artwork_manager=self._artwork_manager,
+            ),
             GetCategoryCreationGuideTool(),
             PlanCategoryCreationTool(),
             ResearchCategoryServicesTool(settings_manager=self._sm),

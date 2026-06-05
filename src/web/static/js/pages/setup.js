@@ -386,13 +386,19 @@ function saveLLM() {
     var webKey = document.getElementById('setup-web-search-key');
     var webBase = document.getElementById('setup-web-search-base');
     var webFallback = document.getElementById('setup-web-search-fallback');
+    var webManaged = document.getElementById('setup-web-search-managed');
     if (webProvider) {
+        var managed = webProvider.value === 'searxng' && (!webManaged || webManaged.checked);
         data.web_search = {
             enabled: true,
             provider: webProvider.value,
+            mode: managed ? 'managed' : 'manual',
+            auto_install: managed,
             api_key: webKey ? webKey.value.trim() : '',
             api_base: webBase ? webBase.value.trim() : '',
             max_results: 5,
+            default_categories: ['general'],
+            safe_search: 1,
             allow_duckduckgo_fallback: webFallback ? webFallback.checked : false,
         };
     }
@@ -796,3 +802,26 @@ document.addEventListener('DOMContentLoaded', function() {
         onSetupProviderChange(providerSelect);
     }
 });
+
+
+/**
+ * Install/configure managed local SearXNG during first-run setup.
+ */
+function installSetupSearxng() {
+    var provider = document.getElementById('setup-web-search-provider');
+    var managed = document.getElementById('setup-web-search-managed');
+    var base = document.getElementById('setup-web-search-base');
+    var status = document.getElementById('setup-searxng-status');
+    if (provider) provider.value = 'searxng';
+    if (managed) managed.checked = true;
+    if (status) status.textContent = 'Installing managed local SearXNG...';
+    APIClient.post('/api/searxng/install', {}).then(function(result) {
+        if (base && result.url) base.value = result.url;
+        if (status) status.textContent = result.ready ? ('Ready at ' + (result.url || 'local SearXNG')) : (result.error || 'Install finished but health is not ready.');
+        if (result.ready) toast.show('Managed local SearXNG is installed and ready.');
+        else toast.show(result.error || 'SearXNG install did not finish cleanly.', 'err');
+    }).catch(function(e) {
+        if (status) status.textContent = e.message || 'SearXNG install failed.';
+        toast.show(e.message || 'SearXNG install failed.', 'err');
+    });
+}

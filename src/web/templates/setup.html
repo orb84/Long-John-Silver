@@ -1025,21 +1025,29 @@
                 <div style="background: rgba(255,255,255,0.01); border: 1px solid var(--glass-border); padding: 12px; border-radius: 10px; margin-bottom: 1rem;">
                     <strong style="color: var(--accent-gold); font-size: 0.85rem;">General Web Search — Assistant Research</strong>
                     <p style="font-size: 0.76rem; color: var(--text-dim); margin: 4px 0 8px 0; line-height: 1.4;">
-                        Used for fresh release news, reviews, troubleshooting, and recommendation context. Prefer a real provider such as Brave, Tavily, Kagi, or SearXNG. DuckDuckGo HTML is disabled unless explicitly allowed as degraded fallback.
+                        Used for category/item research, release-date news, rumours, ambiguity resolution, and metadata gaps. Default is a locally managed SearXNG sidecar; it discovers public sources only and is not used for media download acquisition.
                     </p>
+                    <label style="display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 0.78rem; color: var(--text);">
+                        <input type="checkbox" id="setup-web-search-managed" checked style="width: 16px; height: 16px; margin: 0;">
+                        Auto install/configure local SearXNG for web research
+                    </label>
+                    <div style="display: flex; gap: 8px; margin: 4px 0 10px 24px; flex-wrap: wrap;">
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="installSetupSearxng()"><i class="fa-solid fa-magnifying-glass-location"></i> Auto install SearXNG now</button>
+                        <span id="setup-searxng-status" style="font-size: 0.76rem; color: var(--text-dim); align-self: center;">Not installed yet.</span>
+                    </div>
                     <div style="display: grid; grid-template-columns: 130px 1fr; gap: 8px; align-items: center;">
                         <label for="setup-web-search-provider" style="font-size: 0.76rem; color: var(--text-dim);">Provider</label>
                         <select id="setup-web-search-provider" style="font-size: 0.8rem;">
+                            <option value="searxng" selected>SearXNG</option>
                             <option value="brave">Brave Search API</option>
                             <option value="tavily">Tavily</option>
                             <option value="kagi">Kagi</option>
-                            <option value="searxng">SearXNG</option>
                             <option value="duckduckgo_html">DuckDuckGo HTML fallback</option>
                         </select>
                         <label for="setup-web-search-key" style="font-size: 0.76rem; color: var(--text-dim);">API key</label>
                         <input type="text" class="ljs-secret-input" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" id="setup-web-search-key" placeholder="Optional for SearXNG; required by API providers" style="font-size: 0.8rem;">
                         <label for="setup-web-search-base" style="font-size: 0.76rem; color: var(--text-dim);">Base URL</label>
-                        <input type="text" id="setup-web-search-base" placeholder="Required for SearXNG or custom endpoints" style="font-size: 0.8rem;">
+                        <input type="text" id="setup-web-search-base" placeholder="Auto-filled for managed SearXNG; manual URL also supported" style="font-size: 0.8rem;">
                     </div>
                     <label style="display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.76rem; color: var(--text-dim);">
                         <input type="checkbox" id="setup-web-search-fallback" style="width: 16px; height: 16px; margin: 0;">

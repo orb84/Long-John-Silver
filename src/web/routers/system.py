@@ -70,6 +70,21 @@ class SystemRouter:
         router.add_api_route("/api/search/health", self._search_health, methods=["GET"])
         router.add_api_route("/api/web-search/health", self._web_search_health, methods=["GET"])
         router.add_api_route("/api/web-search/test", self._web_search_test, methods=["POST"])
+        router.add_api_route("/api/web-research/test", self._web_research_test, methods=["POST"])
+        router.add_api_route("/api/web-research/evidence", self._web_research_evidence, methods=["GET"])
+        router.add_api_route("/api/category-web-research/test", self._category_web_research_test, methods=["POST"])
+        router.add_api_route("/api/web-information-watches", self._web_information_watches, methods=["GET"])
+        router.add_api_route("/api/web-information-watches", self._create_web_information_watch, methods=["POST"])
+        router.add_api_route("/api/web-information-watches/{watch_id}/run", self._run_web_information_watch, methods=["POST"])
+        router.add_api_route("/api/web-information-watches/{watch_id}/disable", self._disable_web_information_watch, methods=["POST"])
+        router.add_api_route("/api/searxng/health", self._searxng_health, methods=["GET"])
+        router.add_api_route("/api/searxng/install", self._searxng_install, methods=["POST"])
+        router.add_api_route("/api/searxng/start", self._searxng_start, methods=["POST"])
+        router.add_api_route("/api/searxng/repair", self._searxng_repair, methods=["POST"])
+        router.add_api_route("/api/searxng/upgrade", self._searxng_upgrade, methods=["POST"])
+        router.add_api_route("/api/searxng/rollback", self._searxng_rollback, methods=["POST"])
+        router.add_api_route("/api/searxng/uninstall", self._searxng_uninstall, methods=["POST"])
+        router.add_api_route("/api/searxng/stop", self._searxng_stop, methods=["POST"])
         router.add_api_route("/api/jackett/health", self._jackett_health, methods=["GET"])
         router.add_api_route("/api/jackett/install", self._jackett_install, methods=["POST"])
         router.add_api_route("/api/jackett/start", self._jackett_start, methods=["POST"])
@@ -205,6 +220,218 @@ class SystemRouter:
         service = WebSearchService(self._deps.settings_manager.settings.web_search)
         result = await service.search(query, max_results=max_results)
         return result.model_dump()
+
+
+    async def _web_research_test(self, request: Request, _auth: bool = Depends(verify_auth)):
+        """Run a bounded web-research smoke test and persist provenance when DB is available."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        from src.ai.web_reader import WebReader
+        from src.core.models import WebResearchBudget, WebResearchRequest
+        from src.search.web.research import WebResearchService
+
+        settings = self._deps.settings_manager.settings
+        research_request = WebResearchRequest(
+            query=str(body.get("query") or "SearXNG documentation"),
+            intent=str(body.get("intent") or "manual_test"),
+            category_id=str(body.get("category_id") or ""),
+            item_id=str(body.get("item_id") or ""),
+            item_name=str(body.get("item_name") or ""),
+            categories=body.get("categories") or settings.web_search.default_categories,
+            language=str(body.get("language") or settings.web_search.default_language),
+            time_range=str(body.get("time_range") or ""),
+            max_results=int(body.get("max_results") or settings.web_search.max_results),
+            budget=WebResearchBudget(max_urls_to_fetch=int(body.get("max_urls_to_fetch") or 3)),
+        )
+        repository = getattr(self._deps.db, "web_research", None) if self._deps.db else None
+        bundle = await WebResearchService(
+            settings.web_search,
+            web_reader=WebReader(),
+            repository=repository,
+        ).collect_evidence(research_request)
+        return bundle.model_dump()
+
+    async def _web_research_evidence(
+        self,
+        category_id: str = Query(""),
+        item_id: str = Query(""),
+        limit: int = Query(50),
+        _auth: bool = Depends(verify_auth),
+    ):
+        """Return recent persisted web-source evidence for diagnostics."""
+        repository = getattr(self._deps.db, "web_research", None) if self._deps.db else None
+        if not repository:
+            return {"evidence": [], "error": "Web research repository is not configured."}
+        rows = await repository.list_evidence(category_id=category_id, item_id=item_id, limit=limit)
+        return {"evidence": rows}
+
+    async def _category_web_research_test(self, request: Request, _auth: bool = Depends(verify_auth)):
+        """Run a category-owned web-research diagnostic through the neutral orchestrator."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        category_id = str(body.get("category_id") or "").strip()
+        item_id = str(body.get("item_id") or body.get("item_name") or "").strip()
+        if not category_id or not item_id:
+            raise HTTPException(status_code=400, detail="category_id and item_id/item_name are required")
+        from src.ai.web_reader import WebReader
+        from src.core.models import CategoryWebResearchInput
+        from src.search.web.category_research import CategoryWebResearchService
+
+        settings = self._deps.settings_manager.settings
+        repository = getattr(self._deps.db, "web_research", None) if self._deps.db else None
+        result = await CategoryWebResearchService(
+            category_registry=self._deps.category_registry,
+            config=settings.web_search,
+            web_reader=WebReader(),
+            repository=repository,
+        ).research(CategoryWebResearchInput(
+            category_id=category_id,
+            item_id=item_id,
+            item_name=str(body.get("item_name") or item_id),
+            intent=str(body.get("intent") or "general_research"),
+            language=str(body.get("language") or settings.web_search.default_language),
+            context=body.get("context") if isinstance(body.get("context"), dict) else {},
+        ))
+        return result.model_dump(mode="json")
+
+    def _make_web_information_watch_service(self):
+        """Build the watch service used by web API endpoints."""
+        from src.ai.web_reader import WebReader
+        from src.core.models import WebSearchConfig
+        from src.search.web.information_watch import WebInformationWatchService
+
+        repository = getattr(self._deps.db, "web_research", None) if self._deps.db else None
+        config = self._deps.settings_manager.settings.web_search if self._deps.settings_manager else WebSearchConfig()
+        return WebInformationWatchService(
+            repository=repository,
+            config=config,
+            web_reader=WebReader(),
+            category_registry=self._deps.category_registry,
+        )
+
+    async def _web_information_watches(
+        self,
+        enabled_only: bool = Query(False),
+        category_id: str = Query(""),
+        item_id: str = Query(""),
+        limit: int = Query(100),
+        _auth: bool = Depends(verify_auth),
+    ):
+        """List durable web-information watches for the UI and diagnostics."""
+        service = self._make_web_information_watch_service()
+        watches = await service.list_watches(
+            enabled_only=bool(enabled_only),
+            category_id=str(category_id or ""),
+            item_id=str(item_id or ""),
+            limit=int(limit or 100),
+        )
+        return {"ok": True, "watches": watches}
+
+    async def _create_web_information_watch(self, request: Request, _auth: bool = Depends(verify_auth)):
+        """Create a durable web-information watch and schedule its bounded recurring check when available."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        service = self._make_web_information_watch_service()
+        settings = self._deps.settings_manager.settings
+        watch = await service.create_watch(
+            title=str(body.get("title") or body.get("objective") or "Web information watch"),
+            objective=str(body.get("objective") or body.get("query") or body.get("title") or ""),
+            query=str(body.get("query") or ""),
+            intent=str(body.get("intent") or "general_research"),
+            owner_type="category_item" if body.get("category_id") or body.get("item_id") else "user_task",
+            category_id=str(body.get("category_id") or ""),
+            item_id=str(body.get("item_id") or body.get("item_name") or ""),
+            item_name=str(body.get("item_name") or body.get("item_id") or ""),
+            language=str(body.get("language") or settings.web_search.default_language),
+            cadence_minutes=int(body.get("cadence_minutes") or 10080),
+            delay_minutes=body.get("delay_minutes"),
+            notify_only_if_meaningful=bool(body.get("notify_only_if_meaningful", True)),
+            llm_evaluation_required=bool(body.get("llm_evaluation_required", True)),
+            allow_download_queueing=bool(body.get("allow_download_queueing", False)),
+            query_plan=body.get("query_plan") if isinstance(body.get("query_plan"), dict) else {},
+            user_feedback=body.get("user_feedback") if isinstance(body.get("user_feedback"), dict) else {},
+        )
+        scheduled_task = None
+        if self._deps.prompt_scheduler:
+            from src.search.web.information_watch import WebInformationWatchPromptBuilder
+
+            scheduled_task = await self._deps.prompt_scheduler.create_task(
+                prompt=WebInformationWatchPromptBuilder.scheduled_prompt(watch),
+                interval_minutes=watch.cadence_minutes,
+                user_id=str(body.get("user_id") or "web"),
+                channel=str(body.get("channel") or "web"),
+                title=f"Watch: {watch.title}",
+                task_type="condition_check",
+                schedule_type="recurring",
+                delay_minutes=body.get("delay_minutes") if body.get("delay_minutes") is not None else watch.cadence_minutes,
+                session_id=str(body.get("session_id") or "web_rest"),
+            )
+        return {
+            "ok": True,
+            "watch": watch.model_dump(mode="json"),
+            "scheduled_task": {
+                "id": scheduled_task.id,
+                "next_run_at": scheduled_task.next_run_at.isoformat() if scheduled_task.next_run_at else None,
+                "interval_minutes": scheduled_task.interval_minutes,
+            } if scheduled_task else None,
+            "message": "Created web information watch. It will use fetched evidence and LLM review before notifying.",
+        }
+
+    async def _run_web_information_watch(self, watch_id: str, _auth: bool = Depends(verify_auth)):
+        """Run one durable web-information watch immediately."""
+        service = self._make_web_information_watch_service()
+        return await service.run_watch(str(watch_id or ""))
+
+    async def _disable_web_information_watch(self, watch_id: str, request: Request, _auth: bool = Depends(verify_auth)):
+        """Disable a web-information watch without deleting its history."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        service = self._make_web_information_watch_service()
+        watch = await service.disable_watch(str(watch_id or ""), reason=str(body.get("reason") or "user_requested"))
+        return {"ok": bool(watch), "watch": watch, "message": "Watch disabled." if watch else "Watch not found."}
+
+
+    async def _searxng_health(self, _auth: bool = Depends(verify_auth)):
+        """Return managed SearXNG sidecar health without adopting manual instances."""
+        deps = self._deps
+        if not deps.searxng_manager:
+            return {"installed": False, "running": False, "error": "SearXNG manager not configured"}
+        return await deps.searxng_manager.health_check(deps.settings_manager.settings)
+
+    async def _searxng_install(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_install_searxng', {})
+
+    async def _searxng_start(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_start_searxng', {})
+
+    async def _searxng_repair(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_repair_searxng', {})
+
+    async def _searxng_upgrade(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_upgrade_searxng', {})
+
+    async def _searxng_rollback(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_rollback_searxng', {})
+
+    async def _searxng_uninstall(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_uninstall_searxng', {})
+
+    async def _searxng_stop(self, _auth: bool = Depends(verify_auth)):
+        return await self._execute_action('system_stop_searxng', {})
 
     async def _jackett_health(self):
         deps = self._deps

@@ -19,6 +19,7 @@ from typing import Protocol, runtime_checkable
 from src.core.database import Database
 from src.core.models import ScheduledTask
 from src.core.notifications import NotificationService
+from src.ai.task_prompt_guidance import TaskPromptGuidance
 
 # Named constants replacing magic numbers
 DEFAULT_WEEKLY_INTERVAL_MINUTES = 10080
@@ -219,23 +220,15 @@ class PromptScheduler:
                 session_id=task.session_id or f"scheduled_{task.id}",
                 user_id=task.user_id,
             )
+        if self._should_suppress_condition_notification(task, response):
+            logger.info("Scheduled condition_check '{}' produced no-notification sentinel; notification suppressed.", task.id)
+            return response
         await self._send_response(task, response)
         return response
 
     def _build_scheduled_prompt(self, task: ScheduledTask) -> str:
         """Wrap scheduled prompts with enough context for safe autonomous runs."""
-        if task.task_type == "condition_check":
-            prefix = (
-                "This is a user-created scheduled check. Run the requested check now, "
-                "use the appropriate registered tools, and report the result clearly. "
-                "Do not queue downloads unless the original prompt explicitly asks you to queue them.\n\n"
-            )
-        else:
-            prefix = (
-                "This is a user-created scheduled assistant task. Execute it now and "
-                "return a concise user-facing report.\n\n"
-            )
-        return prefix + task.prompt
+        return TaskPromptGuidance.scheduled_task_context(task.task_type) + "\n\nUSER STORED TASK:\n" + task.prompt
 
     async def _mark_success(self, task: ScheduledTask) -> None:
         """Persist success state and advance or complete the task."""
@@ -276,6 +269,20 @@ class PromptScheduler:
         last = PromptScheduler._as_aware(task.last_run_at)
         elapsed_minutes = (now - last).total_seconds() / 60
         return elapsed_minutes >= task.interval_minutes
+
+    @staticmethod
+    def _should_suppress_condition_notification(task: ScheduledTask, response: str) -> bool:
+        """Return whether a scheduled condition check intentionally has no update.
+
+        This supports proactive web-information watches: the assistant may run a
+        bounded check, inspect fetched evidence, and respond with the sentinel
+        ``LJS_NO_NOTIFICATION`` when nothing meaningful changed.  Other task
+        types always notify so reminders and scheduled reports are preserved.
+        """
+        if task.task_type != "condition_check":
+            return False
+        text = str(response or "").strip()
+        return text == "LJS_NO_NOTIFICATION"
 
     async def _send_response(self, task: ScheduledTask, response: str) -> None:
         """Deliver a task response to the user via notifications."""

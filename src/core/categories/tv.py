@@ -22,6 +22,7 @@ from src.core.categories.tv_agent import TvAgentSearchMixin
 from src.core.categories.tv_context import TvContextMixin
 from src.core.categories.tv_metadata_info import TvMetadataInfoMixin
 from src.core.categories.tv_workflows import TvWorkflowMixin
+from src.core.categories.tv_web_research import TvWebResearchMixin
 from src.core.categories.season_folders import SeasonFolderLayout
 from src.core.categories.search_patterns import SearchPatterns
 from src.core.categories.types import ParsedMedia, ScannedItem, ScannedFileObservation
@@ -109,7 +110,7 @@ class TvSearchPatterns(SearchPatterns):
         return None
 
 
-class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, TvWorkflowMixin, CategoryMedia):
+class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, TvWorkflowMixin, TvWebResearchMixin, CategoryMedia):
     """Television shows with seasons and episodes."""
 
     category_id = "tv"

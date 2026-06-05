@@ -8,10 +8,13 @@ mutation logic invoked via ActionGateway from UI endpoints.
 import uuid
 from typing import Any
 
+from loguru import logger
+
 from src.core.config import SettingsManager
 from src.core.database import Database
 from src.core.security.command_policy import CommandPolicy, CommandPolicyError
 from src.search.jackett_manager import JackettManager
+from src.search.web.searxng_manager import SearXNGManager
 from src.integrations.slskd_manager import SlskdManager
 from src.core.models import SoulseekSettings
 from src.integrations.slskd_client import SlskdClient
@@ -30,16 +33,18 @@ class SystemActionHandler:
         settings_manager — SettingsManager (save settings after jackett install)
         browser_runtime — BrowserRuntime (playwright management)
         jackett_manager — JackettManager (jackett installation)
+        searxng_manager — SearXNGManager (managed web-research installation)
         comms_registry — CommsRegistry (bridge installation)
         db — Database (user CRUD)
         auth_service — AuthService (password hashing)
     """
 
-    def __init__(self, settings_manager: SettingsManager, browser_runtime: BrowserRuntime, jackett_manager: JackettManager, slskd_manager: SlskdManager | None, comms_registry: CommsRegistry, db: Database, auth_service: AuthService) -> None:
+    def __init__(self, settings_manager: SettingsManager, browser_runtime: BrowserRuntime, jackett_manager: JackettManager, slskd_manager: SlskdManager | None, comms_registry: CommsRegistry, db: Database, auth_service: AuthService, searxng_manager: SearXNGManager | None = None) -> None:
         self._sm = settings_manager
         self._browser = browser_runtime
         self._jackett = jackett_manager
         self._slskd = slskd_manager
+        self._searxng = searxng_manager
         self._comms = comms_registry
         self._db = db
         self._auth = auth_service
@@ -114,6 +119,106 @@ class SystemActionHandler:
         self._jackett.save_to_settings(self._sm.settings)
         self._sm.save(self._sm.settings)
         return {"status": "running", "url": self._jackett.url, "api_key": self._jackett.api_key or ""}
+
+
+    async def install_searxng(self) -> dict:
+        """Install, configure, start, and persist the managed local SearXNG runtime."""
+        logger.info("SystemActionHandler: install_searxng requested from ActionGateway")
+        if not self._searxng:
+            return {"status": "error", "error": "SearXNG manager not configured"}
+        settings = self._sm.settings
+        settings.web_search.enabled = True
+        settings.web_search.provider = "searxng"
+        settings.web_search.mode = "managed"
+        settings.web_search.auto_install = True
+        settings.web_search.status = "installing"
+        settings.web_search.status_message = "Installing managed local SearXNG."
+        self._sm.save(settings)
+        ok = await self._searxng.start(settings)
+        self._searxng.save_to_settings(settings)
+        self._sm.save(settings)
+        health = await self._searxng.health_check(settings)
+        if not ok:
+            return {"status": "error", "ready": False, "error": health.get("error") or self._searxng.last_error, "health": health}
+        return {"status": "ready", "ready": True, "url": self._searxng.url, "health": health}
+
+    async def start_searxng(self) -> dict:
+        """Start the already managed SearXNG runtime from saved settings."""
+        logger.info("SystemActionHandler: start_searxng requested from ActionGateway")
+        if not self._searxng:
+            return {"status": "error", "error": "SearXNG manager not configured"}
+        settings = self._sm.settings
+        settings.web_search.enabled = True
+        settings.web_search.provider = "searxng"
+        settings.web_search.mode = "managed"
+        ok = await self._searxng.start(settings)
+        self._searxng.save_to_settings(settings)
+        self._sm.save(settings)
+        health = await self._searxng.health_check(settings)
+        if not ok:
+            return {"status": "error", "ready": False, "error": health.get("error") or self._searxng.last_error, "health": health}
+        return {"status": "ready", "ready": True, "url": self._searxng.url, "health": health}
+
+    async def repair_searxng(self) -> dict:
+        """Repair generated config/venv and restart managed SearXNG."""
+        logger.info("SystemActionHandler: repair_searxng requested from ActionGateway")
+        if not self._searxng:
+            return {"status": "error", "error": "SearXNG manager not configured"}
+        settings = self._sm.settings
+        result = await self._searxng.repair(settings)
+        self._searxng.save_to_settings(settings)
+        self._sm.save(settings)
+        return result
+
+
+    async def upgrade_searxng(self) -> dict:
+        """Upgrade/reinstall managed SearXNG with rollback on failure."""
+        logger.info("SystemActionHandler: upgrade_searxng requested from ActionGateway")
+        if not self._searxng:
+            return {"status": "error", "error": "SearXNG manager not configured"}
+        settings = self._sm.settings
+        settings.web_search.provider = "searxng"
+        settings.web_search.mode = "managed"
+        settings.web_search.status = "upgrading"
+        settings.web_search.status_message = "Upgrading managed local SearXNG."
+        self._sm.save(settings)
+        result = await self._searxng.upgrade(settings)
+        self._searxng.save_to_settings(settings)
+        self._sm.save(settings)
+        return result
+
+    async def rollback_searxng(self) -> dict:
+        """Rollback managed SearXNG to the most recent LJS-owned backup."""
+        logger.info("SystemActionHandler: rollback_searxng requested from ActionGateway")
+        if not self._searxng:
+            return {"status": "error", "error": "SearXNG manager not configured"}
+        settings = self._sm.settings
+        result = await self._searxng.rollback(settings)
+        self._searxng.save_to_settings(settings)
+        self._sm.save(settings)
+        return result
+
+    async def uninstall_searxng(self) -> dict:
+        """Remove only the LJS-owned managed SearXNG runtime."""
+        logger.info("SystemActionHandler: uninstall_searxng requested from ActionGateway")
+        if not self._searxng:
+            return {"status": "error", "error": "SearXNG manager not configured"}
+        settings = self._sm.settings
+        result = await self._searxng.uninstall(settings)
+        self._sm.save(settings)
+        return result
+
+    async def stop_searxng(self) -> dict:
+        """Stop only the SearXNG process owned by this LJS process."""
+        logger.info("SystemActionHandler: stop_searxng requested from ActionGateway")
+        if not self._searxng:
+            return {"status": "error", "error": "SearXNG manager not configured"}
+        result = await self._searxng.stop()
+        settings = self._sm.settings
+        settings.web_search.status = "stopped"
+        settings.web_search.status_message = "Managed SearXNG stopped."
+        self._sm.save(settings)
+        return result
 
     async def install_soulseek(self) -> dict:
         """Install, configure, start, and persist the managed slskd runtime."""

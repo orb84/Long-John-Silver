@@ -903,3 +903,231 @@ semantic sections that can be reflowed by CSS.  Components should avoid fixed
 pixel widths and viewport assumptions.  The shell uses width and aspect-ratio
 breakpoints because mobile browser/device emulation can report a wider CSS
 viewport than the visible frame.
+
+## Round 218 managed SearXNG web-research boundary
+
+SearXNG is an optional managed web-research sidecar, not an acquisition backend.
+Managed mode owns an LJS-local source checkout, virtual environment, generated
+`settings.yml`, logs, and child process.  First-run setup and Compass may install
+or repair this sidecar, but the manager must not adopt an already-running system
+or user SearXNG process; if the preferred localhost port is occupied, managed
+mode chooses another port and persists that endpoint.
+
+The only normal backend path is:
+
+```text
+SearXNGSearchProvider -> WebSearchService -> future WebResearchService/evidence bundle
+    -> category-owned interpretation hooks -> CategoryItemCoordinator/category lifecycle
+```
+
+SearXNG search hits are public-source candidates. They are not queueable release
+candidates, torrent indexers, structured metadata records, or durable facts. The
+download/search acquisition path remains Jackett/Torznab, Soulseek/slskd, and
+category-owned providers. Generic web-search code must not interpret TV air
+windows, episode labels, sports replays, book editions, music releases, or any
+other category semantics.
+
+Setup and Compass expose both automatic local SearXNG and manual/existing
+SearXNG configuration. Automatic local setup is tested first because manual mode
+can hide installer bugs behind a pre-existing service.
+
+## Round 219 web-research evidence provenance
+
+`WebResearchService` is the category-neutral boundary between configured public
+web search providers and category interpretation.  It may plan bounded searches,
+dedupe/canonicalize result URLs, fetch pages through `WebReader`, classify broad
+source kinds, score evidence conservatively, and persist provenance in
+`web_research_query_log` and `web_source_evidence`.  It must not decide that a
+source proves a TV air date, album release, book edition, sports fixture, or any
+other category fact.
+
+The persisted `category_fact_provenance` table exists for category-owned hooks.
+Only a category interpretation step should write durable facts there, and any
+state change based on those facts must still go through `CategoryItemCoordinator`
+or the owning category lifecycle/watch path.  Raw web-search snippets may be
+stored as discovery context, but they are never authoritative facts and must not
+be used directly to mutate item state, release watches, suggestions, or download
+queues.
+
+The normal public-web path is now:
+
+```text
+SearXNG/other WebSearchProvider
+    -> WebSearchService
+    -> WebResearchService evidence bundle
+    -> category-owned interpretation hook
+    -> CategoryItemCoordinator / lifecycle persistence when accepted
+```
+
+The `web_research` assistant tool returns evidence bundles with
+`facts_authoritative=false`.  It is a safer follow-up to `web_search` when a task
+requires fetched pages rather than snippets.  Existing media download flows still
+use metadata/category context, `search_media_torrents`, candidate handles, and
+`queue_download`; web-research results are not queueable candidates.
+
+## Round 220 category-owned web-research hooks
+
+Category web research is now a two-step contract.  Generic orchestration asks a
+category to build a public-web research plan, runs the existing evidence
+collector, then asks that same category to interpret the fetched evidence.  The
+orchestrator lives in `src/search/web/category_research.py` and must stay free of
+category-specific branches, acquisition provider calls, and queue/download
+operations.
+
+The category hook contract is:
+
+```text
+CategoryWebResearchInput
+    -> category.build_web_research_plan(...)
+    -> WebResearchService.collect_evidence(...)
+    -> category.interpret_web_evidence(...)
+    -> category_fact_provenance rows only
+```
+
+The base category default returns no searches and no durable facts.  Concrete
+categories opt in by overriding the hook methods.  TV now implements these hooks
+in `src/core/categories/tv_web_research.py` for official/primary source
+discovery, air-date corroboration signals, and delay/postponement news signals.
+Those interpreted facts are provenance records, not item mutations, and
+`can_mutate_item` remains false until a separate category-owned workflow or
+coordinator path deliberately applies a supported fact.
+
+The `category_web_research` assistant tool and
+`/api/category-web-research/test` diagnostic endpoint expose this hook path. They
+must warn callers that category web research does not authorize downloads and
+does not make search snippets authoritative.  Future music, books, sports, or
+custom categories should add equivalent category-owned hook implementations
+rather than extending the web-search core.
+
+## Round 221 managed SearXNG hardening and rollback
+
+Managed SearXNG must use the same project-level `data/` root pattern as other
+managed runtimes.  Because `src/search/web/searxng_manager.py` is one package
+level deeper than `src/search/jackett_manager.py`, its project-root calculation
+must resolve to the repository root, not `src/data`.  Clean-machine installer
+checks should fail if managed SearXNG drifts into `src/data/searxng`.
+
+Managed upgrade is a sidecar lifecycle operation, not a web-search query.  The
+manager must stop only the LJS-owned child process, create a backup of the
+LJS-owned source checkout, venv, generated settings, and state, then reinstall
+from the configured source ref.  If upgrade/start/JSON health fails, rollback
+restores the backup before reporting status.  Rollback and uninstall also affect
+only the LJS-owned managed runtime directories; manual/external SearXNG
+endpoints are never deleted or adopted.
+
+Compass may expose install, upgrade, rollback, repair, stop, and health controls,
+but these remain system actions routed through `ActionGateway`.  They must not
+bypass the managed-service boundary and must not register SearXNG with torrent
+aggregation, candidate workspaces, or download queueing.
+
+## Round 222 — Web Research Logging and Proactive Information Watches
+
+Managed SearXNG and public web research must be observable before it ships to real devices. The managed installer writes process logs plus `manager-events.jsonl` under the LJS-owned SearXNG logs directory; search and research services log provider choice, health checks, fallback decisions, source dedupe, page-fetch status, evidence persistence, and category interpretation counts. Secret-looking fields must be redacted in structured trace events.
+
+Compass/Settings and the first-run setup panel both expose automatic local SearXNG installation. Compass must save the visible web-search settings before invoking `/api/searxng/install` so source-ref/fallback/mode changes are respected. DuckDuckGo HTML is a separate degraded web-research fallback control and must not reuse the torrent direct-scraper fallback toggle.
+
+Future proactive public-information tracking should reuse existing systems:
+
+- user-authored recurring checks go through `PromptScheduler` and `create_scheduled_task` with `task_type=condition_check`;
+- category-owned item news/rumor watches should be category lifecycle/watch hooks, not generic category branches;
+- SearXNG/WebResearchService discover and fetch evidence;
+- LLM evaluation may decide whether an update is worth notifying the user, but must not silently mutate category items or queue downloads.
+
+This remains separate from media acquisition. Web research tracks public knowledge, patch notes, rumors, release-date/news evidence, and metadata gaps; Jackett/Soulseek/category acquisition providers remain responsible for downloadable candidates.
+
+## Round 223 — First-Class Web Information Watches
+
+Web information watches are now a durable, opt-in layer for proactive public-information tracking. A watch stores the user's objective, cadence, optional category/item scope, bounded query plan, notification policy, and last evidence signature. Watch events store run outcomes and evidence/query-log references. The watch layer is category-neutral: it may call `WebResearchService` for generic public topics or `CategoryWebResearchService` when a category/item scope is present, but it must not interpret category semantics in core code.
+
+The watch service is not a media acquisition path. It must not call torrent search, Soulseek search, `queue_download`, or category-item mutation APIs. It may remember that the original user explicitly allowed future download queueing (`allow_download_queueing=true`), but scheduled runs must still prove release/availability through category/download tools before any queue action. Public web evidence alone never authorizes a download.
+
+Assistant-created watches use `create_web_information_watch`, which creates the durable watch and schedules a bounded `PromptScheduler` condition check. The scheduled prompt first calls `run_web_information_watch`; if the evidence has not changed and no meaningful condition is met, the assistant replies exactly `LJS_NO_NOTIFICATION`, which the scheduler suppresses instead of notifying the user. This prevents weekly checks from producing noise.
+
+When the user asks for a future item workflow such as “find out when the next season of show X starts and start downloading/tracking it,” the allowed flow is:
+
+```text
+metadata_lookup / category_web_research
+        ↓
+track_category_item, if the item is not already tracked
+        ↓
+create_web_information_watch(intent=next_season_start_tracking, allow_download_queueing=true)
+        ↓
+scheduled run_web_information_watch collects evidence
+        ↓
+LLM evaluates novelty/safety
+        ↓
+only if released/available, use generic category download tools to search/select/queue
+```
+
+The durable tracking mutation is owned by `CategoryItemCoordinator` through the generic `track_category_item` tool. TV-specific next-season/news/rumor query wording lives in the TV category web-research hook, not in the watch service or other core layers.
+
+## Round 228 public-web source sufficiency for agent research
+
+Managed SearXNG installation success is not enough by itself: the agent must
+also expose and select the public-web evidence tools when the user's already
+routed SEARCH/DOWNLOAD turn asks for live public information.  Category YAML may
+narrow ordinary media/download tools, but it must not hide `web_search`,
+`web_research`, `category_web_research`, or the web-information watch tools from
+turns where they are otherwise allowed by intent/risk policy.
+
+Structured metadata services remain the first source for stable catalogue facts
+such as show identity, seasons, cast, and known air dates.  They are not
+sufficient for questions about rumours, current news, leaks, production reports,
+renewal/cancellation reports, patch notes, roadmaps, or public discussion.  In
+those cases, a metadata-only answer is considered source-incomplete even when
+`metadata_lookup` succeeds.  The advisory planner should include a non-mutating
+public evidence step: prefer `category_web_research` for category items so the
+owning category can interpret evidence; otherwise use `web_research` and only
+fall back to raw `web_search` as candidate-source discovery.
+
+This is a source-sufficiency rule, not natural-language intent routing.  Intent
+classification remains LLM-owned.  The rule applies after a turn has already
+been routed into SEARCH/DOWNLOAD research and prevents the LLM from treating
+metadata snapshots as proof that no current public rumours/news exist.
+
+### Round 229 — Public web evidence quality and managed SearXNG runtime
+
+Managed SearXNG is now part of the runtime contract, not only the installer contract. If `web_search.provider=searxng` and `web_search.mode=managed`, LJS starts the managed sidecar after the web UI readiness gate and web tools may make one lazy start attempt before reporting provider failure or using an explicit degraded fallback. A previously installed but stopped SearXNG process must not silently cause every agent research turn to fall back to DuckDuckGo HTML.
+
+Public web evidence remains category-neutral until category hooks interpret it, but the assistant must apply source-quality judgement. Search snippets are leads, not facts. Fetched official/provider/trade/reference sources beat unfetched snippets, fan calendars, social posts, SEO schedule pages, or fallback-only results. For current/rumour/news/future-schedule questions, the LLM must search with recency and source intent in mind, and must report uncertainty rather than extrapolating schedules or claiming no official information from weak or stale results.
+
+For TV, category hooks own search planning and interpretation: next-season/rumour searches preserve the user query, include current-year and production/renewal/interview terms, and use recency windows. Episode schedule answers must be grounded in provider episode lists or high-confidence title-bound web sources; local downloaded episode lists and generic weekly assumptions are not schedule evidence.
+
+
+## Round 230 LLM-planned category web research
+
+Category public web research is now LLM-planned by default.  Generic code must not enumerate every natural-language synonym for research objectives such as rumors, renewal chatter, interviews, patch notes, or production updates.  The category exposes a `web_research_contract()` describing capabilities, evidence expectations, and source-quality rules; the LLM receives that contract plus the user's exact query/focus and produces a bounded `CategoryWebResearchPlan`.
+
+Deterministic code still owns provider management, budgets, URL fetching, provenance storage, and safety gates.  Category deterministic plans remain fallback behavior when the LLM planner is unavailable or returns invalid output.  They are not the primary intent-mapping mechanism.
+
+`category_web_research` may receive a free-form semantic `intent`.  Exact enum-style labels are not required.  The `query` argument is the important carrier of user intent and must be preserved into category planning.
+
+
+## Round 231 — Public web research prompt guidance and source-planning context
+
+Public web research prompt/context is a shared contract. Generic code must provide the LLM with current runtime date, source-quality rules, freshness controls, and evidence sufficiency criteria; category code must add domain-specific research guidance through category prompts/contracts. Do not solve future web-research misses by adding one deterministic natural-language synonym at a time.
+
+The reusable category-neutral guidance lives in `src/search/web/research_guidance.py` and is injected into:
+
+- the main assistant SEARCH/DOWNLOAD prompt through `PromptBuilder`;
+- advisory structured planning through `ReasoningPlanner`;
+- category web-research planning through `LLMCategoryWebResearchPlanner`;
+- scheduled web-information watch prompts.
+
+Category-specific web-research rules belong in category-owned surfaces such as `src/core/categories/prompts/<category>.md` and `CategoryContractMixin.web_research_contract()`. For TV, the contract describes current-news/rumour/production/interview/source-quality/freshness behavior, but the generic planner still treats intent labels as semantic hints rather than enum strings.
+
+When tools expose provider controls, the LLM must be told to use them: categories such as `news`/`general`, `time_range` values such as `day`/`month`/`year`, exact title phrases, and targeted source operators such as `site:` for official/source-of-record checks. Search snippets remain leads; fetched pages and category interpretation are required before confident current/future claims. Negative claims such as “no official word” require suitable current official/reference/trade coverage and must not be made from stale, degraded, or snippet-only results.
+
+`web_search` now exposes optional `categories`, `language`, and `time_range` parameters so the LLM can use the same freshness/source controls available to `web_research` and `category_web_research`. `WebResearchService` may reorder candidate fetches within the bounded fetch budget to prefer likely official/trade/reference/news evidence over social/fan/SEO pages, but this remains category-neutral and does not turn search snippets into facts.
+
+## Round 232 LLM Prompt Guidance Rule
+
+LLM-facing behavior must be driven by concise shared task guidance plus category-owned context, not by scattered long rule blobs or hard-coded phrase mappings.
+
+- Generic operating discipline lives in `src/ai/task_prompt_guidance.py`.
+- Public web/source-quality discipline lives in `src/search/web/research_guidance.py`.
+- Category-specific prompt guidance and research/download rules live in category prompt files, category YAML/contracts, and category hooks.
+- Main chat prompts, advisory planner prompts, scheduled task wrappers, and web-information watch prompts should reuse the shared generic guidance so smaller models receive consistent instructions.
+- Tool schemas should describe semantic objectives and stable handles clearly. They should not imply exact enum labels for natural-language intent unless the receiving tool actually requires an enum.
+- The LLM decides semantic research/action strategy from the user wording and current context. Deterministic code validates available tools, schemas, candidate IDs, budgets, evidence provenance, confirmation gates, and side-effect safety.
+- Public web evidence can inform category/download decisions, but category/download tools must still prove release/availability before any queueing action.

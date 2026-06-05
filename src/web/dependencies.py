@@ -40,6 +40,7 @@ class WebDependencies:
     recommender: Any = None
     release_group_tracker: Any = None
     scheduler: Any = None
+    prompt_scheduler: Any = None
     supervisor: Any = None
     comms_registry: Any = None
     torrent_racer: Any = None
@@ -47,6 +48,7 @@ class WebDependencies:
     browser_runtime: Any = None
     jackett_manager: Any = None
     slskd_manager: Any = None
+    searxng_manager: Any = None
     storage_monitor: Any = None
     artwork_manager: Any = None
     metadata_enricher: Any = None

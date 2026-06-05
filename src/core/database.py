@@ -16,6 +16,7 @@ from src.core.repositories.user import UserRepository
 from src.core.repositories.system import SystemRepository
 from src.core.repositories.notifications import NotificationRepository
 from src.core.repositories.release_watch import ReleaseWatchRepository
+from src.core.repositories.web_research import WebResearchRepository
 from src.core.repositories.base import BaseRepository
 
 
@@ -234,6 +235,46 @@ class Database:
             "last_candidate_summary_json": "TEXT NOT NULL DEFAULT '{}'",
             "last_outcome_json": "TEXT NOT NULL DEFAULT '{}'",
         },
+        "web_information_watch": {
+            "owner_type": "TEXT NOT NULL DEFAULT 'user_task'",
+            "title": "TEXT NOT NULL DEFAULT ''",
+            "objective": "TEXT NOT NULL DEFAULT ''",
+            "query": "TEXT NOT NULL DEFAULT ''",
+            "intent": "TEXT NOT NULL DEFAULT 'general_research'",
+            "category_id": "TEXT NOT NULL DEFAULT ''",
+            "item_id": "TEXT NOT NULL DEFAULT ''",
+            "item_name": "TEXT NOT NULL DEFAULT ''",
+            "language": "TEXT NOT NULL DEFAULT 'auto'",
+            "cadence_minutes": "INTEGER NOT NULL DEFAULT 10080",
+            "enabled": "INTEGER NOT NULL DEFAULT 1",
+            "notify_only_if_meaningful": "INTEGER NOT NULL DEFAULT 1",
+            "llm_evaluation_required": "INTEGER NOT NULL DEFAULT 1",
+            "allow_download_queueing": "INTEGER NOT NULL DEFAULT 0",
+            "query_plan_json": "TEXT NOT NULL DEFAULT '{}'",
+            "user_feedback_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_run_at": "TEXT",
+            "next_run_at": "TEXT",
+            "last_event_id": "INTEGER",
+            "last_evidence_signature": "TEXT NOT NULL DEFAULT ''",
+            "last_status": "TEXT NOT NULL DEFAULT 'never_run'",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+        },
+        "web_information_watch_event": {
+            "watch_id": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'completed'",
+            "summary": "TEXT NOT NULL DEFAULT ''",
+            "event_type": "TEXT NOT NULL DEFAULT 'no_change'",
+            "evidence_signature": "TEXT NOT NULL DEFAULT ''",
+            "source_evidence_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+            "query_log_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+            "notification_recommended": "INTEGER NOT NULL DEFAULT 0",
+            "llm_review_required": "INTEGER NOT NULL DEFAULT 1",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+            "error": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+        },
         "category_items": {
             "category_id": "TEXT NOT NULL DEFAULT ''",
             "item_id": "TEXT NOT NULL DEFAULT ''",
@@ -317,6 +358,11 @@ class Database:
         "notifications": ("id", "status", "dedupe_key"),
         "notification_deliveries": ("notification_id", "bridge_id", "status", "attempts", "updated_at"),
         "release_watches": ("id", "category_id", "item_id", "unit_key", "next_check_at", "expected_air_at", "watch_start_at", "requirements_json"),
+        "web_research_query_log": ("id", "provider", "query", "status", "started_at"),
+        "web_source_evidence": ("id", "category_id", "item_id", "canonical_url", "status"),
+        "category_fact_provenance": ("id", "category_id", "item_id", "fact_type", "value_json"),
+        "web_information_watch": ("id", "title", "objective", "intent", "enabled", "next_run_at"),
+        "web_information_watch_event": ("id", "watch_id", "event_type", "created_at"),
     }
 
     def __init__(self, db_path: str = "data/ljs.db"):
@@ -331,6 +377,7 @@ class Database:
         self.plan_traces: Optional[PlanTraceStore] = None
         self.notifications: Optional[NotificationRepository] = None
         self.release_watches: Optional[ReleaseWatchRepository] = None
+        self.web_research: Optional[WebResearchRepository] = None
 
     async def initialize(self) -> None:
         """Create the base schema and run any pending migrations.
@@ -355,6 +402,7 @@ class Database:
         self.plan_traces = PlanTraceStore(self._db)
         self.notifications = NotificationRepository(self._db)
         self.release_watches = ReleaseWatchRepository(self._db)
+        self.web_research = WebResearchRepository(self._db)
 
         logger.info(
             f"Database initialized at {self._db_path} "
@@ -854,6 +902,121 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_release_watches_due
                 ON release_watches(status, next_check_at);
+
+            CREATE TABLE IF NOT EXISTS web_research_query_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_id TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '',
+                category_id TEXT NOT NULL DEFAULT '',
+                item_id TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL,
+                parameters_json TEXT NOT NULL DEFAULT '{}',
+                intent TEXT NOT NULL DEFAULT 'general_research',
+                status TEXT NOT NULL DEFAULT 'running',
+                error_code TEXT NOT NULL DEFAULT '',
+                result_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_research_query_item
+                ON web_research_query_log(category_id, item_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_web_research_query_status
+                ON web_research_query_log(status, started_at);
+
+            CREATE TABLE IF NOT EXISTS web_source_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_log_id INTEGER,
+                category_id TEXT NOT NULL DEFAULT '',
+                item_id TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'unknown',
+                source_name TEXT NOT NULL DEFAULT '',
+                fetched_at TEXT NOT NULL DEFAULT '',
+                published_at TEXT NOT NULL DEFAULT '',
+                extracted_text_hash TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                snippet TEXT NOT NULL DEFAULT '',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'candidate',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(category_id, item_id, canonical_url),
+                FOREIGN KEY(query_log_id) REFERENCES web_research_query_log(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_source_evidence_item
+                ON web_source_evidence(category_id, item_id, source_kind, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_web_source_evidence_url
+                ON web_source_evidence(canonical_url);
+
+            CREATE TABLE IF NOT EXISTS category_fact_provenance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id TEXT NOT NULL DEFAULT '',
+                item_id TEXT NOT NULL DEFAULT '',
+                fact_type TEXT NOT NULL DEFAULT '',
+                value_json TEXT NOT NULL DEFAULT '{}',
+                source_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                decided_by TEXT NOT NULL DEFAULT 'deterministic',
+                decided_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_category_fact_provenance_item
+                ON category_fact_provenance(category_id, item_id, fact_type, decided_at);
+
+            CREATE TABLE IF NOT EXISTS web_information_watch (
+                id TEXT PRIMARY KEY,
+                owner_type TEXT NOT NULL DEFAULT 'user_task',
+                title TEXT NOT NULL DEFAULT '',
+                objective TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                intent TEXT NOT NULL DEFAULT 'general_research',
+                category_id TEXT NOT NULL DEFAULT '',
+                item_id TEXT NOT NULL DEFAULT '',
+                item_name TEXT NOT NULL DEFAULT '',
+                language TEXT NOT NULL DEFAULT 'auto',
+                cadence_minutes INTEGER NOT NULL DEFAULT 10080,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                notify_only_if_meaningful INTEGER NOT NULL DEFAULT 1,
+                llm_evaluation_required INTEGER NOT NULL DEFAULT 1,
+                allow_download_queueing INTEGER NOT NULL DEFAULT 0,
+                query_plan_json TEXT NOT NULL DEFAULT '{}',
+                user_feedback_json TEXT NOT NULL DEFAULT '{}',
+                last_run_at TEXT,
+                next_run_at TEXT,
+                last_event_id INTEGER,
+                last_evidence_signature TEXT NOT NULL DEFAULT '',
+                last_status TEXT NOT NULL DEFAULT 'never_run',
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_information_watch_due
+                ON web_information_watch(enabled, next_run_at, cadence_minutes);
+            CREATE INDEX IF NOT EXISTS idx_web_information_watch_item
+                ON web_information_watch(category_id, item_id, intent, enabled);
+
+            CREATE TABLE IF NOT EXISTS web_information_watch_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                watch_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'completed',
+                summary TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT 'no_change',
+                evidence_signature TEXT NOT NULL DEFAULT '',
+                source_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                query_log_ids_json TEXT NOT NULL DEFAULT '[]',
+                notification_recommended INTEGER NOT NULL DEFAULT 0,
+                llm_review_required INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(watch_id) REFERENCES web_information_watch(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_information_watch_event_watch
+                ON web_information_watch_event(watch_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_web_information_watch_event_type
+                ON web_information_watch_event(event_type, notification_recommended, created_at);
 
             CREATE INDEX IF NOT EXISTS idx_upgrades_item ON upgrade_candidates(category_id, item_id, status);
             CREATE INDEX IF NOT EXISTS idx_behavior_item ON behavior_log(category_id, item_id, action);

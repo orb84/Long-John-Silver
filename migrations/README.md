@@ -24,3 +24,11 @@ Keep migrations additive and simple. Comments are allowed, including comments wi
 ## 108 — Metadata cache and provider rate limits
 
 Adds `category_metadata_cache` for provider result caching and `provider_rate_limits` for persisted upstream backoff/rate-limit state. Fresh installs also create these tables in the base schema.
+
+## 110 — Web research evidence provenance
+
+Adds category-neutral public web-research provenance tables: `web_research_query_log`, `web_source_evidence`, and `category_fact_provenance`. These tables store search/query logs, fetched source evidence, and later category-owned fact decisions. Search snippets remain discovery leads, not durable facts.
+
+## 111 — Web information watches
+
+Adds durable proactive web-information tracking tables: `web_information_watch` and `web_information_watch_event`. Watches store user/category tracking objectives, cadence, query plans, notification policy, and last evidence signature. Events store run outcomes and provenance references. The watch layer is public-information tracking only; it does not mutate category items or queue downloads.

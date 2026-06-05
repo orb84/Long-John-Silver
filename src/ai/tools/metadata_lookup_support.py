@@ -80,6 +80,9 @@ class MetadataLookupRequest:
         season = _safe_int(arguments.get("season")) or MetadataLookupRequest.infer_season_number(coordinate_text)
         episode = _safe_int(arguments.get("episode")) or MetadataLookupRequest.infer_episode_number(coordinate_text)
         include_episodes = bool(arguments.get("include_episodes", season is not None or episode is not None))
+        question_blob = f"{query} {question or ''}".casefold()
+        if not include_episodes and any(term in question_blob for term in ("next episode", "upcoming episode", "episode air", "air date", "airdate", "when does", "when will", "quando")):
+            include_episodes = True
         category_id = str(arguments.get("category_id") or "").strip().lower() or None
         if category_id not in {None, "tv", "movie", "general"}:
             category_id = None
@@ -309,7 +312,14 @@ class LibraryMetadataSnapshotLookup:
             return bool(result.get("cast") or result.get("lead_cast") or result.get("cast_names"))
         if any(term in q for term in episode_terms):
             season_details = result.get("season_details") if isinstance(result.get("season_details"), dict) else {}
-            return bool(result.get("episodes") or season_details.get("episodes"))
+            episodes = result.get("episodes") or season_details.get("episodes")
+            # Persisted library snapshots often store local downloaded episodes as
+            # {season: [episode_numbers]}. That proves local ownership, not an
+            # authoritative provider schedule, so it cannot answer air-date or
+            # next-episode questions.
+            if not isinstance(episodes, list):
+                return False
+            return any(isinstance(ep, dict) and (ep.get("air_date") or ep.get("airdate") or ep.get("name")) for ep in episodes)
         if any(term in q for term in season_terms):
             return bool(
                 result.get("number_of_seasons")

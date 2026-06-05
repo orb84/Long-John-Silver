@@ -21,15 +21,25 @@ class WebResearcher:
     WebResearchReport with evidence, citations, and unresolved questions.
     """
 
-    def __init__(self, runtime: "BrowserRuntime", web_reader: "WebReader"):
-        """Initialize with browser runtime and web reader.
+    def __init__(
+        self,
+        runtime: "BrowserRuntime",
+        web_reader: "WebReader",
+        web_search_config: object | None = None,
+        web_research_repository: object | None = None,
+    ):
+        """Initialize with browser runtime, web reader, and optional research services.
 
         Args:
             runtime: BrowserRuntime for page fetching.
             web_reader: WebReader for httpx-based page reading.
+            web_search_config: Optional configured WebSearchConfig.
+            web_research_repository: Optional repository for evidence provenance.
         """
         self._runtime = runtime
         self._web_reader = web_reader
+        self._web_search_config = web_search_config
+        self._web_research_repository = web_research_repository
         self._extractors: list["PageExtractor"] = []
 
     def register_extractor(self, extractor: "PageExtractor") -> None:
@@ -94,54 +104,37 @@ class WebResearcher:
     async def research_release_info(self, title: str) -> dict:
         """Find release dates, renewal status, and episode schedule info.
 
-        Prefers structured TMDB/TVMaze APIs via the web_reader before
-        attempting browser-based scraping.
-
-        Args:
-            title: The media title to research.
-
-        Returns:
-            Dict with 'topic', 'summary', 'evidence', 'visited_urls'.
+        Uses the configured WebResearchService instead of a hard-coded search
+        scraper.  SearXNG/other providers discover candidate public sources;
+        WebReader fetches pages before evidence is surfaced.
         """
+        from src.core.models import WebResearchBudget, WebResearchRequest, WebSearchConfig
+        from src.search.web.research import WebResearchService
+
+        config = self._web_search_config or WebSearchConfig()
+        request = WebResearchRequest(
+            query=f"{title} release date season announced renewal status",
+            intent="release_info_public_evidence",
+            item_name=title,
+            categories=["general", "news"],
+            max_results=getattr(config, "max_results", 5),
+            budget=WebResearchBudget(max_urls_to_fetch=5, require_page_extraction_before_facts=True),
+        )
+        bundle = await WebResearchService(
+            config,
+            web_reader=self._web_reader,
+            repository=self._web_research_repository,
+        ).collect_evidence(request)
         report = WebResearchReport(
             topic=f"Release info for {title}",
-            summary="",
-            evidence=[],
-            visited_urls=[],
+            summary=(
+                f"Collected {len(bundle.evidence)} fetched public-source evidence item(s) for {title}."
+                if bundle.evidence else f"No fetched release-info evidence found for {title}."
+            ),
+            evidence=bundle.evidence,
+            visited_urls=[source.canonical_url or source.url for source in bundle.sources],
+            unresolved_questions=bundle.unresolved_questions or bundle.warnings,
         )
-
-        try:
-            ddg_query = f"{title} release date season announced renewal status"
-            from src.core.models import BrowserFetchRequest
-            from urllib.parse import urlencode
-            params = {"q": ddg_query}
-            url = f"https://html.duckduckgo.com/html/?{urlencode(params)}"
-            request = BrowserFetchRequest(
-                url=url, wait_seconds=2.0, max_content_chars=4000,
-                screenshot_on_failure=False, purpose="release_info",
-            )
-            result = await self._runtime.fetch(request)
-            if result.ok and result.text:
-                report.visited_urls.append(result.final_url)
-                from src.search.web.duckduckgo_html import DuckDuckGoHtmlSearchProvider
-                parsed = DuckDuckGoHtmlSearchProvider.parse_html(result.html or "", 3)
-                for item in parsed:
-                    report.evidence.append(WebEvidence(
-                        claim=item.title,
-                        source_name="DuckDuckGo",
-                        url=item.url,
-                        snippet=item.snippet or "",
-                        confidence=0.5,
-                    ))
-        except Exception as e:
-            logger.debug(f"Release info search failed for {title}: {e}")
-
-        if report.evidence:
-            report.summary = f"Found {len(report.evidence)} release info results for {title}."
-        else:
-            report.summary = f"No release info found for {title}."
-            report.unresolved_questions = ["Search returned no results."]
-
         return report.model_dump()
 
     async def research_article(self, url: str, question: str | None = None) -> dict:

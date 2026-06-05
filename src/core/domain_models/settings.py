@@ -43,16 +43,46 @@ class BandwidthSchedule(BaseModel):
 
 
 class WebSearchConfig(BaseModel):
-    """Configuration for general web search providers used by the assistant."""
+    """Configuration for general web research providers used by the assistant."""
 
     enabled: bool = True
-    provider: str = "brave"
+    provider: str = "searxng"
+    mode: Literal["managed", "manual"] = "managed"
     api_key: str = ""
     api_base: str = ""
     max_results: int = 5
     allow_duckduckgo_fallback: bool = False
+    auto_install: bool = True
+    managed_port: int = 18888
+    managed_source_ref: str = "master"
+    default_language: str = "auto"
+    default_categories: list[str] = Field(default_factory=lambda: ["general"])
+    safe_search: int = 1
+    request_timeout_seconds: float = 8.0
+    status: str = "not_installed"
+    status_message: str = ""
+    last_health_check: str = ""
 
-
+    @model_validator(mode="after")
+    def _normalize_web_search(self) -> "WebSearchConfig":
+        """Keep web-search settings safe and compatible with legacy configs."""
+        provider = str(self.provider or "searxng").strip().lower()
+        self.provider = provider or "searxng"
+        if self.mode not in {"managed", "manual"}:
+            self.mode = "manual" if self.api_base else "managed"
+        if self.provider != "searxng" and self.mode == "managed":
+            self.mode = "manual"
+        if self.max_results < 1:
+            self.max_results = 5
+        self.managed_port = max(1, min(int(self.managed_port or 18888), 65535))
+        self.managed_source_ref = str(self.managed_source_ref or "master").strip() or "master"
+        self.safe_search = max(0, min(int(self.safe_search or 0), 2))
+        if self.request_timeout_seconds <= 0:
+            self.request_timeout_seconds = 8.0
+        if not self.default_categories:
+            self.default_categories = ["general"]
+        self.default_categories = [str(c).strip() for c in self.default_categories if str(c).strip()] or ["general"]
+        return self
 
 
 

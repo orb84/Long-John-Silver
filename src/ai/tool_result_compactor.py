@@ -61,6 +61,8 @@ class ToolResultCompactor:
             }
         if tool_name == "list_downloads" and isinstance(result, (dict, list)):
             return self._compact_download_list(result)
+        if tool_name == "web_research" and isinstance(result, dict):
+            return self._compact_web_research(result)
         if tool_name in {"read_web_page", "browse_page", "browser_read_selected"}:
             return self._compact_textual(result, 3500, "web content compressed")
         if isinstance(result, str):
@@ -145,6 +147,42 @@ class ToolResultCompactor:
         if isinstance(result, list):
             return [self._compact_candidate(c) if isinstance(c, dict) else c for c in result[:self._SEARCH_CANDIDATE_LIMIT]]
         return self._compact_jsonish(result, self._DEFAULT_MAX_CHARS)
+
+    def _compact_web_research(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Keep fetched web evidence visible without flooding the prompt."""
+        sources = list(result.get("sources") or [])
+        evidence = list(result.get("evidence") or [])
+        return {
+            "ok": result.get("ok"),
+            "topic": result.get("topic"),
+            "intent": result.get("intent"),
+            "provider": result.get("provider"),
+            "facts_authoritative": result.get("facts_authoritative", False),
+            "query_log_ids": result.get("query_log_ids"),
+            "source_count": len(sources),
+            "evidence_count": len(evidence),
+            "sources": [self._compact_web_source(row) for row in sources[:8] if isinstance(row, dict)],
+            "evidence": [self._compact_web_evidence(row) for row in evidence[:6] if isinstance(row, dict)],
+            "warnings": list(result.get("warnings") or [])[:5],
+            "unresolved_questions": list(result.get("unresolved_questions") or [])[:5],
+            "warning": result.get("warning"),
+        }
+
+    @staticmethod
+    def _compact_web_source(row: dict[str, Any]) -> dict[str, Any]:
+        keys = ("title", "canonical_url", "source_kind", "rank", "fetched", "fetch_status", "confidence", "evidence_id")
+        return {key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})}
+
+    @staticmethod
+    def _compact_web_evidence(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "claim": row.get("claim"),
+            "value": row.get("value"),
+            "source_name": row.get("source_name"),
+            "url": row.get("url"),
+            "snippet": str(row.get("snippet") or "")[:900],
+            "confidence": row.get("confidence"),
+        }
 
     def _compact_download_list(self, result: dict[str, Any] | list[Any]) -> Any:
         if isinstance(result, list):

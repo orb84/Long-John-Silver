@@ -123,6 +123,19 @@ class SettingsPanel extends Component {
         this._setVal('pref-jackett-url', this._settings.jackett_url || '');
         this._setVal('pref-jackett-key', this._settings.jackett_api_key || '');
         this._setCheck('pref-direct-scraper-fallback', !!this._settings.direct_scraper_fallback);
+        const webSearch = this._settings.web_search || {};
+        this._setCheck('pref-web-search-enabled', webSearch.enabled !== false);
+        this._setVal('pref-web-search-provider', webSearch.provider || 'searxng');
+        this._setVal('pref-web-search-mode', webSearch.mode || 'managed');
+        this._setVal('pref-web-search-base', webSearch.api_base || '');
+        this._setVal('pref-web-search-key', webSearch.api_key || '');
+        this._setVal('pref-web-search-language', webSearch.default_language || 'auto');
+        this._setVal('pref-web-search-categories', (webSearch.default_categories || ['general']).join('\n'));
+        this._setVal('pref-web-search-safe', webSearch.safe_search === undefined ? '1' : webSearch.safe_search);
+        this._setVal('pref-web-search-timeout', webSearch.request_timeout_seconds || '8');
+        this._setVal('pref-web-search-source-ref', webSearch.managed_source_ref || 'master');
+        this._setCheck('pref-web-search-duckduckgo-fallback', !!webSearch.allow_duckduckgo_fallback);
+        this._updateSearxngStatus({ status: webSearch.status || 'not_installed', error: webSearch.status_message || '', url: webSearch.api_base || '' }, { silent: true });
         const soulseek = this._settings.soulseek || {};
         this._setCheck('pref-soulseek-enabled', !!soulseek.enabled);
         this._setVal('pref-soulseek-host', soulseek.host || 'http://127.0.0.1:5030');
@@ -561,6 +574,123 @@ class SettingsPanel extends Component {
         }
     }
 
+
+    /**
+     * Collect general web research controls into backend settings shape.
+     * @private
+     */
+    _collectWebSearchPayload() {
+        const lines = ((document.getElementById('pref-web-search-categories') || {}).value || '')
+            .split(/\r?\n/)
+            .map(v => v.trim())
+            .filter(Boolean);
+        const provider = (document.getElementById('pref-web-search-provider') || {}).value || 'searxng';
+        const mode = (document.getElementById('pref-web-search-mode') || {}).value || (provider === 'searxng' ? 'managed' : 'manual');
+        return {
+            enabled: !!(document.getElementById('pref-web-search-enabled') || {}).checked,
+            provider: provider,
+            mode: mode,
+            auto_install: provider === 'searxng' && mode === 'managed',
+            api_base: this._nullableValueById('pref-web-search-base') || '',
+            api_key: this._nullableValueById('pref-web-search-key') || '',
+            default_language: this._nullableValueById('pref-web-search-language') || 'auto',
+            default_categories: lines.length ? lines : ['general'],
+            safe_search: parseInt((document.getElementById('pref-web-search-safe') || {}).value || '1', 10),
+            request_timeout_seconds: parseFloat((document.getElementById('pref-web-search-timeout') || {}).value || '8') || 8,
+            managed_source_ref: this._nullableValueById('pref-web-search-source-ref') || 'master',
+            max_results: 5,
+            allow_duckduckgo_fallback: !!(document.getElementById('pref-web-search-duckduckgo-fallback') || {}).checked
+        };
+    }
+
+    /**
+     * Install and configure the managed local SearXNG sidecar from Compass.
+     */
+    async installSearxng() {
+        const provider = document.getElementById('pref-web-search-provider');
+        const mode = document.getElementById('pref-web-search-mode');
+        if (provider) provider.value = 'searxng';
+        if (mode) mode.value = 'managed';
+        this._updateSearxngStatus({ status: 'installing', error: 'Installing managed local SearXNG...' });
+        try {
+            await APIClient.post('/api/settings/search', { web_search: this._collectWebSearchPayload() });
+            const result = await APIClient.post('/api/searxng/install', {});
+            if (result.url) this._setVal('pref-web-search-base', result.url);
+            this._updateSearxngStatus(result);
+            if (result.ready || result.status === 'ready') toast.show('Managed SearXNG is installed and ready for web research.');
+            else toast.error(result.error || 'SearXNG install finished but health is not ready.');
+        } catch (err) {
+            this._updateSearxngStatus({ status: 'error', error: err.message || 'SearXNG install failed.' });
+            toast.error(err.message || 'SearXNG install failed.');
+        }
+    }
+
+
+    /**
+     * Upgrade/reinstall managed SearXNG while keeping a rollback backup.
+     */
+    async upgradeSearxng() {
+        this._updateSearxngStatus({ status: 'checking', error: 'Upgrading managed local SearXNG...' });
+        try {
+            await APIClient.post('/api/settings/search', { web_search: this._collectWebSearchPayload() });
+            const result = await APIClient.post('/api/searxng/upgrade', {});
+            if (result.url) this._setVal('pref-web-search-base', result.url);
+            this._updateSearxngStatus(result);
+            if (result.ready || result.status === 'ready') toast.show('Managed SearXNG upgrade completed.');
+            else toast.error(result.error || 'SearXNG upgrade did not finish cleanly.');
+        } catch (err) {
+            this._updateSearxngStatus({ status: 'error', error: err.message || 'SearXNG upgrade failed.' });
+            toast.error(err.message || 'SearXNG upgrade failed.');
+        }
+    }
+
+    /**
+     * Roll back managed SearXNG to the most recent LJS-owned backup.
+     */
+    async rollbackSearxng() {
+        this._updateSearxngStatus({ status: 'checking', error: 'Rolling back managed local SearXNG...' });
+        try {
+            const result = await APIClient.post('/api/searxng/rollback', {});
+            if (result.url) this._setVal('pref-web-search-base', result.url);
+            this._updateSearxngStatus(result);
+            if (result.ready || result.status === 'ready') toast.show('Managed SearXNG rollback completed.');
+            else toast.error(result.error || 'SearXNG rollback did not finish cleanly.');
+        } catch (err) {
+            this._updateSearxngStatus({ status: 'error', error: err.message || 'SearXNG rollback failed.' });
+            toast.error(err.message || 'SearXNG rollback failed.');
+        }
+    }
+
+    /**
+     * Test the configured web-research provider.
+     */
+    async testWebSearchProvider() {
+        this._updateSearxngStatus({ status: 'checking', error: 'Checking web research provider...' });
+        try {
+            await APIClient.post('/api/settings/search', { web_search: this._collectWebSearchPayload() });
+            const result = await APIClient.get('/api/web-search/health');
+            this._updateSearxngStatus(result);
+            if (result.ok || result.json_api) toast.show('Web research provider health check passed.');
+            else toast.error(result.last_error || result.error || 'Web research provider is not ready.');
+        } catch (err) {
+            this._updateSearxngStatus({ status: 'error', error: err.message || 'Web research provider check failed.' });
+            toast.error(err.message || 'Web research provider check failed.');
+        }
+    }
+
+    /**
+     * Render SearXNG/web research status in Compass.
+     * @private
+     */
+    _updateSearxngStatus(state, opts = {}) {
+        const el = document.getElementById('pref-searxng-status');
+        if (!el || !state) return;
+        const status = state.status || (state.ok || state.ready ? 'ready' : 'not_installed');
+        const message = state.error || state.last_error || state.status_message || (state.url ? `Endpoint: ${state.url}` : 'Managed SearXNG not installed yet.');
+        el.textContent = `${this._humanizeProviderName(status)}: ${message}`;
+        el.className = `setting-status ${(state.ok || state.ready || state.json_api || status === 'ready') ? 'success' : (status === 'checking' || status === 'installing' ? 'checking' : (status === 'not_installed' ? 'neutral' : 'danger'))}`;
+    }
+
     /**
      * Collect Soulseek controls into the backend settings shape.
      * @private
@@ -657,6 +787,7 @@ class SettingsPanel extends Component {
                 jackett_url: this._nullableValueById('pref-jackett-url'),
                 jackett_api_key: this._nullableValueById('pref-jackett-key'),
                 direct_scraper_fallback: !!(document.getElementById('pref-direct-scraper-fallback') || {}).checked,
+                web_search: this._collectWebSearchPayload(),
                 soulseek: this._collectSoulseekPayload(false)
             });
             const sl = result && result.soulseek;
@@ -1429,6 +1560,40 @@ class SettingsPanel extends Component {
      * @private
      */
     _buildServicesPanel() {
+        const webResearch = [
+            DOM.el('p', { className: 'empty-msg' }, ['Optional general web-research provider for category/item research, release-date news, rumours, ambiguity resolution, and metadata gaps. It discovers public sources only; downloadable release search remains Jackett/Soulseek/category-owned.']),
+            this._createSettingItem('Enable web research', 'Allows the assistant and category extensions to discover public evidence sources. Disable to avoid all general web-search calls.', this._toggle('pref-web-search-enabled')),
+            this._createSettingItem('Provider', 'Default is managed local SearXNG. API providers and manual SearXNG endpoints remain advanced options.', DOM.el('select', { id: 'pref-web-search-provider' }, [
+                DOM.el('option', { value: 'searxng' }, ['SearXNG']),
+                DOM.el('option', { value: 'brave' }, ['Brave Search API']),
+                DOM.el('option', { value: 'tavily' }, ['Tavily']),
+                DOM.el('option', { value: 'kagi' }, ['Kagi']),
+                DOM.el('option', { value: 'duckduckgo_html' }, ['DuckDuckGo HTML fallback'])
+            ])),
+            this._createSettingItem('SearXNG mode', 'Managed installs into LJS-owned folders and refuses to adopt pre-existing system instances. Manual uses the URL below.', DOM.el('select', { id: 'pref-web-search-mode' }, [
+                DOM.el('option', { value: 'managed' }, ['Automatic local SearXNG']),
+                DOM.el('option', { value: 'manual' }, ['Manual/existing endpoint'])
+            ])),
+            this._createSettingItem('Base URL', 'Auto-filled for managed SearXNG; required for manual/external SearXNG or custom provider endpoints.', DOM.el('input', { type: 'text', id: 'pref-web-search-base', placeholder: 'http://127.0.0.1:18888' })),
+            this._createSettingItem('API key', 'Only needed for API providers or protected manual endpoints.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-web-search-key', placeholder: 'Optional' })),
+            this._createSettingItem('Language', 'SearXNG language value, e.g. auto, all, it-IT, en-US.', DOM.el('input', { type: 'text', id: 'pref-web-search-language', placeholder: 'auto' })),
+            this._createSettingItem('Categories', 'One SearXNG category per line. Start with general; news can be added for release/delay checks.', DOM.el('textarea', { id: 'pref-web-search-categories', rows: '3', placeholder: `general\nnews` })),
+            this._createSettingItem('Safe search', 'SearXNG safe-search level: 0 off, 1 moderate, 2 strict.', DOM.el('select', { id: 'pref-web-search-safe' }, [
+                DOM.el('option', { value: '0' }, ['0 — off']),
+                DOM.el('option', { value: '1' }, ['1 — moderate']),
+                DOM.el('option', { value: '2' }, ['2 — strict'])
+            ])),
+            this._createSettingItem('Request timeout seconds', 'Timeout for provider health/search calls. Keep bounded so agent research cannot stall the UI.', DOM.el('input', { type: 'number', id: 'pref-web-search-timeout', min: '1', max: '30', step: '1', placeholder: '8' })),
+            this._createSettingItem('Managed SearXNG source ref', 'Advanced: SearXNG git/archive ref used by automatic install and upgrade. Keep master unless testing a pinned ref on a clean machine.', DOM.el('input', { type: 'text', id: 'pref-web-search-source-ref', placeholder: 'master' })),
+            this._createSettingItem('DuckDuckGo degraded fallback', 'Advanced/off by default: only use DuckDuckGo HTML if the configured web-research provider fails. This is not used for media-download acquisition.', this._toggle('pref-web-search-duckduckgo-fallback')),
+            DOM.el('div', { id: 'pref-searxng-status', className: 'setting-status neutral' }, ['Managed SearXNG not installed yet.']),
+            DOM.el('div', { className: 'settings-button-row' }, [
+                DOM.el('button', { type: 'button', className: 'quick-btn btn-secondary', onclick: () => this.installSearxng() }, [DOM.el('i', { className: 'fa-solid fa-magnifying-glass-location' }), ' Auto install/configure SearXNG']),
+                DOM.el('button', { type: 'button', className: 'quick-btn btn-secondary', onclick: () => this.upgradeSearxng() }, [DOM.el('i', { className: 'fa-solid fa-arrow-up-from-bracket' }), ' Upgrade managed SearXNG']),
+                DOM.el('button', { type: 'button', className: 'quick-btn btn-secondary', onclick: () => this.rollbackSearxng() }, [DOM.el('i', { className: 'fa-solid fa-clock-rotate-left' }), ' Roll back managed SearXNG']),
+                DOM.el('button', { type: 'button', className: 'quick-btn btn-secondary', onclick: () => this.testWebSearchProvider() }, [DOM.el('i', { className: 'fa-solid fa-vial-circle-check' }), ' Test web research'])
+            ])
+        ];
         const torrentBackend = [
             this._createSettingItem('Jackett URL', 'Primary torrent indexer endpoint shared by downloadable categories.', DOM.el('input', { type: 'text', id: 'pref-jackett-url', placeholder: 'http://localhost:9117' })),
             this._createSettingItem('Jackett API key', 'API key for the configured Jackett server.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-jackett-key', placeholder: '••••••••' })),
@@ -1486,6 +1651,7 @@ class SettingsPanel extends Component {
             ])
         ];
         return this._panel('fa-solid fa-plug', 'Search Sources', 'Torrent infrastructure plus managed Soulseek/slskd, with source preference kept separate from category behavior.', [
+            this._settingsSubsection('Web research', webResearch, { open: true }),
             this._settingsSubsection('Torrent backend', torrentBackend, { open: true }),
             this._settingsSubsection('Soulseek / slskd runtime', soulseekRuntime, { open: true }),
             this._settingsSubsection('Advanced slskd endpoint', soulseekAdvanced),
