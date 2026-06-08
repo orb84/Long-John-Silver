@@ -7,8 +7,9 @@ facts, mutate items, or queue downloads.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
+
+from src.utils.runtime_prompt_context import RuntimePromptContext
 
 
 class WebResearchPromptGuidance:
@@ -20,15 +21,8 @@ class WebResearchPromptGuidance:
 
     @staticmethod
     def runtime_context() -> str:
-        """Return current-date context for time-sensitive research."""
-        now = datetime.now().astimezone()
-        return (
-            f"CURRENT RUNTIME DATETIME: {now.isoformat(timespec='seconds')}\n"
-            f"CURRENT DATE: {now.date().isoformat()}\n"
-            f"CURRENT YEAR: {now.year}\n"
-            "Use this date when deciding whether a source is current, stale, future, or already happened. "
-            "When the user says today/tomorrow/yesterday/next/recent/latest/current, anchor it to this runtime date."
-        )
+        """Return current date/time context for time-sensitive research."""
+        return RuntimePromptContext.llm_guidance_block()
 
     @staticmethod
     def general_rules() -> str:

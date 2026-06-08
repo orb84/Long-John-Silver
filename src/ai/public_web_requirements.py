@@ -30,6 +30,13 @@ class PublicWebEvidencePolicy:
         "postponed", "posticip", "production", "produzione", "filming", "riprese",
         "casting", "cast", "patch note", "patch notes", "changelog", "roadmap",
         "bugfix", "bug fix", "hotfix", "discussed", "discussione", "forum",
+        # Future/current catalogue questions are public-current too.  Metadata
+        # may know already-released seasons but cannot prove absence/presence of
+        # not-yet-released seasons, production, or schedule updates.
+        "next season", "upcoming season", "future season", "new season",
+        "prossima stagione", "nuova stagione", "stagione futura",
+        "when is season", "when will season", "quando esce", "quando uscir",
+        "not out yet", "not released yet", "non ancora usc",
     )
 
     _RUMOR_TERMS = (

@@ -16,6 +16,7 @@ from src.ai.tools.base import AgentTool
 from src.search.web.url_utils import normalize_search_result_url
 from src.core.models import ToolExecutionContext
 from src.core.models import Intent
+from src.ai.runtime_date_grounding import RuntimeDateGrounding
 
 if TYPE_CHECKING:
     from src.ai.web_reader import WebReader
@@ -297,6 +298,7 @@ class WebSearchTool:
             "fallback_used": result.fallback_used,
             "primary_provider": result.primary_provider,
             "primary_error": result.primary_error,
+            "runtime_date_context": RuntimeDateGrounding.runtime_context(),
             "results": [hit.model_dump() for hit in result.hits],
         }
         if not result.ok:
@@ -403,6 +405,7 @@ class WebResearchTool:
         ).collect_evidence(request)
         logger.info("WebResearchTool: finished ok={} sources={} evidence={} warnings={}", bundle.ok, len(bundle.sources), len(bundle.evidence), len(bundle.warnings))
         payload = bundle.model_dump()
+        payload["runtime_date_context"] = RuntimeDateGrounding.runtime_context()
         payload["warning"] = (
             "Search snippets are not durable facts. Use fetched evidence and category-specific interpretation "
             "before changing item state or claiming confirmation."
@@ -497,6 +500,7 @@ class CategoryWebResearchTool:
         ).research(research_input)
         logger.info("CategoryWebResearchTool: finished ok={} category={} item={} evidence={} facts={}", result.ok, result.category_id, result.item_id, len(result.bundle.evidence), len(result.interpretation.facts))
         payload = result.model_dump()
+        payload["runtime_date_context"] = RuntimeDateGrounding.runtime_context()
         degraded = any("degraded" in str(w).casefold() or "fallback" in str(w).casefold() for w in (result.warnings or []) + (result.bundle.warnings or []))
         payload["source_quality"] = {
             "primary_provider_degraded": degraded,

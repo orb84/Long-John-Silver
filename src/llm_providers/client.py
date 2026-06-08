@@ -11,6 +11,7 @@ from loguru import logger
 from typing import Optional, Any
 from src.llm_providers.registry import ProviderRegistry
 from src.llm_providers.models import ModelInfo, ContextInfo
+from src.utils.runtime_prompt_context import RuntimePromptContext
 
 
 class LLMClient:
@@ -41,6 +42,7 @@ class LLMClient:
         Returns:
             The litellm completion response.
         """
+        messages = RuntimePromptContext.ensure_messages(messages)
         config = self._registry.get_config()
         if not config:
             raise ValueError("No active provider configured. Call registry.set_active_provider() first.")

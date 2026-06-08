@@ -13,6 +13,7 @@ from typing import Any
 
 from loguru import logger
 
+from src.ai.download_context_policy import DownloadContextPolicy
 from src.utils.candidate_ids import load_result_set
 
 
@@ -28,6 +29,8 @@ class PendingActionContextBuilder:
         *,
         max_result_sets: int = 4,
         max_candidates_per_set: int = 8,
+        current_user_prompt: str | None = None,
+        intent: object | None = None,
     ) -> str:
         """Return a compact context packet for recent candidate/result sets.
 
@@ -40,6 +43,12 @@ class PendingActionContextBuilder:
             A system-prompt-ready string, or empty string if no pending state.
         """
         if not session_id or not self._db:
+            return ""
+        if DownloadContextPolicy.should_suppress_pending_candidates(current_user_prompt, intent):
+            logger.info(
+                "PendingActionContextBuilder: suppressing stale candidate context for fresh media request session_id={}",
+                session_id,
+            )
             return ""
         try:
             result_sets = await self._load_recent_result_sets(session_id, max_result_sets)
@@ -72,6 +81,9 @@ class PendingActionContextBuilder:
                 "category_id": data.get("category_id"),
                 "query": data.get("query"),
                 "batch_recommendation": self._compact_batch(data.get("batch_recommendation")),
+                "quality_choice_policy": self._compact_quality_choice(data.get("quality_choice_policy")),
+                "llm_candidate_review": self._compact_llm_review(data.get("llm_candidate_review")),
+                "recommended_candidate_id": data.get("recommended_candidate_id"),
                 "candidates": candidates,
             }
             packets.append(packet)
@@ -110,6 +122,44 @@ class PendingActionContextBuilder:
                 continue
             result_sets.append(data)
         return result_sets
+
+
+    @staticmethod
+    def _compact_quality_choice(policy: Any) -> dict[str, Any] | None:
+        if not isinstance(policy, dict) or not policy.get("requires_user_choice"):
+            return None
+        return {
+            "requires_user_choice": True,
+            "reason": policy.get("reason"),
+            "message": policy.get("message"),
+            "candidate_ids": policy.get("candidate_ids"),
+            "choices": [
+                {
+                    "candidate_id": choice.get("candidate_id"),
+                    "title": choice.get("title"),
+                    "resolution": choice.get("resolution"),
+                    "codec": choice.get("codec"),
+                    "size": choice.get("size"),
+                    "seeders": choice.get("seeders"),
+                    "estimated_bitrate_kbps": choice.get("estimated_bitrate_kbps"),
+                    "languages": choice.get("languages"),
+                }
+                for choice in (policy.get("choices") or [])[:8]
+                if isinstance(choice, dict)
+            ],
+        }
+
+    @staticmethod
+    def _compact_llm_review(review: Any) -> dict[str, Any] | None:
+        if not isinstance(review, dict):
+            return None
+        return {
+            "recommended_candidate_ids": review.get("recommended_candidate_ids"),
+            "confidence": review.get("confidence"),
+            "needs_user_choice": review.get("needs_user_choice"),
+            "should_queue_now": review.get("should_queue_now"),
+            "answer_hint": review.get("answer_hint"),
+        }
 
     @staticmethod
     def _compact_batch(batch: Any) -> dict[str, Any] | None:

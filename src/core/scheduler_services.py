@@ -253,7 +253,12 @@ class SchedulerCatalogService:
         if compact and episode is None:
             season = season or int(compact.group(1))
             cleaned = re.sub(r"\bS0*\d{1,2}\b", " ", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\bof\s+(?=(?:the\s+)?[A-Za-z0-9])", " ", cleaned, flags=re.IGNORECASE)
+        # If the user wrote ``season 1 of <title>``, the season phrase removal
+        # above can leave a leading ``of``.  Strip only that leading connector.
+        # Never remove interior title words: titles such as
+        # ``A Knight of the Seven Kingdoms`` must survive intact for tracker
+        # search, category matching, and LLM candidate adjudication.
+        cleaned = re.sub(r"^\s*of\s+", "", cleaned, count=1, flags=re.IGNORECASE)
         return cleaned, season
 
 
@@ -317,6 +322,15 @@ class SchedulerTorrentSearchService:
             settings=settings,
             category_id=category_id,
             tracked_language=getattr(media, "language", None),
+        )
+        normalized_scope = self._category_default_search_scope(
+            category,
+            media=media,
+            season=season,
+            episode=episode,
+            search_scope=normalized_scope,
+            language=target_lang,
+            settings=settings,
         )
         season = await self._resolve_category_default_season(
             media, category_id, season, episode, normalized_scope, settings,
@@ -608,6 +622,42 @@ class SchedulerTorrentSearchService:
                 continue
         return None
 
+    def _category_default_search_scope(
+        self,
+        category: object | None,
+        *,
+        media: CategoryItem,
+        season: int | None,
+        episode: int | None,
+        search_scope: str,
+        language: str | None,
+        settings: object,
+    ) -> str:
+        """Allow the owning category to refine an omitted search phase."""
+        hook = getattr(category, "default_agent_search_scope", None)
+        if not callable(hook):
+            return search_scope
+        try:
+            context = self._category_workflow_context(settings)
+            resolved = hook(
+                media,
+                season=season,
+                episode=episode,
+                search_scope=search_scope,
+                language=language,
+                context=context,
+            )
+            normalized = self._normalize_search_scope(resolved)
+            if normalized != search_scope:
+                logger.info(
+                    "Category default search scope refined: category=%s item=%r %r -> %r",
+                    getattr(category, "category_id", None), getattr(media, "key", ""), search_scope, normalized,
+                )
+            return normalized
+        except Exception as exc:
+            logger.debug("Category default search scope hook failed for %s: %s", getattr(media, "key", ""), exc)
+            return search_scope
+
     def _category_for_search_scope(self, search_scope: str | None) -> str | None:
         """Resolve a category for category-neutral pack search scopes."""
         if search_scope not in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
@@ -847,6 +897,7 @@ class SchedulerTorrentSearchService:
         candidates = []
         category = self._context.categories.get(category_id) if self._context.categories else None
         projector = TorrentCandidateProjector()
+        expected_episode_count = self._expected_episode_count_from_query_summary(query_summary, season) if season is not None and episode is None else None
         for result in (results or []):
             try:
                 payload = projector.payload(result, category_id=category_id)
@@ -869,6 +920,8 @@ class SchedulerTorrentSearchService:
                         payload["bundle_scope"] = bundle_context.get("scope")
                         payload["pack_type"] = bundle_context.get("pack_type")
                         payload["bundle_unit_count"] = bundle_context.get("unit_count")
+                        if expected_episode_count:
+                            self._annotate_requested_season_coverage(payload, int(season), int(expected_episode_count))
                 if category and hasattr(category, "search_candidate_quality_facts"):
                     facts = category.search_candidate_quality_facts(result, item=media, unit_label=request_label, context=None)
                     if isinstance(facts, dict):
@@ -887,10 +940,56 @@ class SchedulerTorrentSearchService:
             "display_name": getattr(media, "display_name", None) or media.key,
             "season": season,
             "episode": episode,
+            "expected_episode_count": expected_episode_count,
             "metadata_snapshot": self._media_identity_snapshot(media, category_id),
             "search_scope": search_scope,
             "candidates": candidates,
         }
+
+    @staticmethod
+    def _expected_episode_count_from_query_summary(query_summary: str, season: int | None) -> int | None:
+        """Extract category-provided season length from TV pack query summaries.
+
+        TV pack search builds episode-range queries from provider metadata, for
+        example ``S01E01-E06``.  The generic response builder may carry that
+        number forward as opaque evidence for the LLM, but it must not infer TV
+        structure on its own.
+        """
+        if season is None or not query_summary:
+            return None
+        import re
+        pattern = rf"S0*{int(season)}E0*1\s*(?:-|[-_. ]?E)\s*E?0*(\d{{1,3}})"
+        values: list[int] = []
+        for match in re.finditer(pattern, str(query_summary), flags=re.IGNORECASE):
+            try:
+                value = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if value > 1:
+                values.append(value)
+        return max(values) if values else None
+
+    @staticmethod
+    def _annotate_requested_season_coverage(payload: dict[str, Any], season: int, expected_episode_count: int) -> None:
+        """Mark whether a bundle candidate covers the category-known season range."""
+        context = payload.get("bundle_context") if isinstance(payload.get("bundle_context"), dict) else {}
+        if not context or not expected_episode_count:
+            return
+        try:
+            start = int(context.get("start") or 0)
+            end = int(context.get("end") or 0)
+            candidate_season = int(context.get("season") or context.get("season_start") or 0)
+        except (TypeError, ValueError):
+            return
+        if str(context.get("scope") or "") != "episode_range" or candidate_season != int(season):
+            return
+        payload["expected_episode_count"] = expected_episode_count
+        if start == 1 and end == int(expected_episode_count):
+            payload["requested_season_coverage"] = "full_requested_season"
+            payload["coverage_note"] = f"covers S{int(season):02d}E01-E{int(end):02d}; category expected season length is {int(expected_episode_count)}"
+        elif start and end:
+            payload["requested_season_coverage"] = "partial_requested_season"
+            payload["coverage_note"] = f"covers S{int(season):02d}E{int(start):02d}-E{int(end):02d}; category expected season length is {int(expected_episode_count)}"
 
     @staticmethod
     def _request_unit_label(season: int | None, episode: int | None) -> str | None:

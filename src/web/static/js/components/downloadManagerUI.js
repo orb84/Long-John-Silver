@@ -51,12 +51,78 @@ class DownloadManager extends Component {
     async load(options = {}) {
         try {
             const data = await APIClient.get('/api/downloads');
-            this.downloads.clear();
-            (data.active || []).forEach(d => this.downloads.set(d.id, d));
-            this.render();
+            const incoming = new Map();
+            (data.active || []).forEach(d => incoming.set(d.id, d));
+            if (options.silent) {
+                this._mergeSilentPoll(incoming);
+            } else {
+                this.downloads.clear();
+                incoming.forEach((d, id) => this.downloads.set(id, d));
+                this.render();
+            }
         } catch (err) {
             if (!options.silent) console.error('[DownloadManager] Failed to load downloads:', err);
         }
+    }
+
+    _mergeSilentPoll(incoming) {
+        let structuralChange = false;
+        for (const id of Array.from(this.downloads.keys())) {
+            if (!incoming.has(id)) {
+                this.downloads.delete(id);
+                this._expandedFilePanels.delete(id);
+                structuralChange = true;
+            }
+        }
+        incoming.forEach((fresh, id) => {
+            const current = this.downloads.get(id);
+            if (!current) {
+                this.downloads.set(id, fresh);
+                structuralChange = true;
+                return;
+            }
+            const merged = this._preserveLiveTelemetry(id, current, fresh);
+            const oldStatus = String(current.status || '').toLowerCase();
+            const newStatus = String(merged.status || '').toLowerCase();
+            const hadFiles = Array.isArray(current.files) && current.files.length > 0;
+            const hasFiles = Array.isArray(merged.files) && merged.files.length > 0;
+            Object.assign(current, merged);
+            if (oldStatus !== newStatus || (!hadFiles && hasFiles)) {
+                structuralChange = true;
+            }
+        });
+        if (structuralChange) {
+            this.render();
+            return;
+        }
+        this.downloads.forEach((dl, id) => {
+            const card = document.querySelector(`.download-card[data-id="${id}"]`);
+            if (card) DownloadStatsPatcher.patch(card, dl);
+        });
+        this._updateBadge();
+    }
+
+    _preserveLiveTelemetry(id, current, fresh) {
+        const merged = { ...(fresh || {}) };
+        const status = String((merged.status || current.status || '')).toLowerCase();
+        const mem = this._statMemory.get(id) || {};
+        const recent = mem.lastNonZeroAt && (Date.now() - mem.lastNonZeroAt) < 12000;
+        if (status === 'downloading' && recent) {
+            const freshRate = Number(merged.download_rate || 0);
+            if (freshRate <= 0 && Number(current.display_download_rate || current.download_rate || 0) > 0) {
+                merged.download_rate = current.download_rate || 0;
+                merged.display_download_rate = current.display_download_rate || current.download_rate || 0;
+            }
+            const freshPeers = Number(merged.num_peers || 0);
+            if (freshPeers <= 0 && Number(current.num_peers || 0) > 0) {
+                merged.num_peers = current.num_peers;
+            }
+            const freshSeeds = Number(merged.num_seeds || 0);
+            if (freshSeeds <= 0 && Number(current.num_seeds || 0) > 0) {
+                merged.num_seeds = current.num_seeds;
+            }
+        }
+        return merged;
     }
 
     /**
@@ -89,6 +155,20 @@ class DownloadManager extends Component {
             merged.display_download_rate = Math.max(0, mem.lastNonZeroRate * 0.6);
         } else {
             merged.display_download_rate = rawRate;
+        }
+        const peers = Number(merged.num_peers || 0);
+        const seeds = Number(merged.num_seeds || 0);
+        if (peers > 0) {
+            mem.lastPeers = peers;
+            mem.lastPeersAt = now;
+        } else if (status === 'downloading' && mem.lastPeers && (now - mem.lastPeersAt) < 12000) {
+            merged.num_peers = mem.lastPeers;
+        }
+        if (seeds > 0) {
+            mem.lastSeeds = seeds;
+            mem.lastSeedsAt = now;
+        } else if (status === 'downloading' && mem.lastSeeds && (now - mem.lastSeedsAt) < 12000) {
+            merged.num_seeds = mem.lastSeeds;
         }
         this._statMemory.set(id, mem);
         return merged;

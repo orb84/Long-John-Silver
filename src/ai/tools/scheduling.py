@@ -8,11 +8,14 @@ and removing scheduled tasks, as well as immediate show checking.
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Optional, TYPE_CHECKING
 
 from loguru import logger
 
 from src.ai.tools.base import AgentTool
+from src.ai.media_title_repair import MediaTitleRepair
+from src.ai.download_candidate_adjudicator import DownloadCandidateAdjudicator
 from src.core.models import ToolExecutionContext
 from src.core.models import Intent
 
@@ -550,8 +553,9 @@ class ListMediaTool:
     destructive = False
     required_dependencies = ["scheduler"]
 
-    def __init__(self, scheduler: Optional[MediaScheduler] = None) -> None:
+    def __init__(self, scheduler: Optional[MediaScheduler] = None, llm_client: object | None = None) -> None:
         self._scheduler = scheduler
+        self._candidate_adjudicator = DownloadCandidateAdjudicator(llm_client)
 
     async def _maybe_schedule_unmatched_retry(
         self,
@@ -655,8 +659,9 @@ class ListMediaItemsTool:
     destructive = False
     required_dependencies = ["scheduler"]
 
-    def __init__(self, scheduler: Optional[MediaScheduler] = None) -> None:
+    def __init__(self, scheduler: Optional[MediaScheduler] = None, llm_client: object | None = None) -> None:
         self._scheduler = scheduler
+        self._candidate_adjudicator = DownloadCandidateAdjudicator(llm_client)
 
     async def _maybe_schedule_unmatched_retry(
         self,
@@ -777,8 +782,9 @@ class SearchMediaTorrentsTool:
     destructive = False
     required_dependencies = ["scheduler"]
 
-    def __init__(self, scheduler: Optional[MediaScheduler] = None) -> None:
+    def __init__(self, scheduler: Optional[MediaScheduler] = None, llm_client: object | None = None) -> None:
         self._scheduler = scheduler
+        self._candidate_adjudicator = DownloadCandidateAdjudicator(llm_client)
 
     async def _maybe_schedule_unmatched_retry(
         self,
@@ -863,7 +869,7 @@ class SearchMediaTorrentsTool:
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Name of the category item (tracked or untracked).",
+                    "description": "Literal name/title of the category item (tracked or untracked). Preserve the user's title wording exactly, including small words inside titles such as 'of', 'the', 'a', and subtitles. Do not rewrite titles into shortened search-keyword form.",
                 },
                 "season": {
                     "type": "integer",
@@ -884,7 +890,7 @@ class SearchMediaTorrentsTool:
                 "search_scope": {
                     "type": "string",
                     "enum": ["default", "bundle_preferred", "bundle_only", "individual_units_only"],
-                    "description": "Category-neutral search phase preference. Use bundle_preferred when the user asks to prefer a complete category-owned bundle/pack but can fall back to individual units; use bundle_only only when the user explicitly wants bundle-only.",
+                    "description": "Category-neutral search phase preference. Use bundle_preferred when the user asks for a whole TV show/season without a specific episode, or asks to prefer a complete category-owned bundle/pack but can fall back to individual units; use bundle_only only when the user explicitly wants bundle-only.",
                 },
                 "category_id": {
                     "type": "string",
@@ -945,6 +951,14 @@ class SearchMediaTorrentsTool:
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
         """Search torrents for a media item."""
         name = arguments["name"]
+        repaired_name = MediaTitleRepair.recover_literal_title(name, getattr(context, "user_prompt", None))
+        if repaired_name and repaired_name != name:
+            logger.info(
+                "search_media_torrents: repaired lossy LLM title %r -> %r from current user prompt",
+                name,
+                repaired_name,
+            )
+            name = repaired_name
         season = arguments.get("season")
         episode = arguments.get("episode")
         language = arguments.get("language")
@@ -1042,29 +1056,6 @@ class SearchMediaTorrentsTool:
             preferred_language=res.get("language") or language,
         )
 
-        cache_data = {
-            "name": res.get("name") or name,
-            "display_name": res.get("display_name") or res.get("name") or name,
-            "item_id": res.get("item_id") or res.get("name") or name,
-            "query": res.get("query"),
-            "season": res.get("season", season),
-            "episode": res.get("episode", episode),
-            "category_id": res.get("category_id"),
-            "metadata_snapshot": res.get("metadata_snapshot") or {},
-            "search_scope": res.get("search_scope") or search_scope,
-            "result_set_id": result_set_id,
-            "candidates": cache_candidates,
-            "batch_recommendation": batch_recommendation,
-            "companion_soulseek": res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {},
-        }
-
-        db = getattr(self._scheduler, "_db", None)
-        if db:
-            try:
-                await store_result_set(db, session_id=session_id, cache_data=cache_data)
-            except Exception as e:
-                logger.warning(f"Failed to cache search_media_torrents options: {e}")
-
         # Format clean candidates for LLM (with stable IDs, without magnets)
         clean_candidates = []
         for c in cache_candidates:
@@ -1124,6 +1115,128 @@ class SearchMediaTorrentsTool:
                 cache_candidate["auto_queue_allowed"] = False
                 cache_candidate["auto_queue_blocked_reason"] = "quality/bitrate preference must be chosen first"
 
+        category_guidance = ""
+        if category and hasattr(category, "build_torrent_selection_guidance"):
+            try:
+                category_guidance = str(category.build_torrent_selection_guidance() or "")
+            except Exception:
+                category_guidance = ""
+        adjudication_search_result = dict(res)
+        if quality_choice_policy:
+            adjudication_search_result["quality_choice_policy"] = quality_choice_policy
+        llm_candidate_review = await self._candidate_adjudicator.review(
+            user_prompt=getattr(context, "user_prompt", None),
+            tool_arguments={**arguments, "name": name, "search_scope": search_scope, "category_id": category_id},
+            search_result=adjudication_search_result,
+            candidates=clean_candidates,
+            category_guidance=category_guidance,
+        )
+        if llm_candidate_review and quality_choice_policy.get("requires_user_choice"):
+            policy_ids = [str(cid) for cid in (quality_choice_policy.get("candidate_ids") or []) if cid]
+            recommended = [str(cid) for cid in (llm_candidate_review.get("recommended_candidate_ids") or []) if cid]
+            merged: list[str] = []
+            for cid in recommended + policy_ids:
+                if cid and cid not in merged:
+                    merged.append(cid)
+            llm_candidate_review["recommended_candidate_ids"] = merged[:8]
+            llm_candidate_review["should_queue_now"] = False
+            llm_candidate_review["needs_user_choice"] = True
+            note = quality_choice_policy.get("message") or "Multiple quality/size options need a user choice before queueing."
+            reason = str(llm_candidate_review.get("reason") or "").strip()
+            llm_candidate_review["reason"] = (reason + " " + note).strip()[:500]
+            llm_candidate_review["answer_hint"] = (
+                "Present the quality/size options from quality_choice_policy. Do not queue one candidate until the user chooses a quality profile."
+            )
+        llm_candidate_review_status = (
+            "reviewed" if llm_candidate_review else (
+                "skipped_no_task_llm" if not self._candidate_adjudicator.available else (
+                    "skipped_no_candidates" if not clean_candidates else "review_unavailable_or_failed"
+                )
+            )
+        )
+        if llm_candidate_review:
+            clean_candidates = DownloadCandidateAdjudicator.reorder_candidates(clean_candidates, llm_candidate_review)
+            cache_candidates = DownloadCandidateAdjudicator.reorder_candidates(cache_candidates, llm_candidate_review)
+            for i, candidate in enumerate(clean_candidates, 1):
+                candidate["index"] = i
+                if str(candidate.get("candidate_id") or "") in set(llm_candidate_review.get("recommended_candidate_ids") or []):
+                    candidate["llm_recommended"] = True
+            for i, candidate in enumerate(cache_candidates, 1):
+                candidate["index"] = i
+                if str(candidate.get("candidate_id") or "") in set(llm_candidate_review.get("recommended_candidate_ids") or []):
+                    candidate["llm_recommended"] = True
+            logger.info(
+                "search_media_torrents LLM candidate review: name=%r recommended=%s confidence=%s reason=%r",
+                res.get("name") or name,
+                llm_candidate_review.get("recommended_candidate_ids"),
+                llm_candidate_review.get("confidence"),
+                llm_candidate_review.get("reason"),
+            )
+
+        suppress_batch_recommendation = _should_suppress_batch_recommendation(
+            batch_recommendation=batch_recommendation,
+            candidates=clean_candidates,
+            llm_candidate_review=llm_candidate_review,
+            quality_choice_policy=quality_choice_policy,
+        )
+        if suppress_batch_recommendation:
+            logger.info(
+                "search_media_torrents: suppressing deterministic batch_recommendation because a reviewed/requested season-pack or quality-choice workspace is present name=%r result_set_id=%s",
+                res.get("name") or name,
+                result_set_id,
+            )
+            res["batch_recommendation_suppressed"] = True
+            batch_recommendation = None
+
+        _log_search_media_torrents_audit(
+            name=res.get("name") or name,
+            display_name=res.get("display_name") or res.get("name") or name,
+            category_id=res.get("category_id"),
+            season=res.get("season", season),
+            episode=res.get("episode", episode),
+            language=res.get("language") or language,
+            search_scope=res.get("search_scope") or search_scope,
+            query=res.get("query"),
+            result_set_id=result_set_id,
+            raw_candidate_count=len(res.get("candidates") or []),
+            clean_candidates=clean_candidates,
+            quality_choice_policy=quality_choice_policy,
+            llm_candidate_review=llm_candidate_review,
+            llm_candidate_review_status=llm_candidate_review_status,
+            next_actions_preview=_search_result_next_actions(
+                candidates=clean_candidates,
+                search_scope=res.get("search_scope") or search_scope,
+                result_set_id=result_set_id,
+                has_batch=bool(batch_recommendation),
+                quality_choice_policy=quality_choice_policy,
+            ),
+        )
+
+        cache_data = {
+            "name": res.get("name") or name,
+            "display_name": res.get("display_name") or res.get("name") or name,
+            "item_id": res.get("item_id") or res.get("name") or name,
+            "query": res.get("query"),
+            "season": res.get("season", season),
+            "episode": res.get("episode", episode),
+            "category_id": res.get("category_id"),
+            "metadata_snapshot": res.get("metadata_snapshot") or {},
+            "search_scope": res.get("search_scope") or search_scope,
+            "result_set_id": result_set_id,
+            "candidates": cache_candidates,
+            "batch_recommendation": batch_recommendation,
+            "companion_soulseek": res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {},
+            "llm_candidate_review": llm_candidate_review,
+            "llm_candidate_review_status": llm_candidate_review_status,
+        }
+
+        db = getattr(self._scheduler, "_db", None)
+        if db:
+            try:
+                await store_result_set(db, session_id=session_id, cache_data=cache_data)
+            except Exception as e:
+                logger.warning(f"Failed to cache search_media_torrents options: {e}")
+
         selected_for_estimate = _candidate_ids_for_estimate(
             clean_candidates,
             batch_recommendation=batch_recommendation,
@@ -1138,6 +1251,12 @@ class SearchMediaTorrentsTool:
         res["results_total_size_gb"] = round(estimated_total_size_bytes / (1024 ** 3), 3) if estimated_total_size_bytes else 0
         if quality_choice_policy:
             res["quality_choice_policy"] = quality_choice_policy
+        res["llm_candidate_review_status"] = llm_candidate_review_status
+        if llm_candidate_review:
+            res["llm_candidate_review"] = llm_candidate_review
+            recommended_ids = llm_candidate_review.get("recommended_candidate_ids") or []
+            if recommended_ids:
+                res["recommended_candidate_id"] = recommended_ids[0]
         res["candidate_picker"] = _candidate_picker_rows(clean_candidates, limit=60)
         res["result_handle"] = {
             "type": "torrent_result_set",
@@ -1153,6 +1272,23 @@ class SearchMediaTorrentsTool:
             has_batch=bool(batch_recommendation),
             quality_choice_policy=quality_choice_policy,
         )
+        if llm_candidate_review and llm_candidate_review.get("recommended_candidate_ids"):
+            review_ids = [str(cid) for cid in (llm_candidate_review.get("recommended_candidate_ids") or []) if cid]
+            first_review_id = review_ids[0] if review_ids else ""
+            should_queue_now = bool(llm_candidate_review.get("should_queue_now")) and not bool(llm_candidate_review.get("needs_user_choice"))
+            res["next_actions"].insert(0, {
+                "action": "queue_llm_recommended_candidate" if should_queue_now else "review_llm_recommended_candidate",
+                "tool": "queue_download" if should_queue_now else "inspect_torrent_candidate",
+                "reason": llm_candidate_review.get("answer_hint") or llm_candidate_review.get("reason") or "The torrent-candidate review identified the best semantic match for the user request.",
+                "candidate_ids": review_ids,
+                "args_hint": {"result_set_id": result_set_id, "candidate_id": first_review_id},
+            })
+            if should_queue_now and first_review_id:
+                res["llm_next_action"] = (
+                    "The torrent-candidate review selected a clear match and said it can be queued now. "
+                    f"Call queue_download with result_set_id={result_set_id!r} and candidate_id={first_review_id!r}. "
+                    "Do not summarize lower-ranked alternatives as missing episodes unless the tool result explicitly says no season-pack candidate was recommended."
+                )
         companion = res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {}
         if companion:
             full_soulseek_candidates = companion.get("candidates") if isinstance(companion.get("candidates"), list) else []
@@ -1267,11 +1403,46 @@ class SearchMediaTorrentsTool:
                 "groups": clean_groups,
                 "queue_download_arguments": batch_recommendation.get("queue_download_arguments"),
             }
-            res["llm_next_action"] = (
-                "The user asked for a multi-unit download. Queue every recommended candidate by calling "
-                "queue_download with batch_recommendation.queue_download_arguments. Do not queue only the first episode."
-            )
+            if not (llm_candidate_review and llm_candidate_review.get("recommended_candidate_ids")):
+                res["llm_next_action"] = (
+                    "The user asked for a multi-unit download. Queue every recommended candidate by calling "
+                    "queue_download with batch_recommendation.queue_download_arguments. Do not queue only the first episode."
+                )
         return res
+
+
+def _should_suppress_batch_recommendation(
+    *,
+    batch_recommendation: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    llm_candidate_review: dict[str, Any] | None,
+    quality_choice_policy: dict[str, Any] | None,
+) -> bool:
+    """Avoid contradictory per-episode batch plans when a pack/choice is the real workspace."""
+    if not batch_recommendation:
+        return False
+    if quality_choice_policy and quality_choice_policy.get("requires_user_choice"):
+        return True
+    recommended = {str(cid) for cid in ((llm_candidate_review or {}).get("recommended_candidate_ids") or []) if cid}
+    if not recommended:
+        return False
+    by_id = {str(c.get("candidate_id") or ""): c for c in candidates}
+    for candidate_id in recommended:
+        candidate = by_id.get(candidate_id) or {}
+        granularity = str((candidate.get("unit_descriptor") or {}).get("granularity") or "").lower()
+        is_season_pack = bool(
+            candidate.get("is_bundle")
+            or candidate.get("bundle_scope")
+            or candidate.get("pack_type")
+            or granularity == "season"
+        )
+        full_coverage = (
+            not candidate.get("requested_season_coverage")
+            or candidate.get("requested_season_coverage") == "full_requested_season"
+        )
+        if is_season_pack and full_coverage:
+            return True
+    return False
 
 
 def _search_constraints_from_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1378,54 +1549,210 @@ def _canonical_language_token(value: object) -> str:
 
 
 def _quality_choice_policy(candidates: list[dict[str, Any]], constraints: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Detect when the user must choose a bitrate/size profile for a new item.
+    """Detect when the user must choose a quality/size profile.
 
-    A materially smaller same-resolution candidate is not automatically better;
-    it represents a different bitrate/quality tradeoff.  When no bitrate target
-    is already supplied by arguments/profile, keep the search result as a
-    choice instead of letting queue_download silently establish a low-quality
-    default.
+    Deterministic code must not silently establish a low-bitrate preference for
+    a show merely because one candidate is queueable.  Earlier versions only
+    compared same-resolution rows, which missed the important real-world case:
+    a compact 1080p HEVC full-season pack versus a much larger 720p/x264 pack.
+    Those are distinct quality/size tradeoffs and must be shown as options when
+    the user has not supplied or saved a bitrate/size target.
     """
     constraints = constraints or {}
     if any(constraints.get(k) for k in ("target_bitrate_kbps", "preferred_bitrate_kbps", "max_bitrate_kbps", "current_bitrate_kbps")):
         return {"requires_user_choice": False, "reason": "bitrate preference already supplied"}
+    if any(constraints.get(k) for k in ("target_size_gb", "max_size_gb", "min_size_gb", "current_size_gb")):
+        return {"requires_user_choice": False, "reason": "size preference already supplied"}
+
     viable = [c for c in candidates if c.get("auto_queue_allowed") is not False and c.get("estimated_bitrate_kbps") and c.get("resolution")]
+    explicit_resolution = str(constraints.get("required_resolution") or constraints.get("preferred_resolution") or "").strip().lower()
+    if explicit_resolution:
+        viable = [c for c in viable if str(c.get("resolution") or "").strip().lower() == explicit_resolution]
     if len(viable) < 2:
         return {"requires_user_choice": False}
-    # Compare within the top same-resolution group; a 720p and 1080p row are
-    # not the same kind of preference choice.
+
+    # For a full-season/bundle request, compare all requested-language pack
+    # candidates that cover the requested season, even across resolutions/codecs.
+    # This is where size/bitrate tradeoffs matter most and where one wrong
+    # automatic pick can set an undesired quality baseline for an entire show.
+    bundle_group = [
+        c for c in viable
+        if (
+            c.get("is_bundle")
+            or c.get("bundle_scope")
+            or c.get("pack_type")
+            or str((c.get("unit_descriptor") or {}).get("granularity") or "").lower() == "season"
+        )
+        and (
+            not c.get("requested_season_coverage")
+            or c.get("requested_season_coverage") == "full_requested_season"
+        )
+    ]
+    bundle_policy = _material_quality_choice_policy(
+        bundle_group,
+        reason="no_saved_season_pack_quality_preference",
+        message=(
+            "Multiple matching season-pack candidates differ materially in resolution/codec/bitrate/size; "
+            "present the quality options instead of auto-queueing a compact pack as the default."
+        ),
+        tradeoff_type="season_pack_quality_tradeoff",
+    )
+    if bundle_policy.get("requires_user_choice"):
+        return bundle_policy
+
+    # Otherwise compare within the top same-resolution group for exact episodes
+    # and non-bundle searches.
     resolution = viable[0].get("resolution")
     group = [c for c in viable if c.get("resolution") == resolution]
-    if len(group) < 2:
+    return _material_quality_choice_policy(
+        group[:6],
+        reason="no_saved_bitrate_preference",
+        message=(
+            "Multiple same-resolution candidates differ materially in bitrate/size; ask the user which "
+            "quality-size tradeoff to use for this show, then store that bitrate preference when they choose."
+        ),
+        tradeoff_type="same_resolution_bitrate_tradeoff",
+    )
+
+
+def _collapse_equivalent_quality_options(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate quality choices, preferring better seeder health.
+
+    This is only for deciding whether the user must choose a quality profile.
+    It must not remove candidates from the cache/workspace; it simply prevents
+    two mirrors of the same release from becoming a pointless follow-up.
+    """
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    ordered_keys: list[tuple[Any, ...]] = []
+    for candidate in candidates:
+        key = _quality_equivalence_key(candidate)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = candidate
+            ordered_keys.append(key)
+            continue
+        if _quality_option_health_key(candidate) > _quality_option_health_key(existing):
+            grouped[key] = candidate
+    return [grouped[key] for key in ordered_keys if key in grouped]
+
+
+def _quality_equivalence_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+    unit = candidate.get("unit_descriptor") or {}
+    coords = unit.get("coordinates") if isinstance(unit.get("coordinates"), dict) else {}
+    languages = tuple(sorted(str(lang).lower() for lang in (candidate.get("languages") or []) if lang))
+    size_bucket = None
+    try:
+        size = int(candidate.get("size_bytes") or 0)
+        if size > 0:
+            size_bucket = round(size / max(size * 0 + 128 * 1024 * 1024, 1))
+    except Exception:
+        size_bucket = None
+    bitrate_bucket = None
+    try:
+        bitrate = float(candidate.get("estimated_bitrate_kbps") or 0)
+        if bitrate > 0:
+            bitrate_bucket = round(bitrate / 200.0)
+    except Exception:
+        bitrate_bucket = None
+    return (
+        str(unit.get("stable_key") or ""),
+        coords.get("season"),
+        coords.get("episode"),
+        str(candidate.get("resolution") or "").lower(),
+        str(candidate.get("codec") or "").lower(),
+        tuple(languages),
+        str(candidate.get("requested_season_coverage") or ""),
+        int(candidate.get("bundle_unit_count") or 0),
+        size_bucket,
+        bitrate_bucket,
+    )
+
+
+def _quality_option_health_key(candidate: dict[str, Any]) -> tuple[int, int, int]:
+    seeders = _safe_int(candidate.get("seeders"))
+    has_seeders = 1 if candidate.get("seeders") is not None else 0
+    index = _safe_int(candidate.get("index")) or 9999
+    return (has_seeders, seeders, -index)
+
+def _material_quality_choice_policy(candidates: list[dict[str, Any]], *, reason: str, message: str, tradeoff_type: str) -> dict[str, Any]:
+    """Return a choice policy when candidates have materially different quality/size profiles.
+
+    Functionally equivalent duplicates from different indexers are not a user
+    preference question.  Collapse them first and keep the healthier swarm so
+    the user is asked only about real tradeoffs: resolution, bitrate, codec,
+    size, language, or coverage.
+    """
+    candidates = _collapse_equivalent_quality_options(candidates)
+    if len(candidates) < 2:
         return {"requires_user_choice": False}
-    bitrates = []
-    for c in group[:6]:
+    bitrates: list[float] = []
+    sizes: list[float] = []
+    resolutions: set[str] = set()
+    codecs: set[str] = set()
+    for c in candidates:
         try:
-            bitrates.append(float(c.get("estimated_bitrate_kbps") or 0))
+            bitrate = float(c.get("estimated_bitrate_kbps") or 0)
+            if bitrate > 0:
+                bitrates.append(bitrate)
         except (TypeError, ValueError):
             pass
-    bitrates = [b for b in bitrates if b > 0]
-    if len(bitrates) < 2:
+        try:
+            size = float(c.get("size_bytes") or 0)
+            if size > 0:
+                sizes.append(size)
+        except (TypeError, ValueError):
+            pass
+        if c.get("resolution"):
+            resolutions.add(str(c.get("resolution")))
+        if c.get("codec"):
+            codecs.add(str(c.get("codec")))
+    if len(bitrates) < 2 and len(sizes) < 2 and len(resolutions) < 2:
         return {"requires_user_choice": False}
-    low, high = min(bitrates), max(bitrates)
-    if high < low * 1.25:
+    bitrate_material = len(bitrates) >= 2 and max(bitrates) >= min(bitrates) * 1.25
+    size_material = len(sizes) >= 2 and max(sizes) >= min(sizes) * 1.35
+    resolution_material = len(resolutions) >= 2
+    codec_material = len(codecs) >= 2 and (bitrate_material or size_material)
+    if not (bitrate_material or size_material or resolution_material or codec_material):
         return {"requires_user_choice": False}
+
+    def sort_key(row: dict[str, Any]) -> tuple[float, int, int]:
+        try:
+            bitrate = float(row.get("estimated_bitrate_kbps") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0.0
+        return (-bitrate, -_safe_int(row.get("seeders")), _safe_int(row.get("index")) or 9999)
+
     choices = []
-    for c in sorted(group[:6], key=lambda row: float(row.get("estimated_bitrate_kbps") or 0))[:6]:
+    for c in sorted(candidates, key=sort_key)[:8]:
         choices.append({
             "candidate_id": c.get("candidate_id"),
             "title": c.get("title"),
             "resolution": c.get("resolution"),
+            "codec": c.get("codec"),
             "size": c.get("size"),
+            "size_bytes": c.get("size_bytes"),
+            "per_episode_size": c.get("per_episode_size"),
+            "per_episode_size_mb": c.get("per_episode_size_mb"),
             "estimated_bitrate_kbps": c.get("estimated_bitrate_kbps"),
             "seeders": c.get("seeders"),
+            "languages": c.get("languages"),
+            "requested_season_coverage": c.get("requested_season_coverage"),
         })
     return {
         "requires_user_choice": True,
-        "reason": "no_saved_bitrate_preference",
-        "message": "Multiple same-resolution candidates differ materially in bitrate/size; ask the user which quality-size tradeoff to use for this show, then store that bitrate preference when they choose.",
+        "reason": reason,
+        "tradeoff_type": tradeoff_type,
+        "message": message,
         "candidate_ids": [c.get("candidate_id") for c in choices if c.get("candidate_id")],
         "choices": choices,
+        "comparison": {
+            "min_bitrate_kbps": min(bitrates) if bitrates else None,
+            "max_bitrate_kbps": max(bitrates) if bitrates else None,
+            "min_size_bytes": min(sizes) if sizes else None,
+            "max_size_bytes": max(sizes) if sizes else None,
+            "resolutions": sorted(resolutions),
+            "codecs": sorted(codecs),
+        },
     }
 
 
@@ -1509,6 +1836,103 @@ def _search_result_next_actions(*, candidates: list[dict[str, Any]], search_scop
     return actions
 
 
+def _log_search_media_torrents_audit(
+    *,
+    name: str,
+    display_name: str,
+    category_id: str | None,
+    season: int | None,
+    episode: int | None,
+    language: str | None,
+    search_scope: str | None,
+    query: str | None,
+    result_set_id: str,
+    raw_candidate_count: int,
+    clean_candidates: list[dict[str, Any]],
+    quality_choice_policy: dict[str, Any] | None,
+    llm_candidate_review: dict[str, Any] | None,
+    llm_candidate_review_status: str,
+    next_actions_preview: list[dict[str, Any]],
+) -> None:
+    """Emit one compact, structured audit record for the final torrent workspace.
+
+    Provider/query-level logs explain what trackers returned.  This audit
+    explains what the user-facing tool handed to the final chat model: candidate
+    IDs, quality facts, quality-choice policy, and the torrent-ranker review.
+    It is deliberately magnet-free and JSON formatted inside ljs.log so support
+    logs are usable without reconstructing state from several files.
+    """
+    def row(candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "candidate_id": candidate.get("candidate_id"),
+            "index": candidate.get("index"),
+            "title": candidate.get("title"),
+            "source": candidate.get("source"),
+            "size": candidate.get("size"),
+            "size_bytes": candidate.get("size_bytes"),
+            "seeders": candidate.get("seeders"),
+            "languages": candidate.get("languages"),
+            "resolution": candidate.get("resolution"),
+            "codec": candidate.get("codec"),
+            "per_episode_size": candidate.get("per_episode_size"),
+            "per_episode_size_mb": candidate.get("per_episode_size_mb"),
+            "estimated_bitrate_kbps": candidate.get("estimated_bitrate_kbps"),
+            "unit_descriptor": candidate.get("unit_descriptor"),
+            "is_bundle": candidate.get("is_bundle"),
+            "bundle_scope": candidate.get("bundle_scope"),
+            "pack_type": candidate.get("pack_type"),
+            "requested_season_coverage": candidate.get("requested_season_coverage"),
+            "expected_episode_count": candidate.get("expected_episode_count"),
+            "auto_queue_allowed": candidate.get("auto_queue_allowed"),
+            "auto_queue_blocked_reason": candidate.get("auto_queue_blocked_reason"),
+            "selection_warnings": candidate.get("selection_warnings")[:5] if isinstance(candidate.get("selection_warnings"), list) else candidate.get("selection_warnings"),
+            "selection_blockers": candidate.get("selection_blockers")[:5] if isinstance(candidate.get("selection_blockers"), list) else candidate.get("selection_blockers"),
+            "llm_recommended": bool(candidate.get("llm_recommended")),
+        }
+
+    recommended_ids = [str(cid) for cid in ((llm_candidate_review or {}).get("recommended_candidate_ids") or []) if cid]
+    keep_ids = set(recommended_ids)
+    if quality_choice_policy and isinstance(quality_choice_policy.get("candidate_ids"), list):
+        keep_ids.update(str(cid) for cid in quality_choice_policy.get("candidate_ids") or [] if cid)
+    top_rows = clean_candidates[:30]
+    extra_rows = [candidate for candidate in clean_candidates[30:] if str(candidate.get("candidate_id") or "") in keep_ids]
+    payload = {
+        "event": "search_media_torrents_workspace_audit",
+        "name": name,
+        "display_name": display_name,
+        "category_id": category_id,
+        "season": season,
+        "episode": episode,
+        "language": language,
+        "search_scope": search_scope,
+        "query_summary": query,
+        "result_set_id": result_set_id,
+        "counts": {
+            "raw_candidates_before_tool_cleaning": raw_candidate_count,
+            "clean_candidates": len(clean_candidates),
+            "logged_top_candidates": len(top_rows),
+            "logged_extra_recommended_or_quality_options": len(extra_rows),
+        },
+        "quality_choice_policy": quality_choice_policy or {},
+        "llm_candidate_review_status": llm_candidate_review_status,
+        "llm_candidate_review": {
+            "recommended_candidate_ids": recommended_ids,
+            "confidence": (llm_candidate_review or {}).get("confidence"),
+            "needs_user_choice": (llm_candidate_review or {}).get("needs_user_choice"),
+            "should_queue_now": (llm_candidate_review or {}).get("should_queue_now"),
+            "reason": (llm_candidate_review or {}).get("reason"),
+            "answer_hint": (llm_candidate_review or {}).get("answer_hint"),
+            "candidate_count_reviewed": (llm_candidate_review or {}).get("candidate_count_reviewed"),
+            "chunk_count": (llm_candidate_review or {}).get("chunk_count"),
+            "context_limit_tokens": (llm_candidate_review or {}).get("context_limit_tokens"),
+        },
+        "next_actions_preview": next_actions_preview,
+        "candidates": [row(candidate) for candidate in [*top_rows, *extra_rows]],
+        "omitted_clean_candidates": max(0, len(clean_candidates) - len(top_rows) - len(extra_rows)),
+    }
+    logger.info("SEARCH_MEDIA_TORRENTS_WORKSPACE_AUDIT " + json.dumps(payload, ensure_ascii=False, default=str))
+
+
 def _candidate_picker_rows(candidates: list[dict[str, Any]], limit: int = 60) -> list[dict[str, Any]]:
     """Return a dense candidate workspace for the LLM.
 
@@ -1518,8 +1942,10 @@ def _candidate_picker_rows(candidates: list[dict[str, Any]], limit: int = 60) ->
     """
     rows: list[dict[str, Any]] = []
     for c in candidates[: max(0, int(limit))]:
+        candidate_id = c.get("candidate_id")
         row = {
-            "id": c.get("candidate_id"),
+            "id": candidate_id,
+            "candidate_id": candidate_id,
             "index": c.get("index"),
             "title": c.get("title"),
             "size": c.get("size"),
@@ -1536,8 +1962,20 @@ def _candidate_picker_rows(candidates: list[dict[str, Any]], limit: int = 60) ->
             row["estimated_bitrate_kbps"] = c.get("estimated_bitrate_kbps")
         if c.get("bitrate_basis"):
             row["bitrate_basis"] = c.get("bitrate_basis")
+        if c.get("expected_episode_count"):
+            row["expected_episode_count"] = c.get("expected_episode_count")
+        if c.get("requested_season_coverage"):
+            row["requested_season_coverage"] = c.get("requested_season_coverage")
+        if c.get("coverage_note"):
+            row["coverage_note"] = c.get("coverage_note")
         if c.get("source"):
             row["source"] = c.get("source")
+        if c.get("llm_recommended"):
+            row["llm_recommended"] = True
+        if c.get("selection_warnings"):
+            row["selection_warnings"] = c.get("selection_warnings")[:3]
+        if c.get("selection_blockers"):
+            row["selection_blockers"] = c.get("selection_blockers")[:3]
         if c.get("auto_queue_allowed") is False:
             row["auto_queue_allowed"] = False
             row["blocked_reason"] = c.get("auto_queue_blocked_reason")
@@ -1604,6 +2042,24 @@ def _build_batch_recommendation(*, name: str, category_id: str | None, season: i
     indexer returned it first.
     """
     if episode is not None:
+        return None
+    # A season/full-season request that has a plausible bundle candidate should
+    # not also expose a deterministic per-episode batch recommendation.  That
+    # creates contradictory evidence for the final LLM (for example: one LLM
+    # reviewed Italian S01E01-06 pack plus stray S01E07/S08E02 rows from a broad
+    # provider result set).  Keep the bundle candidate visible and let the LLM
+    # adjudicator/queue path decide whether to queue or inspect that single
+    # season-pack candidate.  Only build an episode batch when the user/tool
+    # explicitly requested individual units or no bundle exists.
+    if season is not None and episode is None and str(search_scope or "default").lower() not in {"individual_units_only"}:
+        for candidate in candidates or []:
+            descriptor = candidate.get("unit_descriptor") if isinstance(candidate.get("unit_descriptor"), dict) else {}
+            if candidate.get("is_bundle") or str(descriptor.get("granularity") or "").lower() == "season":
+                return None
+    # A broad item-title search has not declared a multi-unit scope.  Do not
+    # turn unrelated S01/S02/S08 rows into a fake batch recommendation just
+    # because the category can describe their unit coordinates.
+    if season is None and str(search_scope or "default").lower() in {"", "default"}:
         return None
     # Bundle/season-pack searches return alternatives for one requested unit.
     # They must not be converted into a multi-unit batch merely because a broad
@@ -1762,6 +2218,7 @@ class SchedulingToolProvider:
         scheduler: Optional[MediaScheduler] = None,
         settings_manager: Optional[SettingsManager] = None,
         supervisor: Optional[TaskSupervisor] = None,
+        llm_client: object | None = None,
     ) -> None:
         """Initialize with optional dependencies.
 
@@ -1775,6 +2232,7 @@ class SchedulingToolProvider:
         self._scheduler = scheduler
         self._settings_manager = settings_manager
         self._supervisor = supervisor
+        self._llm_client = llm_client
 
     def get_tools(self) -> list:
         """Return instantiated scheduling tool instances.
@@ -1788,5 +2246,5 @@ class SchedulingToolProvider:
             RemoveScheduledTaskTool(prompt_scheduler=self._prompt_scheduler),
             ListMediaTool(scheduler=self._scheduler),
             ListMediaItemsTool(scheduler=self._scheduler),
-            SearchMediaTorrentsTool(scheduler=self._scheduler),
+            SearchMediaTorrentsTool(scheduler=self._scheduler, llm_client=getattr(self, "_llm_client", None)),
         ]

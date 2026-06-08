@@ -81,7 +81,12 @@ class MetadataLookupRequest:
         episode = _safe_int(arguments.get("episode")) or MetadataLookupRequest.infer_episode_number(coordinate_text)
         include_episodes = bool(arguments.get("include_episodes", season is not None or episode is not None))
         question_blob = f"{query} {question or ''}".casefold()
-        if not include_episodes and any(term in question_blob for term in ("next episode", "upcoming episode", "episode air", "air date", "airdate", "when does", "when will", "quando")):
+        if not include_episodes and any(term in question_blob for term in (
+            "next episode", "upcoming episode", "episode air", "air date", "airdate",
+            "when does", "when will", "quando",
+            "next season", "upcoming season", "future season", "new season",
+            "prossima stagione", "nuova stagione", "stagione futura",
+        )):
             include_episodes = True
         category_id = str(arguments.get("category_id") or "").strip().lower() or None
         if category_id not in {None, "tv", "movie", "general"}:

@@ -20,6 +20,7 @@ from src.llm_providers.context_limits import (
     probe_endpoint_context_limit,
 )
 from src.utils.detailed_logger import LLMLogger
+from src.utils.runtime_prompt_context import RuntimePromptContext
 
 
 class ResolvedLLMTask:
@@ -232,6 +233,7 @@ class TaskLLMClient:
         of our custom api_base.
         """
         resolved = self.resolve_task(task)
+        messages = RuntimePromptContext.ensure_messages(messages)
 
         if self._llm_logger:
             try:

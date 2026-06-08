@@ -8,6 +8,8 @@ tool execution with the non-streaming path.
 """
 
 from typing import Any, AsyncIterator
+import json
+import uuid
 
 from loguru import logger
 
@@ -19,6 +21,8 @@ from src.utils.circuit_breaker import CircuitOpenError
 from src.ai.error_presenter import AgentErrorPresenter
 from src.ai.chat_presenter import AgentChatPresenter
 from src.ai.bare_tool_call import BareToolCallDetector
+from src.ai.download_context_policy import DownloadContextPolicy
+from src.ai.download_tool_recovery import DownloadToolRecovery
 
 
 class StreamingAgentLoopExecutor:
@@ -76,6 +80,7 @@ class StreamingAgentLoopExecutor:
         plan_trace_store: Any | None = None,
         session_id: str | None = None,
         active_category_id: str | None = None,
+        user_prompt: str | None = None,
     ) -> AsyncIterator[str]:
         """Execute the streaming agent tool loop, yielding tokens.
 
@@ -117,8 +122,16 @@ class StreamingAgentLoopExecutor:
                 yield plan_error
                 return
 
+        executed_tool_count = 0
+        tool_required_reprompted = False
+        forced_download_search_attempted = False
+
         for i in range(max_iterations):
             try:
+                must_use_tool_before_text = (
+                    executed_tool_count == 0
+                    and DownloadContextPolicy.download_turn_requires_tool(task, allowed_tool_names)
+                )
                 stream_response = await self._stream_completion(
                     task=task,
                     messages=messages,
@@ -145,6 +158,13 @@ class StreamingAgentLoopExecutor:
                         else delta.get("content", "")
                     )
                     if content_text:
+                        if must_use_tool_before_text:
+                            # Fresh DOWNLOAD turns must be grounded in tool output.
+                            # Buffer the model's premature prose until we know whether
+                            # it also emitted tool calls; do not show stale candidate
+                            # summaries to the user before any tool has run.
+                            collected_content += content_text
+                            continue
                         if not emitted_content and BareToolCallDetector.looks_like_json_prefix(pending_jsonish_content + content_text):
                             pending_jsonish_content += content_text
                         else:
@@ -204,12 +224,100 @@ class StreamingAgentLoopExecutor:
                         arguments_raw=recovered.arguments,
                         tool_call_id=recovered.call_id,
                         allowed_tool_names=allowed_tool_names,
-                        tool_context=self._tool_context(session_id, active_category_id=active_category_id),
+                        tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
                     )
                     messages.append(result_message)
+                    executed_tool_count += 1
                     continue
 
                 if not tool_calls:
+                    if must_use_tool_before_text and collected_content and not tool_required_reprompted:
+                        if not forced_download_search_attempted and "search_media_torrents" in set(allowed_tool_names or set()):
+                            recovery_args = DownloadToolRecovery.build_search_media_torrents_args(
+                                user_prompt=user_prompt,
+                                active_category_id=active_category_id,
+                            )
+                            if recovery_args:
+                                forced_download_search_attempted = True
+                                tool_call_id = f"forced_search_media_{uuid.uuid4().hex[:12]}"
+                                logger.warning(
+                                    "DOWNLOAD turn produced prose before any tool call; suppressing prose and executing recovery search_media_torrents call args={}",
+                                    recovery_args,
+                                )
+                                messages.append({
+                                    "role": "assistant",
+                                    "tool_calls": [{
+                                        "id": tool_call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": "search_media_torrents",
+                                            "arguments": json.dumps(recovery_args, ensure_ascii=False),
+                                        },
+                                    }],
+                                })
+                                result_message, _ = await self._tool_executor.execute_tool_call(
+                                    name="search_media_torrents",
+                                    arguments_raw=json.dumps(recovery_args, ensure_ascii=False),
+                                    tool_call_id=tool_call_id,
+                                    allowed_tool_names=allowed_tool_names,
+                                    tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                                )
+                                messages.append(result_message)
+                                executed_tool_count += 1
+                                self.last_content = ""
+                                continue
+                        logger.warning(
+                            "DOWNLOAD turn produced prose before any tool call; suppressing stale answer and reprompting for tool use. chars={}",
+                            len(collected_content),
+                        )
+                        messages.append({
+                            "role": "system",
+                            "content": DownloadContextPolicy.reprompt_after_toolless_download_answer(user_prompt),
+                        })
+                        self.last_content = ""
+                        tool_required_reprompted = True
+                        continue
+                    if DownloadContextPolicy.download_turn_requires_tool(task, allowed_tool_names) and executed_tool_count == 0:
+                        if not forced_download_search_attempted and "search_media_torrents" in set(allowed_tool_names or set()):
+                            recovery_args = DownloadToolRecovery.build_search_media_torrents_args(
+                                user_prompt=user_prompt,
+                                active_category_id=active_category_id,
+                            )
+                            if recovery_args:
+                                forced_download_search_attempted = True
+                                tool_call_id = f"forced_search_media_{uuid.uuid4().hex[:12]}"
+                                logger.warning(
+                                    "DOWNLOAD turn produced no tool call after reprompt; executing recovery search_media_torrents call args={}",
+                                    recovery_args,
+                                )
+                                messages.append({
+                                    "role": "assistant",
+                                    "tool_calls": [{
+                                        "id": tool_call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": "search_media_torrents",
+                                            "arguments": json.dumps(recovery_args, ensure_ascii=False),
+                                        },
+                                    }],
+                                })
+                                result_message, _ = await self._tool_executor.execute_tool_call(
+                                    name="search_media_torrents",
+                                    arguments_raw=json.dumps(recovery_args, ensure_ascii=False),
+                                    tool_call_id=tool_call_id,
+                                    allowed_tool_names=allowed_tool_names,
+                                    tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                                )
+                                messages.append(result_message)
+                                executed_tool_count += 1
+                                continue
+                        fallback = (
+                            "I could not get the tool backend to run a search for that download request. "
+                            "No candidate claim was made from memory; please retry after checking the tool/backend logs."
+                        )
+                        self.last_content = fallback
+                        yield fallback
+                        return
                     # Pure text response — already streamed to the user
                     logger.debug(
                         f"Agent iteration {i}: no tool calls, streamed "
@@ -239,9 +347,10 @@ class StreamingAgentLoopExecutor:
                         arguments_raw=tc.arguments,
                         tool_call_id=tc.id,
                         allowed_tool_names=allowed_tool_names,
-                        tool_context=self._tool_context(session_id, active_category_id=active_category_id),
+                        tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
                     )
                     messages.append(result_message)
+                    executed_tool_count += 1
 
                 # Next iteration will stream the final answer
 
@@ -299,14 +408,14 @@ class StreamingAgentLoopExecutor:
 
 
     @staticmethod
-    def _tool_context(session_id: str | None, *, active_category_id: str | None = None) -> ToolExecutionContext:
+    def _tool_context(session_id: str | None, *, active_category_id: str | None = None, user_prompt: str | None = None) -> ToolExecutionContext:
         """Build lightweight invocation context for declarative tools."""
         source = "web"
         if session_id and ":" in session_id:
             source = session_id.split(":", 1)[0] or "web"
         elif session_id and "_" in session_id:
             source = session_id.split("_", 1)[0] or "web"
-        return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id)
+        return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id, user_prompt=user_prompt)
 
     async def _execute_plan_steps(
         self=None,

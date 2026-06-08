@@ -16,6 +16,7 @@ from loguru import logger
 from src.core.models import Intent, PlanStep, AgentPlan
 from src.utils.circuit_breaker import CircuitBreaker
 from src.utils.json_parser import LLMResponseParser
+from src.utils.runtime_prompt_context import RuntimePromptContext
 from src.search.web.research_guidance import WebResearchPromptGuidance
 from src.ai.task_prompt_guidance import TaskPromptGuidance
 
@@ -363,7 +364,7 @@ class ReasoningPlanner:
             response = await self._breaker.call(
                 litellm.acompletion,
                 model=self._model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=RuntimePromptContext.ensure_messages([{"role": "user", "content": prompt}]),
                 api_base=self._api_base,
                 api_key=self._api_key,
                 max_tokens=500,
@@ -425,7 +426,7 @@ class ReasoningPlanner:
                 response = await self._breaker.call(
                     litellm.acompletion,
                     model=self._model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=RuntimePromptContext.ensure_messages([{"role": "user", "content": prompt}]),
                     api_base=self._api_base,
                     api_key=self._api_key,
                     max_tokens=50,

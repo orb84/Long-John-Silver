@@ -489,15 +489,18 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
     def build_search_query(self, item: Any, unit_label: str | None, language: str | None) -> str:
         """Return the first TV torrent query for a specific unit.
 
-        For TV episodes, language is mostly a ranking/confirmation facet, not a
-        safe hard search term.  The provider query starts broad enough to find
-        the exact SxxEyy release; language-specific variants live in the TV
-        alternative ladder and final queueing still enforces the preferred
-        media-language policy.
+        For TV episodes, a configured/requested media language is important
+        enough to try first: many indexers can return a page full of English or
+        unknown-language rows for a bare SxxEyy query, preventing later Italian
+        variants from being reached.  The broader bare query remains in the
+        alternative ladder for recall.
         """
         title = str(getattr(item, "key", "") or "").strip()
         label = str(unit_label or "").strip()
-        return f"{title} {label}".strip() if label else title
+        query = f"{title} {label}".strip() if label else title
+        if label and language:
+            return self._append_search_language(query, language)
+        return query
 
     def build_alternative_search_queries(self, item: Any, unit_label: str | None, language: str | None) -> list[str]:
         """Return TV-owned fallback queries for exact episode searches.
@@ -515,13 +518,29 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         if not season or not episode:
             return []
         dotted_title = re.sub(r"\s+", ".", title)
-        base_queries = [
+        exact_queries = [
             f"{title} S{season:02d}E{episode:02d}",
             f"{dotted_title}.S{season:02d}E{episode:02d}",
             f"{title} {season}x{episode:02d}",
+        ]
+        language_queries: list[str] = []
+        preferred = str(language or "").strip()
+        if preferred:
+            for query in exact_queries:
+                tagged = self._append_search_language(query, preferred)
+                if tagged != query:
+                    language_queries.append(tagged)
+        quality_queries = [
             f"{title} S{season:02d}E{episode:02d} 1080p",
             f"{title} S{season:02d}E{episode:02d} HEVC",
             f"{title} S{season:02d}E{episode:02d} x265",
+        ]
+        if preferred:
+            for query in quality_queries[:1]:
+                tagged = self._append_search_language(query, preferred)
+                if tagged != query:
+                    language_queries.append(tagged)
+        pack_queries = [
             # Exact-episode releases are not always published separately. Keep
             # season-pack schemas in the episode ladder so a single requested
             # episode can be file-selected from inside a torrent bundle.
@@ -532,10 +551,8 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             f"{title} Season {season} Complete",
             f"{title} S{season:02d} Pack",
         ]
-        language_queries: list[str] = []
-        preferred = str(language or "").strip()
         if preferred:
-            for query in [base_queries[0], base_queries[3]]:
+            for query in pack_queries[:2]:
                 tagged = self._append_search_language(query, preferred)
                 if tagged != query:
                     language_queries.append(tagged)
@@ -545,7 +562,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         # inject unrelated language tokens.
         seen: set[str] = set()
         out: list[str] = []
-        for query in [*base_queries, *language_queries]:
+        for query in [*exact_queries, *language_queries, *quality_queries, *pack_queries]:
             normalized = query.casefold().strip()
             if normalized and normalized not in seen:
                 seen.add(normalized)

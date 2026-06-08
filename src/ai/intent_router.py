@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 from src.core.models import Intent
 from src.utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from src.utils.json_parser import LLMResponseParser
+from src.utils.runtime_prompt_context import RuntimePromptContext
 
 CLARIFY_THRESHOLD = 0.6
 
@@ -158,7 +159,7 @@ class IntentRouter:
             response = await breaker.call(
                 litellm.acompletion,
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=RuntimePromptContext.ensure_messages([{"role": "user", "content": prompt}]),
                 api_base=api_base,
                 api_key=api_key,
                 max_tokens=20,

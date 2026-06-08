@@ -14,6 +14,7 @@ from typing import Optional, TYPE_CHECKING
 from src.core.database import Database
 from src.core.vector_store import VectorStore
 from src.utils.circuit_breaker import CircuitBreaker
+from src.utils.runtime_prompt_context import RuntimePromptContext
 
 if TYPE_CHECKING:
     from src.llm_providers.task_client import TaskLLMClient
@@ -447,7 +448,7 @@ class ConversationManager:
             import litellm
             kwargs = {
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": RuntimePromptContext.ensure_messages([{"role": "user", "content": prompt}]),
                 "max_tokens": 200,
                 "temperature": 0.3,
             }

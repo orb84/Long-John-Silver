@@ -7,6 +7,8 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
+from src.ai.runtime_date_grounding import RuntimeDateGrounding
+
 from src.core.models import (
     CategoryResearchFact,
     CategoryResearchInterpretation,
@@ -82,6 +84,8 @@ class TvWebResearchInterpreter:
                     value={
                         "url": url,
                         "date_mentions": dates[:5],
+                        "date_relations": [RuntimeDateGrounding.classify_date(value) for value in dates[:5] if RuntimeDateGrounding.classify_date(value)],
+                        "runtime_date_context": RuntimeDateGrounding.runtime_context(),
                         "evidence_snippet": evidence.snippet[:500],
                     },
                     source_id=source_id,
@@ -101,6 +105,11 @@ class TvWebResearchInterpreter:
                     confidence=max(float(evidence.confidence or 0.0), 0.48),
                     authoritative=False,
                 )
+        warnings = list(bundle.warnings)
+        for evidence in bundle.evidence:
+            text = self._combined_text(evidence, source_by_url.get(str(evidence.url or "")))
+            freshness = RuntimeDateGrounding.source_freshness_signals(text, query=research_input.context.get("user_query", ""), intent=research_input.intent)
+            warnings.extend(f"TV date-grounding warning: {warning}" for warning in freshness.get("warnings", []))
         summary = self._summary(facts, research_input)
         unresolved = list(bundle.unresolved_questions)
         if not facts and bundle.evidence:
@@ -111,7 +120,7 @@ class TvWebResearchInterpreter:
             intent=research_input.intent,
             summary=summary,
             facts=facts,
-            warnings=list(bundle.warnings),
+            warnings=warnings,
             unresolved_questions=unresolved,
             can_mutate_item=False,
         )
@@ -234,6 +243,7 @@ class TvWebResearchMixin:
                 "For title collisions, include 'TV series', streamer/network, year, and known creator/cast hints from context. Avoid ambiguous queries that could match places, games, companies, or unrelated media.",
                 "For rumours/social chatter, separate unconfirmed fan/social/forum evidence from official or trade-reported confirmation. Social evidence can establish chatter exists; it cannot prove renewal, cancellation, shooting, or dates by itself.",
                 "Use current-year/freshness terms and time_range month/year for ongoing shows, renewal news, production status, and future schedules. Use general/reference searches alongside news searches so old episode guides do not dominate the whole answer.",
+                "For next/upcoming/future season questions, compare every season/page/source date to the runtime current date. A page saying a season is upcoming in a past year is stale background, not the answer. If season 3 aired in 2025 and the runtime year is 2026, the next-season question is about season 4 unless the user explicitly named season 3.",
             ],
             "source_quality_policy": [
                 "Strong TV sources: streamer/network official pages and press rooms; TVMaze/TMDB/IMDb episode pages for episode lists; reputable trades such as Deadline, Variety, Hollywood Reporter; direct creator/showrunner/interview sources.",
@@ -241,13 +251,14 @@ class TvWebResearchMixin:
                 "Weak sources: fan calendars, SEO schedule sites, Reddit/X/Twitter/forum posts, undated blogs. Use them only as unconfirmed chatter unless corroborated.",
             ],
             "freshness_policy": [
-                "For active/returning shows, old season pages are background, not evidence about future seasons.",
+                "For active/returning shows, old season pages are background, not evidence about future seasons. Already-aired seasons must not be described as upcoming.",
                 "For questions phrased as rumours/news/current/next/upcoming/latest, at least one planned search should use category news and a time_range of month or year.",
                 "A negative answer requires current official/reference/trade coverage, not just absence from a generic episode guide.",
             ],
             "answer_policy": [
                 "Do not say a season is unconfirmed if fetched current sources show renewal/production/interviews; state the strongest source type and confidence.",
                 "Do not state an episode aired or will air unless a source provides a concrete date and the date has been compared to the runtime date.",
+                "Do not answer next/upcoming season questions from a past season page alone; say it is stale and search/answer about the later season.",
                 "If evidence is degraded/fallback-only or mostly snippets, explicitly lower confidence and continue searching when the user needs a factual answer.",
             ],
             "query_examples": [

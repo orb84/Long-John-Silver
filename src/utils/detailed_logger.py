@@ -195,15 +195,24 @@ class LLMLogger:
 
 
 class SearchLogger:
-    """Logs exact search query parameters and target results metrics."""
+    """Logs exact search query parameters and target results metrics.
 
-    def __init__(self, writer: ThreadSafeFileWriter) -> None:
+    The human-readable ``searches.log`` is useful for quick inspection, but it
+    is not enough for repeated torrent-search debugging.  The optional JSONL
+    writer records a structured per-query snapshot that can be grepped or loaded
+    into Python without reverse-parsing prose logs.  Magnets are never written;
+    only a short info-hash fingerprint is kept.
+    """
+
+    def __init__(self, writer: ThreadSafeFileWriter, json_writer: ThreadSafeFileWriter | None = None) -> None:
         """Initialize the SearchLogger.
 
         Args:
-            writer: The underlying thread-safe file writer.
+            writer: The underlying thread-safe text writer.
+            json_writer: Optional structured JSONL writer.
         """
         self._writer = writer
+        self._json_writer = json_writer
 
     async def log_search(
         self,
@@ -220,7 +229,7 @@ class SearchLogger:
         accepted_results: Sequence[Any] | None = None,
         ranked_results: Sequence[Any] | None = None,
         fallback_used: bool | None = None,
-        max_results_to_log: int = 50,
+        max_results_to_log: int = 200,
     ) -> None:
         """Log indexing queries, provider diagnostics, and visible candidates.
 
@@ -232,6 +241,7 @@ class SearchLogger:
         passkeys can appear in them.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
+        query_id = self._query_id(timestamp, query, category)
         diagnostics_lines = self._format_provider_diagnostics(provider_diagnostics or {})
         raw_lines = self._format_result_block("Raw Results", raw_results or [], max_results_to_log)
         deduped_lines = self._format_result_block("Deduped Results", deduped_results or [], max_results_to_log)
@@ -240,6 +250,7 @@ class SearchLogger:
         log_entry = (
             "================================================================================\n"
             f"Timestamp: {timestamp}\n"
+            f"Search ID: {query_id}\n"
             f"Query: {query!r} | Category: {category}\n"
             f"Active Providers: {active_providers}\n"
             f"Fallback Used: {fallback_used}\n"
@@ -255,6 +266,90 @@ class SearchLogger:
             "================================================================================\n\n"
         )
         await self._writer.write(log_entry)
+        if self._json_writer:
+            record = {
+                "event": "torrent_search_query",
+                "search_id": query_id,
+                "timestamp": timestamp,
+                "query": query,
+                "category": category,
+                "active_providers": active_providers,
+                "fallback_used": fallback_used,
+                "counts": {
+                    "raw": total_raw,
+                    "deduped": unique_deduped,
+                    "accepted": quality_filtered,
+                    "ranked": len(ranked_results or []),
+                },
+                "provider_diagnostics": self._diagnostics_to_json(provider_diagnostics or {}),
+                "stages": {
+                    "raw": self._results_to_json(raw_results or [], max_results_to_log),
+                    "deduped": self._results_to_json(deduped_results or [], max_results_to_log),
+                    "accepted": self._results_to_json(accepted_results or [], max_results_to_log),
+                    "ranked": self._results_to_json(ranked_results or [], max_results_to_log),
+                },
+            }
+            await self._json_writer.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+    @staticmethod
+    def _query_id(timestamp: str, query: str, category: str) -> str:
+        import hashlib
+        material = f"{timestamp}|{category}|{query}".encode("utf-8", "ignore")
+        return hashlib.sha256(material).hexdigest()[:16]
+
+    @classmethod
+    def _results_to_json(cls, results: Sequence[Any], max_results: int) -> dict[str, Any]:
+        clipped = list(results)[:max(0, max_results)]
+        return {
+            "count": len(results),
+            "omitted": max(0, len(results) - len(clipped)),
+            "rows": [cls._result_to_json(result, idx) for idx, result in enumerate(clipped, start=1)],
+        }
+
+    @staticmethod
+    def _result_to_json(result: Any, index: int) -> dict[str, Any]:
+        magnet = str(getattr(result, "magnet", "") or "")
+        info_hash = ""
+        if magnet:
+            import re
+            m = re.search(r"xt=urn:btih:([a-z0-9]+)", magnet, re.I)
+            info_hash = (m.group(1).lower()[:16] if m else "present_unparsed")
+        url = str(getattr(result, "url", "") or "")
+        url_host = ""
+        if url:
+            try:
+                from urllib.parse import urlparse
+                url_host = urlparse(url).netloc or ""
+            except Exception:
+                url_host = "unparsed"
+        return {
+            "index": index,
+            "title": str(getattr(result, "title", "") or ""),
+            "source": str(getattr(result, "source", "unknown") or "unknown"),
+            "seeders": getattr(result, "seeders", None),
+            "size": getattr(result, "size", None),
+            "size_bytes": getattr(result, "size_bytes", None),
+            "quality_score": getattr(result, "quality_score", None),
+            "magnet_present": bool(magnet),
+            "info_hash_prefix": info_hash,
+            "url_host": url_host,
+        }
+
+    @staticmethod
+    def _diagnostics_to_json(provider_diagnostics: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, diag in provider_diagnostics.items():
+            out[str(key)] = {
+                "provider": getattr(diag, "provider", key),
+                "ok": getattr(diag, "ok", None),
+                "result_count": getattr(diag, "result_count", None),
+                "magnet_count": getattr(diag, "magnet_count", None),
+                "elapsed_ms": getattr(diag, "elapsed_ms", None),
+                "outcome": getattr(diag, "outcome", None),
+                "blocked_reason": getattr(diag, "blocked_reason", None),
+                "error": getattr(diag, "error", None),
+            }
+        return out
 
     @staticmethod
     def _format_provider_diagnostics(provider_diagnostics: dict[str, Any]) -> str:
@@ -462,13 +557,14 @@ class DetailedLoggingSubsystem:
         response_writer = ThreadSafeFileWriter(self._log_dir / "llm_raw_response.log")
         structured_writer = ThreadSafeFileWriter(self._log_dir / "structured_replies.log")
         search_writer = ThreadSafeFileWriter(self._log_dir / "searches.log")
+        search_json_writer = ThreadSafeFileWriter(self._log_dir / "searches.jsonl", max_bytes=25 * 1024 * 1024)
         torrent_writer = ThreadSafeFileWriter(self._log_dir / "torrents.log")
 
         # Initialize individual loggers
         self._chat_logger = ChatLogger(chat_writer)
         self._llm_logger = LLMLogger(context_writer, response_writer)
         self._structured_logger = StructuredReplyLogger(structured_writer)
-        self._search_logger = SearchLogger(search_writer)
+        self._search_logger = SearchLogger(search_writer, search_json_writer)
         self._torrent_logger = TorrentLogger(torrent_writer)
 
     @property

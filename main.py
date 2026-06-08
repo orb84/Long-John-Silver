@@ -859,6 +859,7 @@ async def main():
                 scheduler=scheduler,
                 settings_manager=settings_manager,
                 supervisor=supervisor,
+                llm_client=task_llm_client,
             ),
             WebToolProvider(
                 web_reader=WebReader(),

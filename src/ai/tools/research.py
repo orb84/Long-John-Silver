@@ -19,6 +19,7 @@ from loguru import logger
 
 from src.core.models import Intent, ToolExecutionContext
 from src.ai.public_web_requirements import PublicWebEvidencePolicy
+from src.ai.runtime_date_grounding import RuntimeDateGrounding
 from src.ai.tools.metadata_lookup_support import (
     LibraryMetadataSnapshotLookup,
     MetadataClientResolver,
@@ -432,6 +433,7 @@ class MetadataLookupTool:
             answer_hints["requested_episode"] = requested_episode
             payload["requested_episode"] = requested_episode
             payload["episode"] = requested_episode
+        RuntimeDateGrounding.annotate_metadata_payload(payload)
         if PublicWebEvidencePolicy.requires_public_web_evidence(request.question, request.query):
             public_intent = PublicWebEvidencePolicy.category_research_intent(request.question, request.query)
             payload["requires_public_web_evidence"] = True
@@ -519,30 +521,22 @@ class DateComparisonTool:
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
         """Compare the supplied date to today's runtime date."""
         value = str(arguments.get("date") or "").strip()
-        parsed = self._parse_date(value)
         now = datetime.now(timezone.utc).astimezone()
-        today = now.date()
-        if parsed is None:
+        grounded = RuntimeDateGrounding.classify_date(value)
+        if grounded is None:
             return {
                 "ok": False,
-                "error": "Could not parse date; expected YYYY-MM-DD or ISO timestamp.",
+                "error": "Could not parse date; expected YYYY-MM-DD, ISO timestamp, month/day/year, or year-like phrase.",
                 "input": value,
-                "current_date": today.isoformat(),
+                "current_date": now.date().isoformat(),
                 "current_datetime": now.isoformat(timespec="seconds"),
             }
-        delta = (parsed - today).days
-        relation = "future" if delta > 0 else "past" if delta < 0 else "today"
-        return {
+        grounded.update({
             "ok": True,
             "label": str(arguments.get("label") or "").strip() or None,
-            "input": value,
-            "date": parsed.isoformat(),
-            "current_date": today.isoformat(),
             "current_datetime": now.isoformat(timespec="seconds"),
-            "relation": relation,
-            "days_delta": delta,
-            "tense_guidance": self._tense_guidance(relation),
-        }
+        })
+        return grounded
 
     @staticmethod
     def _parse_date(value: str):

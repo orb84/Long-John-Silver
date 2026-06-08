@@ -17,6 +17,7 @@ from typing import Any
 
 from loguru import logger
 
+from src.ai.download_context_policy import DownloadContextPolicy
 from src.core.models import Intent
 from src.utils.candidate_ids import load_result_set
 
@@ -40,9 +41,11 @@ class AgentGoalState:
         """Return a prompt-safe context packet for the LLM."""
         packet = asdict(self)
         packet["rule"] = (
-            "Use this as task state, not as prose. Continue the active goal when the "
-            "current message semantically refers to it. Use result_set_id/candidate_id "
-            "handles rather than raw magnets or guessed JSON paths."
+            "Use this as task state, not as prose. Continue the active goal only when the "
+            "current message semantically refers to selecting/refining/queueing it. Fresh "
+            "download/search requests must call the search tool again instead of answering "
+            "from old result sets. Use result_set_id/candidate_id handles rather than raw "
+            "magnets or guessed JSON paths."
         )
         return packet
 
@@ -65,8 +68,14 @@ class AgentGoalStateManager:
         if not session_id or not self._db:
             return ""
         previous = await self._load(session_id)
-        current = self._merge_goal(previous, session_id, user_prompt, intent, category_id)
-        current.result_sets = await self._recent_result_set_summaries(session_id)
+        fresh_goal = DownloadContextPolicy.should_start_fresh_goal(user_prompt, intent)
+        current = self._merge_goal(previous, session_id, user_prompt, intent, category_id, force_new=fresh_goal)
+        current.result_sets = [] if fresh_goal else await self._recent_result_set_summaries(session_id)
+        if fresh_goal:
+            logger.info(
+                "AgentGoalStateManager: starting fresh DOWNLOAD goal without inherited result sets session_id={}",
+                session_id,
+            )
         current.next_actions = self._next_actions_for_intent(intent, bool(current.result_sets))
         await self._save(current)
         return self._format_context(previous, current)
@@ -112,9 +121,10 @@ class AgentGoalStateManager:
         user_prompt: str,
         intent: Intent,
         category_id: str | None,
+        force_new: bool = False,
     ) -> AgentGoalState:
         now = datetime.now(timezone.utc).isoformat()
-        if previous and self._should_continue(previous, intent, category_id):
+        if previous and not force_new and self._should_continue(previous, intent, category_id):
             previous.user_goal = user_prompt if intent != Intent.CHAT else previous.user_goal
             previous.intent = intent.value
             previous.category_id = category_id or previous.category_id

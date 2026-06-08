@@ -43,6 +43,7 @@ from src.core.behavior_tracker import BehaviorTracker
 from src.ai.behavior_recorder import BehaviorRecorder
 from src.core.release_groups import ReleaseGroupTracker
 from src.ai.conversation_binding import ConversationBinding
+from src.ai.download_context_policy import DownloadContextPolicy
 from src.ai.llm_task_runtime import LLMTaskRuntime
 from src.ai.error_presenter import AgentErrorPresenter
 from src.ai.chat_presenter import AgentChatPresenter
@@ -197,7 +198,7 @@ class AIAssistant:
         bridge does not pay a second routing call simply to avoid noisy status
         pings for trivial CHAT messages such as thanks/acknowledgements.
         """
-        pending_action_context = await self._pending_actions.build_for_session(session_id)
+        pending_action_context = await self._pending_actions.build_for_session(session_id, current_user_prompt=user_prompt)
         routing_context = await self._conversation_binding.build_intent_routing_context(
             session_id,
             pending_action_context=pending_action_context,
@@ -211,9 +212,17 @@ class AIAssistant:
     async def generate_progress_message(
         self, user_prompt: str, tick: int = 0, intent: Intent | None = None
     ) -> str:
-        """Generate or fall back to a short persona/language-aware progress line."""
+        """Generate or fall back to a short persona/language-aware progress line.
+
+        Progress messages are user-visible before the tool loop has evidence.
+        Never let a free-form LLM progress completion refuse, answer, or steer a
+        side-effecting turn.  DOWNLOAD/CONFIG turns use deterministic persona
+        messages only; other intents may use the LLM as a cosmetic helper, but
+        refusal/error-like text is rejected.
+        """
         fallback = self.format_progress_message(user_prompt, tick)
-        if tick != 0 or not self._llm_client:
+        intent_value = intent.value if isinstance(intent, Intent) else str(intent or "").upper()
+        if tick != 0 or not self._llm_client or intent_value in {"DOWNLOAD", "CONFIG"}:
             return fallback
         language = detect_user_language_label(user_prompt)
         try:
@@ -221,7 +230,7 @@ class AIAssistant:
                 "Write one very short in-character progress acknowledgement for a media-library assistant. "
                 "It must be in the same language as the user's message"
                 + (f" ({language})" if language else "")
-                + ". Do not answer the request. Do not claim a specific tool has run. "
+                + ". Do not answer the request. Do not refuse. Do not apologize. Do not claim a specific tool has run. "
                 "No more than 18 words. Vary the wording.\n\n"
                 f"User message: {user_prompt}\n"
                 f"Intent: {intent.value if intent else 'unknown'}"
@@ -235,11 +244,24 @@ class AIAssistant:
             from src.utils.json_parser import LLMResponseParser
 
             text = LLMResponseParser.safe_extract_content(response).strip().strip('"')
-            if text:
+            if text and not self._looks_like_bad_progress_ack(text):
                 return text[:220]
         except Exception as exc:  # pragma: no cover - status generation must never break chat
             logger.debug(f"Progress acknowledgement generation fell back to templates: {exc}")
         return fallback
+
+    @staticmethod
+    def _looks_like_bad_progress_ack(text: str) -> bool:
+        """Return True for progress text that looks like an answer/refusal."""
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return True
+        bad_fragments = (
+            "i can't help", "i cannot help", "i can’t help",
+            "i'm sorry", "i’m sorry", "can't assist", "cannot assist",
+            "i won't", "i will not", "not able to", "unable to",
+        )
+        return any(fragment in lowered for fragment in bad_fragments)
 
     async def _route_intent(self, user_prompt: str, pending_action_context: str | None) -> Intent:
         """Route user intent through the configured router/client."""
@@ -330,7 +352,7 @@ class AIAssistant:
         Returns:
             ExecutionContext with intent, messages, tool config, etc.
         """
-        pending_action_context = await self._pending_actions.build_for_session(session_id)
+        pending_action_context = await self._pending_actions.build_for_session(session_id, current_user_prompt=user_prompt)
         cache_key = (session_id or "default", user_id or "", user_prompt)
         cached = self._preflight_intent_cache.pop(cache_key, None)
         if cached is not None:
@@ -541,6 +563,7 @@ class AIAssistant:
                 f"{planning_pref_context}\n\n{pending_action_context}"
                 if planning_pref_context else pending_action_context
             )
+        fresh_download_request = DownloadContextPolicy.should_suppress_pending_candidates(user_prompt, intent)
         context_msgs = await self._conversation_binding.build_context_messages(
             session_id,
             user_id,
@@ -549,6 +572,7 @@ class AIAssistant:
             max_tokens=context_budget.get("conversation_tokens"),
             raw_recent_tokens=context_budget.get("raw_recent_conversation_tokens"),
             compressed_history_tokens=context_budget.get("compressed_history_tokens"),
+            fresh_download_request=fresh_download_request,
         )
         messages.extend(context_msgs)
         messages.append({"role": "user", "content": user_prompt})
@@ -678,6 +702,7 @@ class AIAssistant:
             plan_executor=plan_exec,
             plan_trace_store=plan_trace_store,
             session_id=session_id,
+            active_category_id=ctx.category_id,
         )
         final_response = loop_result.response
 
@@ -803,6 +828,7 @@ class AIAssistant:
             plan_trace_store=plan_trace_store,
             session_id=session_id,
             active_category_id=ctx.category_id,
+            user_prompt=user_prompt,
         ):
             yield token
 

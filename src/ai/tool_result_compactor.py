@@ -82,11 +82,14 @@ class ToolResultCompactor:
             }
         candidates = list(result.get("candidates") or [])
         batch = result.get("batch_recommendation") if isinstance(result.get("batch_recommendation"), dict) else None
+        review = result.get("llm_candidate_review") if isinstance(result.get("llm_candidate_review"), dict) else None
         keep_ids = self._recommended_candidate_ids(batch)
+        keep_ids.update(self._llm_recommended_candidate_ids(review))
         selected = self._select_search_candidates(candidates, keep_ids)
         compact: dict[str, Any] = {
             "query": result.get("query"),
             "language": result.get("language"),
+            "expected_episode_count": result.get("expected_episode_count"),
             "category_id": result.get("category_id"),
             "name": result.get("name"),
             "item_id": result.get("item_id"),
@@ -111,6 +114,20 @@ class ToolResultCompactor:
             "candidate_picker": self._compact_candidate_picker(result.get("candidate_picker")),
             "candidates": [self._compact_candidate(c, fallback_result_set_id=result.get("result_set_id")) for c in selected],
         }
+        quality_policy = self._compact_quality_choice_policy(result.get("quality_choice_policy"))
+        if quality_policy:
+            compact["quality_choice_policy"] = quality_policy
+        if result.get("llm_candidate_review_status"):
+            compact["llm_candidate_review_status"] = result.get("llm_candidate_review_status")
+        if result.get("recommended_candidate_id"):
+            compact["recommended_candidate_id"] = result.get("recommended_candidate_id")
+        compact_review = self._compact_llm_candidate_review(review)
+        if compact_review:
+            compact["llm_candidate_review"] = compact_review
+            compact["llm_review_note"] = (
+                "The candidate workspace was semantically reviewed by the task LLM. "
+                "Prefer recommended_candidate_ids when they still satisfy queue/inspection constraints."
+            )
         if result.get("soulseek_summary"):
             compact["soulseek_summary"] = result.get("soulseek_summary")
         companion = result.get("companion_soulseek") if isinstance(result.get("companion_soulseek"), dict) else None
@@ -133,6 +150,67 @@ class ToolResultCompactor:
             compact["llm_next_action"] = result.get("llm_next_action")
         if batch:
             compact["batch_recommendation"] = self._compact_batch_recommendation(batch, result.get("result_set_id"))
+        return compact
+
+
+
+    def _compact_quality_choice_policy(self, policy: Any) -> dict[str, Any]:
+        """Preserve quality/size choice requirements for the final chat model."""
+        if not isinstance(policy, dict) or not policy.get("requires_user_choice"):
+            return {}
+        choices = []
+        for choice in list(policy.get("choices") or [])[:8]:
+            if not isinstance(choice, dict):
+                continue
+            keys = (
+                "candidate_id", "title", "resolution", "codec", "size", "size_bytes",
+                "per_episode_size", "per_episode_size_mb", "estimated_bitrate_kbps",
+                "seeders", "languages", "requested_season_coverage",
+            )
+            choices.append({key: choice.get(key) for key in keys if choice.get(key) not in (None, "", [], {})})
+        compact = {
+            "requires_user_choice": True,
+            "reason": policy.get("reason"),
+            "tradeoff_type": policy.get("tradeoff_type"),
+            "message": policy.get("message"),
+            "candidate_ids": policy.get("candidate_ids"),
+            "choices": choices,
+            "comparison": policy.get("comparison"),
+        }
+        return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+    def _compact_llm_candidate_review(self, review: Any) -> dict[str, Any]:
+        """Keep torrent-candidate LLM adjudication visible after compaction.
+
+        The search tool caches full candidate records and may send dozens or
+        hundreds of raw rows through the adjudicator.  The final chat model still
+        needs to know whether that review actually ran, which IDs it preferred,
+        and why.  Without this compact review, the final model only sees a
+        reordered list and can easily treat the order as opaque provider ranking.
+        """
+        if not isinstance(review, dict):
+            return {}
+        keys = (
+            "reviewed_by",
+            "candidate_review_mode",
+            "candidate_count_reviewed",
+            "chunk_count",
+            "finalist_count",
+            "tournament_round_count",
+            "context_limit_tokens",
+            "recommended_candidate_ids",
+            "confidence",
+            "should_queue_now",
+            "needs_user_choice",
+            "reason",
+            "answer_hint",
+        )
+        compact = {key: review.get(key) for key in keys if review.get(key) not in (None, "", [], {})}
+        rejected = review.get("reject_candidate_ids")
+        if isinstance(rejected, list) and rejected:
+            compact["reject_candidate_ids_preview"] = rejected[:8]
+            if len(rejected) > 8:
+                compact["rejected_candidate_count"] = len(rejected)
         return compact
 
     def _compact_generic_search(self, result: Any) -> Any:
@@ -246,6 +324,17 @@ class ToolResultCompactor:
                 ids.add(str(value))
         return ids
 
+    @staticmethod
+    def _llm_recommended_candidate_ids(review: dict[str, Any] | None) -> set[str]:
+        """Return candidate IDs explicitly recommended by LLM adjudication."""
+        ids: set[str] = set()
+        if not isinstance(review, dict):
+            return ids
+        for value in review.get("recommended_candidate_ids") or []:
+            if value:
+                ids.add(str(value))
+        return ids
+
     def _select_search_candidates(self, candidates: list[Any], keep_ids: set[str]) -> list[dict[str, Any]]:
         selected: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -269,7 +358,13 @@ class ToolResultCompactor:
         if not isinstance(rows, list):
             return []
         compact_rows: list[dict[str, Any]] = []
-        keys = ("id", "index", "title", "size", "size_bytes", "seeders", "languages", "resolution", "source", "unit", "auto_queue_allowed", "blocked_reason", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count")
+        keys = (
+            "id", "candidate_id", "index", "title", "size", "size_bytes", "seeders",
+            "languages", "resolution", "source", "unit", "selection_warnings", "selection_blockers",
+            "auto_queue_allowed", "blocked_reason", "is_bundle", "bundle_scope", "pack_type",
+            "per_episode_size", "per_episode_size_mb", "estimated_bitrate_kbps", "codec",
+            "bundle_unit_count", "expected_episode_count", "requested_season_coverage", "coverage_note", "llm_recommended",
+        )
         for row in rows[: self._SEARCH_PICKER_LIMIT]:
             if not isinstance(row, dict):
                 continue
@@ -281,7 +376,7 @@ class ToolResultCompactor:
             "index", "option_index", "candidate_id", "title", "size", "size_bytes",
             "seeders", "source", "quality_score", "season", "episode", "languages",
             "resolution", "codec", "per_episode_size", "per_episode_size_bytes",
-            "estimated_bitrate_kbps", "selection_warnings", "selection_blockers", "auto_queue_allowed", "auto_queue_blocked_reason", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count",
+            "estimated_bitrate_kbps", "selection_warnings", "selection_blockers", "auto_queue_allowed", "auto_queue_blocked_reason", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count", "expected_episode_count", "requested_season_coverage", "coverage_note", "llm_recommended",
         )
         compact = {key: candidate.get(key) for key in keys if candidate.get(key) not in (None, "", [])}
         compact["result_set_id"] = candidate.get("result_set_id") or fallback_result_set_id

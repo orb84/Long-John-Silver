@@ -20,6 +20,7 @@ from src.core.models import (
 )
 from src.search.web.service import WebSearchService
 from src.search.web.url_utils import normalize_search_result_url
+from src.ai.runtime_date_grounding import RuntimeDateGrounding
 
 
 class WebSourceClassifier:
@@ -192,6 +193,11 @@ class WebResearchService:
             )
         queries = self._bounded_queries(request)
         bundle = WebEvidenceBundle(topic=request.query, intent=request.intent, facts_authoritative=False)
+        bundle.warnings.append(
+            "Runtime date context for this research: "
+            f"{RuntimeDateGrounding.runtime_context()['current_date']} "
+            "(compare source dates before using upcoming/future wording)."
+        )
         seen_urls: set[str] = set()
         fetched_count = 0
         service = self._service_for_request(request)
@@ -419,6 +425,14 @@ class WebResearchService:
         source.fetch_status = "fetched"
         source.confidence = self._classifier.confidence_for(source.source_kind, fetched=True)
         snippet = self._snippet(content) or source.snippet
+        freshness = RuntimeDateGrounding.source_freshness_signals(
+            " ".join([title, source.snippet, snippet, content[:4000]]),
+            published_at=source.published_at,
+            query=request.query,
+            intent=request.intent,
+        )
+        for warning in freshness.get("warnings", []):
+            bundle.warnings.append(f"Source freshness warning for {source.canonical_url}: {warning}")
         text_hash = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest() if content else ""
         evidence_id = await self._persist_source(
             source,
@@ -482,6 +496,13 @@ class WebResearchService:
                     "rank": source.rank,
                     "search_snippet": source.snippet,
                     "content_preview": self._snippet(content, max_chars=1800) if content else "",
+                    "runtime_date_context": RuntimeDateGrounding.runtime_context(),
+                    "freshness_signals": RuntimeDateGrounding.source_freshness_signals(
+                        " ".join([source.title, source.snippet, snippet or "", content[:4000] if content else ""]),
+                        published_at=source.published_at,
+                        query=request.query,
+                        intent=request.intent,
+                    ),
                     "facts_authoritative": False,
                 },
                 status=status,

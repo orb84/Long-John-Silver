@@ -81,3 +81,33 @@ Scheduled tasks / watches
 - Split large legacy scheduling/tool classes; they contain copied retry helper methods that make prompt/tool maintenance harder.
 - Add a prompt snapshot test per routed intent with approximate token/character budgets.
 - Add scenario traces for small-model behavior: pure reminder, condition check, future download tracking, replacement download, category scaffold, and current public information search.
+
+## Round 233 download-search review addendum
+
+The Round 233 Linux logs showed that torrent acquisition failures were not caused by web research. They came from three download-search prompt/tool mismatches:
+
+1. **Literal title preservation** — the LLM shortened `A Knight of the Seven Kingdoms` to `A Knight the Seven Kingdoms`, which reduced indexer recall. Generic tool context now carries the current user prompt so `search_media_torrents` can repair a lossy title argument from the literal user span without hard-coding any title or category.
+2. **TV language-query ordering** — exact episode searches stopped after broad non-language results, so Italian rows were never queried. TV now tries the configured/requested media language first for exact episode labels and uses a category-owned exact-episode query ladder before falling back to broad pack/season forms.
+3. **TV pack naming** — season packs are often named by episode range (`S01E01-06`), not by `Complete` or `Pack`. TV pack search now prioritizes provider-derived episode-range queries, including language-tagged forms, before generic pack words.
+
+Generic code still does not parse TV coordinates. It passes the current prompt and category-neutral search scope; the TV category owns title/unit/bundle interpretation and query schemas. Batch recommendations are suppressed for broad title-only searches so unrelated SxxEyy rows cannot be presented as a fake multi-unit plan.
+
+## Round 247 update — universal runtime date prompt context
+
+Round 246 made metadata and public-web tool results self-contained with runtime
+date evidence.  The follow-up change moves the same current date/time guidance to
+the LLM provider boundary too: `RuntimePromptContext.ensure_messages()` is called
+by the task-aware client and the lower-level provider client before the prompt is
+logged or sent.
+
+That means helper prompts that do not pass through the main assistant
+`PromptBuilder`—intent routing, summarization, candidate adjudication, taste
+extraction, torrent ranking, category research planning, and legacy direct
+provider paths—still receive the current datetime/date/year/timezone plus rules
+for interpreting relative wording such as today, tomorrow, next, upcoming,
+latest, current, and recent.
+
+Prompt builders and tool-result date payloads now share the same source:
+`src/utils/runtime_prompt_context.py`.  Do not add a new handcrafted current-date
+paragraph to individual prompts; reuse the shared context helper or route the
+call through `TaskLLMClient`.

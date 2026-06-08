@@ -1131,3 +1131,238 @@ LLM-facing behavior must be driven by concise shared task guidance plus category
 - Tool schemas should describe semantic objectives and stable handles clearly. They should not imply exact enum labels for natural-language intent unless the receiving tool actually requires an enum.
 - The LLM decides semantic research/action strategy from the user wording and current context. Deterministic code validates available tools, schemas, candidate IDs, budgets, evidence provenance, confirmation gates, and side-effect safety.
 - Public web evidence can inform category/download decisions, but category/download tools must still prove release/availability before any queueing action.
+
+### Round 233 TV Download Search Quality Rule
+
+Assistant torrent search must preserve the user's literal media title and let the owning category build release-query schemas. Generic agent code may carry the current user prompt for auditing/repair and may enforce category-neutral safety rules, but it must not hard-code TV episode or pack semantics.
+
+For TV:
+
+- exact episode searches must not stop after broad non-language results when a configured/requested media language exists;
+- season/show requests should start from category-owned bundle/pack search when no specific episode is requested;
+- pack queries should include episode-range naming patterns such as `S01E01-E06` / `S01E01-06` when provider metadata knows the season length;
+- broad title-only results must not be converted into multi-unit batch recommendations without a declared season/unit scope.
+
+## Round 234 Agent Rule — Fresh download requests must not reuse stale candidate context
+
+A fresh media acquisition request such as “grab/download/search <title> in <language>” must not be answered from old pending torrent candidates or an inherited active-goal result set. Pending candidate context is valid only when the current user message semantically selects, inspects, refines, confirms, or queues a previous result set/candidate.
+
+The LLM remains responsible for semantic download choices, but the runtime must enforce these guardrails:
+
+- suppress stale pending result-set context for fresh acquisition requests before building the main tool prompt;
+- start a fresh active goal without inherited result sets for fresh DOWNLOAD turns;
+- require at least one real download/search/queue-management tool call before a DOWNLOAD turn can produce a user-facing answer;
+- if the LLM tries to answer a DOWNLOAD turn from memory or stale context before using tools, suppress that prose and reprompt it to call the appropriate registered tool;
+- use old `result_set_id` / `candidate_id` handles only for real follow-ups such as choosing “the first one,” inspecting a candidate, or confirming queueing.
+
+Verify this with `scripts/round234_fresh_download_context_tests.py` after touching pending-action context, active-goal state, streaming agent loops, or download prompt guidance.
+
+## Round 235 TV Pack Recall Rule — Title Stopwords Are Not Semantic Barriers
+
+Torrent search must not lose valid category-owned candidates merely because the LLM turned a literal title into a search-shaped title and dropped a small inner title word such as `of`. The downloader may still use exact phrase matching first, but the owning category must validate TV pack relevance with a conservative significant-token matcher so `A Knight the Seven Kingdoms` can match `A Knight of the Seven Kingdoms` while short/article titles such as `The Boys` still do not overmatch unrelated titles such as `The Hardy Boys`.
+
+For fresh TV season/full-season requests, episode-range torrents such as `S01E01-06` are first-class season-pack candidates. They must survive category validation when they match the requested show title and season, especially when they advertise the requested language. If a search log contains such candidates in raw Jackett/Torznab results, they must not be filtered out before reaching the LLM candidate workspace unless the category can explain a hard rejection reason.
+
+Literal-title repair remains a generic pre-search helper, but it is not the only safety net. Category validation must also tolerate harmless missing title stopwords because not every agent/tool route is guaranteed to preserve the exact user span.
+
+## Round 236 LLM Candidate Adjudication Rule — Deterministic Filters Are Not the Semantic Judge
+
+Torrent candidate discovery must treat deterministic category code as a bounded workspace builder, not as the final semantic authority. Hard deterministic filtering is allowed for safety and queueability only: no magnet, blacklisted release type, impossible category shape, or explicit user-blocking constraints. Messy release-name judgments such as title connector words, language tags, episode-range pack naming, edition names, and whether a season pack is a better match than scattered individual episodes must be exposed to the LLM through the compact candidate workspace whenever the row is plausibly related.
+
+`search_media_torrents` now performs an LLM candidate-adjudication pass after category-owned search and safety annotations. The pass receives the exact user prompt, effective tool arguments, category selection guidance, and compact candidate rows. It may recommend/reorder candidates and provide an answer hint, but it must not queue anything and must not delete candidates. Queueing still requires stable `candidate_id`/`result_set_id` handles and normal queue validation.
+
+TV season-pack searches must not silently discard plausible range/pack results before LLM review merely because a title matcher is uncertain or an LLM-generated tool argument lost an inner title word. For example, an `S01E01-06` result with `ITA` evidence must reach the LLM candidate workspace for a full-season Italian request even if deterministic parsing is imperfect. The LLM then compares title, requested season, language, pack coverage, seeders, and warnings.
+
+## Round 238 Download Search Review Rule — title preservation and full-candidate LLM adjudication
+
+Fresh media-download discovery must preserve the user's literal media title all the way from the agent tool call through scheduler/category search. Generic structured-unit parsing may remove season/episode phrases, but it must not delete connector words inside titles such as `of`, `the`, or `a`. If a phrase like `season 1 of <title>` leaves a leading connector after coordinate extraction, strip only the leading connector and never perform global title-word deletion.
+
+Torrent candidate adjudication is LLM-led after deterministic hard guards. Category ranking/filtering may remove non-downloadable rows and obvious hard safety failures, but plausible title/language/pack candidates must stay visible to the LLM candidate reviewer. When candidate lists exceed a model's context, the reviewer must cover the full list through bounded chunks and recursive tournament rounds; it must not silently omit tail finalists from the final comparison.
+
+Search-result payloads should expose whether LLM candidate review actually ran (`llm_candidate_review_status`) so failures to instantiate the task LLM, empty candidate sets, or review errors are visible in logs/tool output instead of masquerading as a complete semantic review.
+
+Verify with `scripts/round238_search_pipeline_deep_review_tests.py` after changing scheduler title parsing, TV pack gates, `search_media_torrents`, candidate adjudication, or candidate result compaction.
+
+## Round 239 Agent Rule — Candidate adjudication must survive result compaction
+
+When `search_media_torrents` runs LLM torrent-candidate adjudication, the final
+chat model must see that adjudication happened. Tool-result compaction may
+remove magnets and raw tracker rows, but it must preserve:
+
+- `llm_candidate_review_status`;
+- compact `llm_candidate_review` metadata;
+- `recommended_candidate_id` and `recommended_candidate_ids`;
+- per-row `llm_recommended` markers in both the compact picker and selected
+  candidate details.
+
+This prevents a reviewed torrent workspace from collapsing back into opaque
+provider ordering. If the review was skipped or failed, that status must also be
+visible so the assistant does not imply that the task LLM semantically reviewed
+the candidates. Verify with `scripts/round239_llm_candidate_visibility_tests.py`
+after changing `DownloadCandidateAdjudicator`, `search_media_torrents`, or
+`ToolResultCompactor`.
+
+## Round 240 Agent Rule — LLM candidate recommendations must stay visible in every picker surface
+
+The torrent candidate reviewer may correctly identify a semantic match, but that
+work is wasted if the compact candidate workspace hides the recommendation from
+the final chat model.  Every LLM-visible candidate picker produced after
+`search_media_torrents` must preserve both stable candidate handles and explicit
+review markers:
+
+- include `candidate_id` alongside any short `id` alias;
+- preserve `llm_recommended=true` for candidates recommended by the task LLM;
+- keep compact warnings/blockers that affect whether the model should inspect,
+  queue, or ask the user;
+- ensure candidates named in `llm_candidate_review.recommended_candidate_ids`
+  remain in the compact `candidates` list even if they are outside the normal
+  top-N provider/ranker window.
+
+This keeps the architecture LLM-led at the semantic selection layer: category
+code and deterministic filters build a safe bounded workspace, the task LLM
+adjudicates torrent relevance, and the final chat LLM receives that adjudication
+as visible decision evidence rather than opaque reordered rows.  Verify with
+`scripts/round240_candidate_visibility_followup_tests.py` after changing
+`_candidate_picker_rows`, `ToolResultCompactor`, or candidate-adjudication
+metadata.
+
+## Round 241 Review Notes — LLM Season-Pack Selection Must Not Be Contradicted by Deterministic Batch Groups
+
+When `search_media_torrents` returns a clear LLM-reviewed season-pack candidate for a full-season request, deterministic batch grouping must not also expose per-episode alternatives as an apparent multi-unit recommendation.  Batch recommendations are useful only when no suitable bundle/season-pack candidate exists or when the user explicitly requested individual units.  Otherwise they can mislead the final chat model into inventing missing/extra episodes from broad provider noise.
+
+For TV season-pack requests, category-owned search may carry provider-derived expected episode counts from the generated range query (for example `S01E01-E06`).  The tool result should preserve that compact evidence and annotate candidates whose episode range covers the full requested season.  The final LLM must treat `requested_season_coverage=full_requested_season` as the season candidate and must not describe that pack as partial or infer additional episodes from unrelated candidates.
+
+If the LLM candidate adjudicator returns a recommended candidate with `should_queue_now=true`, the tool result should place a direct `queue_download` affordance first and should not let lower-ranked batch/episode alternatives override `llm_next_action`.
+
+## Round 242 Download Quality Choice Rule
+
+Torrent selection must not collapse materially different quality/size choices
+into a single proposal merely because one candidate is queueable. Deterministic
+code builds a bounded candidate workspace and annotates hard facts such as
+language, coverage, seeders, resolution, codec, per-episode size, and estimated
+bitrate. When multiple candidates satisfy the requested unit/language/coverage
+but trade resolution, codec, bitrate, size, or seeder health, the tool result
+must preserve those choices and the final assistant must present them to the
+user instead of silently queueing the first or smallest match.
+
+For TV full-season requests, compare matching season/range packs across
+resolution and codec as well as within a single resolution. A compact 1080p HEVC
+pack and a larger 720p/x264 pack are not interchangeable; without a saved or
+explicit bitrate/size preference, the LLM should review them as viable options,
+set `should_queue_now=false`, and ask the user to choose the preferred
+quality-size tradeoff. Generic code may block auto-queue on this ambiguity but
+must not make the semantic preference decision itself.
+
+## Round 243 Search Audit Rule — raw results and filter decisions must be debuggable
+
+Torrent-search quality failures must be diagnosable from logs without guessing.
+Every provider query handled by `SearchAggregator` must write both a readable
+`logs/searches.log` entry and a structured `logs/searches.jsonl` record that
+captures query text, category, provider diagnostics, raw/deduped/accepted/ranked
+counts, and redacted result rows. Magnets and private tracker passkeys must never
+be logged; store only `magnet_present` and a short info-hash prefix.
+
+Category-owned filtering must also be auditable. TV pack and exact-episode query
+ladders must log a structured `TV_SEARCH_FILTER_AUDIT` line for each query,
+including the item, language, season/label, counts, accepted rows, rejected row
+samples, and reason codes such as `accept_structural_season_pack`,
+`accept_llm_review_plausible_pack`, `reject_title_mismatch`, or
+`reject_not_detected_as_requested_season_pack`. This bridges the gap between raw
+tracker results and the final LLM candidate workspace.
+
+`search_media_torrents` must log a `SEARCH_MEDIA_TORRENTS_WORKSPACE_AUDIT` line
+that shows the final cached candidate workspace, quality-choice policy, LLM
+candidate-review status, recommended candidate IDs, and next-action affordances.
+This is the support/debug boundary: if the user says a result was missed, logs
+must show whether it was absent from providers, removed by quality/blacklist,
+rejected by category gates, hidden by compaction, or rejected/ignored by the LLM.
+
+Verify with `scripts/round243_search_audit_logging_tests.py` after changing
+search providers, aggregation, TV search gates, `search_media_torrents`,
+candidate adjudication, or compaction.
+
+## Round 245 Download Follow-up and Telemetry Stability Rule
+
+Progress/status acknowledgements for DOWNLOAD and CONFIG turns are deterministic
+persona messages. They must not use a free-form LLM completion before tool
+evidence exists, because a cosmetic acknowledgement can otherwise become a
+visible refusal or unsupported answer.
+
+Recent torrent candidate context must remain visible for short follow-up
+constraint selections such as a resolution/codec/quality choice. Fresh media
+requests may suppress stale result sets, but a short format/quality selector is
+a continuation of the visible candidate workspace and should let the LLM queue
+or inspect the selected candidate by stable `candidate_id`.
+
+Quality-choice prompts should ask users about real tradeoffs only. Equivalent
+mirror candidates with the same coverage, language, resolution, codec, and
+materially similar size/bitrate must be collapsed for choice presentation, with
+higher seeder health preferred. Asking the user to choose between equivalent
+mirrors is noise; deterministic code may pick the healthier mirror once the user
+has selected the quality tier.
+
+Download telemetry shown in Helm/Hold must avoid UI-only oscillation caused by
+interleaving live websocket samples with slower polling snapshots. Polling may
+refresh structural state, but it must preserve recent non-zero live speed and
+swarm values for active downloads unless the backend reports a true lifecycle
+change or the grace window expires.
+
+## Round 246 Runtime Date Grounding Rule
+
+All agent-facing tools that expose air dates, release dates, publication dates,
+source dates, or future/current public-source claims must carry runtime date
+context in the tool result. Prompt-only date guidance is not sufficient: compact
+result summaries and small LLMs need the current date adjacent to the evidence
+being evaluated.
+
+For SEARCH and category web-research turns, “next”, “upcoming”, “future”,
+“latest”, “current”, and equivalent localized wording must be anchored to the
+runtime current date before answering. A source or metadata page that says a
+season is “upcoming” in a year before the runtime year is stale background, not
+current upcoming evidence. If season 3 aired in 2025 and the runtime date is in
+2026, a user asking about the next/upcoming season is asking about a later
+season, unless they explicitly named season 3.
+
+Structured metadata remains useful for known seasons/episodes, but it must not
+terminate a next/upcoming-season public-information question by itself. Those
+questions require category/web research unless structured metadata contains a
+fresh exact future schedule. Metadata results should include date relations for
+season, episode, and show dates where available, plus a source-sufficiency
+warning when public evidence is required.
+
+Fetched web evidence should be annotated or warned when a source uses
+future/upcoming wording tied to a past year or when a publication/update date is
+stale for a current-public query. The final assistant must not make negative
+claims or future-schedule claims from stale, undated, degraded, or snippet-only
+evidence without stating the limitation and/or searching again.
+
+Verify with `scripts/round246_runtime_date_grounding_tests.py` after changing
+metadata lookup, public-web evidence policy, category web research, web-research
+fetching, or current-date prompt guidance.
+
+## Round 247 — Universal LLM Runtime Date Prompt Context
+
+Round 246 put runtime-date grounding next to metadata and web evidence, but some
+auxiliary model calls still constructed one-off user-only prompts: intent
+routing, summaries, candidate adjudication, taste extraction, legacy direct
+provider calls, and similar helper tasks.  Runtime date/time grounding is now a
+provider-boundary invariant as well as a prompt-builder convention.
+
+`src/utils/runtime_prompt_context.py` owns the shared LLM-facing runtime date/time
+block.  `TaskLLMClient.completion()` and the lower-level `LLMClient.completion()`
+call `RuntimePromptContext.ensure_messages()` before logging or sending messages,
+so every production LLM call receives current datetime, date, year, timezone,
+and explicit instructions for resolving today/tomorrow/yesterday/next/upcoming/
+latest/current/recent wording.  Existing prompt builders still reuse the same
+block through `WebResearchPromptGuidance.runtime_context()`, and
+`RuntimeDateGrounding.runtime_context()` now uses the same payload so prompt text
+and tool-result payloads cannot drift.
+
+Legacy direct `litellm.acompletion` paths that bypass the task-aware client must
+also call `RuntimePromptContext.ensure_messages()`.  New LLM call sites should use
+`TaskLLMClient` where possible; if a direct provider call remains necessary, it
+must explicitly apply the runtime prompt context before sending messages.
+
+Verify with `scripts/round247_universal_runtime_date_prompt_tests.py` after
+changing LLM provider clients, runtime date guidance, direct legacy LLM calls, or
+prompt construction utilities.

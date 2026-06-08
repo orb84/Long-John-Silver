@@ -91,7 +91,7 @@ class AgentRunPreparer:
         # Step 1: Route intent with structured pending action context.
         pending_action_context = ""
         if self._pending_action_builder:
-            pending_action_context = await self._pending_action_builder.build_for_session(session_id)
+            pending_action_context = await self._pending_action_builder.build_for_session(session_id, current_user_prompt=user_prompt)
         intent = await self._route_intent(user_prompt, context=pending_action_context)
 
         # Step 2: Handle CLARIFY — return early with clarification message

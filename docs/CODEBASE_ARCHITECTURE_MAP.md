@@ -119,7 +119,7 @@ src/
   search/                Torrent search providers and aggregation.
     web/                 General web-search provider abstraction.
   subtitles/             Subtitle integrations.
-  utils/                 Shared utilities, browser runtime, auth, parser helpers.
+  utils/                 Shared utilities, browser runtime, auth, parser helpers, runtime prompt context.
   web/                   FastAPI app, routers, templates, static JS/CSS, comms bridges.
 ```
 
@@ -441,9 +441,12 @@ category_resolver.py     CategoryResolver: maps user intent to category.
 prompt_builder.py        PromptBuilder: builds system/developer/user context.
 memory_composer.py       PromptMemoryComposer: conversation/preference context.
 token_budget.py          TokenBudgetManager: prompt/tool result budgeting.
+runtime_prompt_context.py RuntimePromptContext: shared current datetime/date/year/timezone guidance injected into every LLM call through the provider clients.
 ```
 
 The storage-aware package injects storage information into the assistant context when enabled, so the LLM can account for disk pressure without needing to call a tool first.
+
+`TaskLLMClient.completion()` and `LLMClient.completion()` apply `RuntimePromptContext.ensure_messages()` before prompt logging or provider dispatch.  Main assistant prompts still include runtime date/time guidance through `PromptBuilder`, but the provider boundary protects helper prompts such as intent routing, summaries, candidate adjudication, taste extraction, and legacy direct provider paths that do not use the main prompt builder.
 
 ### Tool registry and policy
 

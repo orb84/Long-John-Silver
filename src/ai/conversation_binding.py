@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from loguru import logger
+
 from src.core.conversation import ConversationManager
 
 
@@ -38,6 +40,7 @@ class ConversationBinding:
         max_tokens: int | None = None,
         raw_recent_tokens: int | None = None,
         compressed_history_tokens: int | None = None,
+        fresh_download_request: bool = False,
     ) -> list[dict]:
         """Build conversation context messages from memory.
 
@@ -68,6 +71,17 @@ class ConversationBinding:
             raw_recent_tokens=raw_recent_tokens,
             compressed_history_tokens=compressed_history_tokens,
         )
+
+        if fresh_download_request:
+            dropped = len(context_messages)
+            context_messages = []
+            if dropped:
+                logger.info(
+                    "ConversationBinding: suppressed {} stale conversation context message(s) for fresh DOWNLOAD request session_id={}",
+                    dropped,
+                    session_id,
+                )
+            return context_messages
 
         if user_prompt and max_tokens != 0 and self._conversation.has_vector_store():
             relevant = await self._conversation.get_relevant_context(
