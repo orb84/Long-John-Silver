@@ -231,7 +231,7 @@ class TMDBClient:
         """
         data = await self._get(
             f"{self.BASE_URL}/tv/{tv_id}",
-            params={"api_key": self._api_key, "append_to_response": "credits,external_ids"},
+            params={"api_key": self._api_key, "append_to_response": "credits,external_ids,alternative_titles,translations"},
         )
         if not data:
             return None
@@ -247,6 +247,8 @@ class TMDBClient:
             for s in data.get("seasons", [])
         ]
         networks = [n["name"] for n in data.get("networks", [])]
+        title_aliases = self._tv_title_aliases(data)
+        localized_titles = self._tv_localized_titles(data)
         cast = [
             {"name": c["name"], "character": c["character"]}
             for c in data.get("credits", {}).get("cast", [])[:5]
@@ -260,6 +262,8 @@ class TMDBClient:
             "id": data.get("id"),
             "title": data.get("name"),
             "original_title": data.get("original_name"),
+            "title_aliases": title_aliases,
+            "localized_titles": localized_titles,
             "overview": data.get("overview"),
             "rating": data.get("vote_average"),
             "vote_count": data.get("vote_count"),
@@ -279,6 +283,49 @@ class TMDBClient:
             "producers": producers,
             "imdb_id": data.get("external_ids", {}).get("imdb_id"),
         }
+
+
+    @staticmethod
+    def _tv_title_aliases(data: dict) -> list[str]:
+        """Extract provider-known TV titles from TMDB details."""
+        aliases: list[str] = []
+
+        def add(value: object) -> None:
+            text = str(value or "").strip()
+            if text and text not in aliases:
+                aliases.append(text)
+
+        add(data.get("name"))
+        add(data.get("original_name"))
+        for row in (data.get("alternative_titles") or {}).get("results") or []:
+            if isinstance(row, dict):
+                add(row.get("title"))
+        for row in (data.get("translations") or {}).get("translations") or []:
+            if not isinstance(row, dict):
+                continue
+            payload = row.get("data") if isinstance(row.get("data"), dict) else {}
+            add(payload.get("name"))
+            add(payload.get("title"))
+        return aliases[:40]
+
+    @staticmethod
+    def _tv_localized_titles(data: dict) -> list[dict]:
+        """Return compact localized TV title rows from TMDB translations."""
+        rows: list[dict] = []
+        for row in (data.get("translations") or {}).get("translations") or []:
+            if not isinstance(row, dict):
+                continue
+            payload = row.get("data") if isinstance(row.get("data"), dict) else {}
+            title = payload.get("name") or payload.get("title")
+            if not title:
+                continue
+            rows.append({
+                "title": title,
+                "language": row.get("english_name") or row.get("name") or row.get("iso_639_1"),
+                "iso_639_1": row.get("iso_639_1"),
+                "country": row.get("iso_3166_1"),
+            })
+        return rows[:40]
 
     async def get_tv_season_details(self, tv_id: int,
                                      season_number: int) -> Optional[dict]:

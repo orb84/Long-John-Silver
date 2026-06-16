@@ -66,6 +66,8 @@ TV Shows / Show Name / Season 02 / Show Name - S02E04.mkv
 
 A **TMDB API key is highly recommended** for TV because it improves title identity, seasons, artwork, cast, ratings, IDs, and release metadata. TVMaze can also help with episode schedules and aired/future episode checks.
 
+Tracked TV shows auto-download newly released episodes by default. Open a show from the library/Booty inspector and turn off **Automatically download new episodes** when you want that specific show to notify only instead.
+
 ### Movies
 
 Use this for standalone films. Movies own title/year matching, artwork, cast, genres, runtime, quality upgrades, language/subtitle preferences, and movie-specific organization.

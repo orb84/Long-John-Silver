@@ -111,3 +111,24 @@ Prompt builders and tool-result date payloads now share the same source:
 `src/utils/runtime_prompt_context.py`.  Do not add a new handcrafted current-date
 paragraph to individual prompts; reuse the shared context helper or route the
 call through `TaskLLMClient`.
+
+## Round 250 update — torrent candidate ranking after language satisfaction
+
+The torrent-candidate reviewer now receives compact deterministic fields such as
+`language_preference_status`, `tv_request_fit`, and `availability_seeders`.
+Prompts explicitly state that once requested scope and preferred/acceptable
+language are satisfied, seeder availability outranks marginal bitrate or extra
+audio tracks.  `ITA+ENG`/`MULTI` is acceptable for an English preference only as
+fallback evidence, not as a reason to ask the user about Italian or promote a
+weak swarm over much healthier English/language-unknown candidates.
+
+TV scope filtering remains category-owned.  The generic search tool may invoke a
+category payload hook, but it does not parse TV coordinates itself.
+
+
+## Round 255 - Metadata-backed title authority for torrent search
+
+- TV torrent/Soulseek searches should query from category-owned title authority before relying on the literal user string. Provider canonical names, original titles, alternative titles, and localized titles are now exposed as bounded query titles.
+- Candidate validation first checks exact release-title containment against provider-known aliases. The older TV token-window fallback remains only for items with no metadata title authority.
+- For localized-language requests, localized titles from providers may be included in the query ladder, but language tokens still come only from the requested/configured language.
+- Public web research remains appropriate for title ambiguity when metadata providers cannot resolve a show, but it should supply title/source evidence, not bypass torrent candidate validation.

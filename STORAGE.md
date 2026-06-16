@@ -21,6 +21,21 @@ These are read-only tools. They are intended for download planning, explaining l
 
 Before queueing a magnet, `DownloadManager.add_magnet()` asks the storage monitor for a capacity decision. If an estimated size is available, the projected free space must remain above `settings.storage.minimum_free_after_download_gb`; otherwise the download is blocked with a clear error. Warning-level disks are allowed but logged and surfaced through the UI/context.
 
+
+## Removable media and reconnects
+
+Configured download or library roots may live on external drives. When a path
+looks like a missing mount, such as `/Volumes/<Drive>/downloads`, LJS must not
+create the absent drive directory under the mount parent. It reports the target
+as critical/unavailable, blocks new queue attempts with a clear reason, and keeps
+startup alive so the UI can explain the problem.
+
+Downloads that fail to start only because their save path is unavailable are
+parked as `stalled` with a storage-unavailable reason. A supervised recovery loop
+polls those rows; once the drive is reconnected and the target path is writable
+again, it requeues them for the normal download queue. Normal queue rules still
+apply, including concurrency, priority, and auto-download gates.
+
 ## Settings
 
 ```yaml

@@ -11,6 +11,8 @@ from pathlib import Path
 from loguru import logger
 from typing import Optional
 
+from src.core.storage_path_availability import StoragePathGuard
+
 
 class TorrentEngine:
     """Wrapper for the libtorrent session and low-level operations.
@@ -48,7 +50,14 @@ class TorrentEngine:
             # knows whether active downloads and library seeds are both present.
             "pause_library_seeds_when_downloading": 0,
         }
-        Path(download_dir).mkdir(parents=True, exist_ok=True)
+        availability = StoragePathGuard.try_prepare_directory(download_dir)
+        if not availability.available_for_writes:
+            logger.warning(f"Torrent download directory is unavailable at startup: {availability.reason}")
+
+    @property
+    def download_dir(self) -> str:
+        """Return the configured default download directory."""
+        return self._download_dir
 
     async def initialize(self) -> None:
         """Initialize the libtorrent session."""
@@ -197,9 +206,9 @@ class TorrentEngine:
         Returns:
             The libtorrent torrent handle.
         """
-        import libtorrent as lt
         resolved_save_path = str(save_path or self._download_dir)
-        Path(resolved_save_path).mkdir(parents=True, exist_ok=True)
+        StoragePathGuard.ensure_directory(resolved_save_path)
+        import libtorrent as lt
         params = {
             "save_path": resolved_save_path,
             "storage_mode": lt.storage_mode_t.storage_mode_sparse,

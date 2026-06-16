@@ -22,12 +22,22 @@ class TVMazeClient:
 
     BASE_URL = "https://api.tvmaze.com"
 
+    def __init__(self) -> None:
+        self.last_error: str = ""
+
+    def _clear_error(self) -> None:
+        self.last_error = ""
+
+    def _record_error(self, exc: Exception) -> None:
+        self.last_error = str(exc)
+
     async def search(self, query: str) -> list[dict]:
         """Search for TV shows on TVMaze.
 
         Returns:
             List of show dicts with id, name, year, rating, genres, and status.
         """
+        self._clear_error()
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
@@ -37,6 +47,7 @@ class TVMazeClient:
                 response.raise_for_status()
                 data = response.json()
         except Exception as e:
+            self._record_error(e)
             logger.error(f"TVMaze search failed: {e}")
             return []
 
@@ -74,6 +85,7 @@ class TVMazeClient:
         Returns dict with name, genres, rating, schedule, next episode,
         episode count, and network.
         """
+        self._clear_error()
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
@@ -83,6 +95,7 @@ class TVMazeClient:
                 response.raise_for_status()
                 data = response.json()
         except Exception as e:
+            self._record_error(e)
             logger.error(f"TVMaze show details failed: {e}")
             return None
 
@@ -121,6 +134,7 @@ class TVMazeClient:
         Returns:
             List of episode dicts with season, number, name, airdate.
         """
+        self._clear_error()
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 if season is not None:
@@ -135,6 +149,7 @@ class TVMazeClient:
                 response.raise_for_status()
                 data = response.json()
         except Exception as e:
+            self._record_error(e)
             logger.error(f"TVMaze episode list failed: {e}")
             return []
 
@@ -168,6 +183,7 @@ class TVMazeClient:
             Dict with name, season, number, airdate, or None if no
             next episode is scheduled (show ended or on hiatus).
         """
+        self._clear_error()
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
@@ -191,6 +207,7 @@ class TVMazeClient:
                 "summary": (next_ep.get("summary") or "").replace("<p>", "").replace("</p>", "").strip()[:200],
             }
         except Exception as e:
+            self._record_error(e)
             logger.error(f"TVMaze next episode failed: {e}")
             return None
 
@@ -205,6 +222,7 @@ class TVMazeClient:
         Returns:
             List of airing episodes with show name and air time.
         """
+        self._clear_error()
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 params = {"country": country}
@@ -217,6 +235,7 @@ class TVMazeClient:
                 response.raise_for_status()
                 data = response.json()
         except Exception as e:
+            self._record_error(e)
             logger.error(f"TVMaze schedule failed: {e}")
             return []
 

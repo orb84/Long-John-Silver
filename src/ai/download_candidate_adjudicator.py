@@ -439,8 +439,10 @@ class DownloadCandidateAdjudicator:
             "- Preserve the user's exact requested title, season/episode scope, and media language.\n"
             "- For TV full-season requests, prefer one season pack/range release over scattered episodes when it covers the requested season and matches language.\n"
             "- Treat title stopwords/articles (of/the/a) as semantically important in the answer, but do not reject a candidate merely because another layer dropped one in a search query.\n"
-            "- Recognize release language tags: ITA/Italian/Italiano means Italian; ENG means English; MULTI/dual means possible multi-audio but weaker than explicit ITA unless the title also says ITA.\n"
-            "- Episode ranges like S01E01-06 or S01e01-06 are season-pack evidence.\n"
+            "- Recognize release language tags: ITA/Italian/Italiano means Italian; ENG means English; MULTI/dual means possible multi-audio but weaker than an explicit preferred-language tag unless the title also names that preferred language.\n"
+            "- If the preferred/requested language is English, ITA+ENG/MULTI is a fallback only: prefer English-only or language-unknown scene releases when coverage is comparable, and do not turn extra audio into a language question for the user.\n"
+            "- Once the requested unit and preferred/acceptable language are satisfied, seeder availability outranks marginal bitrate or extra audio tracks. Do not recommend a weak dual-audio row over much healthier English or language-unknown equivalents.\n"
+            "- Episode ranges like S01E01-06, S01e01-06, or S01e01 06 are season-pack evidence.\n"
             "- Reject obvious title collisions, wrong seasons, unrelated episode-title collisions, and candidates without magnets already removed by the tool.\n"
             "- If a clear requested-language season pack exists, recommend it above a single Italian episode.\n"
             "- If a candidate has requested_season_coverage=full_requested_season, treat it as the complete requested season; do not describe it as partial.\n"
@@ -462,6 +464,7 @@ class DownloadCandidateAdjudicator:
             "season", "episode", "languages", "resolution", "codec", "unit_descriptor",
             "bundle_context", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count",
             "selection_warnings", "selection_blockers", "auto_queue_allowed", "auto_queue_blocked_reason",
+            "language_preference_status", "tv_request_fit", "availability_seeders",
             "per_episode_size_mb", "estimated_bitrate_kbps", "expected_episode_count", "requested_season_coverage", "coverage_note",
         ]
         return {k: candidate.get(k) for k in fields if candidate.get(k) not in (None, "", [], {})}
@@ -505,11 +508,25 @@ class DownloadCandidateAdjudicator:
             rows,
             key=lambda row: (
                 not bool(row.get("is_bundle") or row.get("bundle_scope") or row.get("pack_type")),
+                -DownloadCandidateAdjudicator.language_status_sort_rank(row),
                 -int(row.get("seeders") or 0),
                 int(row.get("index") or 9999),
             ),
         )
         return str(ranked[0].get("candidate_id") or "")
+
+    @staticmethod
+    def language_status_sort_rank(row: dict[str, Any]) -> int:
+        status = str(row.get("language_preference_status") or "").lower()
+        return {
+            "preferred_only": 5,
+            "preferred_by_title": 5,
+            "unknown_acceptable": 4,
+            "preferred_with_extra_audio": 3,
+            "multi_language_fallback": 2,
+            "not_applicable": 1,
+            "mismatch": -100,
+        }.get(status, 1)
 
     @staticmethod
     def _merge_unique(*groups: list[str]) -> list[str]:

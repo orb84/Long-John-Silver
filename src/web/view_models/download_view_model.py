@@ -50,6 +50,57 @@ class DownloadViewModelBuilder:
             result['display_seeders'] = 0
             result['display_seeders_basis'] = 'none'
 
+    @staticmethod
+    def _apply_parent_progress_estimate(result: dict, result_files: list[dict]) -> None:
+        """Fill blank multi-file rows from aggregate torrent progress.
+
+        libtorrent can report a reliable torrent-level percentage before this
+        process has received usable per-file byte counters after metadata/restart
+        transitions.  In that state the expanded UI must not show every file at
+        0% while the parent card shows progress.  The fallback is marked as an
+        estimate so exact per-file cache updates can replace it later.
+        """
+        if len(result_files) <= 1:
+            return
+        try:
+            parent_progress = float(result.get('progress') or 0.0)
+        except (TypeError, ValueError):
+            parent_progress = 0.0
+        if parent_progress <= 0:
+            total_size = int(result.get('total_size') or result.get('size_bytes') or 0)
+            downloaded = int(result.get('downloaded_bytes') or 0)
+            if total_size > 0 and downloaded > 0:
+                parent_progress = min(1.0, max(0.0, downloaded / total_size))
+        if parent_progress <= 0:
+            return
+        has_exact_file_progress = any(
+            (int(f.get('downloaded_bytes') or 0) > 0 or float(f.get('progress') or 0.0) > 0)
+            and not f.get('progress_estimated')
+            for f in result_files
+        )
+        if has_exact_file_progress:
+            return
+        selected = []
+        for f in result_files:
+            try:
+                priority = int(f.get('priority') or 0)
+            except (TypeError, ValueError):
+                priority = 0
+            if priority > 0:
+                selected.append(f)
+        target_files = selected or result_files
+        for f in target_files:
+            if f.get('status') in ('complete', 'organized'):
+                continue
+            size = int(f.get('size') or 0)
+            if size <= 0:
+                continue
+            estimated_progress = min(1.0, max(0.0, parent_progress))
+            f['progress'] = max(float(f.get('progress') or 0.0), estimated_progress)
+            f['downloaded_bytes'] = max(int(f.get('downloaded_bytes') or 0), int(size * estimated_progress))
+            f['progress_estimated'] = True
+            f['progress_basis'] = 'estimated_from_parent_torrent_progress'
+
     def build(self, item: Any) -> dict:
         """Merge live file progress from cache into the model's per-file data.
 
@@ -123,6 +174,7 @@ class DownloadViewModelBuilder:
                     if len(result_files) == 1 and parent_progress > f['progress']:
                         f['progress'] = parent_progress
                     f['downloaded_bytes'] = downloaded
+            self._apply_parent_progress_estimate(result, result_files)
         elif cache_files:
             result['files'] = [
                 {

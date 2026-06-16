@@ -291,8 +291,9 @@ class HelmPanel extends Component {
                 const freeGb = (v.free_bytes / (1024 ** 3)).toFixed(1);
                 const totalGb = (v.total_bytes / (1024 ** 3)).toFixed(1);
                 const cats = (v.category_ids && v.category_ids.length) ? v.category_ids.join(', ') : 'downloads';
-                listEl.appendChild(DOM.el('div', { className: 'stat-item storage-volume-row' }, [
-                    DOM.el('span', { className: 'stat-label', title: v.mount_point }, [`${v.status.toUpperCase()} ${cats}`]),
+                const detail = v.message || v.mount_point;
+                listEl.appendChild(DOM.el('div', { className: 'stat-item storage-volume-row', title: detail }, [
+                    DOM.el('span', { className: 'stat-label', title: detail }, [`${v.status.toUpperCase()} ${cats}`]),
                     DOM.el('span', { className: 'stat-value' }, [`${freeGb}/${totalGb} GB`])
                 ]));
             });

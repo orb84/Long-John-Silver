@@ -73,7 +73,13 @@ class TvSuggestionWorkflow:
 
     async def compile_one(self, item: CategoryItem) -> int:
         """Compile and persist suggestions for one TV item."""
-        suggestions = await self.build_suggestions(item)
+        suggestions, audit_payload = await self._build_suggestions_with_evidence(item)
+        if audit_payload.get("provider_unavailable") and not suggestions:
+            logger.warning(
+                "TV suggestion compile preserved existing suggestions for {!r} because provider episode data was unavailable",
+                item.key,
+            )
+            return 0
         await self._db.downloads.clear_suggestions_for_item("tv", item.key)
         for suggestion in suggestions:
             await self._db.downloads.upsert_suggested_action(suggestion)
@@ -81,6 +87,11 @@ class TvSuggestionWorkflow:
 
     async def build_suggestions(self, item: CategoryItem) -> list[SuggestedActionRecord]:
         """Build suggestions for one TV item without writing them."""
+        suggestions, _audit_payload = await self._build_suggestions_with_evidence(item)
+        return suggestions
+
+    async def _build_suggestions_with_evidence(self, item: CategoryItem) -> tuple[list[SuggestedActionRecord], dict[str, Any]]:
+        """Build TV suggestions and keep audit evidence for persistence policy."""
         now = datetime.now(timezone.utc).isoformat()
         tv_item = await self._enrich_metadata(item)
         downloaded_set, library_evidence = await self._downloaded_episode_context(tv_item)
@@ -156,7 +167,7 @@ class TvSuggestionWorkflow:
                 metadata_json=json.dumps(metadata, ensure_ascii=False),
                 created_at=now,
             ))
-        return suggestions
+        return suggestions, audit_payload
 
 
     @staticmethod
@@ -392,9 +403,19 @@ class TvSuggestionWorkflow:
                 episodes = await self._tvmaze.get_episode_list(tvmaze_id)
             else:
                 results = await self._tvmaze.search(item.key)
+                last_error = str(getattr(self._tvmaze, "last_error", "") or "").strip()
+                if last_error:
+                    evidence["provider_error"] = last_error
+                    evidence["provider_unavailable"] = True
+                    return missing, evidence
                 if not results:
                     return missing, evidence
                 episodes = await self._tvmaze.get_episode_list(results[0]["id"])
+            last_error = str(getattr(self._tvmaze, "last_error", "") or "").strip()
+            if last_error:
+                evidence["provider_error"] = last_error
+                evidence["provider_unavailable"] = True
+                return missing, evidence
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             aired: list[tuple[int, int, str]] = []
             for episode in episodes or []:
@@ -417,6 +438,7 @@ class TvSuggestionWorkflow:
         except Exception as exc:
             logger.warning(f"Missing-episode lookup failed for '{item.key}': {exc}")
             evidence["provider_error"] = str(exc)
+            evidence["provider_unavailable"] = True
         return missing, evidence
 
     async def _find_related_items(self, item: CategoryItem) -> list[tuple[str, str, str]]:

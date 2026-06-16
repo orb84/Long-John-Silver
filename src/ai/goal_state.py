@@ -68,9 +68,21 @@ class AgentGoalStateManager:
         if not session_id or not self._db:
             return ""
         previous = await self._load(session_id)
-        fresh_goal = DownloadContextPolicy.should_start_fresh_goal(user_prompt, intent)
+        recent_result_sets = await self._recent_result_set_summaries(session_id)
+        fresh_goal_requested = DownloadContextPolicy.should_start_fresh_goal(user_prompt, intent)
+        previous_has_actionable_results = bool(
+            previous
+            and previous.status in {"active", "awaiting_user_choice", "searching"}
+            and previous.result_sets
+        )
+        fresh_goal = fresh_goal_requested and not previous_has_actionable_results and not recent_result_sets
+        if fresh_goal_requested and not fresh_goal:
+            logger.info(
+                "AgentGoalStateManager: retaining active result-set context despite fresh-request heuristic session_id={}",
+                session_id,
+            )
         current = self._merge_goal(previous, session_id, user_prompt, intent, category_id, force_new=fresh_goal)
-        current.result_sets = [] if fresh_goal else await self._recent_result_set_summaries(session_id)
+        current.result_sets = [] if fresh_goal else recent_result_sets
         if fresh_goal:
             logger.info(
                 "AgentGoalStateManager: starting fresh DOWNLOAD goal without inherited result sets session_id={}",

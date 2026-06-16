@@ -208,6 +208,25 @@ The prompt should make clear when information comes from:
 - suggestion evidence;
 - taste snapshot.
 
+## Evidence-Backed Title Authority
+
+Torrent and Soulseek release titles are messy, but deterministic singular/plural
+or punctuation heuristics must not be the primary source of truth for media
+identity. When a category has provider metadata, category search and validation
+should use provider-backed title authority first: canonical title, original
+title, alternative titles, localized/translated titles, and service-specific
+aliases. Query ladders may include the user's literal item key as a fallback,
+but provider-known titles should lead search and exact title-containment
+validation.
+
+If provider metadata is unavailable, the category may use conservative fuzzy
+matching as a degraded recall path. That fallback must remain bounded and must
+not collapse unrelated titles such as one title being a suffix or partial token
+window of another. Public web research can be used for title-ambiguity
+resolution when metadata providers cannot identify a title, but fetched public
+evidence should establish aliases/context rather than becoming a torrent
+queueing shortcut.
+
 ## UI Access
 
 The UI should render canonical library objects and category manifests. Generic screens can display common fields (`display_name`, `computed`, `units`, artwork) and pass through category-specific nested sections. Category-specific UI components may exist, but they belong to the category or are selected by manifest/component declaration.
@@ -1366,3 +1385,210 @@ must explicitly apply the runtime prompt context before sending messages.
 Verify with `scripts/round247_universal_runtime_date_prompt_tests.py` after
 changing LLM provider clients, runtime date guidance, direct legacy LLM calls, or
 prompt construction utilities.
+
+## Round 248 — Missing Media Drive Startup Resilience
+
+Configured payload storage paths may point to removable or external volumes. A
+missing removable volume must be treated as a runtime storage-unavailable state,
+not as an instruction to create the missing mount directory under a parent such
+as `/Volumes`, `/mnt`, `/media`, or `/run/media`. Creating that directory can hide
+an unplugged-drive problem and redirect downloads to the wrong disk.
+
+`src/core/storage_path_availability.py` owns writable storage-path probing and
+safe directory creation. Startup constructors for the torrent engine and
+download manager may best-effort prepare the configured download directory, but
+they must never raise a fatal startup exception just because a media drive is
+unplugged. LJS should still launch its UI/API so the user can see and fix the
+configuration.
+
+Storage reports and the `check_storage_capacity` tool must surface unavailable
+configured roots as critical, with a clear reason such as a missing/unplugged
+volume. Queueing or starting a torrent must call the guard before handing a save
+path to libtorrent. If a recovered/queued download cannot start because the
+configured storage target is unavailable, the item should be held/stalled with a
+storage-unavailable reason rather than crashing startup or marking the payload as
+a normal torrent failure.
+
+`src/core/download_storage_recovery.py` owns reconnect recovery for these held
+items. It polls storage-stalled downloads, checks their configured save path
+without faking mount roots, and requeues only the rows whose target path has
+become writable again. The ordinary queue gate still decides when those rows may
+consume slots, so reconnect recovery must not bypass auto-download settings,
+explicit user approvals, priorities, or category-owned save-path choices.
+
+Verify with `scripts/round248_missing_media_drive_startup_tests.py` after
+changing storage monitoring, download startup/recovery, torrent engine save-path
+creation, or setup/settings path handling.
+
+## Round 249 — Torrent Scope, Language, and Quality Candidate Hygiene
+
+Torrent candidate workspaces must be scope-clean before the LLM and user see
+options. Category-owned TV search may keep messy but plausible range/pack names
+visible for LLM review, but a row that is explicitly for the wrong season or a
+single unrelated unit is not a valid alternative for a requested season pack.
+For example, an `S04E01` or `S05E01` single episode must never be presented as an
+option for a `Season 1` request merely because the broad tracker query returned
+it and the show title matched.
+
+TV owns tracker-specific season-pack parsing. Public trackers may express full
+or partial season ranges as adjacent numbers such as `S01e01 10` as well as
+`S01E01-E10` or `S01e01-10`; those forms must be recognized as episode-range
+season packs when the range is sane. The parser must also avoid treating
+resolution tokens such as `S01E01 1080p` as episode ranges.
+
+Configured media language is a constraint, not a conversational prompt. If the
+effective media language is English and a candidate advertises `ITA+ENG`,
+`dual`, or `MULTI`, the assistant may mention that extra audio exists as a fact,
+but it must not ask whether the user wants Italian unless the user explicitly
+requested Italian or the configured language cannot be satisfied.
+
+Quality-choice prompts must compare equivalent logical units only. Different
+episodes from the same season are not bitrate alternatives to one another. For
+a season request that falls back to individual files, the tool may report that
+coverage is scattered or incomplete, but it must not use S01E01, S01E04, and
+S01E08 as a fake same-resolution quality spread. Same-episode variants and
+matching season-pack variants may still trigger a quality/size choice when their
+size, bitrate, resolution, or codec differences are material.
+
+When the user replies to a visible quality-choice prompt with a preference such
+as higher quality, smaller size, or a specific resolution, the assistant should
+resolve that preference against the pending `result_set_id` / `candidate_id`
+workspace first. It should not launch a fresh broad search that can pollute the
+conversation with wrong-season rows unless the pending workspace cannot satisfy
+the requested scope.
+
+Verify with `scripts/round249_torrent_scope_language_quality_tests.py` after
+changing TV pack parsing, TV torrent gates, torrent candidate quality-choice
+policy, download prompt guidance, or the LLM candidate adjudicator.
+
+## Round 250 Review Notes — Torrent Candidate Scope, Language, Seeder Health, and File Progress
+
+Round 250 fixed a live torrent-selection failure where a TV season request surfaced wrong-season single episodes, promoted weak dual-audio rows too highly, and displayed blank per-file progress despite non-zero parent torrent progress.
+
+The rules added here are architectural, not title-specific:
+
+1. **Final candidate payload cleanup is category-owned.** `search_media_torrents` may call an optional category hook such as `filter_agent_candidate_payloads_for_request()` after generic candidate projection. Generic code still only passes neutral payload fields and conventional descriptors; the owning category decides whether a row is the requested season, requested episode, containing bundle, or fallback.
+2. **TV bundle sizing must use the TV bundle parser everywhere.** Tracker-style ranges such as `S01e01 10` are season/range-pack evidence and must be divided by the detected episode count before estimating useful per-episode size or bitrate. No ranking path should treat such a range pack as one giant episode.
+3. **Language satisfaction is not a bonus for extra languages.** When the configured media language is English, `ITA+ENG` or `MULTI` can be acceptable because it contains English, but it ranks behind English-only or language-unknown scene releases when those have comparable scope and better swarm health. The assistant should not ask whether the user wants Italian just because a dual-audio candidate exists.
+4. **Seeder health comes before marginal quality differences.** After requested unit/pack coverage and acceptable language are satisfied, materially higher seeder availability outranks small bitrate/size differences and extra audio tracks. Quality-choice prompts may still show distinct tradeoffs, but their ordering must not make a weak swarm look like the preferred result.
+5. **Expanded file progress may be estimated from parent progress.** If multi-file torrent rows have no exact per-file counters yet but the parent torrent has reliable aggregate progress, the UI view model may mark selected file rows with `progress_estimated=true` and `progress_basis=estimated_from_parent_torrent_progress`. Exact file-progress cache updates always replace that estimate.
+
+Regression coverage lives in `scripts/round250_torrent_language_scope_session_recovery_tests.py` and `scripts/round250_torrent_language_seed_scope_progress_tests.py`.
+
+## Round 251 — Download Chat Session-State and Streaming Stability
+
+Download correction/refinement turns must not erase the immediately previous
+machine state. Fresh-request heuristics may guard old torrent result sets so the
+LLM does not queue them for an unrelated new title, but they must not hide
+structured handles or the latest state-changing conversation facts. The pending
+result-set packet now stays visible with `fresh_request_guard=true`; this tells
+the LLM that the prior workspace is usable for corrections, refinements,
+complaints, confirmations, and stable `result_set_id`/`candidate_id` actions,
+but not as a substitute for an unrelated fresh search.
+
+Active goal state follows the same rule. If a session has actionable recent
+result sets, a fresh-looking DOWNLOAD prompt may start a new search semantically,
+but the runtime must still expose the active result-set context so the model can
+understand what it is correcting or replacing. Conversation context trimming for
+fresh-looking DOWNLOAD turns keeps the immediate recent tail and drops only older
+compressed/semantic recalls. This prevents the model from forgetting a torrent it
+just queued, cancelled, paused, or otherwise changed.
+
+Streaming tool loops must never show assistant prose from an iteration that also
+emits tool calls. Providers can stream a candidate table or partial explanation
+before the tool-call delta appears; displaying that text causes duplicate or
+contradictory chat messages when later iterations run more tools and produce a
+new answer. The streaming loop therefore buffers each iteration. If tool calls or
+bare-tool recovery are present, buffered prose is suppressed and only the final
+no-tool response is emitted and recorded in conversation memory.
+
+State-changing download tools are receipt-bound. After any queue, cancel,
+remove, pause, resume, restart, movement, or priority mutation, the final answer
+must report what the latest tool result says, including any download IDs/statuses
+returned. The agent must not claim a queue/cancel happened without tool evidence,
+and must not silently cancel/remove an active download merely because the user is
+asking for a better match or correcting constraints; that is a search/refinement
+until the user explicitly asks to cancel/remove or confirms a confirmation gate.
+
+Verify with `scripts/round251_chat_stream_context_action_tests.py` after changing
+pending-action context, active-goal state, conversation trimming, streaming agent
+loops, or download prompt/tool guidance.
+
+## Round 252 — TV Aired-Missing Release Watches and Provider-Outage Suggestion Safety
+
+TV release monitoring must not depend only on provider ``next_episode`` fields.
+Some active shows expose a reliable aired episode list while no future
+``nextepisode`` object is available. In that state, the TV suggestion workflow
+can correctly detect aired missing episodes, but the generic release-watch retry
+job has nothing to search unless the TV category creates concrete watches for
+the aired missing frontier.
+
+The TV category now owns both forms of release watch:
+
+1. **Already-aired missing frontier watches.** When TVMaze episode-guide data
+   shows aired episodes after the latest local/progress coordinate, and those
+   SxxEyy units are not in the canonical downloaded set, `TvShowCategory` emits
+   concrete `CategoryReleaseWatchSpec` rows for those units. The generic
+   scheduler still only persists and retries neutral unit watches; it does not
+   learn what a season or episode means.
+2. **Future next-episode watches.** If provider metadata also exposes a future
+   next episode, TV adds that watch too, deduped by unit key.
+
+Suggestion compilation is passive UI evidence and must not be mistaken for an
+automatic search/queue mechanism. If an aired episode is missing and automation
+is enabled, the release-watch path must own retrying search/discovery. If
+automation is disabled, the same watch may still search/notify according to the
+scheduler policy, but it must be a real durable watch row rather than only a
+suggestion card.
+
+Provider outages must not erase useful existing suggestions. TVMaze/TMDB errors
+or empty results caused by provider failure should mark the episode guide as
+unavailable and preserve existing suggestions instead of clearing the item and
+making a show appear fully up to date. An empty provider response with a recorded
+provider error is an outage signal, not proof that there are zero aired episodes.
+
+Verify with `scripts/round252_star_city_release_watch_tests.py` after changing TV
+watch planning, TV suggestion compilation, TVMaze error handling, scheduler
+release-watch syncing, or release-watch retry behavior.
+
+## Round 253 — TV Show New-Episode Automation Checkbox
+
+TV new-episode automation is now an item-owned policy with a default-on user
+experience.  Every tracked TV show detail/inspector payload must expose the
+show's `auto_download` state as a simple enabled/disabled checkbox labeled for
+new episodes.  Missing or legacy `null` TV values mean enabled; users can turn a
+specific show off, at which point release-watch retries for that show switch to
+notify/search-only behavior instead of automatic queueing.
+
+The generic scheduler still does not interpret seasons or episodes.  It only
+reads the category-provided release-watch `requirements.auto_download` snapshot
+and then calls the existing category-aware discovery path.  TV owns the default
+and the requirement snapshot through `TvShowItem`, `TvShowCategory.create_item()`,
+`TvShowCategory._release_watch_requirements()`, and the TV detail payload.  The
+frontend saves the checkbox through the generic category item update endpoint so
+`CategoryItemCoordinator` persists the item and immediately resynchronizes the
+category watch policy.
+
+Important invariants:
+
+- New TV shows default to auto-downloading newly released episodes.
+- Legacy TV items with missing/null `auto_download` are normalized to enabled.
+- A user-set `auto_download: false` on one show must be preserved and must keep
+  that show in notify-only release-watch behavior.
+- UI code may render the checkbox for TV/episodic category detail payloads, but
+  it must save through category item mutation APIs rather than editing settings
+  directly.
+
+Verify with `scripts/round253_tv_auto_download_inspector_tests.py` after changing
+TV item models, TV watch planning, category item update flows, or the TV library
+inspector.
+
+## Round 254 — TV Torrent Recall: Title Variants, Explicit-Language Ranking, and Bounded Fallbacks
+
+TV torrent search must treat small title-normalization differences as recall issues, not as proof that a candidate is unrelated. Tracker/provider titles may represent possessives and plural forms differently from user prompts: for example, a user may ask for `Widow Bay` while provider metadata and torrent rows say `Widow's Bay` or `Widows Bay`. TV title matching may allow narrow singular/plural token equivalence inside an otherwise ordered multi-token title window, but it must still reject unsafe one-token/article-title collisions such as `The Boys` versus `The Hardy Boys`.
+
+Explicit media-language requests are stricter than configured-language defaults. For an English-configured install, unknown-language scene releases may remain preferable to weak `ITA+ENG`/`MULTI` fallbacks when English is merely the default. When the user explicitly asks for Italian, French, or another non-English media language, candidates that actually advertise that language must outrank unknown-language rows even if those unknown rows have more seeders. Unknown-language rows may remain visible as fallbacks, but they must not be auto-queueable for explicit non-English requests.
+
+A full-season TV request made before a full-season pack exists must not degrade into “nothing found” when partial episode-range packs or same-season explicit-language single episodes are already present in broad season searches. The TV pack workspace may include same-season single-episode rows as fallback coverage when they advertise the explicit requested language. This keeps the LLM candidate reviewer informed about realistic partial coverage such as `S01E01-06` packs plus `S01E07`/`S01E08` singles, without launching a long per-episode query storm or pretending that the unaired/unreleased tail of the season is available.
+
+Verify with `scripts/round254_widows_bay_recall_ui_responsiveness_tests.py` after changing TV title matching, TV pack gates, explicit-language ranking, candidate payload sorting, or the `search_media_torrents` selection annotation policy.

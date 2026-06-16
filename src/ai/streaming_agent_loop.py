@@ -139,43 +139,33 @@ class StreamingAgentLoopExecutor:
                     **generation_options,
                 )
 
-                # Use StreamingToolCallAssembler for correct multi-tool handling
+                # Use StreamingToolCallAssembler for correct multi-tool handling.
+                # All assistant text is buffered until the stream is complete for
+                # this iteration.  Some providers emit prose and tool-call deltas
+                # in the same streamed response; showing that prose immediately can
+                # make the UI display stale option lists and then a second, different
+                # answer after tools finish.  Only the final no-tool iteration is
+                # allowed to emit user-visible text.
                 assembler = StreamingToolCallAssembler()
                 collected_content = ""
                 pending_jsonish_content = ""
-                emitted_content = False
 
                 async for chunk in stream_response:
                     delta = chunk.choices[0].delta
 
-                    # Yield content tokens as they arrive, except for a leading
-                    # JSON object that may be a malformed tool call.  Buffering
-                    # prevents raw objects like {"query": "..."} from flashing
-                    # in chat before we can recover them as real tool calls.
                     # Some providers return dict-style chunks, others object-style.
                     content_text = (
                         delta.content if hasattr(delta, "content")
                         else delta.get("content", "")
                     )
                     if content_text:
-                        if must_use_tool_before_text:
-                            # Fresh DOWNLOAD turns must be grounded in tool output.
-                            # Buffer the model's premature prose until we know whether
-                            # it also emitted tool calls; do not show stale candidate
-                            # summaries to the user before any tool has run.
-                            collected_content += content_text
-                            continue
-                        if not emitted_content and BareToolCallDetector.looks_like_json_prefix(pending_jsonish_content + content_text):
+                        if not collected_content and BareToolCallDetector.looks_like_json_prefix(pending_jsonish_content + content_text):
                             pending_jsonish_content += content_text
                         else:
                             if pending_jsonish_content:
                                 collected_content += pending_jsonish_content
-                                emitted_content = True
-                                yield pending_jsonish_content
                                 pending_jsonish_content = ""
                             collected_content += content_text
-                            emitted_content = True
-                            yield content_text
 
                     # Accumulate tool call deltas using the assembler
                     tool_deltas = None
@@ -194,14 +184,10 @@ class StreamingAgentLoopExecutor:
                     recovered = BareToolCallDetector.from_text(pending_jsonish_content, allowed_tool_names)
                     if recovered is None:
                         collected_content += pending_jsonish_content
-                        emitted_content = True
-                        yield pending_jsonish_content
                     pending_jsonish_content = ""
-
-                # Store the complete text content from this iteration
-                # so the caller can record the final response.  Recovered bare
-                # tool calls intentionally do not become assistant text.
-                self.last_content = collected_content
+                elif pending_jsonish_content:
+                    collected_content += pending_jsonish_content
+                    pending_jsonish_content = ""
 
                 if recovered is not None:
                     logger.warning(
@@ -228,6 +214,7 @@ class StreamingAgentLoopExecutor:
                     )
                     messages.append(result_message)
                     executed_tool_count += 1
+                    self.last_content = ""
                     continue
 
                 if not tool_calls:
@@ -318,13 +305,22 @@ class StreamingAgentLoopExecutor:
                         self.last_content = fallback
                         yield fallback
                         return
-                    # Pure text response — already streamed to the user
+                    # Pure text response — emit the buffered final text now.
+                    self.last_content = collected_content
+                    if collected_content:
+                        yield collected_content
                     logger.debug(
-                        f"Agent iteration {i}: no tool calls, streamed "
+                        f"Agent iteration {i}: no tool calls, emitted buffered "
                         f"{len(collected_content)} chars"
                     )
                     break
 
+                if collected_content:
+                    logger.warning(
+                        "Suppressing {} chars of assistant prose emitted with tool calls; waiting for tool-grounded final response.",
+                        len(collected_content),
+                    )
+                self.last_content = ""
                 logger.info(
                     f"Agent iteration {i}: executing {len(tool_calls)} tool call(s)"
                 )

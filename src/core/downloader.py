@@ -16,10 +16,12 @@ from src.core.downloader_lifecycle import SeedingPolicy
 from src.core.downloader_monitor_registry import DownloadMonitorRegistry
 from src.core.downloader_progress_cache import DownloadFileProgressCache
 from src.core.downloader_start_coordinator import DownloadStartCoordinator
+from src.core.download_storage_recovery import DownloadStorageRecoveryService
 from src.core.security.path_policy import SafePathResolver, SecurityPolicyError
 from src.core.download_dependencies import DownloadDependencies
 from src.core.downloader_sharing_mixin import DownloadSharingMixin
 from src.core.download_partial_files import PartialDownloadMarkerRepairService
+from src.core.storage_path_availability import StoragePathGuard
 from src.core.download_import_identity import (
     _apply_import_context_defaults,
     _find_duplicate_import_context,
@@ -53,6 +55,8 @@ class DownloadManager(DownloadSharingMixin):
         self._on_complete_callback: Optional[Callable] = None
         self._on_ready_callback: Optional[Callable] = None
 
+        self._storage_recovery = DownloadStorageRecoveryService(self._db, self._download_dir)
+
         self._start_coordinator = DownloadStartCoordinator(
             engine=self._engine,
             db=self._db,
@@ -71,7 +75,9 @@ class DownloadManager(DownloadSharingMixin):
         # Explicit user starts may continue later even when auto-download is off.
         self._explicit_start_allowed: set[str] = set()
         self._queue_lock = asyncio.Lock()
-        Path(deps.download_dir).mkdir(parents=True, exist_ok=True)
+        availability = StoragePathGuard.try_prepare_directory(deps.download_dir)
+        if not availability.available_for_writes:
+            logger.warning(f"Download directory is unavailable at startup: {availability.reason}")
 
     async def initialize(self) -> None:
         """Initialize the engine and start the queue manager."""
@@ -85,6 +91,11 @@ class DownloadManager(DownloadSharingMixin):
             "bandwidth_manager",
             self._bandwidth.run_loop,
             TaskCriticality.CRITICAL,
+        )
+        self._supervisor.spawn_restartable(
+            "download_storage_recovery",
+            lambda: self._storage_recovery.run_loop(self._enforce_concurrency_limit),
+            TaskCriticality.IMPORTANT,
         )
         logger.info("Download manager initialized.")
 

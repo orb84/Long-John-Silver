@@ -1027,7 +1027,33 @@ class SearchMediaTorrentsTool:
                 "auto_queue_blocked_reason": c.get("auto_queue_blocked_reason"),
             })
 
+        category = None
+        registry = getattr(self._scheduler, "_categories", None)
+        if registry and res.get("category_id"):
+            try:
+                category = registry.get(res.get("category_id"))
+            except Exception:
+                category = None
         cache_candidates = attach_candidate_ids(cache_candidates)
+        category_filter = getattr(category, "filter_agent_candidate_payloads_for_request", None) if category else None
+        if callable(category_filter):
+            try:
+                cache_candidates = list(category_filter(
+                    cache_candidates,
+                    season=res.get("season", season),
+                    episode=res.get("episode", episode),
+                    search_scope=res.get("search_scope") or search_scope,
+                    language=res.get("language") or language,
+                ))
+                for i, candidate in enumerate(cache_candidates, 1):
+                    candidate["index"] = i
+            except Exception as exc:
+                logger.warning(
+                    "search_media_torrents category candidate payload filter failed for category=%r name=%r: %s",
+                    res.get("category_id"),
+                    res.get("name") or name,
+                    exc,
+                )
         result_set_id = stable_result_set_id(
             session_id=session_id,
             name=res.get("name") or name,
@@ -1036,14 +1062,6 @@ class SearchMediaTorrentsTool:
             episode=res.get("episode", episode),
             candidate_ids=[c["candidate_id"] for c in cache_candidates],
         )
-
-        category = None
-        registry = getattr(self._scheduler, "_categories", None)
-        if registry and res.get("category_id"):
-            try:
-                category = registry.get(res.get("category_id"))
-            except Exception:
-                category = None
         batch_recommendation = _build_batch_recommendation(
             name=res.get("name") or name,
             category_id=res.get("category_id"),
@@ -1090,7 +1108,7 @@ class SearchMediaTorrentsTool:
                 "auto_queue_blocked_reason": c.get("auto_queue_blocked_reason"),
             })
 
-        _annotate_selection_policy(clean_candidates, preferred_language=res.get("language") or language)
+        _annotate_selection_policy(clean_candidates, preferred_language=res.get("language") or language, language_is_explicit=language_is_explicit)
         for cache_candidate in cache_candidates:
             clean_match = next((c for c in clean_candidates if c.get("candidate_id") == cache_candidate.get("candidate_id")), None)
             if clean_match:
@@ -1225,6 +1243,7 @@ class SearchMediaTorrentsTool:
             "result_set_id": result_set_id,
             "candidates": cache_candidates,
             "batch_recommendation": batch_recommendation,
+            "quality_choice_policy": quality_choice_policy,
             "companion_soulseek": res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {},
             "llm_candidate_review": llm_candidate_review,
             "llm_candidate_review_status": llm_candidate_review_status,
@@ -1481,7 +1500,7 @@ def _search_constraints_from_arguments(arguments: dict[str, Any]) -> dict[str, A
         constraints["preserve_resolution"] = True
     return constraints
 
-def _annotate_selection_policy(candidates: list[dict[str, Any]], *, preferred_language: str | None = None) -> None:
+def _annotate_selection_policy(candidates: list[dict[str, Any]], *, preferred_language: str | None = None, language_is_explicit: bool = False) -> None:
     """Mark candidates that should not be queued without user confirmation.
 
     This is a narrow safety layer for the tool contract: it does not try to
@@ -1490,9 +1509,10 @@ def _annotate_selection_policy(candidates: list[dict[str, Any]], *, preferred_la
     """
     preferred = _canonical_language_token(preferred_language) if preferred_language else ""
     for candidate in candidates:
-        warnings: list[str] = []
-        blockers: list[str] = []
+        warnings: list[str] = list(candidate.get("selection_warnings") or [])
+        blockers: list[str] = list(candidate.get("selection_blockers") or [])
         seeders = _safe_int(candidate.get("seeders"))
+        candidate["availability_seeders"] = seeders
         if seeders <= 0:
             blockers.append("no seeder count reported")
         elif seeders < 5:
@@ -1509,9 +1529,30 @@ def _annotate_selection_policy(candidates: list[dict[str, Any]], *, preferred_la
             title_has_preferred = _title_has_language_token(title, preferred)
             multi = "multi" in normalized or "multi" in title.lower() or "dual" in title.lower()
             if normalized and preferred not in normalized and not multi and not title_has_preferred:
+                candidate["language_preference_status"] = "mismatch"
                 blockers.append(f"does not advertise preferred media language {preferred_language}")
+            elif preferred == "english" and normalized and preferred in normalized:
+                extras = {lang for lang in normalized if lang not in {preferred, "multi"}}
+                if extras or multi:
+                    candidate["language_preference_status"] = "preferred_with_extra_audio"
+                    warnings.append(
+                        "advertises extra non-preferred audio languages; keep as fallback behind English/unknown-language candidates"
+                    )
+                else:
+                    candidate["language_preference_status"] = "preferred_only"
             elif not normalized and not title_has_preferred:
-                warnings.append(f"language not advertised; preferred media language is {preferred_language}")
+                candidate["language_preference_status"] = "unknown_acceptable"
+                message = f"language not advertised; preferred media language is {preferred_language}"
+                if language_is_explicit and preferred != "english":
+                    blockers.append(message)
+                else:
+                    warnings.append(message)
+            elif title_has_preferred:
+                candidate["language_preference_status"] = "preferred_by_title"
+            elif multi:
+                candidate["language_preference_status"] = "multi_language_fallback"
+        elif "language_preference_status" not in candidate:
+            candidate["language_preference_status"] = "not_applicable"
 
         bundle_context = candidate.get("bundle_context") or {}
         if isinstance(bundle_context, dict) and bundle_context.get("selective_download_required"):
@@ -1546,6 +1587,45 @@ def _canonical_language_token(value: object) -> str:
         "multi": "multi", "multilanguage": "multi", "multi-audio": "multi", "dual": "multi",
     }
     return aliases.get(token, token)
+
+
+def _candidate_logical_unit_key(candidate: dict[str, Any]) -> str:
+    descriptor = candidate.get("unit_descriptor") if isinstance(candidate.get("unit_descriptor"), dict) else {}
+    stable = str(descriptor.get("stable_key") or "").strip()
+    if stable:
+        return stable
+    coords = descriptor.get("coordinates") if isinstance(descriptor.get("coordinates"), dict) else {}
+    try:
+        season = int(coords.get("season") or candidate.get("season") or 0)
+    except (TypeError, ValueError):
+        season = 0
+    try:
+        episode = int(coords.get("episode") or candidate.get("episode") or 0)
+    except (TypeError, ValueError):
+        episode = 0
+    if season and episode:
+        return f"S{season:02d}E{episode:02d}"
+    if season:
+        return f"S{season:02d}"
+    return ""
+
+
+def _quality_scope_key(candidate: dict[str, Any]) -> tuple[str, str]:
+    coverage = str(candidate.get("requested_season_coverage") or "")
+    if coverage == "full_requested_season":
+        return ("season", _candidate_logical_unit_key(candidate))
+    if candidate.get("is_bundle") or candidate.get("bundle_scope") or candidate.get("pack_type"):
+        return ("bundle", _candidate_logical_unit_key(candidate))
+    return ("unit", _candidate_logical_unit_key(candidate))
+
+
+def _quality_same_scope_group(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    first_key = _quality_scope_key(candidates[0])
+    if not first_key[1]:
+        return candidates[:1]
+    return [candidate for candidate in candidates if _quality_scope_key(candidate) == first_key]
 
 
 def _quality_choice_policy(candidates: list[dict[str, Any]], constraints: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1600,10 +1680,15 @@ def _quality_choice_policy(candidates: list[dict[str, Any]], constraints: dict[s
     if bundle_policy.get("requires_user_choice"):
         return bundle_policy
 
-    # Otherwise compare within the top same-resolution group for exact episodes
-    # and non-bundle searches.
+    # Otherwise compare within the top same-resolution and same-logical-unit
+    # group for exact episodes and non-bundle searches.  A season request that
+    # fell back to individual files must not compare S01E01, S01E04, and S01E08
+    # as if they were alternative encodes of the same thing; that creates fake
+    # bitrate choices and hides the fact that the season still needs per-episode
+    # coverage.
     resolution = viable[0].get("resolution")
     group = [c for c in viable if c.get("resolution") == resolution]
+    group = _quality_same_scope_group(group)
     return _material_quality_choice_policy(
         group[:6],
         reason="no_saved_bitrate_preference",
@@ -1674,6 +1759,35 @@ def _quality_option_health_key(candidate: dict[str, Any]) -> tuple[int, int, int
     index = _safe_int(candidate.get("index")) or 9999
     return (has_seeders, seeders, -index)
 
+
+def _quality_language_preference_rank(candidate: dict[str, Any]) -> int:
+    status = str(candidate.get("language_preference_status") or "").lower()
+    return {
+        "preferred_only": 5,
+        "preferred_by_title": 5,
+        "unknown_acceptable": 4,
+        "preferred_with_extra_audio": 3,
+        "multi_language_fallback": 2,
+        "not_applicable": 1,
+        "mismatch": -100,
+    }.get(status, 1)
+
+
+def _quality_availability_bucket(candidate: dict[str, Any]) -> int:
+    seeders = _safe_int(candidate.get("seeders"))
+    if seeders >= 100:
+        return 5
+    if seeders >= 30:
+        return 4
+    if seeders >= 10:
+        return 3
+    if seeders >= 5:
+        return 2
+    if seeders > 0:
+        return 1
+    return 0
+
+
 def _material_quality_choice_policy(candidates: list[dict[str, Any]], *, reason: str, message: str, tradeoff_type: str) -> dict[str, Any]:
     """Return a choice policy when candidates have materially different quality/size profiles.
 
@@ -1715,12 +1829,18 @@ def _material_quality_choice_policy(candidates: list[dict[str, Any]], *, reason:
     if not (bitrate_material or size_material or resolution_material or codec_material):
         return {"requires_user_choice": False}
 
-    def sort_key(row: dict[str, Any]) -> tuple[float, int, int]:
+    def sort_key(row: dict[str, Any]) -> tuple[int, int, int, float, int]:
         try:
             bitrate = float(row.get("estimated_bitrate_kbps") or 0)
         except (TypeError, ValueError):
             bitrate = 0.0
-        return (-bitrate, -_safe_int(row.get("seeders")), _safe_int(row.get("index")) or 9999)
+        return (
+            -_quality_language_preference_rank(row),
+            -_quality_availability_bucket(row),
+            -_safe_int(row.get("seeders")),
+            -bitrate,
+            _safe_int(row.get("index")) or 9999,
+        )
 
     choices = []
     for c in sorted(candidates, key=sort_key)[:8]:
@@ -1736,6 +1856,8 @@ def _material_quality_choice_policy(candidates: list[dict[str, Any]], *, reason:
             "estimated_bitrate_kbps": c.get("estimated_bitrate_kbps"),
             "seeders": c.get("seeders"),
             "languages": c.get("languages"),
+            "language_preference_status": c.get("language_preference_status"),
+            "selection_warnings": c.get("selection_warnings") or [],
             "requested_season_coverage": c.get("requested_season_coverage"),
         })
     return {
@@ -2151,7 +2273,11 @@ def _batch_candidate_score(candidate: dict[str, Any], preferred_language: str | 
     preferred = _canonical_language_token(preferred_language) if preferred_language else ""
     title_lower = str(candidate.get("title") or "").lower()
     if preferred and preferred in normalized_languages:
-        lang_score = 3
+        extras = {lang for lang in normalized_languages if lang not in {preferred, "multi"}}
+        if preferred == "english" and (extras or "multi" in normalized_languages or "dual" in title_lower or "multi" in title_lower):
+            lang_score = 1
+        else:
+            lang_score = 3
     elif "multi" in normalized_languages or "dual" in title_lower or "multi" in title_lower:
         lang_score = 2
     elif not normalized_languages:

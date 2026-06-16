@@ -41,6 +41,12 @@ _SEASON_PACK_RANGE_RE = re.compile(
     r"S(\d{1,2})E(\d{1,2})[\s._-]*(?:-|to|thru|through)[\s._-]*E?(\d{1,2})",
     re.IGNORECASE,
 )
+_SEASON_PACK_ADJACENT_EPISODE_RANGE_RE = re.compile(
+    # Examples from public trackers: "S01e01 10" or "S01E01 08".
+    # The negative lookahead prevents misreading S01E01 1080p as episode 10.
+    r"S(\d{1,2})E(\d{1,2})[\s._-]+E?(\d{1,2})(?!\d)",
+    re.IGNORECASE,
+)
 _SEASON_EPISODE_RE = re.compile(r"S(\d{1,2})E(\d{1,2})", re.IGNORECASE)
 _ANIME_INDICATORS = re.compile(r"\[.*?\]|subsplease|erai-raws|horriblesubs|crunchyroll", re.IGNORECASE)
 _STANDARD_SHOW_EP_RANGE = (18, 24)
@@ -75,6 +81,21 @@ class TVBundleKnowledge:
                 "start": int(m.group(2)),
                 "end": int(m.group(3)),
             }
+
+        m = _SEASON_PACK_ADJACENT_EPISODE_RANGE_RE.search(title)
+        if m:
+            start = int(m.group(2))
+            end = int(m.group(3))
+            if end > start and end <= 60:
+                return {
+                    "season": int(m.group(1)),
+                    "season_start": int(m.group(1)),
+                    "season_end": int(m.group(1)),
+                    "pack_type": "partial_range",
+                    "scope": "episode_range",
+                    "start": start,
+                    "end": end,
+                }
 
         for pattern in (_SEASON_RANGE_RE, _SEASON_WORD_RANGE_RE, _SEASON_WORD_ADJACENT_LIST_RE):
             m = pattern.search(title)

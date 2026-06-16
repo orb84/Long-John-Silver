@@ -105,6 +105,10 @@ class CategoryMediaMetadata(BaseModel):
     category_id: str = ""
     item_id: str = ""
     display_name: str = ""
+    title_aliases: list[str] = Field(default_factory=list)
+    """Provider-known canonical/original/alternative names for title matching."""
+    localized_titles: list[dict[str, Any]] = Field(default_factory=list)
+    """Compact localized title rows from metadata providers."""
     provider: str = ""
     external_id: str = ""
     tmdb_id: int | None = None

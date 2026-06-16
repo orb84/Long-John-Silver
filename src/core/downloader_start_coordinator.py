@@ -8,6 +8,8 @@ import asyncio
 from typing import Any, Callable, Optional
 from loguru import logger
 from src.core.models import DownloadItem, DownloadStatus, TaskCriticality
+from src.core.storage_path_availability import StoragePathUnavailableError
+from src.core.download_storage_recovery import StorageUnavailableDownloadReason
 from src.core.downloader_lifecycle import (
     DownloadLifecycleContext,
     DownloadLifecycleMonitor,
@@ -137,6 +139,12 @@ class DownloadStartCoordinator:
                 save_path=save_path,
                 mode="download",
             )
+        except StoragePathUnavailableError as e:
+            logger.warning(f"Download storage unavailable for {item.item_name} ({item.id}): {e}")
+            item.status = DownloadStatus.STALLED
+            item.reason = StorageUnavailableDownloadReason.from_error(e)
+            await self._db.downloads.upsert_download(item)
+            raise
         except Exception as e:
             logger.error(f"Failed to start download for {item.item_name} ({item.id}): {e}")
             item.status = DownloadStatus.FAILED

@@ -879,8 +879,13 @@ class AIAssistant:
             + "- Treat the ACTIVE GOAL STATE and PENDING ACTION CONTEXT as structured task state. Continue an active goal when the current user message semantically refers to it.\n"
             + "- For torrent discovery, call search_media_torrents with literal item constraints and a category-neutral search_scope. The owning category resolves latest season, missing units, packs, fallbacks, and naming schemas.\n"
             + "- When search results return candidate_picker, summarize candidates by result_set_id/candidate_id/title/size/seeders and choose by candidate_id. Ask to inspect more detail when coverage is ambiguous.\n"
+            + "- Never present candidates outside the requested season/episode as options to satisfy that request; wrong-scope rows are diagnostic noise unless the user explicitly broadens the target.\n"
+            + "- Apply the configured media language as a constraint. Do not ask whether the user wants other languages merely because a candidate is dual/MULTI; on English-configured installs, do not let ITA+ENG/MULTI rows outrank English-only or language-unknown scene releases unless they are the only viable coverage.\n"
             + "- If storage context is WARNING/CRITICAL and a candidate size is known, call check_storage_capacity before claiming it cannot fit; deterministic storage math belongs to that tool/queue preflight, not prose guesses.\n"
             + "- Queue only when the chosen candidate or batch is clear and queue_download confirms status=queued or returns download IDs.\n"
+            + "- If any state-changing download tool runs (queue, cancel, remove, pause, resume, restart, priority), the final answer must explicitly report each action result with any download_id/status returned by the tool. Do not bury or omit a cancellation because you then searched again.\n"
+            + "- Do not cancel/remove an already queued or active download merely because the user asks for a better match or corrects constraints. Treat that as a search/refinement first; cancel/remove only after explicit user instruction or confirmation from a manage_downloads confirmation_required result.\n"
+            + "- Never say a download was queued, started, cancelled, paused, resumed, or removed unless the latest tool result explicitly reports that state change.\n"
             + "- If a tool returns ok=false with recoverable=true, adjust the next tool call using its next_actions instead of ending with a crash.\n"
         )
 

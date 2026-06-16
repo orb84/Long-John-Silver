@@ -154,7 +154,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             language=str(kwargs.get("language") or "English"),
             enabled=bool(kwargs.get("enabled", True)),
             check_interval_days=int(kwargs.get("check_interval_days") or 7),
-            auto_download=kwargs.get("auto_download"),
+            auto_download=kwargs.get("auto_download") if kwargs.get("auto_download") is not None else True,
             last_season=kwargs.get("last_season"),
             last_episode=kwargs.get("last_episode"),
             tvmaze_id=kwargs.get("tvmaze_id"),
@@ -221,6 +221,12 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                     if details:
                         metadata["tvmaze"] = details
                         metadata["tvmaze_id"] = tvmaze_id
+                        aliases = list(metadata.get("title_aliases") or [])
+                        for value in (details.get("name"), title):
+                            if value and value not in aliases:
+                                aliases.append(str(value))
+                        if aliases:
+                            metadata["title_aliases"] = aliases
                         if details.get("status") and not metadata.get("lifecycle_status"):
                             metadata["lifecycle_status"] = details.get("status")
                         if db and getattr(db, "media", None):
@@ -237,9 +243,10 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         """Build a TV-owned watch plan.
 
         The generic scheduler stores and retries watches, but TV owns the
-        semantics: next-episode metadata, airing cadence, RSS windows, release
-        retry start/expiry, and download requirements.  Ended/inactive shows do
-        not get near-real-time RSS simply because they are episodic.
+        semantics: next-episode metadata, already-aired missing frontier
+        episodes, airing cadence, RSS windows, release retry start/expiry, and
+        download requirements.  Ended/inactive shows do not get near-real-time
+        RSS simply because they are episodic.
         """
         from src.core.categories.watch import CategoryReleaseWatchSpec, CategoryRssFeedSpec, CategoryWatchPlan
 
@@ -249,61 +256,100 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
 
         metadata = await self._watch_metadata_for_item(item, context)
         lifecycle = self._tv_lifecycle_status(metadata)
-        next_ep = self._next_episode_from_metadata(metadata)
         preferred_language = str(getattr(item, "language", "") or getattr(getattr(context, "settings", None), "language", "") or "")
+        release_watches: list[CategoryReleaseWatchSpec] = []
+        rss_feeds: list[CategoryRssFeedSpec] = []
+        reasons: list[str] = []
+        seen_units: set[str] = set()
 
+        def add_episode_watch(
+            episode_row: dict[str, Any],
+            *,
+            reason: str,
+            rss_reason: str,
+            trigger: str,
+        ) -> None:
+            season = self._safe_positive_int(episode_row.get("season") or episode_row.get("season_number"))
+            episode = self._safe_positive_int(episode_row.get("episode") or episode_row.get("number") or episode_row.get("episode_number"))
+            if not season or not episode:
+                return
+            unit_key = f"S{season:02d}E{episode:02d}"
+            if unit_key in seen_units:
+                return
+            seen_units.add(unit_key)
+            expected_air_at = self._episode_air_datetime(episode_row, metadata)
+            cadence = self._tv_cadence_profile(metadata, episode_row)
+            interval_hours = self._release_watch_interval_hours(metadata, cadence_profile=cadence, default=2.0)
+            watch_start_at = self._watch_start_for_air_datetime(expected_air_at)
+            expires_at = self._watch_expiry_for_air_datetime(expected_air_at, cadence)
+            requirements = self._release_watch_requirements(item, context)
+            payload = {
+                "expected_air_at": expected_air_at,
+                "expected_air_date": episode_row.get("air_date") or episode_row.get("airdate") or "",
+                "lifecycle": lifecycle,
+                "cadence_profile": cadence,
+                "season": season,
+                "episode": episode,
+                "title_hint": episode_row.get("name") or episode_row.get("title") or "",
+                "watch_trigger": trigger,
+            }
+            if self._rss_window_is_open(watch_start_at, expires_at):
+                rss_feeds.extend([
+                    CategoryRssFeedSpec(query=f"{title} {unit_key}", target_name=title, reason=rss_reason),
+                    CategoryRssFeedSpec(query=f"{title} S{season:02d}", target_name=title, reason=f"season pack containing {unit_key}"),
+                ])
+            release_watches.append(CategoryReleaseWatchSpec(
+                unit_key=unit_key,
+                preferred_language=preferred_language,
+                interval_hours=interval_hours,
+                expected_air_at=expected_air_at,
+                watch_start_at=watch_start_at,
+                expires_at=expires_at,
+                cadence_profile=cadence,
+                requirements=requirements,
+                payload=payload,
+            ))
+            reasons.append(f"{unit_key}: {reason}")
+
+        # Important: a show can have already-aired episodes missing from the
+        # local library while TVMaze has no future ``nextepisode`` object.  That
+        # was the Star City failure mode: suggestions knew S01E03/S01E04 were
+        # missing, but release_watch_retry had no rows to search.  Build
+        # concrete watches for the aired frontier first, then add future next-
+        # episode metadata if present.
+        for missing_row in await self._missing_frontier_episodes_for_watch(item, context, metadata):
+            add_episode_watch(
+                missing_row,
+                reason="already-aired episode missing after latest local episode",
+                rss_reason="already-aired missing episode release window",
+                trigger="already_aired_missing_frontier",
+            )
+
+        next_ep = self._next_episode_from_metadata(metadata)
         if next_ep:
-            season = self._safe_positive_int(next_ep.get("season") or next_ep.get("season_number"))
-            episode = self._safe_positive_int(next_ep.get("episode") or next_ep.get("number") or next_ep.get("episode_number"))
-            if season and episode:
-                unit_key = f"S{season:02d}E{episode:02d}"
-                expected_air_at = self._episode_air_datetime(next_ep, metadata)
-                cadence = self._tv_cadence_profile(metadata, next_ep)
-                interval_hours = self._release_watch_interval_hours(metadata, cadence_profile=cadence, default=2.0)
-                watch_start_at = self._watch_start_for_air_datetime(expected_air_at)
-                expires_at = self._watch_expiry_for_air_datetime(expected_air_at, cadence)
-                requirements = self._release_watch_requirements(item, context)
-                payload = {
-                    "expected_air_at": expected_air_at,
-                    "expected_air_date": next_ep.get("air_date") or next_ep.get("airdate") or "",
-                    "lifecycle": lifecycle,
-                    "cadence_profile": cadence,
-                    "season": season,
-                    "episode": episode,
-                }
-                rss_feeds: list[CategoryRssFeedSpec] = []
-                if self._rss_window_is_open(watch_start_at, expires_at):
-                    rss_feeds = [
-                        CategoryRssFeedSpec(query=f"{title} {unit_key}", target_name=title, reason="next episode release window"),
-                        CategoryRssFeedSpec(query=f"{title} S{season:02d}", target_name=title, reason="season pack containing next episode"),
-                    ]
-                return CategoryWatchPlan(
-                    self.category_id,
-                    title,
-                    mode="release_watch",
-                    reason=f"next episode known from TV metadata; cadence={cadence}; start={watch_start_at or 'now'}",
-                    rss_feeds=rss_feeds,
-                    release_watches=[
-                        CategoryReleaseWatchSpec(
-                            unit_key=unit_key,
-                            preferred_language=preferred_language,
-                            interval_hours=interval_hours,
-                            expected_air_at=expected_air_at,
-                            watch_start_at=watch_start_at,
-                            expires_at=expires_at,
-                            cadence_profile=cadence,
-                            requirements=requirements,
-                            payload=payload,
-                        )
-                    ],
-                )
+            add_episode_watch(
+                next_ep,
+                reason="next episode known from TV metadata",
+                rss_reason="next episode release window",
+                trigger="next_episode_metadata",
+            )
+
+        if release_watches:
+            return CategoryWatchPlan(
+                self.category_id,
+                title,
+                mode="release_watch",
+                reason="; ".join(reasons[:8]) or "TV release watches active",
+                rss_feeds=self._dedupe_rss_feeds(rss_feeds),
+                release_watches=release_watches,
+            )
 
         if lifecycle in {"returning series", "in production", "running", "to be determined", "active_airing"}:
             return CategoryWatchPlan(
                 self.category_id,
                 title,
                 mode="periodic_metadata",
-                reason=f"TV lifecycle is active but no concrete next episode is known ({lifecycle or 'unknown active'}); refresh metadata instead of broad RSS",
+                reason=f"TV lifecycle is active but no concrete episode watch is known ({lifecycle or 'unknown active'}); refresh metadata instead of broad RSS",
             )
 
         return CategoryWatchPlan(
@@ -312,6 +358,114 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             mode="periodic_metadata",
             reason=f"TV lifecycle is not actively airing ({lifecycle or 'unknown'}); use scheduled lifecycle checks, not RSS",
         )
+
+    async def _missing_frontier_episodes_for_watch(self, item: Any, context: Any, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return aired, missing frontier episodes that deserve release watches.
+
+        This is category-owned TV logic.  Core scheduling still knows only that
+        a concrete ``unit_key`` has a retry watch.  The TV category decides that
+        SxxEyy episodes after the latest local/progress coordinate are current
+        frontier releases and should be retried even when provider metadata does
+        not expose a future ``next_episode`` field.
+        """
+        tvmaze = (getattr(context, "metadata_clients", {}) or {}).get("tvmaze")
+        if tvmaze is None:
+            return []
+        tvmaze_id = self._watch_tvmaze_id(item, metadata)
+        if not tvmaze_id:
+            return []
+        downloaded = await self._downloaded_episode_keys_for_watch(item, context)
+        latest = self._latest_episode_coordinate_for_watch(item, downloaded)
+        if latest == (0, 0):
+            return []
+        try:
+            episodes = await tvmaze.get_episode_list(int(tvmaze_id))
+        except Exception as exc:
+            logger.warning("TV release-watch episode guide lookup failed for %s: %s", getattr(item, "key", ""), exc)
+            return []
+        last_error = str(getattr(tvmaze, "last_error", "") or "").strip()
+        if last_error:
+            logger.warning("TV release-watch episode guide unavailable for %s: %s", getattr(item, "key", ""), last_error)
+            return []
+
+        today = datetime.now(timezone.utc).date()
+        out: list[dict[str, Any]] = []
+        latest_season, latest_episode = latest
+        for episode_row in episodes or []:
+            if not isinstance(episode_row, dict):
+                continue
+            season = self._safe_positive_int(episode_row.get("season"))
+            episode = self._safe_positive_int(episode_row.get("number") or episode_row.get("episode"))
+            if not season or not episode:
+                continue
+            air = self._episode_air_datetime(episode_row, metadata)
+            air_dt = self._parse_datetimeish(air)
+            if air_dt is None or air_dt.date() > today:
+                continue
+            if (season, episode) in downloaded:
+                continue
+            if season < latest_season or (season == latest_season and episode <= latest_episode):
+                continue
+            normalized = dict(episode_row)
+            normalized["season"] = season
+            normalized["number"] = episode
+            out.append(normalized)
+        out.sort(key=lambda row: (int(row.get("season") or 0), int(row.get("number") or 0)))
+        return out[:8]
+
+    async def _downloaded_episode_keys_for_watch(self, item: Any, context: Any) -> set[tuple[int, int]]:
+        """Read TV-owned downloaded episode coordinates for release watches."""
+        downloaded: set[tuple[int, int]] = set()
+        db = getattr(context, "db", None)
+        media_repo = getattr(db, "media", None) if db is not None else None
+        if media_repo is None:
+            return downloaded
+        try:
+            rows = await media_repo.list_category_units(self.category_id, getattr(item, "key", ""), status="downloaded")
+        except Exception as exc:
+            logger.debug("TV release-watch downloaded-unit lookup failed for %s: %s", getattr(item, "key", ""), exc)
+            return downloaded
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            season = self._safe_positive_int(row.get("season"))
+            episode = self._safe_positive_int(row.get("episode"))
+            if not season or not episode:
+                text = " ".join(str(row.get(key) or "") for key in ("unit_key", "stable_key", "label", "file_name", "path"))
+                season, episode = self._unit_coordinates(text)
+            if season and episode:
+                downloaded.add((int(season), int(episode)))
+        return downloaded
+
+    def _latest_episode_coordinate_for_watch(self, item: Any, downloaded: set[tuple[int, int]]) -> tuple[int, int]:
+        """Return latest local/progress coordinate; (0, 0) means insufficient evidence."""
+        if downloaded:
+            return max(downloaded)
+        season = self._safe_positive_int(getattr(item, "last_season", None))
+        episode = self._safe_positive_int(getattr(item, "last_episode", None))
+        if season and episode:
+            return (season, episode)
+        return (0, 0)
+
+    def _watch_tvmaze_id(self, item: Any, metadata: dict[str, Any]) -> int | None:
+        tvmaze = metadata.get("tvmaze") if isinstance(metadata.get("tvmaze"), dict) else {}
+        for value in (getattr(item, "tvmaze_id", None), metadata.get("tvmaze_id"), tvmaze.get("id")):
+            parsed = self._safe_positive_int(value)
+            if parsed:
+                return parsed
+        return None
+
+    @staticmethod
+    def _dedupe_rss_feeds(feeds: list[Any]) -> list[Any]:
+        seen: set[tuple[str, str]] = set()
+        out: list[Any] = []
+        for feed in feeds:
+            key = (str(getattr(feed, "query", "") or "").casefold(), str(getattr(feed, "target_name", "") or "").casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(feed)
+        return out
 
     async def _watch_metadata_for_item(self, item: Any, context: Any) -> dict[str, Any]:
         metadata = dict(getattr(item, "metadata", {}) or {})
@@ -471,8 +625,17 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         return max(1.0, min(float(default), 6.0))
 
     def _release_watch_requirements(self, item: Any, context: Any) -> dict[str, Any]:
+        """Return TV release-watch requirements for one tracked show.
+
+        New-episode auto-download is a TV item policy, not an accidental mirror
+        of the global Captain-mode default.  Legacy/null values inherit the TV
+        default of enabled so active tracked shows keep following newly aired
+        episodes unless the user disables the inspector checkbox.
+        """
         settings = getattr(context, "settings", None)
         quality = getattr(item, "quality", None)
+        item_auto = getattr(item, "auto_download", None)
+        can_auto_download = True if item_auto is None else bool(item_auto)
         return {
             "preferred_language": str(getattr(item, "language", "") or getattr(settings, "language", "") or ""),
             "subtitle_languages": list(getattr(item, "subtitle_languages", []) or []),
@@ -481,7 +644,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             "max_bitrate_kbps": getattr(quality, "max_bitrate_kbps", None),
             "max_file_size_mb": getattr(quality, "max_file_size_mb", None),
             "preferred_codecs": list(getattr(quality, "preferred_codecs", []) or []),
-            "auto_download": bool(getattr(item, "auto_download", None) if getattr(item, "auto_download", None) is not None else getattr(settings, "auto_download", False)),
+            "auto_download": can_auto_download,
             "language_fallback_requires_approval": True,
             "selective_pack_download_allowed": True,
         }
@@ -495,7 +658,8 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         variants from being reached.  The broader bare query remains in the
         alternative ladder for recall.
         """
-        title = str(getattr(item, "key", "") or "").strip()
+        titles = self._agent_query_titles_for_item(item, language) if hasattr(self, "_agent_query_titles_for_item") else []
+        title = (titles[0] if titles else str(getattr(item, "key", "") or "")).strip()
         label = str(unit_label or "").strip()
         query = f"{title} {label}".strip() if label else title
         if label and language:
@@ -510,19 +674,26 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         an ``ITA`` token even when the episode is real.  Preferred language is
         still passed to ranking and final confirmation checks.
         """
-        title = str(getattr(item, "key", "") or "").strip()
+        titles = self._agent_query_titles_for_item(item, language) if hasattr(self, "_agent_query_titles_for_item") else []
+        if not titles:
+            titles = [str(getattr(item, "key", "") or "").strip()]
+        titles = [title for title in titles if title][:4]
         label = str(unit_label or "").strip()
-        if not title or not label:
+        if not titles or not label:
             return []
         season, episode = self._unit_coordinates(label)
         if not season or not episode:
             return []
+        exact_queries: list[str] = []
+        for title in titles:
+            dotted_title = re.sub(r"\s+", ".", title)
+            exact_queries.extend([
+                f"{title} S{season:02d}E{episode:02d}",
+                f"{dotted_title}.S{season:02d}E{episode:02d}",
+                f"{title} {season}x{episode:02d}",
+            ])
+        title = titles[0]
         dotted_title = re.sub(r"\s+", ".", title)
-        exact_queries = [
-            f"{title} S{season:02d}E{episode:02d}",
-            f"{dotted_title}.S{season:02d}E{episode:02d}",
-            f"{title} {season}x{episode:02d}",
-        ]
         language_queries: list[str] = []
         preferred = str(language or "").strip()
         if preferred:
@@ -588,12 +759,12 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             # noise and triggering slow per-episode fanout.  TV owns the pack
             # semantics here: a result is structurally valid only when it is a
             # season/series bundle that can contain the requested season.
-            if not self._title_matches_requested_series(title, str(getattr(item, "key", "") or "")):
+            if not self._title_matches_item_series(title, item):
                 return False
             return self._is_relevant_season_pack_result(result, int(requested_season), item=item)
         if not requested_season or not requested_episode:
             return super().validate_search_result_for_request(result, item, unit_label)
-        if not self._title_matches_requested_series(title, str(getattr(item, "key", "") or "")):
+        if not self._title_matches_item_series(title, item):
             return False
         candidate_season, candidate_episode = self._unit_coordinates(title)
         if candidate_season == requested_season and candidate_episode == requested_episode:
@@ -611,17 +782,23 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         context: Any | None = None,
     ) -> list[str]:
         """Build TV-owned Soulseek queries for exact episodes or packs."""
-        title = str(getattr(item, "key", "") or query_summary or "").strip()
+        titles = self._agent_query_titles_for_item(item, language) if hasattr(self, "_agent_query_titles_for_item") else []
+        if not titles:
+            titles = [str(getattr(item, "key", "") or query_summary or "").strip()]
         label = str(unit_label or "").strip()
-        queries = [f"{title} {label}".strip() if label else title]
+        queries: list[str] = []
         season, episode = self._unit_coordinates(label)
-        if season and episode:
-            queries.extend([
-                f"{title} S{season:02d}E{episode:02d}",
-                f"{title} {season}x{episode:02d}",
-                f"{title} S{season:02d}",
-                f"{title} Season {season}",
-            ])
+        for title in titles[:4]:
+            if not title:
+                continue
+            queries.append(f"{title} {label}".strip() if label else title)
+            if season and episode:
+                queries.extend([
+                    f"{title} S{season:02d}E{episode:02d}",
+                    f"{title} {season}x{episode:02d}",
+                    f"{title} S{season:02d}",
+                    f"{title} Season {season}",
+                ])
         seen: set[str] = set()
         out: list[str] = []
         for query in queries:
@@ -631,7 +808,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             if cleaned and key not in seen:
                 seen.add(key)
                 out.append(cleaned)
-        return out[:6]
+        return out[:10]
 
     def soulseek_search_limit(
         self,
@@ -664,7 +841,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             probe = type("SoulseekTVCandidate", (), {"title": text})()
             if unit_label and not self.validate_search_result_for_request(probe, item, unit_label):
                 continue
-            if not unit_label and not self._title_matches_requested_series(text, str(getattr(item, "key", "") or "")):
+            if not unit_label and not self._title_matches_item_series(text, item):
                 continue
             season, episode = self._unit_coordinates(text)
             score = 0.0

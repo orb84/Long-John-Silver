@@ -16,6 +16,7 @@ from typing import Iterable
 
 from loguru import logger
 
+from src.core.storage_path_availability import StoragePathGuard
 from src.core.models import (
     Settings,
     StorageCapacityDecision,
@@ -108,6 +109,8 @@ class StorageMonitor:
                 f"- {volume.status.upper()} {volume.mount_point}: {free_gb:.1f} GB free "
                 f"of {total_gb:.1f} GB ({volume.free_percent:.1f}%) for {categories}."
             )
+            if volume.message:
+                lines.append(f"  Reason: {volume.message}")
             if volume.status in {"warning", "critical"}:
                 lines.append("  Use check_storage_capacity with the candidate's estimated size before deciding whether a download fits; low percentage alone is not a size calculation.")
         if len(report.volumes) > max_volumes:
@@ -138,6 +141,19 @@ class StorageMonitor:
                 category_id=category_id,
                 estimated_bytes=estimated_bytes,
                 reason="No monitored storage target matched this category; proceeding without a disk-space decision.",
+            )
+
+        if target_usage.status == "critical" and str(target_usage.volume_id).startswith("unavailable:"):
+            return StorageCapacityDecision(
+                ok=False,
+                status="critical",
+                category_id=category_id,
+                estimated_bytes=estimated_bytes,
+                target_path=target_usage.path,
+                volume_id=target_usage.volume_id,
+                free_bytes=target_usage.free_bytes,
+                projected_free_bytes=target_usage.free_bytes,
+                reason=target_usage.message or "Configured storage target is unavailable.",
             )
 
         projected_free = None
@@ -217,15 +233,30 @@ class StorageMonitor:
 
     def _usage_for_target(self, target: StoragePathTarget) -> StoragePathUsage:
         """Resolve and measure one monitored target path."""
-        requested = target.path.expanduser()
-        resolved = requested.resolve(strict=False)
-        anchor = self._existing_anchor(resolved)
-        exists = requested.exists()
+        availability = StoragePathGuard.inspect(target.path)
+        requested = availability.requested
+        resolved = availability.path
+        anchor = availability.existing_anchor
+        exists = availability.exists
+        if not availability.available_for_writes and availability.status == "unavailable":
+            return StoragePathUsage(
+                path=str(resolved),
+                purpose=target.purpose,
+                category_id=target.category_id,
+                category_name=target.category_name,
+                exists=exists,
+                volume_id=f"unavailable:{resolved}",
+                mount_point=str(availability.missing_root or anchor),
+                status="critical",
+                message=availability.reason,
+            )
         try:
             usage = shutil.disk_usage(anchor)
             volume_id, mount_point = self._volume_identity(anchor)
             free_percent = (usage.free / usage.total * 100.0) if usage.total else 0.0
             status, message = self._status_for_usage(free_percent, usage.free, mount_point)
+            if not exists and availability.can_create:
+                message = f"{message} Configured path does not exist yet but can be created: {resolved}."
             return StoragePathUsage(
                 path=str(resolved),
                 purpose=target.purpose,

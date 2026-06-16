@@ -124,7 +124,27 @@ class MediaCategoryItem(CategoryItem):
 
 
 class TvShowItem(MediaCategoryItem):
-    """A television show being tracked for new episodes."""
+    """A television show being tracked for new episodes.
+
+    TV treats new-episode automation as item-owned and default-on.  Users can
+    disable it from the TV show inspector, but missing/null legacy values are
+    normalized to True so tracked active shows keep following newly aired
+    episodes after upgrades.
+    """
+
+    auto_download: bool | None = True
+    """Whether release-watch automation may auto-download new TV episodes."""
+
+    @model_validator(mode="after")
+    def _default_new_episode_auto_download(self) -> "TvShowItem":
+        """Normalize legacy null automation values to the TV default.
+
+        Returns:
+            The normalized TV show item.
+        """
+        if self.auto_download is None:
+            self.auto_download = True
+        return self
 
     @property
     def item_type(self) -> str:

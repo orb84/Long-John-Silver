@@ -225,6 +225,8 @@ class TMDBMetadataEnricher(MetadataEnricher):
 
             return CategoryMediaMetadata(
                 display_name=details.get("title") or details.get("name") or clean_name,
+                title_aliases=list(details.get("title_aliases") or []),
+                localized_titles=list(details.get("localized_titles") or []),
                 tmdb_id=details.get("id"),
                 genres=details.get("genres", []),
                 overview=details.get("overview", ""),

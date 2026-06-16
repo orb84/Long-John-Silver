@@ -73,12 +73,14 @@ class ConversationBinding:
         )
 
         if fresh_download_request:
-            dropped = len(context_messages)
-            context_messages = []
+            original_count = len(context_messages)
+            context_messages = self._fresh_request_recent_tail(context_messages)
+            dropped = max(0, original_count - len(context_messages))
             if dropped:
                 logger.info(
-                    "ConversationBinding: suppressed {} stale conversation context message(s) for fresh DOWNLOAD request session_id={}",
+                    "ConversationBinding: suppressed {} older context message(s) for guarded DOWNLOAD request and kept {} latest message(s) session_id={}",
                     dropped,
+                    len(context_messages),
                     session_id,
                 )
             return context_messages
@@ -109,6 +111,29 @@ class ConversationBinding:
                     })
 
         return context_messages
+
+    @staticmethod
+    def _fresh_request_recent_tail(context_messages: list[dict]) -> list[dict]:
+        """Keep immediate history for guarded download requests.
+
+        Older transcript and semantic recalls can drag stale candidates into a
+        genuinely fresh search. Dropping the whole transcript is worse: the
+        model loses state-changing facts from the immediately previous turns,
+        such as a queued or cancelled download it must acknowledge.
+        """
+        if not context_messages:
+            return []
+        recent = []
+        for message in context_messages[-8:]:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = str(message.get("content") or "")
+            if role == "system" and content.startswith("COMPRESSED RELEVANT PAST CONTEXT"):
+                continue
+            recent.append(message)
+        return recent[-6:]
+
 
 
     async def build_intent_routing_context(

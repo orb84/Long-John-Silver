@@ -44,12 +44,12 @@ class PendingActionContextBuilder:
         """
         if not session_id or not self._db:
             return ""
-        if DownloadContextPolicy.should_suppress_pending_candidates(current_user_prompt, intent):
+        fresh_request_guard = DownloadContextPolicy.should_suppress_pending_candidates(current_user_prompt, intent)
+        if fresh_request_guard:
             logger.info(
-                "PendingActionContextBuilder: suppressing stale candidate context for fresh media request session_id={}",
+                "PendingActionContextBuilder: retaining recent candidate handles with fresh-request guard session_id={}",
                 session_id,
             )
-            return ""
         try:
             result_sets = await self._load_recent_result_sets(session_id, max_result_sets)
         except Exception as exc:
@@ -84,6 +84,12 @@ class PendingActionContextBuilder:
                 "quality_choice_policy": self._compact_quality_choice(data.get("quality_choice_policy")),
                 "llm_candidate_review": self._compact_llm_review(data.get("llm_candidate_review")),
                 "recommended_candidate_id": data.get("recommended_candidate_id"),
+                "fresh_request_guard": fresh_request_guard,
+                "fresh_request_guard_rule": (
+                    "This result set is still actionable for corrections/refinements/selections/confirmations, "
+                    "but must not satisfy an unrelated fresh request unless the current message semantically refers to it."
+                    if fresh_request_guard else None
+                ),
                 "candidates": candidates,
             }
             packets.append(packet)
@@ -93,8 +99,10 @@ class PendingActionContextBuilder:
         return (
             "PENDING ACTION CONTEXT (structured, not natural-language parsed):\n"
             "The following recent result sets remain actionable. If the user semantically "
-            "refers to choosing, continuing, confirming, changing, or queueing one of these, "
-            "the LLM should route/plan using the listed result_set_id and candidate_id values.\n"
+            "refers to choosing, continuing, correcting, confirming, changing, or queueing one of these, "
+            "the LLM should route/plan using the listed result_set_id and candidate_id values. "
+            "If a packet has fresh_request_guard=true, treat it as a guarded prior workspace: do not queue "
+            "from it for an unrelated new title, but do use it to understand complaints/corrections/refinements.\n"
             + json.dumps(packets, ensure_ascii=False, indent=2, default=str)
         )
 

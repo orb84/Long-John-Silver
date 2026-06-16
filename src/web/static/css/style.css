@@ -1094,6 +1094,25 @@ input:-webkit-autofill:active {
 }
 .detail-section { padding: 1rem; }
 .detail-section h3 { margin: 0 0 .75rem; }
+.detail-toggle-row {
+    display: flex;
+    align-items: flex-start;
+    gap: .8rem;
+    cursor: pointer;
+}
+.detail-toggle-row input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    margin-top: .2rem;
+    accent-color: var(--gold);
+    flex-shrink: 0;
+}
+.detail-toggle-copy {
+    display: flex;
+    flex-direction: column;
+    gap: .2rem;
+    line-height: 1.35;
+}
 .season-detail-group {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 14px;

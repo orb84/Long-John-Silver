@@ -81,6 +81,7 @@ class CategoryItemDetailModal extends Component {
         const content = DOM.el('div', { className: 'modal-content glass-panel category-detail-modal' }, [
             this._hero(item),
             this._overview(item),
+            this._automationSection(item),
             this._suggestionsSection(item),
             this._sections(item),
             DOM.el('div', { className: 'category-detail-footer' }, [
@@ -137,11 +138,65 @@ class CategoryItemDetailModal extends Component {
         add('Tracked key', item.key || item.item_id);
         add('Language', item.language || item.configured_language);
         add('Quality', this._qualityText(item.quality));
+        if (this._isTvItem()) add('New episodes', this._autoDownloadEnabled(item) ? 'Auto-download' : 'Notify only');
         add('Downloaded units', item.downloaded_episodes_count ?? item.total_units);
         add('Total seasons', item.total_seasons);
         add('Total episodes', item.total_episodes);
         add('Genres', item.genres);
         return cells.length ? DOM.el('section', { className: 'category-detail-stats' }, cells) : DOM.el('div');
+    }
+
+    _automationSection(item) {
+        if (!this._isTvItem()) return null;
+        const checked = this._autoDownloadEnabled(item);
+        const checkbox = DOM.el('input', {
+            type: 'checkbox',
+            className: 'category-detail-auto-download-checkbox',
+            onchange: (event) => this._setAutoDownloadForCurrentItem(Boolean(event.target.checked)),
+            'aria-label': 'Automatically download new episodes for this TV show'
+        });
+        checkbox.checked = checked;
+        return this._panel('Episode automation', [
+            DOM.el('label', { className: 'detail-toggle-row category-detail-auto-download-row' }, [
+                checkbox,
+                DOM.el('span', { className: 'detail-toggle-copy' }, [
+                    DOM.el('strong', {}, ['Automatically download new episodes']),
+                    DOM.el('small', { className: 'muted' }, [
+                        'Enabled by default. Turn this off for this show to keep release-watch checks ',
+                        'in notify-only mode.'
+                    ])
+                ])
+            ])
+        ]);
+    }
+
+    _isTvItem() {
+        const categoryId = String(this.currentCategoryId || this.manifest?.category_id || '').toLowerCase();
+        const capabilities = Array.isArray(this.manifest?.capabilities) ? this.manifest.capabilities : [];
+        return categoryId === 'tv' || capabilities.includes('episodic');
+    }
+
+    _autoDownloadEnabled(item) {
+        return item.auto_download !== false;
+    }
+
+    async _setAutoDownloadForCurrentItem(enabled) {
+        if (!this.currentCategoryId || !this.currentItemId) return;
+        return this._runLockedItemAction('Updating episode automation…', async () => {
+            await CategoryApiClient.updateItem(
+                this.currentCategoryId,
+                this.currentItemId,
+                { auto_download: Boolean(enabled) }
+            );
+            const message = enabled
+                ? 'New episodes will be downloaded automatically for this show.'
+                : 'New episodes will only notify for this show.';
+            toast.show(message);
+            await this._refreshCurrentItem();
+            if (window.releaseWatchPanel && typeof window.releaseWatchPanel.load === 'function') {
+                window.releaseWatchPanel.load();
+            }
+        });
     }
 
     async _loadSuggestionsForItem(categoryId, itemId) {

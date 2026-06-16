@@ -289,7 +289,7 @@ Use this when code needs to:
 
 #### `TvShowCategory` — `src/core/categories/tv.py`
 
-Owns TV-specific behavior, including episode/unit interpretation, TV metadata expectations, TV prompts, and TV actions/workflows. TV-specific terms like seasons, episodes, SxxExx, and TVMaze should remain here or in TV-owned metadata/workflow modules.
+Owns TV-specific behavior, including episode/unit interpretation, TV metadata expectations, TV prompts, TV actions/workflows, and TV release-watch semantics. TV-specific terms like seasons, episodes, SxxExx, aired-missing frontier episodes, and TVMaze should remain here or in TV-owned metadata/workflow modules. The generic scheduler may persist/retry `CategoryReleaseWatchSpec` rows, but it must not decide what counts as a missing TV episode.
 
 #### `MovieCategory` — `src/core/categories/movie.py`
 
@@ -634,6 +634,8 @@ Storage files:
 
 ```text
 src/core/storage.py              StorageMonitor and StoragePathTarget.
+src/core/storage_path_availability.py  Safe writable-path probing for removable media roots.
+src/core/download_storage_recovery.py  Requeues storage-stalled downloads after reconnect.
 src/ai/tools/storage.py          LLM storage tools.
 src/web/routers/storage.py       `/api/storage/status` and capacity check API.
 STORAGE.md                       Human-readable storage model.
@@ -657,7 +659,7 @@ Settings/Compass   Displays storage panel.
 /api/health         Degrades when storage is critical.
 AIAssistant         Receives prompt context summary when enabled.
 LLM tools           get_storage_status and check_storage_capacity.
-DownloadManager     Checks capacity before queueing downloads.
+DownloadManager     Checks capacity before queueing downloads and supervises storage reconnect recovery.
 ```
 
 ## 12. Web UI Architecture
@@ -951,3 +953,36 @@ ManageDownloadsTool            thin LLM tool orchestration wrapper
 ```
 
 When extending download control, add fields to the schema, predicates to the resolver, and mutations to a focused service. Do not put new business rules directly into `ManageDownloadsTool` unless they are specifically tool-bound orchestration rules such as confirmation or dry-run output.
+
+### Round 250 torrent-search and download-progress seams
+
+- `src/core/categories/tv_agent.py`
+  - owns final TV candidate payload filtering through `filter_agent_candidate_payloads_for_request()`;
+  - ranks language-satisfying candidates by swarm health before marginal bitrate differences;
+  - uses `TVBundleKnowledge` for tracker-style range packs such as `S01e01 10` in every per-episode size/bitrate path.
+- `src/ai/tools/scheduling.py`
+  - projects generic torrent payloads, attaches stable candidate IDs, and then calls optional category-owned payload filters before LLM adjudication and caching;
+  - annotates `language_preference_status` and availability metadata for prompt-safe ranking.
+- `src/ai/download_candidate_adjudicator.py`
+  - includes language/status/scope/availability fields in compact candidate rows and instructs the LLM not to promote weak dual-audio rows over healthier language-satisfying equivalents.
+- `src/web/view_models/download_view_model.py`
+  - estimates blank multi-file rows from parent torrent progress only when exact file-progress data is absent, marking the rows as estimated so live cache updates can replace them.
+- `scripts/round250_torrent_language_scope_session_recovery_tests.py`
+  - covers the log-driven session recovery behavior: dual-audio fallback handling, quality-choice persistence for follow-ups, and prompt guidance.
+- `scripts/round250_torrent_language_seed_scope_progress_tests.py`
+  - covers the adjacent-range sizing, wrong-season payload filtering, language/seeder quality ordering, and multi-file progress fallback regressions.
+
+### Round 253 TV per-show new-episode automation
+
+- `src/core/domain_models/media.py` — `TvShowItem` owns the TV-specific default
+  that new-episode auto-download is enabled unless the item is explicitly turned
+  off.
+- `src/core/categories/tv.py` — `TvShowCategory.create_item()` and
+  `_release_watch_requirements()` emit the category-owned automation requirement
+  snapshot consumed by generic release-watch retry.
+- `src/core/categories/tv_context.py` — TV detail payloads normalize legacy/null
+  automation state to the enabled value shown by the inspector checkbox.
+- `src/web/static/js/components/categoryItemDetailModal.js` — the library item
+  inspector renders the TV-only “Automatically download new episodes” checkbox
+  and saves through `CategoryApiClient.updateItem()`, which reaches
+  `CategoryItemCoordinator` and resynchronizes release watches.
