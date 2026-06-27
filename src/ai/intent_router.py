@@ -61,7 +61,7 @@ class IntentRouter:
         "current message refers to selecting/continuing/acting on that pending choice, "
         "classify DOWNLOAD even if the current message is short or indirect.\n"
         "- DOWNLOAD means the user wants to find/queue/control downloads, act on pending candidates, or research something specifically so it can be tracked/downloaded when safe.\n"
-        "- A follow-up asking to search for a better torrent option, season pack, full pack, alternate release, or fallback for the previously discussed download target is still DOWNLOAD, not general SEARCH.\n"
+        "- A follow-up asking to search for a better download option, bundle/range, alternate release, or fallback for the previously discussed target is still DOWNLOAD, not general SEARCH.\n"
         "- SEARCH means the user wants information/research/metadata without queueing, tracking, scheduling, or changing app state.\n"
         "- Short correction/refinement follow-ups inherit the last relevant user goal from context: "
         "phrases like 'I meant released movie', 'not future', 'in Italian', 'the older one', "

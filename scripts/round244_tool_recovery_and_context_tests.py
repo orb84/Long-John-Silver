@@ -29,12 +29,11 @@ class Round244ToolRecoveryTests:
             active_category_id="tv",
         )
         assert args is not None
-        assert args["name"] == "A Knight of the Seven Kingdoms"
-        assert args["language"] == "Italian"
-        assert args["language_is_explicit"] is True
-        assert args["season"] == 1
-        assert args["search_scope"] == "bundle_preferred"
+        assert args["name"] == "A Knight of the Seven Kingdoms in italian ? Full first season"
         assert args["category_id"] == "tv"
+        assert "language" not in args
+        assert "season" not in args
+        assert "search_scope" not in args
 
     def _fresh_download_context_filter_is_wired(self) -> None:
         assistant = (self.root / "src/ai/assistant.py").read_text(encoding="utf-8")
@@ -42,7 +41,7 @@ class Round244ToolRecoveryTests:
         assert "fresh_download_request = DownloadContextPolicy.should_suppress_pending_candidates" in assistant
         assert "fresh_download_request=fresh_download_request" in assistant
         assert "if fresh_download_request:" in binding
-        assert "suppressed {} stale conversation context message(s)" in binding
+        assert "suppressed {} older context message(s)" in binding
 
     def _streaming_recovery_is_wired_before_user_fallback(self) -> None:
         src = (self.root / "src/ai/streaming_agent_loop.py").read_text(encoding="utf-8")

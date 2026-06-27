@@ -7,14 +7,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.ai.tools.scheduling import (
-    SearchMediaTorrentsTool,
-    _annotate_selection_policy,
-    _search_result_next_actions,
-)
+from src.ai.tools.scheduling import SearchMediaTorrentsTool
 from src.core.categories.tv import TvShowCategory
 from src.core.models import ToolExecutionContext
 from src.core.scheduler_services import SchedulerServiceContext, SchedulerTorrentSearchService
+from src.ai.tools.search_workspace import SearchWorkspaceNextActions
+from src.ai.tools.search_workspace import SelectionPolicyAnnotator
 
 
 class StubScheduler:
@@ -106,14 +104,14 @@ def test_low_seed_wrong_language_candidate_is_not_clear_queue_choice():
             "languages": ["English", "Hindi"],
         }
     ]
-    _annotate_selection_policy(candidates, preferred_language="Italian")
+    SelectionPolicyAnnotator.annotate(candidates, preferred_language="Italian")
     assert candidates[0]["auto_queue_allowed"] is False
     assert "very low seeders" in candidates[0]["auto_queue_blocked_reason"]
     assert "preferred media language" in candidates[0]["auto_queue_blocked_reason"]
-    actions = _search_result_next_actions(candidates=candidates, search_scope="bundle_preferred", result_set_id="rs", has_batch=False)
+    actions = SearchWorkspaceNextActions.build(candidates=candidates, search_scope="bundle_preferred", result_set_id="rs", has_batch=False)
     assert not any(action.get("action") == "queue_clear_candidate" for action in actions), actions
     assert any(action.get("action") == "do_not_auto_queue_top_candidate" for action in actions), actions
-    assert any(action.get("action") == "try_individual_units_before_queueing_weak_pack" for action in actions), actions
+    assert any(action.get("action") == "try_individual_units_before_queueing_weak_bundle" for action in actions), actions
 
 
 if __name__ == "__main__":

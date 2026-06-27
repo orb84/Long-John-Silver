@@ -668,6 +668,29 @@ class DownloadCompletionHandler:
                 logger.warning(f"Failed to reconcile post-import sidecar {path}: {exc}")
         return created
 
+
+    def _category_allows_ready_import(
+        self,
+        category: object | None,
+        source: Path,
+        item: DownloadItem,
+        settings: Settings,
+        *,
+        file_info: object | None = None,
+    ) -> bool:
+        """Ask the category whether this completed file is primary library media."""
+        hook = getattr(category, "ready_import_file_allowed", None) if category is not None else None
+        if not callable(hook):
+            return True
+        try:
+            return bool(hook(source, item=item, file_info=file_info, settings=settings))
+        except Exception as exc:
+            logger.warning(
+                "Category ready-import policy failed for {} on {}: {}; skipping file",
+                getattr(category, "category_id", "unknown"), source, exc,
+            )
+            return False
+
     async def _link_completed_file_to_library(
         self,
         source: Path,
@@ -869,6 +892,9 @@ class DownloadCompletionHandler:
             for df in item.files:
                 source = self._resolve_downloaded_source(df.file_path, item)
                 if source and (df.status in {"complete", "organized"} or item.progress >= 0.999):
+                    if not self._category_allows_ready_import(category, source, item, settings, file_info=df):
+                        logger.info(f"Ready callback: skipping non-primary payload for {item.item_name}: {source}")
+                        continue
                     df.organized_path = str(source)
                     df.status = "organized"
                     changed = True
@@ -912,6 +938,9 @@ class DownloadCompletionHandler:
                 return False
             source = Path(item.file_path).resolve()
             if source.exists() and self._path_allowed_for_item(source, item):
+                if not self._category_allows_ready_import(category, source, item, settings, file_info=None):
+                    logger.info(f"Ready callback: skipping non-primary payload for {item.item_name}: {source}")
+                    return False
                 target = await self._link_completed_file_to_library(source, item, category, settings)
                 if target:
                     item.file_path = str(source)
@@ -931,6 +960,9 @@ class DownloadCompletionHandler:
             if not source:
                 attempted = (Path(item.save_path or self._dl_dir) / str(df.file_path)).resolve()
                 logger.warning(f"Ready callback: skipping missing source for {item.item_name}: {attempted}")
+                continue
+            if not self._category_allows_ready_import(category, source, item, settings, file_info=df):
+                logger.info(f"Ready callback: skipping non-primary payload for {item.item_name}: {source}")
                 continue
             target = await self._link_completed_file_to_library(
                 source,
@@ -960,10 +992,58 @@ class DownloadCompletionHandler:
         season: int | None = None,
         episode: int | None = None,
         episode_title: str | None = None,
+        file_info: object | None = None,
+        source_name: str | None = None,
     ) -> Path | None:
         """Move a completed staging file into the library after seeding ends."""
         if not source.exists() or not self._path_allowed_for_item(source, item):
             return None
+        settings = self._current_settings()
+        category = self._category_for_item(item)
+        if category and not self._category_allows_ready_import(category, source, item, settings, file_info=file_info):
+            logger.info(f"Completion cleanup: skipping non-primary payload for {item.item_name}: {source}")
+            return None
+        if category:
+            try:
+                target = self._planned_target_path(
+                    source,
+                    item,
+                    category,
+                    settings,
+                    file_info=file_info,
+                    source_name=source_name or getattr(file_info, "file_path", None) or source.name,
+                    episode_title=episode_title,
+                )
+                resolver = SafePathResolver.for_category(
+                    category,
+                    settings,
+                    extra_roots=[self._dl_dir, Path(getattr(item, "save_path", "") or self._dl_dir), source.parent],
+                )
+                destination = self._resolve_safe_completion_destination(
+                    resolver=resolver,
+                    target=target,
+                    source=source,
+                    item=item,
+                    category=category,
+                    settings=settings,
+                    file_info=file_info,
+                )
+                if destination is None:
+                    return None
+                safe_target, already_present = destination
+                if already_present:
+                    logger.info(f"Organized '{item.item_name}' already present -> {safe_target}")
+                    if source.exists() and not self._same_payload(source, safe_target):
+                        return safe_target
+                    if source.exists() and not source.samefile(safe_target):
+                        self._safe_unlink(source)
+                    return safe_target
+                resolver.safe_move(source, safe_target, purpose="download.complete.move")
+                logger.info(f"Organized '{item.item_name}' -> {safe_target}")
+                return safe_target
+            except Exception as exc:
+                logger.error(f"Category completion move failed for {item.item_name} from {source}: {exc}")
+                return None
         try:
             result = self._librarian.organize_file(
                 source=source,
@@ -1009,6 +1089,8 @@ class DownloadCompletionHandler:
                     season=df.season or item.season,
                     episode=df.episode or item.episode,
                     episode_title=df.episode_title,
+                    file_info=df,
+                    source_name=df.file_path,
                 )
                 if target:
                     if category:
@@ -1104,6 +1186,7 @@ class DownloadCompletionHandler:
                     item.episode,
                     download_id=item.id,
                     category_id=item.category_id,
+                    unit_label=item.unit_label,
                 )
             return
 
@@ -1142,6 +1225,7 @@ class DownloadCompletionHandler:
                 item.episode,
                 download_id=item.id,
                 category_id=item.category_id,
+                unit_label=item.unit_label,
             )
 
     async def reconcile_completed_imports(self, limit: int = 200) -> int:
@@ -1187,13 +1271,13 @@ class DownloadCompletionHandler:
         return bool(item.file_path and self._path_allowed_for_item(Path(item.file_path), item))
 
     def _safe_unlink(self, path: Path) -> bool:
-        """Quarantine a staging file only if it is inside the download directory."""
+        """Permanently delete a staging file only if it is inside the download directory."""
         if not path.exists() or not self._path_in_download_dir(path):
             return False
         try:
             settings = self._current_settings()
             resolver = SafePathResolver(allowed_roots=[self._dl_dir], config=settings.security)
-            resolver.safe_unlink(path, purpose="download.cleanup", move_to_trash=True)
+            resolver.safe_unlink(path, purpose="download.cleanup", move_to_trash=False)
             return True
         except Exception as exc:
             logger.warning(f"Failed to clean up {path}: {exc}")
@@ -1203,7 +1287,7 @@ class DownloadCompletionHandler:
         """Remove empty torrent-created parent folders after file cleanup/import.
 
         Season packs often download as ``downloads/Release.Name/...episode files``.
-        Once every episode has been moved or quarantined, leaving the now-empty
+        Once every episode has been moved or deleted, leaving the now-empty
         release folder behind litters the download directory.  This helper walks
         upward from cleaned source files and removes only empty directories that
         are strictly inside the configured download root.  It never removes the

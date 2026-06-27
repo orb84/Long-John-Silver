@@ -18,6 +18,7 @@ class AppDeck {
         console.log('[AppDeck] Commissioning Long John Silver Control Bridge...');
         this._eventBus = window.shipEvents;
         this._wsClient = null;
+        this._perf = null;
         this._viewManager = null;
         this._compass = null;
         
@@ -32,6 +33,9 @@ class AppDeck {
         this._lastHydrateAt = 0;
         this._voyageLogLineLimit = 160;
         this._voyageLogLevel = 'all';
+        this._ambientBubbleStop = null;
+        this._logsIntervalStop = null;
+        this._deferredHydrateReason = null;
         
         this.init();
     }
@@ -40,7 +44,10 @@ class AppDeck {
      * Bootstrap dependencies, dynamic views, components, and spawn visual ambient helpers.
      */
     init() {
-        // 1. Setup networking layer and attach globally
+        // 1. Setup frontend performance coordination and networking layer.
+        this._perf = window.ljsPerf || new FrontendPerformanceCoordinator(this._eventBus);
+        window.ljsPerf = this._perf;
+
         this._wsClient = new WebSocketClient(this._eventBus);
         window.wsClient = this._wsClient;
         this._wsClient.connect();
@@ -92,6 +99,13 @@ class AppDeck {
         this._eventBus.subscribe('system:connection_status', (status) => {
             this._updateSystemStatus(status.connected);
             if (status && status.connected) this._hydrateInitialPanels('websocket_connected');
+        });
+        this._eventBus.subscribe('ui:visibility', (state) => {
+            if (state && state.visible && this._deferredHydrateReason) {
+                const reason = this._deferredHydrateReason;
+                this._deferredHydrateReason = null;
+                this._hydrateInitialPanels(`${reason}_visible_resume`);
+            }
         });
         this._eventBus.subscribe('system', (event) => {
             if (event.subtype === 'background_status') {
@@ -159,11 +173,19 @@ class AppDeck {
      * @private
      */
     _hydrateInitialPanels(reason = 'manual') {
+        if (this._perf && !this._perf.isVisible()) {
+            this._deferredHydrateReason = reason;
+            return;
+        }
         const now = Date.now();
         if (now - this._lastHydrateAt < 1000) return;
         this._lastHydrateAt = now;
         if (this._hydrateTimer) clearTimeout(this._hydrateTimer);
         this._hydrateTimer = setTimeout(async () => {
+            if (this._perf && !this._perf.isVisible()) {
+                this._deferredHydrateReason = reason;
+                return;
+            }
             const jobs = [];
             // The Booty/library catalog performs its own progressive initial load.
             // Do not duplicate it during global hydration: large libraries were
@@ -294,8 +316,11 @@ class AppDeck {
     _spawnBubbles() {
         const container = document.getElementById('bubbles');
         if (!container) return;
+        const maxBubbles = 18;
 
         const makeBubble = () => {
+            if (this._perf && !this._perf.allowAmbientAnimation()) return;
+            if (container.childElementCount >= maxBubbles) return;
             const size = Math.random() * 15 + 5; // Size in px
             const left = Math.random() * 100;    // Position in %
             const duration = Math.random() * 10 + 6; // Float time in sec
@@ -309,19 +334,35 @@ class AppDeck {
 
             container.appendChild(bubble);
 
-            // Clean up DOM node once animation ends
+            // Clean up DOM node once animation ends. Hidden tabs can throttle
+            // timers, so the child-count cap above is the real leak guard.
             setTimeout(() => {
                 bubble.remove();
-            }, duration * 1000);
+            }, duration * 1000 + 250);
         };
 
-        // Seed initial floating bubbles
-        for (let i = 0; i < 15; i++) {
-            setTimeout(makeBubble, Math.random() * 3000);
-        }
+        const seedBubbles = () => {
+            if (this._perf && !this._perf.allowAmbientAnimation()) return;
+            for (let i = 0; i < 8; i++) {
+                setTimeout(makeBubble, Math.random() * 2500);
+            }
+        };
+        seedBubbles();
 
-        // Spawn bubbles continuously
-        setInterval(makeBubble, 1200);
+        if (this._perf) {
+            this._ambientBubbleStop = this._perf.registerAdaptiveInterval(makeBubble, {
+                foregroundMs: 1800,
+                backgroundMs: 90000,
+                initialDelayMs: 1800,
+                shouldRun: () => this._perf.allowAmbientAnimation()
+            });
+            this._eventBus.subscribe('ui:visibility', (state) => {
+                if (state && state.visible) seedBubbles();
+                if (state && !state.visible) container.querySelectorAll('.bubble').forEach(node => node.remove());
+            });
+        } else {
+            this._ambientBubbleStop = setInterval(makeBubble, 1800);
+        }
     }
 
     /**
@@ -342,15 +383,26 @@ class AppDeck {
         });
 
         // Trigger first log pull once HelmPanel has rendered its terminal.
-        setTimeout(() => this._refreshVoyageLogs(), 1000);
+        setTimeout(() => {
+            if (!this._perf || this._perf.isViewActive('helm')) this._refreshVoyageLogs();
+        }, 1000);
 
         // Keep the log terminal as a bounded visible tail.  Polling only while
         // The Helm is visible avoids pointless network/DOM churn during long
         // sessions on other tabs, and every refresh replaces the old rows.
-        setInterval(() => {
-            const helm = document.getElementById('helm');
-            if (!helm || helm.classList.contains('active')) this._refreshVoyageLogs();
-        }, 10000);
+        if (this._perf) {
+            this._logsIntervalStop = this._perf.registerAdaptiveInterval(() => this._refreshVoyageLogs(), {
+                foregroundMs: 10000,
+                backgroundMs: 120000,
+                initialDelayMs: 10000,
+                shouldRun: () => this._perf.isViewActive('helm')
+            });
+        } else {
+            this._logsIntervalStop = setInterval(() => {
+                const helm = document.getElementById('helm');
+                if (!helm || helm.classList.contains('active')) this._refreshVoyageLogs();
+            }, 10000);
+        }
     }
 
     /**
@@ -360,6 +412,7 @@ class AppDeck {
     async _refreshVoyageLogs() {
         const container = document.getElementById('log-container');
         if (!container || typeof APIClient === 'undefined') return;
+        if (this._perf && !this._perf.isViewActive('helm')) return;
         try {
             const level = this._voyageLogLevel || 'all';
             const data = await APIClient.get(`/api/system/logs?lines=${this._voyageLogLineLimit}&level=${encodeURIComponent(level)}`);

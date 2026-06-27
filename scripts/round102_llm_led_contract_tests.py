@@ -24,8 +24,8 @@ from src.ai.tool_executor import ToolCallExecutor
 from src.ai.tool_policy import AgentToolPolicy
 from src.ai.tool_registry import ToolRegistry
 from src.ai.tools.downloads import DownloadToolProvider
-from src.ai.tools.scheduling import _search_result_next_actions
 from src.core.models import Intent
+from src.ai.tools.search_workspace import SearchWorkspaceNextActions
 
 
 async def _fake_search_media_torrents(**kwargs):
@@ -106,7 +106,7 @@ def test_download_turns_do_not_use_structured_preplan() -> None:
 
 
 def test_search_results_expose_affordances() -> None:
-    actions = _search_result_next_actions(
+    actions = SearchWorkspaceNextActions.build(
         candidates=[{"candidate_id": "abc", "title": "Yellowstone.S05", "is_bundle": True, "seeders": 50}],
         search_scope="season_pack_preferred",
         result_set_id="rs_1",

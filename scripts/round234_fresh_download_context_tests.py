@@ -101,12 +101,16 @@ def test_policy_distinguishes_fresh_request_from_candidate_followup() -> None:
         "please grab me A Knight of the Seven Kingdoms in italian",
         Intent.DOWNLOAD,
     )
-    assert not DownloadContextPolicy.should_suppress_pending_candidates(
+    assert DownloadContextPolicy.should_suppress_pending_candidates(
         "queue the first one",
+        Intent.DOWNLOAD,
+    ), "natural-language ordinal follow-ups must not bypass the fresh-request guard without a stable handle"
+    assert not DownloadContextPolicy.should_suppress_pending_candidates(
+        "candidate a84e9cc9bbf158cf looks good",
         Intent.DOWNLOAD,
     )
     assert not DownloadContextPolicy.should_suppress_pending_candidates(
-        "candidate a84e9cc9bbf158cf looks good",
+        "#1 720p please",
         Intent.DOWNLOAD,
     )
 

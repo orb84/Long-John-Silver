@@ -90,7 +90,7 @@ class TorrentSelectionPromptBuilder:
             parts.extend([
                 "  4. Have a clearly wrong language — if lang:X shows a single language ",
                 f"     that does NOT match the preferred language '{preferred_language}', reject it.",
-                "     Example: lang:Hindi when preferred is English → REJECT.",
+                "     Example: lang:X when preferred is Y → REJECT.",
                 "  5. Have no magnet link — can't be downloaded",
             ])
         else:
@@ -126,9 +126,9 @@ class TorrentSelectionPromptBuilder:
             parts.extend([
                 "Language rules:",
                 f"  - Preferred language: {preferred_language}",
-                "  - MULTI-language releases are acceptable when they include the preferred audio/subtitle track, but they are not automatically better than a clean preferred-language release",
-                f"  - Dual-audio with {preferred_language} + another language is acceptable, not ideal",
-                f"  - Single-language releases in {preferred_language} are preferred when quality/coverage are otherwise comparable",
+                "  - Multi-language or multi-format releases are acceptable when category guidance says they include the requested language/content form, but they are not automatically better than a clean preferred-language match",
+                f"  - Releases explicitly including {preferred_language} plus other languages can be acceptable when category guidance treats that as useful evidence",
+                f"  - Releases clearly in {preferred_language} are preferred when identity, coverage, quality, and size are otherwise comparable",
                 "  - Single-language releases in a DIFFERENT language → REJECT",
                 "  - No language tag: UNKNOWN risk; prefer confirmed language matches",
                 "  - If ALL candidates have unknown language, pick the best quality one",
@@ -140,7 +140,7 @@ class TorrentSelectionPromptBuilder:
                 "Language rules:",
                 "  - This category did not provide a search language constraint.",
                 "  - Do not penalize candidates merely because they lack language tags.",
-                "  - Do not introduce English/Italian/MULTI preferences unless the user explicitly asked for language-specific content.",
+                "  - Do not introduce language-specific or multi-audio preferences unless the user explicitly asked for language-specific content.",
                 "",
             ])
         parts.extend([

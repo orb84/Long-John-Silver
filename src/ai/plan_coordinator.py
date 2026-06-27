@@ -22,6 +22,7 @@ from src.core.models import Intent, AgentPlan, PlanStep
 from src.utils.item_matcher import ItemMatcher
 from src.ai.tools.metadata_lookup_support import MetadataLookupRequest
 from src.ai.public_web_requirements import PublicWebEvidencePolicy
+from src.core.categories.search_scope import SearchScopePolicy
 
 if TYPE_CHECKING:
     from src.core.models import Settings
@@ -382,68 +383,65 @@ class PlanCoordinator:
 
     @staticmethod
     def _looks_like_multi_unit_download_request(user_prompt: str, agent_plan: AgentPlan) -> bool:
-        """Return True when a download request targets a set of units.
+        """Return whether the planner supplied a structured multi-unit signal.
 
-        The planner may collapse phrases such as "missing episodes", "latest
-        season", or "all remaining units" into a single guessed episode.  That
-        is unsafe: category hooks own missing-unit expansion and pack safety.
-        This detector is intentionally generic and only looks for multi-unit
-        language, not category-specific workflows.
+        Earlier cleanup removed natural-language follow-up parsers from the
+        download flow, but this method still kept an English/Italian unit-word
+        list. That made ``PlanCoordinator`` a hidden second interpreter for
+        category semantics. It now trusts only structured planner output such as
+        canonical search scopes or explicit multi-unit flags; the LLM/category
+        prompt skills are responsible for turning user prose into those fields.
         """
-        text = f"{user_prompt or ''} {agent_plan.user_goal or ''}".casefold()
-        unit_words = (
-            "episodes", "episodi", "unit", "units", "capitoli", "chapters",
-            "tracks", "discs", "volumes", "season", "stagione",
-        )
-        scope_words = (
-            "missing", "mancanti", "remaining", "rimanenti", "latest",
-            "current", "all", "every", "rest", "complete", "whole",
-        )
-        return any(word in text for word in unit_words) and any(word in text for word in scope_words)
+        _ = user_prompt
+        structured_values: list[Any] = []
+        structured_values.extend(agent_plan.constraints.get(key) for key in (
+            "multi_unit_scope",
+            "requested_unit_scope",
+            "requested_units",
+            "download_unit_scope",
+        ))
+        for step in agent_plan.steps:
+            if not isinstance(step.arguments, dict):
+                continue
+            structured_values.extend(step.arguments.get(key) for key in (
+                "multi_unit_scope",
+                "requested_unit_scope",
+                "requested_units",
+                "download_unit_scope",
+            ))
+            if SearchScopePolicy.is_bundle_scope(step.arguments.get("search_scope")):
+                return True
+        for value in structured_values:
+            if isinstance(value, (list, tuple, set)) and len(value) > 1:
+                return True
+            token = str(value or "").strip().casefold()
+            if token in {"multi", "multiple", "all", "remaining", "missing", "bundle", "collection"}:
+                return True
+        return False
 
     @staticmethod
     def _requested_pack_scope(user_prompt: str, agent_plan: AgentPlan) -> str | None:
-        """Infer a category-neutral pack search scope from planner/user wording.
+        """Return an already-structured category-neutral bundle scope.
 
-        This does not decide TV behavior.  It only carries the user's search
-        phase preference to the owning category, which may interpret packs,
-        bundles, volumes, editions, archives, or platform builds appropriately.
+        This method intentionally does not parse phrases such as "latest
+        season", "whole collection", or "solo pacchetto" from user text. The
+        planner/LLM and category prompt skills own that interpretation. The
+        coordinator may only preserve stable ``search_scope`` values that the
+        planner already emitted in structured tool arguments or constraints.
         """
-        text = f"{user_prompt or ''} {agent_plan.user_goal or ''} {agent_plan.constraints}".casefold()
-        pack_words = ("pack", "bundle", "complete", "full", "whole", "intera", "completa", "pacchetto")
-        unit_scope = ("season", "stagione", "series", "saga", "volume", "collection", "discography", "catalog", "catalogue")
-        explicit_pack_request = any(word in text for word in pack_words) and any(word in text for word in unit_scope)
-
-        # A request for a whole/latest/last season is not a request for one
-        # episode.  Treat it as pack-preferred even when the user did not say
-        # "pack" explicitly, but do not apply that to missing/remaining-unit
-        # requests where the category should search only the absent units.
-        whole_scope_phrases = (
-            "latest season", "last season", "current season", "new season",
-            "ultima stagione", "stagione più recente", "stagione piu recente",
-            "stagione corrente", "nuova stagione",
-        )
-        missing_words = ("missing", "mancanti", "remaining", "rimanenti", "need", "needed", "manca", "mancano")
-        implicit_whole_season_request = any(phrase in text for phrase in whole_scope_phrases) and not any(
-            word in text for word in missing_words
-        )
-        if not explicit_pack_request and not implicit_whole_season_request:
-            return None
-
-        # Strict pack-only intent must come from the user's wording/goal, not
-        # from internal constraint strings such as "download_plan_contract=...only...".
-        strict_text = f"{user_prompt or ''} {agent_plan.user_goal or ''}".casefold()
-        strict_patterns = (
-            r"\bpack[-\s]?only\b",
-            r"\bonly\s+(?:a\s+)?(?:season\s+)?pack\b",
-            r"\bsolo\s+(?:il\s+)?pacchetto\b",
-            r"\bsoltanto\s+(?:il\s+)?pacchetto\b",
-            r"\bexclusively\s+(?:a\s+)?(?:season\s+)?pack\b",
-            r"\bnot\s+single\s+episodes\b",
-        )
-        if explicit_pack_request and any(re.search(pattern, strict_text) for pattern in strict_patterns):
-            return "bundle_only"
-        return "bundle_preferred"
+        _ = user_prompt
+        for step in agent_plan.steps:
+            if not isinstance(step.arguments, dict):
+                continue
+            raw_scope = step.arguments.get("search_scope")
+            normalized = SearchScopePolicy.normalize(raw_scope)
+            if normalized != SearchScopePolicy.DEFAULT:
+                return normalized
+        for key in ("download_search_scope", "search_scope"):
+            normalized = SearchScopePolicy.normalize(agent_plan.constraints.get(key))
+            if normalized != SearchScopePolicy.DEFAULT:
+                return normalized
+        return None
 
     @staticmethod
     def _recent_media_name_from_context(context: str | None) -> str | None:
@@ -475,13 +473,13 @@ class PlanCoordinator:
         return None
 
     def _normalize_multi_unit_search_steps(self, agent_plan: AgentPlan, user_prompt: str) -> AgentPlan:
-        """Remove single-unit guesses from generic media searches.
+        """Remove single-unit guesses only from structured multi-unit searches.
 
-        For multi/missing requests, a structured ``episode=10`` (or equivalent
-        unit coordinate) produced by the planner is treated as a guess unless
-        the user explicitly asked for that one unit.  Keeping the broader season
-        or item coordinate lets ``search_media_torrents`` delegate fan-out and
-        safe bundle discovery to the category implementation.
+        The coordinator deliberately does not infer multi-unit intent from user
+        prose. If the planner/category context marks the search as multi-unit,
+        a single concrete unit coordinate is treated as an unsafe guess and
+        removed so the owning category can expand the request from its own
+        context.
         """
         if not self._looks_like_multi_unit_download_request(user_prompt, agent_plan):
             return agent_plan
@@ -995,9 +993,9 @@ class PlanCoordinator:
                 if not query_binds_to_recent:
                     # A fresh, explicit metadata query such as "Quentin Tarantino"
                     # must not inherit the previous media title, season, or media
-                    # type.  Earlier repair logic overwrote these SEARCH turns with
-                    # stale context (for example Yellowstone/Leon), which made web
-                    # research look broken even when the browser fallback worked.
+                    # type. Earlier repair logic overwrote fresh SEARCH turns with
+                    # stale media context, which made web research look broken even
+                    # when the browser fallback worked.
                     continue
 
                 if media_type and str(step.arguments.get("media_type") or "auto") == "auto":

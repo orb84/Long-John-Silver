@@ -162,7 +162,16 @@ class HelmPanel extends Component {
         this.updateStats();
         this.updateModelBadge();
         this.updateStorageStatus();
-        this._storageTimer = setInterval(() => this.updateStorageStatus(), 60000);
+        if (window.ljsPerf) {
+            this._storageTimer = window.ljsPerf.registerAdaptiveInterval(() => this.updateStorageStatus(), {
+                foregroundMs: 60000,
+                backgroundMs: 180000,
+                initialDelayMs: 60000,
+                shouldRun: () => window.ljsPerf.isViewActive('helm')
+            });
+        } else {
+            this._storageTimer = setInterval(() => this.updateStorageStatus(), 60000);
+        }
     }
 
 

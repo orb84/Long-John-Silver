@@ -17,14 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.ai.tools.scheduling import (
-    _annotate_selection_policy,
-    _build_batch_recommendation,
-    _estimated_total_size_bytes,
-)
 from src.core.categories.tv import TvShowCategory
 from src.core.models import SearchResult
 from src.search.jackett import JackettSearch
+from src.ai.tools.search_workspace import SearchBatchRecommendationBuilder
+from src.ai.tools.search_workspace import SearchQualityChoicePolicy
+from src.ai.tools.search_workspace import SelectionPolicyAnnotator
 
 
 def assert_true(condition: bool, message: str) -> None:
@@ -74,15 +72,15 @@ def test_multi_season_pack_requires_selective_download_and_size_projection() -> 
         "per_episode_size_bytes": 600 * 1024**2,
         "bundle_context": context,
     }]
-    _annotate_selection_policy(candidates, preferred_language="Italian")
+    SelectionPolicyAnnotator.annotate(candidates, preferred_language="Italian")
     assert_true(candidates[0]["auto_queue_allowed"] is False, f"selective pack should not be one-click queueable: {candidates[0]!r}")
     assert_true("requires selective file inspection" in candidates[0]["auto_queue_blocked_reason"], f"missing selective blocker: {candidates[0]!r}")
-    projected = _estimated_total_size_bytes(candidates, ["c1"])
+    projected = SearchQualityChoicePolicy.estimated_total_size_bytes(candidates, ["c1"])
     assert_true(projected == 600 * 1024**2 * 10, f"selective size should project requested season only, got {projected}")
 
 
 def test_bundle_scope_does_not_create_multi_unit_batch_recommendation() -> None:
-    recommendation = _build_batch_recommendation(
+    recommendation = SearchBatchRecommendationBuilder.build(
         name="The Boys",
         category_id="tv",
         season=1,

@@ -66,6 +66,105 @@ For cheap background discovery, callers may pass mutation context such as
 persistence and watch-policy synchronization while avoiding provider storms
 during startup or filesystem scans.
 
+## Category-Owned Background Automation Safety
+
+Background automation is not a global permission to reinterpret category state.
+Release-watch retry, queued-download promotion, and startup recovery must ask the
+owning category how to interpret conventional per-item automation fields such as
+`auto_download`.  For TV, `auto_download=True` is the only state that may
+auto-start new-episode rows; `False` and legacy/null values are hard stops.
+Generic code may enforce queue slots, dedupe rows, and persist retry ledgers, but
+it must not decide what a missing episode, complete season, or active-airing
+season means.
+
+Watch-plan synchronization is authoritative.  When a category rebuilds a watch
+plan from canonical library/provider state, any nonterminal release-watch rows
+for that item that are omitted by the new plan must be retired/cancelled.  This
+prevents stale watches from continuing to search or queue units that the current
+canonical object says are already present or no longer eligible.
+
+User cancellation is persistent for the matching category unit.  Download rows
+carry the category-owned `unit_descriptor`; cancellation uses that descriptor to
+cancel the matching release-watch unit instead of letting retry resurrect the
+same background download.
+
+The user-visible category item row and the runtime tracked-item settings must
+not be allowed to disagree for background automation.  Before unattended
+scheduled checks, watch-policy sync, or release-watch retry, the scheduler asks
+the owning category to reconcile settings with the persisted category item row.
+For TV, any non-literal-true value in either store is an authoritative off state
+and is written back to both stores before any search or queue action can run.
+
+Scheduled category workflows must use the category watch plan for unattended
+units.  They must not invent new TV episode coordinates from local progress such
+as `last_episode + 1`, because provider seasons can be complete and historical
+gaps are not consent to search or queue.
+
+
+### Category-Owned Agent Search Normalization
+
+Generic search/download tools preserve user wording and structured tool
+arguments, but they must not parse domain vocabulary such as seasons, episodes,
+volumes, discs, chapters, tracks, packs, editions, or collections from natural
+language titles.  When an LLM accidentally puts category unit words inside the
+`name` field, the flow is:
+
+```text
+search_media_torrents tool argument
+        ↓
+category.normalize_agent_search_name_argument(...) when category_id is known
+        ↓
+generic literal-title recovery preserving user wording
+        ↓
+scheduler category routing/parser evidence
+        ↓
+category.normalize_agent_search_units_from_name(...)
+```
+
+`MediaTitleRepair` is deliberately category-neutral.  It may recover dropped
+title stopwords from the current prompt, but it must not strip words such as
+season, episode, volume, album, pack, edition, or language terms.  Categories
+that understand those words own the normalization hook.
+
+Scheduler core may validate already-structured numeric tool arguments and may
+ask the registry which category owns a request. It must not run fallback
+English/Italian phrase parsers before category selection.  Ambiguous untracked
+searches fall back to neutral `media`, not to Movie or TV, unless a category
+router/parser/provider gives evidence.
+
+User-facing download notifications should use the category-owned
+`DownloadItem.unit_label` when available. Legacy `season`/`episode` fields are
+only a compatibility fallback for old rows; generic notification code must not
+infer a category such as TV from those fields.
+
+### Round 263 — Release-Watch Search Suppression and Truthful Queue Receipts
+
+A due background watch must not perform even a notification-only search when the
+owning category says the watched unit is already present in the canonical library
+object.  Release-watch retry therefore checks the category-owned
+`discovery_already_satisfied(...)` hook before both branches: automatic queueing
+and candidate-notification search.  If the hook says the unit is local, the watch
+is marked completed and no provider/indexer search is attempted.
+
+Category satisfaction checks should prefer canonical library objects.  Raw unit
+rows are compatibility fallbacks only.  This keeps suggestions, release watches,
+agent context, and UI state aligned around the same read model instead of letting
+one subsystem believe a show is complete while another continues searching stale
+units.
+
+Queueing tools must treat scheduler receipts as authoritative.  A search result
+is not a download.  A duplicate failed/cancelled/completed row is not a newly
+queued download.  `queue_download` receipts must distinguish `queued`,
+`already_active`, `already_complete`, and `not_queued`; agent tools may report
+success only for verified active queue receipts and must surface partial failures
+instead of turning them into a successful batch.
+
+When a generic/tag search result has no provider-backed media identity and no
+category-owned structured unit descriptor, the concrete release title is the
+best available identity for duplicate checks.  The result-set query text, such
+as a broad tag or search phrase, must not collapse unrelated candidates into one
+logical media identity.
+
 ## Category-First Data Flow
 
 ```text
@@ -226,6 +325,16 @@ window of another. Public web research can be used for title-ambiguity
 resolution when metadata providers cannot identify a title, but fetched public
 evidence should establish aliases/context rather than becoming a torrent
 queueing shortcut.
+
+Movie search follows the same authority-first rule as TV. Before an interactive
+movie download/search reaches the generic LLM candidate reviewer, the Movie
+category should enrich TMDB title authority when configured, build query ladders
+from provider/user title variants without dropping explicit sequel numbers, and
+run a category-owned exact-title payload filter. Keyword-neighbor rows such as
+``The Best Exotic Marigold Hotel`` for a request named ``Hotel Exotica`` must
+be rejected before the LLM sees them, regardless of seeder count. Low-seeded
+exact-title rows may be low-confidence availability evidence, but they must not
+be buried behind unrelated higher-seeded rows.
 
 ## UI Access
 
@@ -855,6 +964,8 @@ Jackett search and Jackett indexer administration are separate health surfaces. 
 ## Soulseek / slskd source boundary
 
 Soulseek is modeled as a companion source provider through slskd, not as a Jackett/torrent fallback. `SoulseekSettings` stores the endpoint, API key, Soulseek credentials, and sharing policy. `slskd_config.py` computes the effective share plan, and `slskd_client.py` owns API/search/queue calls. Agent tools use `search_soulseek` and `enqueue_soulseek_download`; they must not pass Soulseek candidates to `queue_download`. A future transfer-monitor boundary should import completed slskd downloads through category hooks.
+
+Automatic torrent companion searches still respect `SoulseekSettings.search_enabled_categories`, but direct user-invoked `search_soulseek` calls are exploratory and non-queueing. A stale legacy settings file that lists only `music`, `audiobooks`, and `ebooks` must be migrated to include `tv`, `movie`, and `general`, and direct explicit Soulseek requests should return category-filtered evidence rather than failing before any search is attempted.
 
 
 ## Round 193 macOS Jackett readiness rule
@@ -1551,37 +1662,51 @@ Verify with `scripts/round252_star_city_release_watch_tests.py` after changing T
 watch planning, TV suggestion compilation, TVMaze error handling, scheduler
 release-watch syncing, or release-watch retry behavior.
 
-## Round 253 — TV Show New-Episode Automation Checkbox
+## Round 253 / Round 258 — TV Show New-Episode Automation Checkbox and Safe Default
 
-TV new-episode automation is now an item-owned policy with a default-on user
-experience.  Every tracked TV show detail/inspector payload must expose the
-show's `auto_download` state as a simple enabled/disabled checkbox labeled for
-new episodes.  Missing or legacy `null` TV values mean enabled; users can turn a
-specific show off, at which point release-watch retries for that show switch to
-notify/search-only behavior instead of automatic queueing.
+TV new-episode automation is an item-owned policy exposed in every tracked TV
+show detail/inspector payload as a simple enabled/disabled checkbox labeled for
+new episodes.  After the Round 258 disk-space incident review, the safe default
+is **disabled** for library shows: missing or legacy `null` TV values are
+normalized to disabled, and release-watch retries for that show may notify or
+search but must not auto-queue until the user explicitly opts in.
 
-The generic scheduler still does not interpret seasons or episodes.  It only
-reads the category-provided release-watch `requirements.auto_download` snapshot
-and then calls the existing category-aware discovery path.  TV owns the default
-and the requirement snapshot through `TvShowItem`, `TvShowCategory.create_item()`,
-`TvShowCategory._release_watch_requirements()`, and the TV detail payload.  The
-frontend saves the checkbox through the generic category item update endpoint so
-`CategoryItemCoordinator` persists the item and immediately resynchronizes the
-category watch policy.
+TV may auto-enable the per-show switch only after a user explicitly downloads an
+episode or season unit from the currently active/airing season of that same show.
+Historical backfills, completed/ended shows, whole-library imports, ambiguous
+metadata, and existing library entries must remain opt-in.  The category owns the
+active-airing decision from provider metadata (`next_episode`, status, and
+episode airdate rows); generic download/queue code only calls the category hook
+and must not interpret TV seasons or episodes itself.
+
+The generic scheduler still does not interpret seasons or episodes.  It reads
+the current category item state plus category-provided release-watch requirement
+snapshots and then calls the existing category-aware discovery path.  The current
+item value is authoritative: a stale queued/release-watch row whose snapshot says
+`auto_download=True` must not override a current `TvShowItem.auto_download=False`.
+The frontend saves the checkbox through the generic category item update endpoint
+so `CategoryItemCoordinator` persists the item and immediately resynchronizes
+the category watch policy.
 
 Important invariants:
 
-- New TV shows default to auto-downloading newly released episodes.
-- Legacy TV items with missing/null `auto_download` are normalized to enabled.
-- A user-set `auto_download: false` on one show must be preserved and must keep
-  that show in notify-only release-watch behavior.
+- New and legacy TV shows default to notify/search-only behavior, not automatic
+  background downloads.
+- A user-set `auto_download: false` on one show must be preserved and must veto
+  stale watch snapshots created by older default-on builds.
+- Manual user-approved downloads of an active-airing season may set that show to
+  `auto_download=True`; manual old-season backfills must not.
+- Duplicate queued/download rows for the same category item and category-owned
+  unit descriptor must be rejected or cancelled safely before queue workers start
+  them, including provider-light rows that lack TMDB/TVMaze IDs.
 - UI code may render the checkbox for TV/episodic category detail payloads, but
   it must save through category item mutation APIs rather than editing settings
   directly.
 
-Verify with `scripts/round253_tv_auto_download_inspector_tests.py` after changing
-TV item models, TV watch planning, category item update flows, or the TV library
-inspector.
+Verify with `scripts/round253_tv_auto_download_inspector_tests.py` and
+`scripts/round258_tv_auto_download_safety_and_duplicate_queue_tests.py` after
+changing TV item models, TV watch planning, category item update flows,
+download queue identity, or the TV library inspector.
 
 ## Round 254 — TV Torrent Recall: Title Variants, Explicit-Language Ranking, and Bounded Fallbacks
 
@@ -1592,3 +1717,502 @@ Explicit media-language requests are stricter than configured-language defaults.
 A full-season TV request made before a full-season pack exists must not degrade into “nothing found” when partial episode-range packs or same-season explicit-language single episodes are already present in broad season searches. The TV pack workspace may include same-season single-episode rows as fallback coverage when they advertise the explicit requested language. This keeps the LLM candidate reviewer informed about realistic partial coverage such as `S01E01-06` packs plus `S01E07`/`S01E08` singles, without launching a long per-episode query storm or pretending that the unaired/unreleased tail of the season is available.
 
 Verify with `scripts/round254_widows_bay_recall_ui_responsiveness_tests.py` after changing TV title matching, TV pack gates, explicit-language ranking, candidate payload sorting, or the `search_media_torrents` selection annotation policy.
+
+## Round 256 — Release-Watch Queue Start and Blocked-Download Visibility
+
+Release-watch auto-download is a two-step contract: the category/scheduler may
+approve a watch for automatic discovery, but the queued torrent must still pass
+through the generic download queue start gate.  That gate must honor the
+category item envelope's conventional `auto_download` value before falling back
+to the global automation setting.  A tracked TV show whose inspector checkbox is
+enabled must not be held merely because the global legacy setting is false;
+conversely, a per-item `auto_download: false` must keep background release-watch
+rows in notify/search-only behavior.
+
+Duplicate torrent rows are part of the same contract.  A release-watch retry may
+find the same magnet or same category-owned import identity that was already
+persisted as `queued`.  The duplicate path must not return early forever; if the
+existing queued row's tracked item allows automation, it should be promoted for
+normal queue processing.  Paused/stalled rows still require their existing
+control policies and must not be force-started by duplicate discovery.
+
+When automatic release-watch queueing fails after a candidate is found, users
+need a visible explanation, not only an internal retry ledger.  Storage and
+availability failures such as missing drives, unwritable paths, or critically low
+disk should create a deduplicated `release_watch_queue_blocked` notification that
+says the release was found but blocked.  The retry row remains retryable, but the
+UI/bridge surface must not make this look like “new episode found” with no reason
+for the missing download.
+
+Verify with `scripts/round256_release_watch_autostart_tests.py` after changing
+download queue start gates, duplicate magnet handling, release-watch retry
+error handling, or per-item automation policy handoff.
+
+## Download Cleanup Delete Semantics
+
+Download lifecycle cleanup is intentionally different from an explicit
+recoverable archive workflow. When a completed import moves or links a payload
+into the library, when a cancelled download cleans partial files, or when a
+racing/fallback torrent is discarded, the download-root source files are
+permanently deleted after `SafePathResolver` verifies they are inside an allowed
+root. They must not be moved into hidden in-place folders such as `.ljs-trash`,
+because that leaves the UI reporting successful cleanup while disk usage grows
+invisibly.
+
+`SafePathResolver` still supports explicit quarantine for workflows that request
+it deliberately, but generic download cleanup and confirmed library-file deletes
+now pass an explicit permanent-delete policy.
+
+## Frontend Performance and Browser Tab Lifecycle
+
+The browser dashboard is a long-running control surface, not a short-lived page.
+Frontend code must therefore treat tab visibility, active view state, and
+reduced-motion preferences as first-class runtime constraints.
+
+`FrontendPerformanceCoordinator` (`src/web/static/js/core/performanceCoordinator.js`)
+owns the shared UI lifecycle signal. Components that poll APIs, render large DOM
+lists, or run decorative animation loops should ask this coordinator whether the
+browser tab is visible, whether their view is active, and whether low-power mode
+is in effect. New components should prefer adaptive intervals or frame-scheduled
+updates through this coordinator over raw `setInterval` loops.
+
+Rules:
+
+- Decorative animation such as ocean bubbles, slow background rotation, progress
+  shimmer, avatar sway, and compass cursor tracking must stop in hidden tabs and
+  under reduced-motion preferences.
+- Inactive views should not keep painting heavy subtrees. The active view is the
+  only view that should run high-frequency DOM work.
+- Download telemetry may arrive frequently over WebSocket, but UI updates must be
+  batched to a frame and patched in place when possible. Full download-card
+  rebuilds are reserved for structural changes such as new/removed rows, file
+  lists appearing, or status group changes.
+- API polling should be visibility-aware and non-overlapping. A background tab may
+  keep slow safety refreshes where useful, but it must not keep 5-second active
+  dashboard polling alive indefinitely.
+- Hidden/collapsed detail rows, such as expanded torrent file lists, must not be
+  patched on every telemetry tick.
+- Library/catalog and release-watch panels should coalesce in-flight loads and
+  render into document fragments so large libraries do not cause repeated layout
+  storms.
+
+This is still a generic UI rule. Do not solve performance by adding category-
+specific frontend branches; category-specific rendering belongs behind manifest
+or detail payload contracts.
+
+## Round 264 Background Automation, TV Candidate Proof, and Movie Collection Import Rules
+
+Background automation remains category-owned. Core schedulers and download
+services may execute searches, queues, and imports, but they must ask the owning
+category whether unattended work is allowed for that item/unit. `background_discovery_allowed(...)`
+and `release_watch_search_allowed(...)` are now separate hooks: a category may
+allow notification-only release checks for some domains while refusing them for
+high-false-positive domains such as TV.
+
+TV release watching is strict opt-in. A TV item with `auto_download` missing,
+`None`, or `False` must not create episode release-watch rows, perform
+notification-only torrent searches, or queue downloads just because metadata says
+episodes are missing. Watch-plan rebuilds should retire stale episode rows by
+omitting them; due rows that survive from older builds are cancelled before any
+provider/indexer call when the category says background search is disabled.
+
+TV candidate validation must prove both series identity and language before
+automatic queueing. Series aliases are matched only against the release-title
+scope before TV unit markers such as `S01E06`; a show name appearing only in the
+episode-title suffix is not a series match. Automatic TV queueing also fails
+closed on language: visible non-preferred audio and unknown audio evidence both
+require user approval unless the tracked preference is explicitly matched by the
+release title.
+
+Movie bundle imports must preserve collection identity. For downloads whose
+payload contains multiple distinct primary movie files, the movie category maps
+files under a stable collection folder and keeps each source movie filename. This
+decision is based on file-list/payload structure, not release-title marketing
+words. The download handler asks `ready_import_file_allowed(...)` before exposing
+or moving completed payload files; the movie category allows video files as
+primary movie payloads and skips covers/screenshots/JPGs instead of importing
+them as standalone movies.
+
+Verify with `scripts/round264_automation_language_collection_import_tests.py`
+after changing TV watch plans, release-watch retry policy, TV torrent candidate
+validation, movie collection detection, or download ready/completion import
+handoffs.
+
+## Round 265 — Payload-based movie collections and staged torrent file priority
+
+Movie collection handling must be based on payload structure, not marketing words in a torrent or folder title. The movie category may treat a download as a collection only when file-list or persisted download metadata shows multiple primary video payloads with distinct parsed movie identities. Cached tracker file lists may provide this evidence before queueing; otherwise the decision is made after torrent metadata is available. Generic code must not detect movie collections by terms such as pack, collection, trilogy, or similar title markers.
+
+For multi-file torrents, displayed per-file priority must match actual libtorrent file priority. After metadata parsing, the download lifecycle applies persisted `DownloadFileInfo.priority` values to the live handle. Distinct positive file priorities are staged: only the highest unfinished priority band is enabled, and lower bands remain priority 0 until earlier files complete. Equal positive priorities remain parallel. This makes file priority a real progressive-availability control instead of a cosmetic UI field.
+
+## Round 267 — TV consent, stale RSS safety, and scoped TV candidate selection
+
+TV background automation is explicit-checkbox only. The TV category must not infer
+consent from manual downloads, active-airing metadata, global automation, stale
+release-watch requirements, RSS events, or legacy runtime rows. Before any
+unattended scheduler, release-watch, RSS, discovery, queue-creation, or queue-start
+path runs, generic orchestration asks the owning category to reconcile runtime
+settings with the persisted category item row. For TV, literal JSON/Python
+`true` must be confirmed by the persisted category item payload; nested visible
+configuration fields such as `properties.auto_download` are authoritative off
+signals when false, null, string, integer, or missing.
+
+Download row creation is also a policy boundary. Generic downloader code may
+create/start rows for explicit user/manual approvals, but background rows must be
+accepted by the owning category policy first. If a category declares a
+`queued_background_start_allowed(...)` policy and no matching tracked item is
+found, the safe generic behavior is to deny unattended queue creation/start rather
+than inherit global automation.
+
+Stale RSS state must fail closed. Watch-policy rebuilds must update the RSS
+monitor from the newly computed plans and must not leave old feed URLs active
+because one item crashed while building a plan or URL. TV release events that
+arrive from stale feeds must re-check category background-search permission before
+creating release-watch rows, notifications, or downloads.
+
+TV torrent selection has a deterministic structural guard before LLM ranking.
+For exact SxxEyy requests, TV keeps exact episode releases and verified
+season/series bundles that can contain that episode; wrong episodes and releases
+whose series title does not match before the TV unit marker are rejected before
+the model sees them. For broad TV show searches without a concrete unit, verified
+season/series bundles are preferred over random individual episode rows when such
+bundles are available. This remains category-owned: core search and LLM ranking
+pass candidates through category hooks and do not interpret seasons, episodes, or
+TV pack semantics themselves.
+
+Verify with `scripts/round267_tv_background_consent_and_search_scope_tests.py`
+after changing TV consent reconciliation, RSS/watch-policy handling, downloader
+background gates, or TV torrent candidate filtering.
+
+## Round 268 — Category-owned LLM skill guidance and generic prompt hygiene
+
+Category-specific release-name knowledge belongs in category-owned prompt and
+selection guidance, not in generic AI prompt builders. Each category may provide a
+prompt file under `src/core/categories/prompts/` and a
+`build_torrent_selection_guidance()` implementation that teaches the LLM how to
+interpret that category's release names, bundle/range notation, language tags,
+unit coverage, and fallback strategy. Main assistant prompts and torrent
+candidate adjudication must inject those category skills when a category is
+active.
+
+Hardcoded TV/movie torrent vocabulary must not live in generic LLM prompt code.
+Generic download/adjudication prompts may tell the model to preserve titles,
+respect tool/category annotations, use candidate IDs, handle quality-choice
+policies, and treat seeders as evidence. They must delegate examples such as TV
+`SxxEyy`/season-range notation, compressed TV language tags, or movie collection
+payload behavior to the owning category. This prevents a fix for one category
+from leaking incorrect semantics into another category and keeps the LLM as the
+semantic reviewer inside category-provided evidence rather than a pile of global
+special cases.
+
+TV's category skill describes common exact-episode formats, season/range-pack
+formats, title-prefix validation before episode markers, compressed language
+codes, multi-audio evidence, and manual-vs-background automation separation.
+Movie's category skill describes title/year identity, release-quality rejection,
+compressed audio-language evidence, and evidence-based multi-film collection
+handling.
+
+Verify with `scripts/round268_category_llm_skill_prompt_tests.py` after changing
+category prompt files, `build_prompt_guidance(...)`, torrent-selection guidance,
+`DownloadCandidateAdjudicator`, or generic download task guidance.
+
+## Round 269 — Definition-backed category skill files and category-aware torrent quality
+
+Definition-backed categories must get the same LLM skill-file mechanism as
+handwritten categories. A concrete YAML-backed category may declare
+`prompt_file`, and otherwise LJS loads `src/core/categories/prompts/<category_id>.md`
+when it exists. These prompt files are category-owned teaching material: common
+release-name shapes, file formats, edition/identity fields, bundle semantics,
+language relevance, safe sidecars, and rejection boundaries. Generic prompt code
+must not copy those examples into global AI modules.
+
+Torrent selection must also remain category-aware. Video quality guides such as
+REMUX/WEB-DL/BluRay, resolution ladders, HDR/DV, and codec ranking apply only to
+categories that opt into the global video quality profile. Definition-backed
+non-video categories such as Music, Ebooks, and Audiobooks instead use their own
+format/edition/narrator/track/chapter guidance plus seed availability and safe
+payload checks. Generic torrent prompts may ask the model to follow the owning
+category skill, use candidate IDs, respect seeders, and fail closed on unclear
+identity/language/format evidence; they must not smuggle movie/TV quality rules
+into unrelated domains.
+
+Research-backed category skill updates currently cover:
+
+- TV: SxxEyy/1x02 variants, multi-episode files, season/range packs, complete-series containers, title-prefix validation, compressed language tags, subtitles vs audio, and manual-vs-background automation separation.
+- Movie: title/year identity, remakes/local titles, edition/cut tags, source/quality/HDR/audio/video tags, language evidence, auxiliary files, and payload-structure collection handling.
+- Music: artist/album/release-group vs exact-release identity, remaster/edition/medium/catalog facets, lossless/lossy/sample-rate tags, complete album/discography handling, track-order/sidecar preservation, and language irrelevance unless explicit.
+- Ebooks: author/title/series/translator/ISBN/edition identity, EPUB/AZW3/MOBI/PDF/DJVU/CBZ/CBR differences, retail/scan/OCR/omnibus terms, multi-format bundles, and language/translation handling.
+- Audiobooks: author/title/narrator identity, abridged/unabridged status, M4B/M4A/MP3 folder shapes, chaptering, duration/language, and source-preserving conversion safety.
+
+Verify with `scripts/round269_category_torrent_skill_expansion_tests.py` after
+changing definition-backed category prompt loading, category prompt files,
+`TorrentSelectionService.build_quality_reference(...)`, or generic torrent
+selection prompt wording.
+
+## Round 270 — Prompt-file skills are the torrent-selection source of truth
+
+Category prompt files under `src/core/categories/prompts/` are now the canonical
+place for category LLM teaching material.  Main assistant prompts may include the
+full file, while torrent candidate review must use the search/download-relevant
+sections extracted from those same files: release-name skills, language/format
+skills, collection or bundle semantics, import safety, and automation safety.
+Concrete categories must not duplicate long release examples inside Python
+`build_torrent_selection_guidance()` methods.  Duplicating examples such as TV
+range-pack notation or movie collection evidence in code lets the main prompt and
+torrent reviewer drift apart.  Category code should call
+`prompt_file_torrent_skill()` or otherwise derive guidance from the prompt file,
+not copy/paste a second independent skill block.
+
+Generic torrent prompts remain category-neutral.  They may say to preserve the
+user's requested title/unit/language, obey the owning category guidance, respect
+candidate IDs and category annotations, and prefer healthier seeders among
+equivalent candidates.  They must not assume that every language-relevant
+category is audiovisual: ebooks and audiobooks use language differently from TV
+or movies, and music normally ignores global spoken-language defaults unless the
+user explicitly asks for language-specific content.
+
+`DownloadCandidateAdjudicator` keeps enough category-guidance budget for the full
+search-relevant TV/movie/music/book/audiobook skill to reach the LLM.  If a
+future prompt file grows too large, extract tighter sections in the category
+prompt file rather than truncating away tail safety rules.
+
+Verify with `scripts/round270_category_skill_source_of_truth_tests.py` after
+changing category prompt files, `prompt_file_torrent_skill()`, concrete
+`build_torrent_selection_guidance()` methods, torrent prompt language rules, or
+candidate-adjudicator guidance budgets.
+
+## Round 271 — Prompt architecture drift cleanup and TV unattended-unit hard stop
+
+Round 271 closes two remaining drift paths discovered during a broad prompt and
+architecture review.
+
+First, unattended TV update paths must use the same category watch-plan contract
+as release-watch retry and scheduled checks.  TV code must not synthesize a new
+search unit from local progress such as `last local episode + one`.  Local
+progress is evidence for canonical state and display, not permission to invent a
+provider/release unit.  When unattended TV background work is due, the category
+must ask `build_watch_plan(...)` for concrete release-watch units and run
+discovery only for a unit the plan exposes and only when the per-show TV
+automation policy allows background discovery.  If the watch plan has no unit,
+the correct behavior is no search.
+
+Second, generic DOWNLOAD recovery must remain category-neutral.  If the live LLM
+fails to emit a tool call, fallback code may force one conservative
+`search_media_torrents` call with literal user text and the active category, but
+it must not parse languages, seasons, episodes, packs, editions, or formats from
+English/Italian regexes.  Those meanings belong to category context, prompt-file
+skills, and the LLM candidate reviewer.  This keeps fallback recovery from
+becoming a second hidden category parser that drifts away from category-owned
+skills.
+
+Downloader policy helpers must read tracked items from both the modern
+`ItemList.items` container and legacy plain-list test/runtime settings.  Missing
+a matched tracked item for a category that owns queue policy is a safety signal:
+for TV and other strict categories, background queue creation/start must fail
+closed rather than silently bypassing item policy because a settings container
+shape differed.
+
+Concrete categories should rely on the base prompt-file injection unless they are
+adding real behavior.  No-op overrides of `build_prompt_guidance(...)` are
+unnecessary maintenance points and should be removed.  Category prompt files and
+`prompt_file_torrent_skill()` remain the source of truth for category LLM skills.
+
+Verify with `scripts/round271_prompt_architecture_drift_cleanup_tests.py` after
+changing TV update workflows, generic DOWNLOAD recovery, tracked-item iteration,
+category prompt injection, or prompt architecture audits.
+
+## Round 272 — Search-scope and follow-up parser drift cleanup
+
+Search scope is a category-neutral phase hint, not a hidden TV parser. Generic
+AI, scheduling, and plan-execution code must normalize scope labels through
+`SearchScopePolicy` (`src/core/categories/search_scope.py`) instead of carrying
+legacy literals such as `season_pack_preferred` or `pack_only` in multiple
+modules. The policy may preserve legacy aliases at the boundary, but downstream
+code should reason only about canonical scopes: `default`, `bundle_preferred`,
+`bundle_only`, and `individual_units_only`. Categories then interpret those
+canonical scopes in their own domain: TV may treat a bundle as a season pack,
+music as an album/discography, ebooks as a series/omnibus, and so on.
+
+The plan coordinator must not derive bundle/pack scope from natural-language
+phrases such as “latest season”, “whole collection”, or “solo pacchetto”. That
+interpretation belongs to the LLM, category prompt-file skills, and structured
+tool arguments. The coordinator may preserve a structured `search_scope` already
+emitted by the planner/tool arguments and normalize legacy aliases, but it must
+not become a second keyword parser for category semantics.
+
+Pending torrent candidate context must also avoid natural-language follow-up
+phrase lists. `DownloadContextPolicy` may keep candidate context for stable
+handles such as `candidate_id`, `result_set_id`, raw candidate hashes, `#1`, or
+short quality refinements like `720p`; it must not special-case “yes”, “ok”,
+“first one”, “queue it”, or language-specific equivalents. The user-facing
+candidate picker and final assistant responses should encourage stable
+candidate IDs/handles, because those are portable across languages and do not
+let stale result sets satisfy fresh acquisition requests.
+
+Verify with `scripts/round272_search_scope_and_followup_drift_tests.py` after
+changing search-scope normalization, plan download normalization,
+`DownloadContextPolicy`, candidate pending-action context, or torrent-result next
+actions.
+
+## Round 273 — Category language/quality drift cleanup
+
+Torrent language-token handling is shared plumbing, not a place for each agent,
+TV helper, and scheduling helper to grow separate alias tables. Common release
+language aliases and bounded title-token matching live in
+`LanguageTokenPolicy` (`src/core/categories/language.py`). Generic AI/tool code
+may use that policy only as normalization support; the owning category still
+decides whether language is relevant and whether a token means audio, subtitle,
+translation, ebook language, vocal language, or something else.
+
+Generic torrent selection and batch recommendation scoring must respect category
+hooks before applying media preferences. If a category reports
+`language_is_search_relevant() == False`, generic tools must not reward or block
+candidates because a title contains `ITA`, `ENG`, `dual`, or similar release
+language tokens. If a category reports `uses_global_quality_profile() == False`,
+generic tools must not reward video resolution/codec fields or run the global
+video quality-choice policy for that category. Non-video categories should rank
+by category-owned identity/format evidence, safe payloads, plausible size, and
+seeder availability unless their own category guidance/profile opts into a
+specific quality model.
+
+Base category torrent guidance must stay category-neutral. It should reject
+cross-category and unsafe executable/software payloads, but it must not globally
+ban adult-rated media, archives, multi-file payloads, books, audio, games, or
+sidecars. Those are category/user-target questions. Concrete categories and
+prompt-file skills remain the source of truth for whether such payload shapes are
+valid.
+
+Source comments and docs inside `src/` should avoid incident-specific show/movie
+names from past debugging sessions. Regression tests may use synthetic fixture
+names, but production source should describe the generic failure class instead of
+leaving historical sample names that invite future per-case fixes.
+
+Verify with `scripts/round273_category_language_quality_drift_tests.py` after
+changing language-token helpers, torrent scoring/ranking, search-media tool
+schemas, base torrent guidance, or source-level drift audits.
+
+## Round 275 — Structured Planner Signal and Definition-Backed Local Model Cleanup
+
+Generic planner repair must not become a second natural-language parser for
+category semantics. `PlanCoordinator` may preserve structured planner/tool
+fields such as `search_scope`, `requested_unit_scope`, `requested_units`, or
+`multi_unit_scope`, but it must not scan user prose for category unit words such
+as episodes, seasons, tracks, volumes, or language-specific equivalents in order
+to rewrite download searches. If a weak planner collapses a multi-unit request
+into a guessed single unit, the fix belongs in LLM/category prompt context and
+structured tool arguments, not in hidden keyword lists inside coordinator core.
+
+Definition-backed local object reconstruction is owned by
+`LocalObjectReconstructor` and focused builder collaborators in
+`src/core/categories/local_object_reconstruction.py`. Scanner/core code still
+emits neutral file observations; the definition-backed category asks this
+category-owned collaborator to shape Music, Ebooks, and Audiobooks into local
+object evidence and unit rows. Do not re-add module-level reconstruction
+functions or duplicate local file heuristics in scanner, scheduler, or web code.
+
+Definition-backed provider/source strategy must be declarative category data.
+For example, Music can prefer Soulseek for normal album/track searches and
+prefer torrents for large discography-style requests by declaring a
+`source_strategy` section in its category definition. `DefinitionBackedCategory`
+reads that section generically; it must not branch on concrete category ids to
+hard-code provider preferences.
+
+Verify with `scripts/round275_structural_cleanup_drift_tests.py` after changing
+planner download normalization, definition-backed local scan reconstruction, or
+Soulseek/torrent source-preference strategy for definition-backed categories.
+
+## Round 276 — Category-Owned Search Workspace Annotation Cleanup
+
+Search workspace annotations are category facts, not scheduler facts. The shared
+scheduler may assemble a response payload, preserve structured tool arguments,
+and call category hooks, but it must not parse category release-name notation to
+infer counts, coverage, disc ranges, episode ranges, edition spans, or similar
+meaning.  For TV specifically, fields such as `expected_episode_count`,
+`requested_season_coverage`, and coverage notes must be produced by the TV
+category from TV-owned query labels and bundle parsing.  The scheduler only
+carries those opaque facts into the candidate workspace for the LLM.
+
+Transitional structured tool arguments such as `season` and `episode` may still
+exist in public schemas for compatibility, but generic services must not format
+them as TV labels.  The scheduler now asks `agent_unit_label_from_args(...)` for
+an opaque label before running fallback searches, Soulseek companion searches,
+and candidate descriptor hooks.  Categories that do not accept those arguments
+return no label rather than inheriting `Season N` or `SxxEyy` formatting.
+
+Definition-backed local object reconstruction should remain builder-owned after
+Round 275. Compact local counters such as music track counts, audiobook chapter
+counts, or ebook format counts are now emitted by each local-object builder via
+`enrich_properties(...)`; `LocalObjectReconstructor` coordinates builders but no
+longer branches on concrete category ids to attach those counters.
+Definition-backed scan progress should also key off the reconstructed local
+model evidence itself, not off a hardcoded set of category ids.
+
+Verify with `scripts/round276_category_response_annotation_cleanup_tests.py`
+after changing scheduler search responses, category agent-search hooks,
+definition-backed local object reconstruction, or candidate workspace payloads.
+
+## Round 277 — Provider registry, audio conversion policy, and bundle workspace cleanup
+
+Metadata provider lookup for definition-backed categories is provider-keyed, not category-id-keyed. `MetadataProviderRegistry` reads the active category definition's `metadata.providers` map, applies provider defaults from a capability registry, and applies per-category kwargs such as Internet Archive `mediatype` or Apple Search `media` from YAML. `CategoryMetadataResolver` depends on that registry collaborator and must not recreate procedural branches such as "if Music, use MusicBrainz/Discogs" or "if Ebooks/Audiobooks, use book adapters." Provider adapter families remain explicit implementation classes, but provider membership and provider call details belong to category definitions.
+
+Audio conversion policy is now profile-driven. `AudioConversionPolicy` interprets `download_profile` fields such as `preferred_lossless_format`, `preferred_audio_format`, `preferred_lossy_format`, and `auto_convert_lossless_to_preferred`; `AudioConversionService` owns FFmpeg execution and safe paths only. Do not add concrete category-id branches for Music or Audiobooks to select M4A/M4B sidecars. A future audio-capable category should opt into the same behavior by declaring the appropriate profile fields.
+
+Search workspace quality-choice policy now consumes the generic `requested_bundle_coverage` annotation first. TV may still expose compatibility facts such as `requested_season_coverage` and `expected_episode_count`, but generic candidate/quality code should reason in terms of category-owned bundles, containers, and logical units instead of TV-specific examples or reason names. Category hooks may add both generic and domain-specific annotations when the UI or older tests still need the legacy fields.
+
+## Round 278 — Notification-only unmatched-search retry cleanup
+
+Unmatched-search retry is a notification mechanism, not an acquisition grant. If
+a user-initiated torrent/Soulseek search returns zero candidates, the assistant
+may schedule one deduplicated follow-up search because peer-to-peer availability
+can change, but that scheduled task must never queue, start, or auto-download a
+candidate by itself. The retry prompt must surface stable candidate IDs, source,
+size, seeders, and category-owned language/quality warnings for a later explicit
+LLM/user queue decision.
+
+The retry policy lives in `src/ai/tools/search_retry.py` as
+`UnmatchedSearchRetryScheduler`. Individual list/schedule tools must not carry
+copies of missed-search retry behavior, and future retry variants must keep the
+same notification-only contract unless a category-owned workflow and explicit
+user consent provide a separate automation policy.
+
+Verify with `scripts/round278_retry_policy_cleanup_tests.py` after changing
+unmatched-search retry scheduling, `search_media_torrents`, prompt-scheduler
+condition checks, or deferred search retry wording.
+
+## Round 279 — Search workspace extraction and generic bundle cleanup
+
+`search_media_torrents` must remain an agent boundary, not a policy dumping ground. Candidate row formatting, batch recommendation scoring, quality-choice annotation, next-action construction, and audit logging now live in `src/ai/tools/search_workspace.py` as focused collaborators. `src/ai/tools/scheduling.py` wires the tool and delegates to those collaborators; it must not grow new private workspace engines or module-level helper functions.
+
+Generic search workspace code may read category-published facts such as `unit_descriptor`, `requested_bundle_coverage`, `selection_warnings`, `selection_blockers`, language relevance hooks, and global-quality-profile hooks. It must not recover TV, album, ebook, or other category semantics by inspecting legacy `season`/`episode` fields, descriptor coordinates, or title words. If a category needs a bundle coverage fact or logical unit label, add or improve the category hook that publishes that fact.
+
+Quality-choice grouping is descriptor-first. When category descriptors are present, the workspace groups candidates by category-owned stable unit keys. When descriptors are missing, the quality policy may compare alternatives inside the current result set but must not invent a logical unit identity from generic fields. This keeps interactive quality alternatives useful without reintroducing hidden TV parsers.
+
+Verify with `scripts/round279_search_workspace_extraction_tests.py` after changing `search_media_torrents`, candidate workspace payloads, quality-choice/batch recommendation policy, or scheduler search response assembly.
+
+## Round 280 — Metadata helper, media probe, and prompt-example drift cleanup
+
+Generic metadata tools must not duplicate agent argument parsing helpers across
+research modules. `MetadataLookupArgumentNormalizer` in
+`src/ai/tools/metadata_lookup_support.py` is now the single class-owned boundary
+for title argument resolution and safe integer coercion used by both
+`metadata_lookup` and the legacy IMDb details tool. Future metadata/research
+tools should reuse or extend that collaborator instead of reintroducing
+module-level `_resolve_title` / `_safe_int` helpers in `src/ai/tools`.
+
+`src/core/categories/media_probe.py` keeps its backwards-compatible public
+function API for scanners and older regression scripts, but stream parsing,
+language normalization, resolution labeling, cache freshness, and serialized
+ffprobe execution now live on named collaborators: `MediaProbeValueParser`,
+`MediaProbeLanguageNormalizer`, `MediaProbeResolution`, and
+`MediaProbeService`. New media-probe behavior should be added to those classes,
+not to module-level helper state. The public wrappers should remain thin
+compatibility shims.
+
+Active prompt/config examples must not teach from troubleshooting titles or
+single-run fixtures. TV search examples in `config/category-definitions/tv.yaml`
+now use neutral `Series Title ...` patterns, while TV-specific release-name
+teaching remains in the TV-owned YAML/prompt files. Generic router prompt wording
+uses bundle/range terminology rather than TV-specific season-pack wording.
+
+Verify with `scripts/round280_metadata_prompt_drift_tests.py` after changing
+metadata research tools, media probing, TV category definition prompt examples,
+or the generic intent-router download follow-up wording.

@@ -265,7 +265,7 @@ class SecurityConfig(BaseModel):
 
     enabled: bool = True
     require_confirmation_for_destructive_actions: bool = True
-    use_trash_for_deletes: bool = True
+    use_trash_for_deletes: bool = False
     trash_folder_name: str = ".ljs-trash"
     max_files_per_destructive_action: int = 100
     max_gb_per_destructive_action: float = 50.0

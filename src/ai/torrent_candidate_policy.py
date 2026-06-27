@@ -123,13 +123,17 @@ class TorrentCandidateRanking:
     """Deterministic ordering for prompt compactness, not final judgment."""
 
     @staticmethod
-    def pre_score(result: SearchResult, preferred_language: str | None = None) -> tuple:
+    def pre_score(result: SearchResult, preferred_language: str | None = None, *, language_relevant: bool = True) -> tuple:
         """Order candidates before prompt construction without rejecting ambiguity."""
         tags = extract_quality_tags(result.title)
-        preferred = (preferred_language or "").strip().lower()
-        langs = [str(lang).lower() for lang in tags.get("languages", [])]
-        lang_match = 1 if preferred and preferred in langs else 0
-        multi = 1 if tags.get("is_multi_language") else 0
+        if language_relevant:
+            preferred = (preferred_language or "").strip().lower()
+            langs = [str(lang).lower() for lang in tags.get("languages", [])]
+            lang_match = 1 if preferred and preferred in langs else 0
+            multi = 1 if tags.get("is_multi_language") else 0
+        else:
+            lang_match = 0
+            multi = 0
         return (lang_match, multi, result.quality_score, result.seeders or 0)
 
     @staticmethod
@@ -162,13 +166,16 @@ class TorrentCandidateRanking:
         preferred_language: str | None,
         preferred_resolution: str | None,
         target_episode_size_mb: float | None = None,
+        *,
+        language_relevant: bool = True,
+        use_global_quality_profile: bool = True,
     ) -> tuple:
         """Rank candidates before/after LLM tie-breaking without semantic rejection."""
-        lang_score = TorrentCandidateRanking.language_score(candidate, preferred_language)
-        res_score = TorrentCandidateRanking.resolution_score(candidate, preferred_resolution)
+        lang_score = TorrentCandidateRanking.language_score(candidate, preferred_language) if language_relevant else 0
+        res_score = TorrentCandidateRanking.resolution_score(candidate, preferred_resolution) if use_global_quality_profile else 0
         size_mb = TorrentCandidateRanking.per_episode_size_mb(candidate)
-        target_score, undersized_penalty = TorrentCandidateRanking.size_scores(size_mb, target_episode_size_mb)
-        codec_bonus = 1 if (candidate.codec or "").lower() in {"h265", "x265", "hevc", "av1"} else 0
+        target_score, undersized_penalty = TorrentCandidateRanking.size_scores(size_mb, target_episode_size_mb) if use_global_quality_profile else (0.0, 0)
+        codec_bonus = 1 if use_global_quality_profile and (candidate.codec or "").lower() in {"h265", "x265", "hevc", "av1"} else 0
         return (
             lang_score,
             res_score,

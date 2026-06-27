@@ -263,6 +263,74 @@ class ReleaseWatchRepository(BaseRepository):
         )
         await self._db.commit()
 
+    async def cancel_unit(
+        self,
+        category_id: str,
+        item_id: str,
+        unit_key: str,
+        *,
+        error: str = "cancelled",
+        outcome: dict[str, Any] | None = None,
+    ) -> None:
+        """Cancel one release watch unit so retries do not resurrect user-cancelled work."""
+        now = self._now()
+        await self._db.execute(
+            """UPDATE release_watches
+               SET status = 'cancelled', next_check_at = '', last_error = ?,
+                   last_outcome_json = ?, updated_at = ?
+               WHERE category_id = ? AND item_id = ? AND unit_key = ?
+                 AND status NOT IN ('completed', 'expired')""",
+            (
+                error,
+                json.dumps(outcome or {}, ensure_ascii=False, default=str),
+                now,
+                category_id,
+                item_id,
+                unit_key,
+            ),
+        )
+        await self._db.commit()
+
+    async def retire_missing_for_item(
+        self,
+        category_id: str,
+        item_id: str,
+        active_unit_keys: set[str],
+        *,
+        error: str = "no longer present in category watch plan",
+    ) -> int:
+        """Cancel nonterminal watches omitted by the category's latest plan.
+
+        Categories rebuild watch plans from canonical library/provider state. If
+        a previously watched unit disappears from that plan, the old retry row is
+        stale and must not keep searching/queueing in the background.
+        """
+        now = self._now()
+        rows = await self.list(category_id=category_id, item_id=item_id, limit=500)
+        active = {str(key or "").strip() for key in active_unit_keys if str(key or "").strip()}
+        cancelled = 0
+        for row in rows:
+            status = str(row.get("status") or "")
+            unit_key = str(row.get("unit_key") or "").strip()
+            if status in _TERMINAL_STATUSES or unit_key in active:
+                continue
+            await self._db.execute(
+                """UPDATE release_watches
+                   SET status = 'cancelled', next_check_at = '', last_error = ?,
+                       last_outcome_json = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    error,
+                    json.dumps({"status": "retired_by_watch_plan", "active_unit_keys": sorted(active)}, ensure_ascii=False),
+                    now,
+                    int(row.get("id") or 0),
+                ),
+            )
+            cancelled += 1
+        if cancelled:
+            await self._db.commit()
+        return cancelled
+
     async def due(self, *, limit: int = 25) -> list[dict[str, Any]]:
         """Return retryable watches whose retry time has arrived."""
         now = self._now()

@@ -345,9 +345,9 @@ class CategoryContextMixin:
         """Merge common display metadata into a detail payload.
 
         Provider snapshots may know the canonical title even when the catalog
-        item key came from a dirty release folder.  In that case, prefer the
-        provider display title so library cards show ``Silicon Valley`` instead
-        of ``Silicon.Valley.S01-06.ITA.DLMUX.x264``.
+        item key came from a dirty release folder. In that case, prefer the
+        provider display title so library cards show the clean canonical name
+        instead of a raw release-folder string.
         """
         if not metadata:
             return
@@ -461,6 +461,64 @@ class CategoryContextMixin:
             return f"{guidance}\n\nCategory prompt file guidance:\n{prompt_file_guidance}"
         return guidance
 
+
+    def prompt_file_torrent_skill(self) -> str:
+        """Return torrent/search-relevant sections from the category prompt file.
+
+        Category prompt files are the source of truth for domain teaching.  The
+        main assistant prompt can receive the full file, but torrent candidate
+        review needs the parts that explain release-name formats, language and
+        format evidence, bundle semantics, and safe import/rejection behavior.
+        Keeping this extraction here prevents TV/movie/music rules from being
+        duplicated inside generic prompt builders.
+        """
+        prompt_file_guidance = self.load_prompt_file()
+        if not prompt_file_guidance:
+            return ""
+        keywords = (
+            "release-name skill",
+            "language skill",
+            "language and collection skill",
+            "safety and import skill",
+            "import skill",
+            "automation safety",
+        )
+        sections = self._markdown_sections_matching(prompt_file_guidance, keywords)
+        return "\n\n".join(sections).strip() or prompt_file_guidance.strip()
+
+    @staticmethod
+    def _markdown_sections_matching(markdown: str, heading_keywords: tuple[str, ...]) -> list[str]:
+        """Extract markdown sections whose heading contains one keyword.
+
+        This deliberately looks at headings, not body words, so examples inside
+        one category cannot accidentally pull in an unrelated section.
+        """
+        lines = markdown.splitlines()
+        selected: list[str] = []
+        current: list[str] = []
+        current_level = 0
+        active = False
+        lowered_keywords = tuple(keyword.lower() for keyword in heading_keywords)
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                hashes = len(stripped) - len(stripped.lstrip("#"))
+                heading = stripped[hashes:].strip().lower()
+                if active and hashes <= current_level:
+                    selected.append("\n".join(current).strip())
+                    current = []
+                    active = False
+                if any(keyword in heading for keyword in lowered_keywords):
+                    active = True
+                    current_level = hashes
+                    current = [line]
+                    continue
+            if active:
+                current.append(line)
+        if active and current:
+            selected.append("\n".join(current).strip())
+        return [section for section in selected if section]
+
     def build_torrent_selection_guidance(self) -> str:
         """Return category-specific guidance for the torrent selection LLM.
 
@@ -469,15 +527,15 @@ class CategoryContextMixin:
         and any category-specific quality considerations.
         """
         exts = ", ".join(self.accepted_file_patterns)
+        skill = self.prompt_file_torrent_skill()
+        skill_block = f"\n\nCategory prompt file torrent skill:\n{skill}" if skill else ""
         return (
             f"This is a {self.display_name} download. Only select candidates that "
             f"are {self.display_name.lower()} media files (expected formats: {exts}). "
-            f"Reject anything that is not a {self.display_name.lower()} — "
-            f"including games, ebooks, software, music, adult content, "
-            f"tutorials, or multi-part archives (.rar, .zip, .7z). "
-            f"If a candidate's title suggests it contains non-{self.display_name.lower()} "
-            f"content (file extensions like .pdf, .exe, .iso, .mp3, .epub, .rar in the title), "
-            f"reject it."
+            f"Reject candidates that clearly belong to another installed category or unsafe executable/software payloads. "
+            f"Do not import richer-category assumptions here: archives, multi-file payloads, adult-rated media, books, audio, games, or sidecars are acceptable only when this category or the user target says they are. "
+            f"If a candidate's title or file list suggests it is outside {self.display_name.lower()} scope, reject it or ask for confirmation instead of guessing."
+            f"{skill_block}"
         )
 
 

@@ -195,6 +195,111 @@ class TorrentFileMetadataParser:
         return (1, text.casefold())
 
 
+
+
+class TorrentRuntimePriorityController:
+    """Apply persisted per-file priorities to a live libtorrent handle.
+
+    Libtorrent priority numbers are not a strict sequencing guarantee when every
+    file remains enabled.  LJS therefore treats distinct positive file priorities
+    as staged availability: the highest unfinished priority band is enabled, and
+    lower bands stay at priority 0 until earlier files complete.  Equal positive
+    priorities remain parallel.
+    """
+
+    def __init__(self) -> None:
+        self._last_signature_by_download: dict[str, tuple[int, ...]] = {}
+
+    def apply(self, download_id: str, handle: Any, item: DownloadItem) -> bool:
+        """Apply current DB priorities to the torrent handle when they changed."""
+        files = list(getattr(item, "files", []) or [])
+        if not files or handle is None or not getattr(handle, "has_metadata", lambda: False)():
+            return False
+        try:
+            torrent_info = handle.torrent_file()
+            num_files = int(torrent_info.num_files()) if torrent_info else 0
+        except Exception:
+            return False
+        if num_files <= 0:
+            return False
+        priorities = self._desired_priorities(files, num_files)
+        signature = tuple(priorities)
+        if self._last_signature_by_download.get(download_id) == signature:
+            return False
+        try:
+            handle.prioritize_files(priorities)
+            self._last_signature_by_download[download_id] = signature
+            staged = self._is_staged(files)
+            active = sum(1 for value in priorities if value > 0)
+            logger.info(
+                f"Applied {'staged ' if staged else ''}file priorities for {download_id}: "
+                f"active_files={active}/{num_files}"
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to apply file priorities for {download_id}: {exc}")
+            return False
+
+    def clear(self, download_id: str) -> None:
+        self._last_signature_by_download.pop(download_id, None)
+
+    def _desired_priorities(self, files: list[DownloadFileInfo], num_files: int) -> list[int]:
+        priorities = [0] * num_files
+        staged = self._is_staged(files)
+        active_band = self._active_priority_band(files) if staged else None
+        for file_info in files:
+            raw_index = getattr(file_info, "file_index", -1)
+            try:
+                index = int(raw_index)
+            except Exception:
+                index = -1
+            if index < 0 or index >= num_files:
+                continue
+            base = self._clamp_priority(getattr(file_info, "priority", 0))
+            if base <= 0:
+                priorities[index] = 0
+                continue
+            if staged:
+                if self._file_complete(file_info):
+                    priorities[index] = 0
+                elif active_band is not None and base == active_band:
+                    priorities[index] = base
+                else:
+                    priorities[index] = 0
+            else:
+                priorities[index] = base
+        return priorities
+
+    def _is_staged(self, files: list[DownloadFileInfo]) -> bool:
+        positive = {self._clamp_priority(getattr(file_info, "priority", 0)) for file_info in files}
+        positive.discard(0)
+        return len(positive) >= 2
+
+    def _active_priority_band(self, files: list[DownloadFileInfo]) -> int | None:
+        unfinished = [
+            self._clamp_priority(getattr(file_info, "priority", 0))
+            for file_info in files
+            if self._clamp_priority(getattr(file_info, "priority", 0)) > 0 and not self._file_complete(file_info)
+        ]
+        return max(unfinished) if unfinished else None
+
+    @staticmethod
+    def _clamp_priority(value: Any) -> int:
+        try:
+            return max(0, min(7, int(value or 0)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _file_complete(file_info: DownloadFileInfo) -> bool:
+        status = str(getattr(file_info, "status", "") or "").lower()
+        if status in {"complete", "organized"}:
+            return True
+        size = int(getattr(file_info, "size", 0) or 0)
+        done = int(getattr(file_info, "downloaded_bytes", 0) or 0)
+        return size > 0 and done >= size
+
+
 class DownloadProgressStore:
     """Maps libtorrent stats into DownloadItem updates.
 
@@ -439,6 +544,7 @@ class DownloadLifecycleMonitor:
         self._rate_sample_time: float | None = None
         self._rate_sample_bytes: int = 0
         self._smoothed_download_rate: float = 0.0
+        self._priority_controller = TorrentRuntimePriorityController()
 
     async def run(self, download_id: str, handle: Any) -> None:
         """Main monitoring entry point for a single download.
@@ -485,6 +591,7 @@ class DownloadLifecycleMonitor:
             await self._ctx.db.downloads.upsert_download(item)
         if self._ctx.queue:
             self._ctx.queue.deregister_active(download_id)
+        self._priority_controller.clear(download_id)
         if self._ctx.monitor_registry:
             self._ctx.monitor_registry.unregister(download_id)
 
@@ -527,6 +634,7 @@ class DownloadLifecycleMonitor:
             )
             item.files = file_infos
             await self._ctx.db.downloads.upsert_download(item)
+            self._priority_controller.apply(download_id, handle, item)
             # Fire stats callback so frontend receives file data immediately
             stats_files = self._ctx.metadata_parser.build_stats_files(file_infos)
             if self._ctx.on_stats_callback:
@@ -549,6 +657,7 @@ class DownloadLifecycleMonitor:
             if item:
                 item = self._ctx.progress_store.update_item(item, stats)
                 await self._ctx.db.downloads.upsert_download(item)
+                self._priority_controller.apply(download_id, handle, item)
             if self._ctx.on_stats_callback:
                 self._ctx.on_stats_callback(download_id, stats)
             files_list = stats.get("files")
@@ -788,6 +897,7 @@ class DownloadLifecycleMonitor:
         await self._ctx.db.downloads.upsert_download(item)
         if self._ctx.queue:
             self._ctx.queue.deregister_active(download_id)
+        self._priority_controller.clear(download_id)
         if self._ctx.monitor_registry:
             self._ctx.monitor_registry.unregister(download_id)
         return True

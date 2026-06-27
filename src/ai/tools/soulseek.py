@@ -61,14 +61,11 @@ class SearchSoulseekTool:
         settings = self._settings_manager.settings
         cfg = settings.soulseek
         category_id = str(arguments.get("category_id") or getattr(context, "category_id", None) or "").strip().lower()
-        if category_id and cfg.search_enabled_categories and category_id not in set(cfg.search_enabled_categories):
-            return {
-                "ok": False,
-                "recoverable": True,
-                "error_code": "SLSKD_CATEGORY_DISABLED",
-                "error": f"Soulseek search is not enabled for category '{category_id}'.",
-                "next_actions": ["Use torrent search", "Enable the category in Soulseek settings"],
-            }
+        category_was_disabled = bool(category_id and cfg.search_enabled_categories and category_id not in set(cfg.search_enabled_categories))
+        # Direct user-invoked Soulseek searches are exploratory and non-queueing;
+        # do not fail before searching just because an old settings file still
+        # lists only music/audiobook/ebook companion categories.  Automatic
+        # companion searches still respect category policy in the scheduler.
         if not cfg.api_configured:
             return self._not_configured("Soulseek/slskd is disabled or missing an API key.")
         if getattr(cfg, "managed", True):
@@ -123,6 +120,7 @@ class SearchSoulseekTool:
             result["raw_candidate_count"] = len(raw_candidates)
             result["category_filtered_count"] = max(0, len(raw_candidates) - len(ranked))
             result["category_id"] = category_id or None
+            result["category_policy_bypassed_for_direct_search"] = category_was_disabled
             result["candidates"] = ranked[: int(max_results_arg or 12)]
             result["candidate_count"] = len(result["candidates"])
             result["queries_tried"] = list(tried)
@@ -135,6 +133,8 @@ class SearchSoulseekTool:
             await self._mark_account_ready(cfg)
             result["queueing_note"] = "Use enqueue_soulseek_download with candidate_id and result_set_id when available. These candidates are category-filtered when category_id is supplied; do not use queue_download for Soulseek candidates."
             result.setdefault("search_notes", []).append("Private/locked Soulseek files are filtered out before candidates are shown.")
+            if category_was_disabled:
+                result.setdefault("search_notes", []).append("This direct Soulseek search bypassed a stale disabled-category setting; automatic companion searches still use Settings policy.")
             if result.get("raw_candidate_count") and not result.get("candidate_count") and category_id:
                 result.setdefault("search_notes", []).append("Soulseek returned raw rows, but none matched the selected category's file/quality/language rules.")
         return result

@@ -50,7 +50,7 @@ def test_multi_unit_download_plan_drops_single_episode_guess() -> None:
     plan = AgentPlan(
         intent=Intent.DOWNLOAD,
         user_goal="Grab the missing episodes from the latest season",
-        constraints={},
+        constraints={"requested_unit_scope": "missing"},
         steps=[
             PlanStep(
                 id="search_latest_guess",

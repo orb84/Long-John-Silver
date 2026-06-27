@@ -38,15 +38,32 @@ def test_safe_path_resolver_allows_nested_paths_inside_root(tmp_path: Path) -> N
     assert resolved == target.resolve()
 
 
-def test_safe_unlink_quarantines_files_in_category_trash(tmp_path: Path) -> None:
-    """Deletes should move files to .ljs-trash by default instead of permanently removing them."""
+def test_safe_unlink_permanently_deletes_by_default(tmp_path: Path) -> None:
+    """Deletes should permanently remove files by default instead of hiding them in .ljs-trash."""
+    allowed = tmp_path / "library"
+    file_path = allowed / "Movie" / "Movie.mkv"
+    file_path.parent.mkdir(parents=True)
+    file_path.write_text("media", encoding="utf-8")
+
+    resolver = SafePathResolver([allowed], category_id="movie", config=SecurityConfig())
+    operation = resolver.safe_unlink(file_path, purpose="movie.delete")
+
+    assert operation.allowed
+    assert operation.operation == "unlink"
+    assert not file_path.exists()
+    assert operation.trash_path is None
+    assert not (allowed / ".ljs-trash").exists()
+
+
+def test_safe_unlink_can_quarantine_files_when_explicitly_requested(tmp_path: Path) -> None:
+    """Explicit quarantine remains available for workflows that deliberately request recoverability."""
     allowed = tmp_path / "library"
     file_path = allowed / "Movie" / "Movie.mkv"
     file_path.parent.mkdir(parents=True)
     file_path.write_text("media", encoding="utf-8")
 
     resolver = SafePathResolver([allowed], category_id="movie", config=SecurityConfig(use_trash_for_deletes=True))
-    operation = resolver.safe_unlink(file_path, purpose="movie.delete", move_to_trash=True)
+    operation = resolver.safe_unlink(file_path, purpose="movie.quarantine", move_to_trash=True)
 
     assert operation.allowed
     assert operation.operation == "trash_file"

@@ -16,8 +16,9 @@ from types import MethodType
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.ai.tools.scheduling import _annotate_selection_policy, _batch_candidate_score
 from src.core.categories.tv import TvShowCategory
+from src.ai.tools.search_workspace import SearchQualityChoicePolicy
+from src.ai.tools.search_workspace import SelectionPolicyAnnotator
 
 
 @dataclass
@@ -69,7 +70,7 @@ def test_english_extra_language_candidates_are_marked_as_fallback() -> None:
         "seeders": 88,
     }
     candidates = [extra, clean]
-    _annotate_selection_policy(candidates, preferred_language="English")
+    SelectionPolicyAnnotator.annotate(candidates, preferred_language="English")
     assert any("extra non-preferred audio" in warning for warning in extra["selection_warnings"])
     assert not any("extra non-preferred audio" in warning for warning in clean["selection_warnings"])
 
@@ -77,7 +78,7 @@ def test_english_extra_language_candidates_are_marked_as_fallback() -> None:
 def test_batch_score_keeps_english_dual_audio_behind_clean_english() -> None:
     clean = {"languages": ["English"], "resolution": "1080p", "seeders": 10, "size_bytes": 2_000_000_000}
     dual = {"languages": ["Italian", "English"], "resolution": "1080p", "seeders": 1000, "size_bytes": 2_000_000_000}
-    assert _batch_candidate_score(clean, "English") > _batch_candidate_score(dual, "English")
+    assert SearchQualityChoicePolicy.batch_candidate_score(clean, "English") > SearchQualityChoicePolicy.batch_candidate_score(dual, "English")
 
 
 def test_season_search_suppresses_extra_language_pack_when_episode_fallback_exists() -> None:
@@ -119,9 +120,11 @@ def test_prompt_guidance_no_longer_tells_llm_ita_eng_is_equivalent() -> None:
     guidance = (ROOT / "src/ai/task_prompt_guidance.py").read_text(encoding="utf-8")
     assistant = (ROOT / "src/ai/assistant.py").read_text(encoding="utf-8")
     adjudicator = (ROOT / "src/ai/download_candidate_adjudicator.py").read_text(encoding="utf-8")
-    assert "prefer English-only or language-unknown scene releases over ITA+ENG/MULTI rows" in guidance
-    assert "do not let ITA+ENG/MULTI rows outrank" in assistant
-    assert "ITA+ENG/MULTI is a fallback only" in adjudicator
+    tv_guidance = TvShowCategory().build_torrent_selection_guidance()
+    assert "owning category's language-tag skill" in guidance
+    assert "Use category guidance for language-tag semantics" in assistant
+    assert "ITA+ENG/MULTI is a fallback only" not in adjudicator
+    assert "If the configured language is English, ITA+ENG or MULTI is only a fallback" in tv_guidance
     assert "ITA+ENG is acceptable" not in adjudicator
 
 

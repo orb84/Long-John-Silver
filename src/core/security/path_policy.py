@@ -202,7 +202,13 @@ class SafePathResolver:
         return operation
 
     def safe_unlink(self, path: Path | str, purpose: str = "unlink", move_to_trash: bool | None = None) -> SafeFileOperation:
-        """Delete a file safely, moving to trash by default when configured."""
+        """Delete a file safely after allowed-root validation.
+
+        Permanent deletion is the default policy.  Callers that genuinely need a
+        recoverable quarantine must request it explicitly or enable it through
+        security configuration; routine download cleanup must not hide payloads
+        in an in-place ``.ljs-trash`` folder.
+        """
         safe_path = self.require(path, purpose=f"{purpose}:path", must_exist=True)
         if safe_path.is_dir():
             raise SecurityPolicyError(f"Refusing to unlink a directory: {safe_path}")
@@ -227,7 +233,11 @@ class SafePathResolver:
         return operation
 
     def safe_rmtree(self, path: Path | str, purpose: str = "rmtree", move_to_trash: bool | None = None) -> SafeFileOperation:
-        """Remove a directory tree safely, preferring quarantine/trash over permanent deletion."""
+        """Remove a directory tree safely after allowed-root validation.
+
+        Permanent removal is the default policy; explicit quarantine remains
+        available only for workflows that deliberately request recoverability.
+        """
         safe_path = self.require(path, purpose=f"{purpose}:path", must_exist=True)
         if not safe_path.is_dir():
             raise SecurityPolicyError(f"Refusing to recursively delete a non-directory: {safe_path}")

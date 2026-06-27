@@ -14,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.ai.tool_result_compactor import ToolResultCompactor
-from src.ai.tools.scheduling import _build_batch_recommendation, _candidate_picker_rows
-from src.core.scheduler_services import SchedulerTorrentSearchService
+from src.core.categories.tv import TvShowCategory
+from src.ai.tools.search_workspace import SearchBatchRecommendationBuilder
+from src.ai.tools.search_workspace import SearchWorkspaceFormatter
 
 
 def test_season_pack_candidate_suppresses_episode_batch_recommendation() -> None:
@@ -34,7 +35,7 @@ def test_season_pack_candidate_suppresses_episode_batch_recommendation() -> None
             "unit_descriptor": {"stable_key": "S01E07", "label": "S01E07", "granularity": "episode", "sort_key": [1, 7], "coordinates": {"season": 1, "episode": 7}},
         },
     ]
-    assert _build_batch_recommendation(
+    assert SearchBatchRecommendationBuilder.build(
         name="A Knight of the Seven Kingdoms",
         category_id="tv",
         season=1,
@@ -49,7 +50,9 @@ def test_season_pack_candidate_suppresses_episode_batch_recommendation() -> None
 
 def test_expected_episode_count_and_full_coverage_annotation() -> None:
     query = "Season 1 pack queries: A Knight S01E01-E06 | A Knight S01E01-06 | A Knight S01"
-    assert SchedulerTorrentSearchService._expected_episode_count_from_query_summary(query, 1) == 6
+    tv = TvShowCategory()
+    facts = tv.agent_search_response_facts(item=tv.create_item("A Knight"), season=1, query_summary=query)
+    assert facts["expected_episode_count"] == 6
     payload = {
         "bundle_context": {
             "scope": "episode_range",
@@ -59,9 +62,11 @@ def test_expected_episode_count_and_full_coverage_annotation() -> None:
             "unit_count": 6,
         }
     }
-    SchedulerTorrentSearchService._annotate_requested_season_coverage(payload, 1, 6)
-    assert payload["requested_season_coverage"] == "full_requested_season"
-    assert "expected season length is 6" in payload["coverage_note"]
+    annotated = tv.annotate_agent_search_candidate_payload(
+        payload, object(), item=tv.create_item("A Knight"), season=1, response_facts=facts
+    )
+    assert annotated["requested_season_coverage"] == "full_requested_season"
+    assert "expected season length is 6" in annotated["coverage_note"]
 
 
 def test_candidate_picker_and_compactor_preserve_full_season_coverage_and_queue_instruction() -> None:
@@ -81,7 +86,7 @@ def test_candidate_picker_and_compactor_preserve_full_season_coverage_and_queue_
         "coverage_note": "covers S01E01-E06; category expected season length is 6",
         "llm_recommended": True,
     }
-    picker = _candidate_picker_rows([candidate])
+    picker = SearchWorkspaceFormatter.candidate_picker_rows([candidate])
     assert picker[0]["requested_season_coverage"] == "full_requested_season"
     assert picker[0]["coverage_note"].startswith("covers S01E01")
     result = {
@@ -116,8 +121,8 @@ def test_candidate_picker_and_compactor_preserve_full_season_coverage_and_queue_
 
 def test_download_prompt_tells_model_not_to_invent_extra_episodes() -> None:
     guidance = (ROOT / "src/ai/task_prompt_guidance.py").read_text()
-    assert "Never infer missing or extra TV episodes from candidate groups" in guidance
-    assert "recommended S01E01-06 pack" in guidance
+    assert "Never infer missing or extra category units from candidate groups" in guidance
+    assert "category-approved bundle/range coverage" in guidance
 
 
 def main() -> None:

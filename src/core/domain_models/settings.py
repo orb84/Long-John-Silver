@@ -305,6 +305,13 @@ class SoulseekSettings(BaseModel):
         if not self.share_filters:
             self.share_filters = [r"\.DS_Store$", r"Thumbs\.db$", r"desktop\.ini$"]
         self.search_enabled_categories = [str(cat).strip().lower() for cat in self.search_enabled_categories if str(cat).strip()]
+        legacy_source_only = {"music", "audiobooks", "ebooks"}
+        if set(self.search_enabled_categories) == legacy_source_only:
+            # Older configs were saved before Soulseek companion search supported
+            # video categories.  Treat that exact legacy default as stale
+            # configuration so explicit movie/TV Soulseek searches do not fail
+            # with SLSKD_CATEGORY_DISABLED after an upgrade.
+            self.search_enabled_categories = ["music", "audiobooks", "ebooks", "tv", "movie", "general"]
         if self.download_preference not in {"torrent_first", "soulseek_first", "ask"}:
             self.download_preference = "torrent_first"
         if self.share_mode == SoulseekShareMode.DISABLED:

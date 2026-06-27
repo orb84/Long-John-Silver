@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from loguru import logger
 
 from src.core.categories.title_authority import CategoryTitleAuthority
+from src.core.categories.search_scope import SearchScopePolicy
+from src.core.categories.language import LanguageTokenPolicy
 
 
 class TvAgentSearchMixin:
@@ -19,6 +22,101 @@ class TvAgentSearchMixin:
     episode inference, aired-date safeguards, language filtering, and season-pack
     ranking rules.
     """
+
+    _TRAILING_SEARCH_UNIT_RE = re.compile(
+        r"(?:"
+        r"\b(?:season|series|complete|full|pack)\b\s*(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)?"
+        r"|\bS\d{1,2}(?:E\d{1,2})?(?:[-_. ]*E?\d{1,2})?\b.*"
+        r")\s*$",
+        re.IGNORECASE,
+    )
+
+    def normalize_agent_search_name_argument(
+        self,
+        name: str,
+        *,
+        user_prompt: str | None = None,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+    ) -> str:
+        """Remove TV-owned unit/scope suffixes from an item-name argument.
+
+        The generic search tool only preserves literal title wording.  TV owns
+        season/episode/series-pack vocabulary, so it is the only layer allowed
+        to trim those words when an LLM accidentally puts them in ``name``
+        instead of the structured unit/search-scope arguments.
+        """
+        _ = (user_prompt, season, episode, search_scope)
+        value = str(name or "").strip()
+        if not value:
+            return value
+        stripped = self._TRAILING_SEARCH_UNIT_RE.sub("", value).strip(" \t\n\r.,;:!?()[]{}\"'")
+        return stripped or value
+
+    def normalize_agent_search_units_from_name(
+        self,
+        name: str,
+        *,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+    ) -> tuple[str, int | None, int | None]:
+        """Extract TV-owned season/episode words from an under-structured title.
+
+        This compatibility hook is deliberately category-owned.  Scheduler core
+        passes the text through only after routing to TV, so other categories do
+        not inherit English/Italian TV phrase parsing.
+        """
+        _ = search_scope
+        parsed_season = self._safe_positive_int(season)
+        parsed_episode = self._safe_positive_int(episode)
+        cleaned = str(name or "").strip()
+        if not cleaned:
+            return cleaned, parsed_season, parsed_episode
+
+        episode_match = re.search(r"\bS0*(\d{1,2})\s*E0*(\d{1,3})\b", cleaned, re.IGNORECASE)
+        if episode_match:
+            parsed_season = parsed_season or int(episode_match.group(1))
+            parsed_episode = parsed_episode or int(episode_match.group(2))
+            cleaned = re.sub(r"\bS0*\d{1,2}\s*E0*\d{1,3}\b", " ", cleaned, flags=re.IGNORECASE)
+
+        ordinal_map = {
+            "first": 1, "1st": 1,
+            "second": 2, "2nd": 2,
+            "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4,
+            "fifth": 5, "5th": 5,
+            "sixth": 6, "6th": 6,
+            "seventh": 7, "7th": 7,
+            "eighth": 8, "8th": 8,
+            "ninth": 9, "9th": 9,
+            "tenth": 10, "10th": 10,
+        }
+        ordinal_pattern = re.compile(
+            r"\b(?:the\s+)?("
+            + "|".join(re.escape(key) for key in sorted(ordinal_map, key=len, reverse=True))
+            + r")\s+(?:season|stagione)\s*(?:of\s+)?\b",
+            re.IGNORECASE,
+        )
+        ordinal = ordinal_pattern.search(cleaned)
+        if ordinal:
+            parsed_season = parsed_season or ordinal_map.get(ordinal.group(1).lower())
+            cleaned = ordinal_pattern.sub(" ", cleaned, count=1)
+
+        season_match = re.search(r"\b(?:season|stagione)\s*0*(\d{1,2})\b", cleaned, re.IGNORECASE)
+        if season_match:
+            parsed_season = parsed_season or int(season_match.group(1))
+            cleaned = re.sub(r"\b(?:season|stagione)\s*0*\d{1,2}\b", " ", cleaned, flags=re.IGNORECASE)
+        compact_match = re.search(r"\bS0*(\d{1,2})\b", cleaned, re.IGNORECASE)
+        if compact_match and parsed_episode is None:
+            parsed_season = parsed_season or int(compact_match.group(1))
+            cleaned = re.sub(r"\bS0*\d{1,2}\b", " ", cleaned, flags=re.IGNORECASE)
+
+        cleaned = re.sub(r"\b(?:complete|pack|torrent|torrents|missing|episodes?|episodi|serie|series)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*of\s+", "", cleaned, count=1, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.,")
+        return cleaned or str(name or "").strip(), parsed_season, parsed_episode
 
     def _search_audit_row(self, result: Any, *, index: int, status: str, reason: str, item: Any | None = None, language: str | None = None, season: int | None = None) -> dict[str, Any]:
         """Return a compact, grep-friendly TV search audit row.
@@ -322,10 +420,94 @@ class TvAgentSearchMixin:
         pack-preferred unless the LLM/user explicitly selected another phase.
         """
         _ = (item, language, context)
-        scope = str(search_scope or "default").strip().lower()
-        if scope == "default" and season is None and episode is None:
-            return "bundle_preferred"
+        scope = SearchScopePolicy.normalize(search_scope)
+        if scope == SearchScopePolicy.DEFAULT and season is None and episode is None:
+            return SearchScopePolicy.BUNDLE_PREFERRED
         return scope
+
+    def agent_search_response_facts(
+        self,
+        *,
+        item: Any,
+        season: int | None = None,
+        episode: int | None = None,
+        query_summary: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> dict[str, Any]:
+        """Expose TV-owned response facts from TV-built search evidence.
+
+        The generic scheduler must not parse TV range notation. TV pack search
+        already emits query labels such as S01E01-E06 from provider/category
+        knowledge; this hook converts that TV-owned evidence into compact facts
+        for the candidate workspace.
+        """
+        _ = (item, search_scope, context)
+        season_i = self._safe_positive_int(season)
+        if not season_i or episode is not None:
+            return {}
+        expected = self._expected_episode_count_from_agent_query_summary(str(query_summary or ""), season_i)
+        return {"expected_episode_count": expected} if expected else {}
+
+    def annotate_agent_search_candidate_payload(
+        self,
+        payload: dict[str, Any],
+        result: Any,
+        *,
+        item: Any,
+        unit_label: str | None = None,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+        response_facts: dict[str, Any] | None = None,
+        context: Any | None = None,
+    ) -> dict[str, Any] | None:
+        """Annotate TV pack coverage on a candidate payload.
+
+        Coverage labels such as ``full_requested_season`` are TV facts derived
+        from TV bundle parsing and the TV response-level expected episode count.
+        They stay category-owned instead of living in scheduler core.
+        """
+        _ = (result, item, unit_label, episode, search_scope, context)
+        expected = self._safe_positive_int((response_facts or {}).get("expected_episode_count"))
+        season_i = self._safe_positive_int(season)
+        bundle = payload.get("bundle_context") if isinstance(payload.get("bundle_context"), dict) else {}
+        if not expected or not season_i or not bundle:
+            return payload
+        try:
+            start = int(bundle.get("start") or 0)
+            end = int(bundle.get("end") or 0)
+            candidate_season = int(bundle.get("season") or bundle.get("season_start") or 0)
+        except (TypeError, ValueError):
+            return payload
+        if str(bundle.get("scope") or "") != "episode_range" or candidate_season != season_i:
+            return payload
+        payload["expected_episode_count"] = expected
+        if start == 1 and end == expected:
+            payload["requested_bundle_coverage"] = "full_requested_bundle"
+            payload["requested_season_coverage"] = "full_requested_season"
+            payload["coverage_note"] = f"covers S{season_i:02d}E01-E{end:02d}; category expected season length is {expected}"
+        elif start and end:
+            payload["requested_bundle_coverage"] = "partial_requested_bundle"
+            payload["requested_season_coverage"] = "partial_requested_season"
+            payload["coverage_note"] = f"covers S{season_i:02d}E{start:02d}-E{end:02d}; category expected season length is {expected}"
+        return payload
+
+    @staticmethod
+    def _expected_episode_count_from_agent_query_summary(query_summary: str, season: int) -> int | None:
+        """Extract TV episode count from TV-generated pack query labels."""
+        if not query_summary:
+            return None
+        pattern = rf"S0*{int(season)}E0*1\s*(?:-|[-_. ]?E)\s*E?0*(\d{{1,3}})"
+        values: list[int] = []
+        for match in re.finditer(pattern, str(query_summary), flags=re.IGNORECASE):
+            try:
+                value = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if value > 1:
+                values.append(value)
+        return max(values) if values else None
 
     async def build_agent_search_labels(
         self,
@@ -344,11 +526,11 @@ class TvAgentSearchMixin:
         search a season pack before fanning out to individual episodes; pack-only
         requests never fan out.
         """
-        scope = str(search_scope or "default").strip().lower()
+        scope = SearchScopePolicy.normalize(search_scope)
         if season is not None and episode is not None:
             return [f"S{int(season):02d}E{int(episode):02d}"]
         if season is None:
-            if scope in {"bundle_only", "bundle_preferred", "season_pack_only", "season_pack_preferred"}:
+            if SearchScopePolicy.is_bundle_scope(scope):
                 resolved = await self.resolve_agent_pack_season(item, context) if context is not None else None
                 if resolved is not None:
                     season = int(resolved)
@@ -358,7 +540,7 @@ class TvAgentSearchMixin:
                 return [None]
 
         season_label = f"Season {int(season)}"
-        if scope in {"bundle_only", "bundle_preferred", "season_pack_only", "season_pack_preferred"}:
+        if SearchScopePolicy.is_bundle_scope(scope):
             return [season_label]
         if scope == "individual_units_only":
             labels: list[str | None] = []
@@ -386,8 +568,8 @@ class TvAgentSearchMixin:
         UX without pretending packs are always available.
         """
         item = await self._ensure_agent_title_authority(item, context)
-        scope = str(search_scope or "default").strip().lower()
-        if scope in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"} and season is None and episode is None:
+        scope = SearchScopePolicy.normalize(search_scope)
+        if SearchScopePolicy.is_bundle_scope(scope) and season is None and episode is None:
             resolved = await self.resolve_agent_pack_season(item, context)
             if resolved is not None:
                 season = int(resolved)
@@ -398,14 +580,14 @@ class TvAgentSearchMixin:
         # the LLM rank individual episodes unnecessarily.  Episode fanout remains
         # available as a bounded fallback, and callers can still force it with
         # ``individual_units_only``.
-        if season is not None and episode is None and scope != "individual_units_only":
-            pack_suffix = "pack only" if scope in {"bundle_only", "season_pack_only"} else "season pack first"
+        if season is not None and episode is None and not SearchScopePolicy.is_individual_units_only(scope):
+            pack_suffix = "pack only" if SearchScopePolicy.is_bundle_only(scope) else "season pack first"
             pack_results, pack_summary = await self._run_agent_pack_queries(
                 item, int(season), language=language, context=context, summary_suffix=pack_suffix,
             )
             if pack_results and not self._pack_results_need_individual_fallback(pack_results, language=language):
                 return pack_results, pack_summary
-            if scope in {"bundle_only", "season_pack_only"}:
+            if SearchScopePolicy.is_bundle_only(scope):
                 return pack_results, pack_summary
             episode_labels = await self._episode_fallback_labels_for_agent(item, int(season), context)
             if not episode_labels:
@@ -1004,7 +1186,11 @@ class TvAgentSearchMixin:
                 continue
             seen.add(normalized)
             queries.append(query.strip())
-        return queries[:26]
+        # Keep interactive/manual season-pack searches short. Provider-backed
+        # context may safely spend more queries because expected episode counts
+        # and latest-season facts make range/series fallback more targeted.
+        max_queries = 12 if (episode_count or latest_season) else 8
+        return queries[:max_queries]
 
 
     @classmethod
@@ -1135,7 +1321,7 @@ class TvAgentSearchMixin:
             return False
         authority_aliases = CategoryTitleAuthority.authoritative_aliases_for_item(item)
         if authority_aliases:
-            return CategoryTitleAuthority.matches_any_alias(result_title, authority_aliases)
+            return self._matches_alias_before_tv_unit_marker(result_title, authority_aliases)
         return self._title_matches_requested_series(result_title, str(getattr(item, "key", "") or ""))
 
     def _agent_query_titles_for_item(self, item: Any, language: str | None = None) -> list[str]:
@@ -1212,14 +1398,14 @@ class TvAgentSearchMixin:
 
         Exact phrase matching remains the first guard, but LLM/tool arguments
         sometimes drop tiny title words such as ``of``.  For multi-token titles,
-        allow a second pass over significant title tokens only.  This keeps
-        ``A Knight the Seven Kingdoms`` matching ``A Knight of the Seven
-        Kingdoms`` while still preventing one-word/article titles such as
-        ``The Boys`` from matching unrelated titles like ``The Hardy Boys``.
+        allow a second pass over significant title tokens only.  Matching is
+        scoped to the release-name prefix before TV unit markers so a requested
+        show title does not match an unrelated episode title.
         """
         import re
         requested = re.sub(r"[^a-z0-9]+", " ", str(requested_title or "").lower()).strip()
-        result = re.sub(r"[^a-z0-9]+", " ", str(result_title or "").lower()).strip()
+        result_scope = cls._series_title_scope(result_title)
+        result = re.sub(r"[^a-z0-9]+", " ", result_scope.lower()).strip()
         if not requested:
             return True
         if re.search(rf"(?:^| ){re.escape(requested)}(?: |$)", result):
@@ -1236,6 +1422,34 @@ class TvAgentSearchMixin:
         if len(requested_sig) < 2:
             return False
         return cls._contains_ordered_token_window(result_sig, requested_sig)
+
+
+    @staticmethod
+    def _series_title_scope(result_title: str) -> str:
+        """Return the part of a TV release title that identifies the series.
+
+        Torrent names often include episode titles after SxxEyy/season markers.
+        Series-title validation must not match aliases that occur only there.
+        """
+        import re
+        title = str(result_title or "")
+        patterns = [
+            r"\bS\d{1,2}E\d{1,3}\b",
+            r"\b\d{1,2}x\d{1,3}\b",
+            r"\bS\d{1,2}\s*[-–]\s*\d{1,3}\b",
+            r"\b(?:season|stagione)\s*\d{1,2}\b",
+            r"\bS\d{1,2}\b",
+        ]
+        starts = [m.start() for pattern in patterns for m in [re.search(pattern, title, flags=re.IGNORECASE)] if m]
+        if starts:
+            return title[:min(starts)].strip(" ._-[]()") or title
+        return title
+
+    @classmethod
+    def _matches_alias_before_tv_unit_marker(cls, result_title: str, aliases: list[str] | tuple[str, ...] | set[str]) -> bool:
+        """Return whether a known series alias appears in the series-title scope."""
+        scope = cls._series_title_scope(result_title)
+        return CategoryTitleAuthority.matches_any_alias(scope, aliases)
 
     @staticmethod
     def _significant_title_tokens(value: str) -> list[str]:
@@ -1260,11 +1474,9 @@ class TvAgentSearchMixin:
     def _title_token_equivalent(actual: str, expected: str) -> bool:
         """Return true for narrow singular/plural title-token variants.
 
-        Tracker titles may normalize possessives differently from user text:
-        ``Widow's Bay`` commonly appears as ``Widows Bay``, while a user may ask
-        for ``Widow Bay``.  Keep this token-local and require the caller's
-        multi-token window check so one-word titles such as ``The Boys`` still
-        cannot match unrelated multi-token shows.
+        Tracker titles may normalize possessives differently from user text.
+        Keep this token-local and require the caller's multi-token window check
+        so one-word titles still cannot match unrelated multi-token shows.
         """
         a = str(actual or "").casefold()
         e = str(expected or "").casefold()
@@ -1526,6 +1738,89 @@ class TvAgentSearchMixin:
         return [result for result, _, _ in sorted(eligible, key=score, reverse=True)][:60]
 
 
+    def filter_torrent_candidates_for_unit(
+        self,
+        candidates: list[Any],
+        *,
+        item_id: str | None = None,
+        item_display_name: str | None = None,
+        unit_key: str | None = None,
+        unit_request: dict[str, Any] | None = None,
+        preferred_language: str | None = None,
+    ) -> list[Any]:
+        """Apply TV-owned structural unit coverage before torrent LLM ranking.
+
+        Generic selection may ask a category to remove candidates that cannot
+        possibly satisfy the requested unit.  TV owns the meaning of SxxEyy,
+        season bundles, and title-prefix matching; the core does not inspect those
+        coordinates.  For exact episode requests, keep exact episode releases and
+        verified bundles containing that episode.  For season requests, prefer
+        verified season/series bundles and only keep individual episodes as a
+        fallback when no bundle exists.
+        """
+        label = str(unit_key or (unit_request or {}).get("label") or "").strip()
+        requested_season, requested_episode = self._unit_coordinates(label)
+        pseudo_item = SimpleNamespace(
+            key=str(item_id or item_display_name or ""),
+            display_name=str(item_display_name or item_id or ""),
+            metadata={},
+        )
+        if not str(pseudo_item.key or pseudo_item.display_name or "").strip():
+            return list(candidates or [])
+        if not requested_season and not requested_episode:
+            title_matched = [
+                candidate for candidate in (candidates or [])
+                if self._title_matches_item_series(str(getattr(candidate, "title", "") or ""), pseudo_item)
+            ]
+            if not title_matched:
+                return []
+            bundle_like = [
+                candidate for candidate in title_matched
+                if bool(getattr(candidate, "is_bundle", False))
+                or bool(getattr(candidate, "bundle_context", {}) or {})
+                or bool(self.torrent_bundle_candidate_context(candidate, item=pseudo_item, unit_label=None))
+            ]
+            return bundle_like or title_matched
+        accepted: list[tuple[str, Any]] = []
+        for candidate in candidates or []:
+            title = str(getattr(candidate, "title", "") or "")
+            if not title or not self._title_matches_item_series(title, pseudo_item):
+                continue
+            bundle_context = getattr(candidate, "bundle_context", {})
+            if not isinstance(bundle_context, dict):
+                bundle_context = {}
+            payload = {
+                "title": title,
+                "season": getattr(candidate, "season", None),
+                "episode": getattr(candidate, "episode", None),
+                "is_bundle": bool(getattr(candidate, "is_bundle", False)),
+                "bundle_context": bundle_context,
+                "bundle_scope": getattr(candidate, "bundle_scope", None) or bundle_context.get("scope"),
+                "pack_type": bundle_context.get("pack_type"),
+                "seeders": getattr(candidate, "seeders", None),
+                "resolution": getattr(candidate, "resolution", None),
+                "quality_score": getattr(candidate, "quality_score", None),
+                "languages": [getattr(candidate, "language", None)] if getattr(candidate, "language", None) else [],
+            }
+            reason = self._candidate_payload_fit_reason(
+                payload,
+                requested_season=requested_season,
+                requested_episode=requested_episode,
+                search_scope="",
+            )
+            if reason.startswith("reject_"):
+                continue
+            if requested_episode and reason not in {"accept_exact_episode", "accept_bundle_contains_requested_unit"}:
+                continue
+            if requested_season and not requested_episode and reason == "accept_unknown_scope":
+                continue
+            accepted.append((reason, candidate))
+        if requested_season and not requested_episode:
+            bundle_reasons = {"accept_bundle_contains_requested_unit", "accept_requested_season"}
+            if any(reason in bundle_reasons for reason, _ in accepted):
+                accepted = [(reason, candidate) for reason, candidate in accepted if reason in bundle_reasons]
+        return [candidate for _, candidate in accepted]
+
     def filter_agent_candidate_payloads_for_request(
         self,
         candidates: list[dict[str, Any]],
@@ -1570,6 +1865,13 @@ class TvAgentSearchMixin:
             candidate["selection_warnings"] = warnings
             candidate["tv_request_fit"] = reason
             filtered.append(candidate)
+        if requested_season is None and requested_episode is None:
+            bundle_rows = [
+                row for row in filtered
+                if row.get("is_bundle") or row.get("bundle_context") or row.get("bundle_scope") or row.get("pack_type")
+            ]
+            if bundle_rows:
+                filtered = bundle_rows
         return sorted(
             filtered,
             key=lambda row: self._candidate_payload_preference_key(row, language=language),
@@ -1611,7 +1913,7 @@ class TvAgentSearchMixin:
         if requested_episode and candidate_episode and candidate_episode != requested_episode:
             return "reject_wrong_requested_episode"
 
-        pack_requested = search_scope in {"bundle_only", "pack_only", "season_pack", "season_pack_only"}
+        pack_requested = SearchScopePolicy.is_bundle_only(search_scope)
         if requested_episode:
             if candidate_season == requested_season and candidate_episode == requested_episode:
                 return "accept_exact_episode"
@@ -1843,21 +2145,13 @@ class TvAgentSearchMixin:
 
     @staticmethod
     def _canonical_language_token(value: object) -> str:
-        token = str(value or "").strip().lower()
-        aliases = {
-            "italian": "italian", "italiano": "italian", "ita": "italian", "it": "italian",
-            "english": "english", "eng": "english", "en": "english",
-            "multi": "multi", "multilanguage": "multi", "dual": "multi",
-        }
-        return aliases.get(token, token)
+        """Compatibility wrapper around the shared category language-token policy."""
+        return LanguageTokenPolicy.canonical_token(value)
 
     @staticmethod
     def _title_has_language_token(title_lower: str, preferred_token: str) -> bool:
-        if preferred_token == "italian":
-            return bool(re.search(r"(?:^|[\s._\-\[\]()])(?:ita|italian|italiano)(?:$|[\s._\-\[\]()])", title_lower, re.I))
-        if preferred_token == "english":
-            return bool(re.search(r"(?:^|[\s._\-\[\]()])(?:eng|english)(?:$|[\s._\-\[\]()])", title_lower, re.I))
-        return preferred_token in title_lower
+        """Compatibility wrapper around bounded shared language-token matching."""
+        return LanguageTokenPolicy.title_has_language_token(title_lower, preferred_token)
 
 
     @classmethod

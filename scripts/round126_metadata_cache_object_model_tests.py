@@ -47,14 +47,11 @@ def test_metadata_results_have_stable_ids_object_models_and_disambiguation_hints
     stable = make_stable_id("musicbrainz", {"musicbrainz_release_id": "abc"}, "Blur", ["Blur"], "1997")
     require(stable == "musicbrainz:musicbrainz_release_id:abc", "provider IDs should produce stable deterministic IDs")
 
-    class DummyCategory:
-        category_id = "music"
-        def category_service_enabled(self, settings, provider, default=True):
-            return default
-        def category_service_secret(self, settings, provider, key):
-            return None
+    import yaml
+    from src.core.categories.definition_backed import DefinitionBackedCategory
 
-    resolver = CategoryMetadataResolver(DummyCategory(), settings=None)
+    category = DefinitionBackedCategory(yaml.safe_load((ROOT / "config/category-definitions/music.yaml").read_text(encoding="utf-8")))
+    resolver = CategoryMetadataResolver(category, settings=None)
     results = [
         ProviderResult(
             provider="musicbrainz",
@@ -83,14 +80,11 @@ def test_metadata_results_have_stable_ids_object_models_and_disambiguation_hints
 def test_provider_profiles_encode_cache_ttl_and_rate_limits() -> None:
     from src.integrations.category_metadata import CategoryMetadataResolver
 
-    class DummyCategory:
-        category_id = "music"
-        def category_service_enabled(self, settings, provider, default=True):
-            return default
-        def category_service_secret(self, settings, provider, key):
-            return None
+    import yaml
+    from src.core.categories.definition_backed import DefinitionBackedCategory
 
-    resolver = CategoryMetadataResolver(DummyCategory(), settings=None)
+    category = DefinitionBackedCategory(yaml.safe_load((ROOT / "config/category-definitions/music.yaml").read_text(encoding="utf-8")))
+    resolver = CategoryMetadataResolver(category, settings=None)
     profile = resolver._provider_profile()
     mb = next(spec for spec in profile if spec.provider == "musicbrainz")
     require(mb.ttl_seconds >= 7 * 24 * 60 * 60, "MusicBrainz responses should be persistently cached")

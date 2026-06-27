@@ -81,6 +81,69 @@ class LanguageSearchTagger:
         return f"{query} {tag}" if tag else query
 
 
+class LanguageTokenPolicy:
+    """Shared language-token helpers for category/download prompt plumbing.
+
+    This is intentionally small and category-neutral: it normalizes common
+    torrent/indexer language aliases and checks bounded title tokens. Category
+    code still decides whether language is relevant and whether subtitles,
+    audio, translation, or format-language evidence satisfies a request.
+    """
+
+    _ALIASES: dict[str, str] = {
+        "italian": "italian", "italiano": "italian", "ita": "italian", "it": "italian",
+        "english": "english", "inglese": "english", "eng": "english", "en": "english",
+        "french": "french", "francais": "french", "français": "french", "fre": "french", "fra": "french", "fr": "french",
+        "german": "german", "deutsch": "german", "ger": "german", "deu": "german", "de": "german",
+        "spanish": "spanish", "espanol": "spanish", "español": "spanish", "spa": "spanish", "esp": "spanish", "es": "spanish",
+        "japanese": "japanese", "jpn": "japanese", "ja": "japanese",
+        "korean": "korean", "kor": "korean", "ko": "korean",
+        "multi": "multi", "multilanguage": "multi", "multi-language": "multi", "multi_audio": "multi", "multi-audio": "multi", "dual": "multi", "dual-audio": "multi",
+    }
+
+    _TITLE_TOKENS: dict[str, tuple[str, ...]] = {
+        "italian": ("ita", "italian", "italiano"),
+        "english": ("eng", "english", "inglese"),
+        "french": ("fre", "fra", "french", "francais", "français"),
+        "german": ("ger", "deu", "german", "deutsch"),
+        "spanish": ("spa", "esp", "spanish", "espanol", "español"),
+        "japanese": ("jpn", "japanese"),
+        "korean": ("kor", "korean"),
+        "multi": ("multi", "multilanguage", "multi-language", "dual", "dual-audio"),
+    }
+
+    @classmethod
+    def canonical_token(cls, value: object) -> str:
+        """Return a compact canonical token for language/status comparisons."""
+        token = str(value or "").strip().lower().replace("_", "-")
+        return cls._ALIASES.get(token, token)
+
+    @classmethod
+    def canonical_tokens(cls, values: object) -> set[str]:
+        """Normalize a scalar/list language value into comparable tokens."""
+        if values is None:
+            return set()
+        raw = values if isinstance(values, (list, tuple, set)) else [values]
+        return {cls.canonical_token(value) for value in raw if str(value or "").strip()}
+
+    @classmethod
+    def title_has_language_token(cls, title: str, language: object) -> bool:
+        """Return true when a bounded release-title token names the language."""
+        canonical = cls.canonical_token(language)
+        if not canonical:
+            return False
+        terms = cls._TITLE_TOKENS.get(canonical, (canonical,))
+        escaped = "|".join(re.escape(term.lower()) for term in terms if term)
+        if not escaped:
+            return False
+        return bool(re.search(rf"(?:^|[\s._\-\[\]()])(?:{escaped})(?:$|[\s._\-\[\]()])", str(title or "").lower(), re.IGNORECASE))
+
+    @classmethod
+    def title_has_multi_language_signal(cls, title: str) -> bool:
+        """Return true when the title advertises a multi/dual-language release."""
+        return cls.title_has_language_token(title, "multi")
+
+
 class LanguageDetector:
     """Detects media language from release names and serialized audio metadata."""
 

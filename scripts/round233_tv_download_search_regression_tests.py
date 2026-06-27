@@ -12,8 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.ai.media_title_repair import MediaTitleRepair
-from src.ai.tools.scheduling import _build_batch_recommendation
 from src.core.categories.tv import TvShowCategory
+from src.ai.tools.search_workspace import SearchBatchRecommendationBuilder
 
 
 class _PackQueryTv(TvShowCategory):
@@ -78,7 +78,7 @@ def test_tv_default_scope_for_title_only_download_is_bundle_preferred() -> None:
 
 
 def test_broad_default_search_does_not_make_fake_batch() -> None:
-    result = _build_batch_recommendation(
+    result = SearchBatchRecommendationBuilder.build(
         name="A Knight of the Seven Kingdoms",
         category_id="tv",
         season=None,

@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT))
 
 from src.ai.download_candidate_adjudicator import DownloadCandidateAdjudicator
 from src.ai.tool_result_compactor import ToolResultCompactor
-from src.ai.tools.scheduling import _candidate_picker_rows, _quality_choice_policy
+from src.ai.tools.search_workspace import SearchQualityChoicePolicy
+from src.ai.tools.search_workspace import SearchWorkspaceFormatter
 
 
 def _pack(cid: str, title: str, resolution: str, codec: str | None, size: int, bitrate: int, seeders: int) -> dict:
@@ -62,9 +63,9 @@ def test_cross_resolution_italian_season_packs_require_quality_choice() -> None:
         2569,
         11,
     )
-    policy = _quality_choice_policy([compact_1080, larger_720], {})
+    policy = SearchQualityChoicePolicy.evaluate([compact_1080, larger_720], {})
     assert policy["requires_user_choice"] is True
-    assert policy["tradeoff_type"] == "season_pack_quality_tradeoff"
+    assert policy["tradeoff_type"] == "bundle_quality_tradeoff"
     assert set(policy["candidate_ids"]) == {"compact-1080", "larger-720"}
     assert policy["comparison"]["max_bitrate_kbps"] > policy["comparison"]["min_bitrate_kbps"] * 1.25
 
@@ -92,8 +93,8 @@ def test_adjudicator_prompt_tells_llm_quality_policy_blocks_auto_queue() -> None
 def test_compactor_preserves_quality_choice_policy_and_picker_details() -> None:
     compact_1080 = _pack("compact-1080", "Compact 1080p Ita pack", "1080p", "h265", 3521873182, 1422, 39)
     larger_720 = _pack("larger-720", "Larger 720p Ita pack", "720p", None, 6358800384, 2569, 11)
-    policy = _quality_choice_policy([compact_1080, larger_720], {})
-    picker = _candidate_picker_rows([compact_1080, larger_720])
+    policy = SearchQualityChoicePolicy.evaluate([compact_1080, larger_720], {})
+    picker = SearchWorkspaceFormatter.candidate_picker_rows([compact_1080, larger_720])
     result = {
         "query": "A Knight of the Seven Kingdoms S01E01-06 ITA",
         "language": "Italian",

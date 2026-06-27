@@ -11,10 +11,10 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.ai.tool_policy import AgentToolPolicy
-from src.ai.tools.scheduling import _quality_choice_policy
 from src.core.categories.registry import CategoryRegistry
 from src.core.models import Intent, QualityProfile, SearchResult
 from src.integrations.slskd_import_monitor import SlskdImportMonitor
+from src.ai.tools.search_workspace import SearchQualityChoicePolicy
 
 
 GLOBAL_TOOLS = {"list_downloads", "manage_downloads", "set_download_priority", "get_storage_status", "inspect_torrent_candidate"}
@@ -67,10 +67,10 @@ def test_new_show_quality_choice_blocks_silent_autopick() -> None:
         {"candidate_id": "a", "title": "Show S01E01 ITA 1080p H264", "resolution": "1080p", "estimated_bitrate_kbps": 12200, "size": "4.7 GB", "seeders": 80, "auto_queue_allowed": True},
         {"candidate_id": "b", "title": "Show S01E01 ITA 1080p H265", "resolution": "1080p", "estimated_bitrate_kbps": 8950, "size": "3.45 GB", "seeders": 40, "auto_queue_allowed": True},
     ]
-    policy = _quality_choice_policy(candidates, constraints={})
+    policy = SearchQualityChoicePolicy.evaluate(candidates, constraints={})
     assert policy.get("requires_user_choice") is True, policy
     assert policy.get("candidate_ids") == ["b", "a"] or set(policy.get("candidate_ids") or []) == {"a", "b"}
-    supplied = _quality_choice_policy(candidates, constraints={"preferred_bitrate_kbps": 9000})
+    supplied = SearchQualityChoicePolicy.evaluate(candidates, constraints={"preferred_bitrate_kbps": 9000})
     assert supplied.get("requires_user_choice") is False, supplied
 
 

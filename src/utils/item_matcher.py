@@ -94,8 +94,8 @@ class ItemMatcher:
             return False
 
         # Substring matches are accepted only when the shorter side still has
-        # enough content after stop-word cleanup. This keeps "The Wire" ↔
-        # "Wire" working while rejecting accidental matches on release junk.
+        # enough content after stop-word cleanup. This keeps meaningful
+        # one-token aliases working while rejecting accidental release-junk matches.
         if n1 in n2 or n2 in n1:
             shorter = w1 if len(n1) <= len(n2) else w2
             longer = w2 if len(n1) <= len(n2) else w1

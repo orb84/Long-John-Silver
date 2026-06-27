@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.ai.download_context_policy import DownloadContextPolicy
-from src.ai.tools.scheduling import _quality_choice_policy
+from src.ai.tools.search_workspace import SearchQualityChoicePolicy
 
 
 def _pack(cid: str, title: str, resolution: str, size: int, bitrate: int, seeders: int | None) -> dict:
@@ -71,7 +71,7 @@ def test_equivalent_720_mirrors_are_not_user_choice_options() -> None:
         2568,
         None,
     )
-    policy = _quality_choice_policy([compact_1080, larger_720, mirror_720], {})
+    policy = SearchQualityChoicePolicy.evaluate([compact_1080, larger_720, mirror_720], {})
     assert policy["requires_user_choice"] is True
     assert "larger-720-good" in policy["candidate_ids"]
     assert "compact-1080" in policy["candidate_ids"]
@@ -82,7 +82,7 @@ def test_explicit_resolution_prevents_cross_resolution_quality_prompt() -> None:
     larger_720 = _pack("larger-720-good", "720p pack", "720p", 6358800384, 2569, 11)
     mirror_720 = _pack("larger-720-mirror", "720p mirror", "720p", 6356551680, 2568, None)
     compact_1080 = _pack("compact-1080", "1080p pack", "1080p", 3521873182, 1422, 39)
-    policy = _quality_choice_policy([larger_720, mirror_720, compact_1080], {"preferred_resolution": "720p"})
+    policy = SearchQualityChoicePolicy.evaluate([larger_720, mirror_720, compact_1080], {"preferred_resolution": "720p"})
     assert policy["requires_user_choice"] is False
 
 

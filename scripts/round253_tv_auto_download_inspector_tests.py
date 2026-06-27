@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Round 253 regressions for per-show TV new-episode automation.
 
-TV release automation is item-owned and default-on: every TV inspector exposes a
-simple checkbox that writes the tracked-item ``auto_download`` field through the
-category item coordinator.  The scheduler then rebuilds category-owned release
-watches from that item policy; generic code must not invent TV semantics.
+TV release automation is item-owned and opt-in by default: every TV inspector
+exposes a simple checkbox that writes the tracked-item ``auto_download`` field
+through the category item coordinator.  The scheduler then rebuilds
+category-owned release watches from that item policy; generic code must not
+invent TV semantics.
 """
 from __future__ import annotations
 
@@ -114,28 +115,28 @@ class FakeContext:
 
 
 def test_tv_auto_download_defaults(check: Check) -> None:
-    """Verify TV normalizes legacy/null automation to enabled."""
+    """Verify TV normalizes legacy/null automation to the safe opt-in default."""
     category = TvShowCategory()
     implicit = TvShowItem(key="Default Show")
     legacy_null = TvShowItem(key="Legacy Show", auto_download=None)
     created = category.create_item("Created Show")
-    explicit_off = category.create_item("Off Show", auto_download=False)
-    check.ok(implicit.auto_download is True, "TV items should default new-episode auto-download to True")
-    check.ok(legacy_null.auto_download is True, "legacy null TV automation should normalize to True")
-    check.ok(created.auto_download is True, "TV create_item should default new-episode auto-download to True")
-    check.ok(explicit_off.auto_download is False, "explicitly disabled TV automation must stay False")
+    explicit_on = category.create_item("On Show", auto_download=True)
+    check.ok(implicit.auto_download is False, "TV items should default new-episode auto-download to False")
+    check.ok(legacy_null.auto_download is False, "legacy null TV automation should normalize to False")
+    check.ok(created.auto_download is False, "TV create_item should default new-episode auto-download to False")
+    check.ok(explicit_on.auto_download is True, "explicitly enabled TV automation must stay True")
 
 
-def test_release_watch_requirements_default_on(check: Check) -> None:
-    """Verify release-watch automation ignores the old global false default."""
+def test_release_watch_requirements_default_off(check: Check) -> None:
+    """Verify release-watch automation stays notify-only until the item opts in."""
     category = TvShowCategory()
     context = FakeContext()
     default_item = types.SimpleNamespace(language="English", auto_download=None)
-    disabled_item = types.SimpleNamespace(language="English", auto_download=False)
+    enabled_item = types.SimpleNamespace(language="English", auto_download=True)
     requirements = category._release_watch_requirements(default_item, context)
-    disabled = category._release_watch_requirements(disabled_item, context)
-    check.ok(requirements.get("auto_download") is True, "TV release watches should default to auto-download enabled")
-    check.ok(disabled.get("auto_download") is False, "TV release watches must respect the per-show checkbox off state")
+    enabled = category._release_watch_requirements(enabled_item, context)
+    check.ok(requirements.get("auto_download") is False, "TV release watches should default to notify-only")
+    check.ok(enabled.get("auto_download") is True, "TV release watches must respect the per-show checkbox on state")
 
 
 def test_inspector_update_resyncs_watch_policy(check: Check) -> None:
@@ -163,13 +164,13 @@ def test_inspector_frontend_contains_checkbox(check: Check) -> None:
     check.ok("_automationSection(item)" in js, "inspector should render the automation section")
     check.ok("CategoryApiClient.updateItem" in js, "checkbox should persist through the category item update API")
     check.ok("auto_download: Boolean(enabled)" in js, "checkbox should send the auto_download field")
-    check.ok("item.auto_download !== false" in js, "inspector should display missing/null auto_download as enabled")
+    check.ok("item.auto_download === true" in js, "inspector should display missing/null auto_download as disabled")
 
 
 if __name__ == "__main__":
     check = Check()
     test_tv_auto_download_defaults(check)
-    test_release_watch_requirements_default_on(check)
+    test_release_watch_requirements_default_off(check)
     test_inspector_update_resyncs_watch_policy(check)
     test_inspector_frontend_contains_checkbox(check)
     check.finish()

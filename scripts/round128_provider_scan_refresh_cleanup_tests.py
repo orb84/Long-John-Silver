@@ -24,11 +24,11 @@ def test_provider_adapters_are_split_from_resolver() -> None:
     music = (ROOT / "src/integrations/metadata_providers/music.py").read_text(encoding="utf-8")
     books = (ROOT / "src/integrations/metadata_providers/books.py").read_text(encoding="utf-8")
     require("class CategoryMetadataResolver" in resolver, "resolver class should remain the orchestration boundary")
-    require("provider_method" in resolver and "ProviderRateLimiter" in resolver, "resolver should orchestrate adapters/cache/rate-limit state")
+    require("method_for_invocation" in resolver and "ProviderRateLimiter" in resolver, "resolver should orchestrate provider registry/cache/rate-limit state")
     require("musicbrainz.org/ws/2/release" not in resolver, "provider URLs should not live in resolver")
     require("musicbrainz.org/ws/2/release" in music, "music provider URL should live in music adapter")
     require("openlibrary.org/search.json" in books and "librivox.org/api/feed/audiobooks" in books, "book/audio-book URLs should live in book adapters")
-    require("_PROVIDER_PROFILES" in registry, "provider profiles should remain declarative data")
+    require("_PROVIDERS" in registry, "provider registry should remain declarative data")
 
 
 async def test_music_scan_reconstructs_album_track_units() -> None:

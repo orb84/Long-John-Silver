@@ -190,7 +190,7 @@ class TMDBClient:
         """
         data = await self._get(
             f"{self.BASE_URL}/movie/{movie_id}",
-            params={"api_key": self._api_key, "append_to_response": "credits"},
+            params={"api_key": self._api_key, "append_to_response": "credits,external_ids,alternative_titles,translations"},
         )
         if not data:
             return None
@@ -221,7 +221,50 @@ class TMDBClient:
             "writers": writers,
             "producers": producers,
             "imdb_id": data.get("imdb_id"),
+            "title_aliases": self._movie_title_aliases(data),
+            "localized_titles": self._movie_localized_titles(data),
         }
+
+    @staticmethod
+    def _movie_title_aliases(data: dict) -> list[str]:
+        """Extract provider-known movie titles from TMDB details."""
+        aliases: list[str] = []
+
+        def add(value: object) -> None:
+            text = str(value or "").strip()
+            if text and text not in aliases:
+                aliases.append(text)
+
+        add(data.get("title"))
+        add(data.get("original_title"))
+        for row in (data.get("alternative_titles") or {}).get("titles") or []:
+            if isinstance(row, dict):
+                add(row.get("title"))
+        for row in (data.get("translations") or {}).get("translations") or []:
+            if not isinstance(row, dict):
+                continue
+            payload = row.get("data") if isinstance(row.get("data"), dict) else {}
+            add(payload.get("title"))
+        return aliases[:40]
+
+    @staticmethod
+    def _movie_localized_titles(data: dict) -> list[dict]:
+        """Return compact localized movie title rows from TMDB translations."""
+        rows: list[dict] = []
+        for row in (data.get("translations") or {}).get("translations") or []:
+            if not isinstance(row, dict):
+                continue
+            payload = row.get("data") if isinstance(row.get("data"), dict) else {}
+            title = payload.get("title")
+            if not title:
+                continue
+            rows.append({
+                "title": title,
+                "language": row.get("english_name") or row.get("name") or row.get("iso_639_1"),
+                "iso_639_1": row.get("iso_639_1"),
+                "country": row.get("iso_3166_1"),
+            })
+        return rows[:40]
 
     async def get_tv_details(self, tv_id: int) -> Optional[dict]:
         """Get detailed info for a TV show by TMDB ID.

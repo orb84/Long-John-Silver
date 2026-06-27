@@ -16,7 +16,7 @@ import httpx
 
 from src.integrations.metadata_cache import MetadataCacheStore, ProviderRateLimiter, stable_cache_key
 from src.integrations.metadata_disambiguation import PROVIDER_PRIORITY, rank_and_group
-from src.integrations.metadata_providers import ProviderInvocation, ProviderResult, make_stable_id, provider_method, provider_profile
+from src.integrations.metadata_providers import MetadataProviderRegistry, ProviderInvocation, ProviderResult, make_stable_id
 from src.integrations.metadata_providers.base import ProviderAdapterContext, compact
 
 
@@ -32,6 +32,7 @@ class CategoryMetadataResolver:
         self._client = http_client
         self._db = db
         self._cache = MetadataCacheStore(db)
+        self._provider_registry = MetadataProviderRegistry()
 
     async def resolve(self, query: str, *, limit: int = 5) -> dict[str, Any]:
         """Query enabled category services and return normalized candidates.
@@ -91,7 +92,7 @@ class CategoryMetadataResolver:
 
     def _provider_profile(self) -> tuple[ProviderInvocation, ...]:
         """Return the declarative provider profile for this category."""
-        return provider_profile(str(self.category.category_id))
+        return self._provider_registry.profile_for_category(self.category)
 
     def _provider_adapter_context(self, client: httpx.AsyncClient) -> ProviderAdapterContext:
         """Build the adapter context passed to provider-specific modules."""
@@ -123,7 +124,7 @@ class CategoryMetadataResolver:
         if spec.keyed and not self._secret(spec.provider, spec.key_name):
             services_skipped.append({"provider": spec.provider, "reason": f"requires {spec.key_name}"})
             return
-        method = provider_method(str(self.category.category_id), self._provider_adapter_context(client), spec.method_name)
+        method = self._provider_registry.method_for_invocation(spec, self._provider_adapter_context(client))
         if not callable(method):
             services_skipped.append({"provider": spec.provider, "reason": "provider adapter is not implemented"})
             return

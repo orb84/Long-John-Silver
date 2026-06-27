@@ -601,7 +601,7 @@ Allowed roots only.
 Resolved path containment checks.
 Traversal rejection.
 Symlink escape rejection.
-Quarantine/trash-first deletion where appropriate.
+Permanent deletion after safe-path validation for routine cleanup; explicit quarantine only where a workflow deliberately requests recoverability.
 No raw destructive file calls in high-level code.
 ```
 
@@ -972,17 +972,94 @@ When extending download control, add fields to the schema, predicates to the res
 - `scripts/round250_torrent_language_seed_scope_progress_tests.py`
   - covers the adjacent-range sizing, wrong-season payload filtering, language/seeder quality ordering, and multi-file progress fallback regressions.
 
-### Round 253 TV per-show new-episode automation
+### Round 253 / 258 TV per-show new-episode automation
 
-- `src/core/domain_models/media.py` — `TvShowItem` owns the TV-specific default
-  that new-episode auto-download is enabled unless the item is explicitly turned
-  off.
-- `src/core/categories/tv.py` — `TvShowCategory.create_item()` and
-  `_release_watch_requirements()` emit the category-owned automation requirement
-  snapshot consumed by generic release-watch retry.
+- `src/core/domain_models/media.py` — `TvShowItem` owns the TV-specific safe
+  default: new-episode auto-download is disabled unless the item is explicitly
+  turned on or the TV category auto-enables it after a user-approved active-airing
+  season download.
+- `src/core/categories/tv.py` — `TvShowCategory.create_item()`,
+  `_release_watch_requirements()`, and
+  `maybe_enable_auto_download_after_user_download()` emit and update the
+  category-owned automation policy consumed by generic release-watch retry and
+  manual-download hooks.
 - `src/core/categories/tv_context.py` — TV detail payloads normalize legacy/null
-  automation state to the enabled value shown by the inspector checkbox.
+  automation state to the disabled value shown by the inspector checkbox.
+- `src/core/scheduler.py` — release-watch queueing treats the current category
+  item value as authoritative over stale requirements snapshots.
+- `src/core/repositories/download.py` and `src/core/domain_models/downloads.py`
+  — provider-light download identity falls back to category/item plus
+  category-owned unit descriptors so duplicate episode/pack rows can be rejected.
+- `src/core/downloader.py` — startup duplicate-active-identity cleanup cancels
+  duplicate queued/downloading rows before queue workers resume them, without
+  deleting payload files.
 - `src/web/static/js/components/categoryItemDetailModal.js` — the library item
   inspector renders the TV-only “Automatically download new episodes” checkbox
   and saves through `CategoryApiClient.updateItem()`, which reaches
   `CategoryItemCoordinator` and resynchronizes release watches.
+
+### Round 261 movie search precision and Soulseek recovery
+
+- `src/core/categories/movie.py`
+  - owns interactive movie candidate search through `search_agent_candidates()` so the generic scheduler does not expose broad keyword-neighbor rows directly to the LLM;
+  - enriches provider-backed title authority through the category metadata enricher when available;
+  - preserves explicit sequel numbers in query ladders and validates release titles by exact provider/user title phrase containment;
+  - applies a final `filter_agent_candidate_payloads_for_request()` fail-safe before candidates are cached or shown.
+- `src/integrations/tmdb.py` and `src/core/categories/metadata/enricher.py`
+  - expose movie original titles, alternative titles, translations, and release year in category-neutral metadata fields.
+- `src/core/domain_models/settings.py`
+  - migrates legacy Soulseek category defaults that predated video companion search so direct movie/TV Soulseek searches do not fail before searching.
+- `src/ai/tools/soulseek.py`
+  - keeps automatic companion search governed by settings, while direct user-invoked searches can bypass stale category-disabled settings as non-queueing exploratory evidence.
+- `src/llm_providers/task_client.py`
+  - validates NVIDIA NIM response shape before reading `choices`, preventing opaque `KeyError('choices')` failures in the chat loop.
+- `scripts/round261_movie_search_soulseek_recovery_tests.py`
+  - covers exact-title movie recall, unrelated candidate rejection, sequel-number preservation, TMDB movie alias extraction, Soulseek legacy category migration, and missing-choices provider response guarding.
+
+## Definition-Backed Local Object Reconstruction
+
+Definition-backed categories keep their local file object reconstruction in
+`src/core/categories/local_object_reconstruction.py`:
+
+```text
+DefinitionBackedCategory
+  -> LocalObjectReconstructor
+      -> LocalFileFactExtractor
+      -> MusicLocalObjectBuilder
+      -> AudiobookLocalObjectBuilder
+      -> EbookLocalObjectBuilder
+      -> GenericLocalObjectBuilder
+```
+
+Scanner and scheduler code should not learn album, chapter, ebook-format, or
+comic-archive semantics. They pass neutral file observations into the category,
+and the category asks `LocalObjectReconstructor` to build local object evidence
+and category unit rows.
+
+Provider/source preferences for definition-backed categories are declared in the
+category definition, for example `source_strategy` in
+`config/category-definitions/music.yaml`. Do not hard-code concrete category ids
+inside `DefinitionBackedCategory` just to prefer Soulseek, torrents, or another
+provider for one domain.
+
+### Round 278 unmatched-search retry boundary
+
+- `src/ai/tools/search_retry.py` owns the notification-only policy for deferred
+  zero-result torrent/Soulseek searches. It schedules a bounded follow-up search
+  prompt, but that prompt must not authorize queueing or automatic downloading.
+- `src/ai/tools/scheduling.py` may call `UnmatchedSearchRetryScheduler` from the
+  generic torrent-search tool. Other scheduling/list tools should not duplicate
+  missed-search retry behavior.
+
+### Round 279 search workspace boundary
+
+- `src/ai/tools/search_workspace.py` owns the reusable workspace projection for `search_media_torrents`: candidate row formatting, descriptor-first bundle policy, quality-choice annotation, batch recommendation, next actions, and audit logging.
+- `src/ai/tools/scheduling.py` should stay a tool orchestrator. It must not regain module-level helper functions for candidate scoring, candidate rows, next-action wording, or audit payload construction.
+- Generic workspace code consumes category-published descriptors and annotations. It must not parse category coordinates or legacy TV-shaped fields to infer logical units.
+
+### Round 280 metadata/research and media-probe boundaries
+
+- `src/ai/tools/metadata_lookup_support.py` owns metadata argument normalization through `MetadataLookupArgumentNormalizer`; `src/ai/tools/research.py` must not keep duplicate module-level title/int helpers.
+- `src/core/categories/media_probe.py` now has class-owned probe collaborators (`MediaProbeValueParser`, `MediaProbeLanguageNormalizer`, `MediaProbeResolution`, `MediaProbeService`). Public module functions are compatibility wrappers only.
+- `config/category-definitions/tv.yaml` active search examples should remain neutral pattern examples, not titles copied from troubleshooting logs or one-off local test scenarios.
+- `src/ai/intent_router.py` should keep generic download follow-up wording in bundle/range terms; TV-specific season-pack teaching belongs to TV-owned category guidance.

@@ -69,22 +69,17 @@ def test_audio_conversion_command_preserves_metadata_chapters_and_artwork() -> N
 def test_metadata_resolver_uses_declarative_provider_profiles() -> None:
     from src.integrations.category_metadata import CategoryMetadataResolver
 
-    class DummyCategory:
-        category_id = "music"
+    import yaml
+    from src.core.categories.definition_backed import DefinitionBackedCategory
 
-        def category_service_enabled(self, settings, provider, default=True):
-            return default
-
-        def category_service_secret(self, settings, provider, key):
-            return None
-
-    resolver = CategoryMetadataResolver(DummyCategory(), settings=None)
+    category = DefinitionBackedCategory(yaml.safe_load((ROOT / "config/category-definitions/music.yaml").read_text(encoding="utf-8")))
+    resolver = CategoryMetadataResolver(category, settings=None)
     profile = resolver._provider_profile()
     require([spec.provider for spec in profile][:2] == ["musicbrainz", "discogs"], "music profile should be declarative and ordered")
     body = (ROOT / "src/integrations/category_metadata.py").read_text(encoding="utf-8")
     registry = (ROOT / "src/integrations/metadata_providers/registry.py").read_text(encoding="utf-8")
     require('if self.category.category_id == "music"' not in body, "resolver should not dispatch provider profiles through category-specific if ladders")
-    require("_PROVIDER_PROFILES" in registry, "provider registry should expose provider profiles as data")
+    require("_PROVIDERS" in registry, "provider registry should expose provider profiles as data")
 
 
 if __name__ == "__main__":

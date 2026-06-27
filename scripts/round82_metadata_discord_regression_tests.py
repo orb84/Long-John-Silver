@@ -49,12 +49,12 @@ def test_probe_payload_preserves_multiaudio_and_resolution() -> None:
     assert_equal(data["subtitle_languages"], ["Italian"], "Subtitle language")
     assert_equal(data["height"], 1080, "Video height")
     assert_equal(data["bit_rate_kbps"], 4500, "Probe bitrate")
-    assert data.get("parser_version", 0) >= 2, "probe cache rows must carry parser version"
+    assert data.get("parser_version", 0) >= 3, "probe cache rows must carry current parser version"
 
 
 def test_old_probe_cache_is_not_trusted() -> None:
     old = {"size_bytes": 123, "mtime_ns": 456, "audio_languages": [], "height": 1080}
-    new = {"size_bytes": 123, "mtime_ns": 456, "audio_languages": ["Italian"], "height": 1080, "parser_version": 2}
+    new = {"size_bytes": 123, "mtime_ns": 456, "audio_languages": ["Italian"], "height": 1080, "parser_version": 3}
     assert_equal(_cached_probe_is_current(old, 123, 456), False, "Old parser cache invalidated")
     assert_equal(_cached_probe_is_current(new, 123, 456), True, "Current parser cache trusted")
 

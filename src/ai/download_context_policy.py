@@ -14,18 +14,15 @@ from src.core.models import Intent
 class DownloadContextPolicy:
     """Classify whether previous candidate context should be used.
 
-    Pending candidate/result-set context is powerful for follow-ups like
-    "queue the second one".  It is dangerous for fresh acquisition requests like
+    Pending candidate/result-set context is powerful when the user cites stable
+    candidate/result handles. It is dangerous for fresh acquisition requests like
     "grab <title> in Italian": the model may answer from stale candidates instead
-    of running a new search.  Keep this policy intentionally small and generic.
+    of running a new search. Keep this policy intentionally small and generic;
+    do not add natural-language confirmation/ordinal phrase lists here.
     """
 
     _ACQUIRE_RE = re.compile(
         r"\b(download|grab|get|fetch|find|search|look\s+for|queue|add|scarica|prendi|cerca|trova|metti)\b",
-        re.I,
-    )
-    _FOLLOWUP_RE = re.compile(
-        r"\b(that|this|those|these|it|one|ones|first|second|third|option|candidate|result|pack|same|yes|ok|okay|queue\s+it|download\s+it|quello|questa|questo|prima|seconda|terza)\b",
         re.I,
     )
     _CANDIDATE_ID_RE = re.compile(r"\b[a-f0-9]{12,24}\b", re.I)
@@ -90,15 +87,19 @@ class DownloadContextPolicy:
     def _is_candidate_followup(cls, text: str) -> bool:
         if cls._CANDIDATE_ID_RE.search(text):
             return True
-        words = re.findall(r"[\wÀ-ÿ']+", text, flags=re.UNICODE)
-        if len(words) <= 5 and cls._FOLLOWUP_RE.search(text):
+        # Stable result handles are safe across languages and do not require a
+        # hidden English/Italian follow-up parser.
+        if re.search(r"\b(?:candidate_id|result_set_id|candidate|result)[\s:=#-]*[A-Za-z0-9_-]{2,}\b", text, re.I):
             return True
+        if re.search(r"(?:^|\s)#\d{1,3}(?:\s|$)", text):
+            return True
+        words = re.findall(r"[\wÀ-ÿ']+", text, flags=re.UNICODE)
         # Short quality/resolution refinements such as "get the 720 version"
         # are selections against the visible candidate workspace, not fresh
         # media discovery.  This test is intentionally format/token based
         # rather than title/category specific.
         if len(words) <= 7 and cls._QUALITY_SELECTOR_RE.search(text):
             return True
-        # Longer messages can still be follow-ups if they explicitly mention a
-        # candidate/result handle rather than a fresh title request.
-        return bool(re.search(r"\b(candidate|result_set|result set|candidate_id|option\s+\d+)\b", text, re.I))
+        # Longer messages can still be follow-ups only when they explicitly
+        # mention structured handles rather than a natural-language ordinal.
+        return bool(re.search(r"\b(?:candidate_id|result_set_id|result_set)\b", text, re.I))

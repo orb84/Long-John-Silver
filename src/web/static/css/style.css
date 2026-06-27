@@ -3229,3 +3229,56 @@ body {
     font-size: .68rem;
   }
 }
+
+/* ─── Round 260: long-running tab frontend performance guardrails ─── */
+.view:not(.active) {
+  display: none;
+}
+.view.active {
+  display: flex;
+  content-visibility: auto;
+  contain-intrinsic-size: 900px 1200px;
+}
+.ljs-background-tab .bubble,
+.ljs-perf-low-power .bubble,
+.ljs-background-tab .bubbles-container,
+.ljs-perf-low-power .bubbles-container {
+  display: none !important;
+}
+.ljs-background-tab .ocean-bg,
+.ljs-perf-low-power .ocean-bg {
+  animation: none !important;
+  transform: none !important;
+}
+.ljs-background-tab .persona-avatar,
+.ljs-perf-low-power .persona-avatar,
+.ljs-background-tab .progress-fill::after,
+.ljs-perf-low-power .progress-fill::after,
+.ljs-background-tab .pulse-dot,
+.ljs-perf-low-power .pulse-dot {
+  animation: none !important;
+}
+.ljs-background-tab .glass-panel,
+.ljs-perf-low-power .glass-panel,
+.ljs-background-tab .card-title-banner,
+.ljs-perf-low-power .card-title-banner,
+.ljs-background-tab .modal-content,
+.ljs-perf-low-power .modal-content {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+.ljs-background-tab *,
+.ljs-perf-low-power * {
+  transition-duration: 0.01ms !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .bubble,
+  .ocean-bg,
+  .persona-avatar,
+  .progress-fill::after,
+  .pulse-dot,
+  .dl-pending-loader i,
+  .loading-spinner {
+    animation: none !important;
+  }
+}

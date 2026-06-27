@@ -31,10 +31,15 @@ class TvWorkflowMixin:
 
 
     def candidate_requires_user_language_confirmation(self, result: Any, item: Any, unit_label: str | None, preferred_language: str | None) -> bool:
-        """Return True when a torrent candidate is visibly not the preferred TV audio language."""
+        """Return True when a TV candidate cannot prove the preferred audio language.
+
+        Background TV automation must fail closed. A release title with no
+        language evidence is fine to show the user, but it is not safe to
+        auto-queue when the tracked show has an explicit language preference.
+        """
         language = str(preferred_language or self._preferred_media_language(item, type("Ctx", (), {"settings": object()})())).strip()
         status = self._candidate_language_status(str(getattr(result, "title", "") or ""), language)
-        return status == "non_preferred"
+        return status in {"non_preferred", "unknown"}
 
     async def handle_release_event(
         self,
@@ -60,6 +65,12 @@ class TvWorkflowMixin:
             logger.info("TV release event ignored for %s: no concrete unit in %r", title, unit_label)
             return {"status": "ignored", "reason": "no_concrete_tv_unit", "unit_label": unit_label}
 
+        requirements = self._release_watch_requirements(item, context) if hasattr(self, "_release_watch_requirements") else {}
+        search_allowed = self.release_watch_search_allowed(item, requirements, getattr(context, "settings", None)) if hasattr(self, "release_watch_search_allowed") else True
+        if not search_allowed:
+            logger.info("TV release event ignored for %s %s: background search disabled by item policy", title, unit_key)
+            return {"status": "ignored", "reason": "background_search_disabled", "unit_key": unit_key}
+
         downloaded = await self._downloaded_episode_keys(context, title)
         if (season, episode) in downloaded:
             return {"status": "ignored", "reason": "already_downloaded", "unit_key": unit_key}
@@ -69,7 +80,7 @@ class TvWorkflowMixin:
         candidate_title = str(source_result.get("title") or "")
         language_status = self._candidate_language_status(candidate_title, preferred_language)
         item_auto = getattr(item, "auto_download", None)
-        can_auto = bool(item_auto) and frontier and language_status == "preferred"
+        can_auto = item_auto is True and frontier and language_status == "preferred"
         action_arguments: dict[str, Any] = {"item_id": title, "season": season, "episode": episode}
         source_magnet = str(source_result.get("magnet") or "")
         if source_magnet:
@@ -345,21 +356,36 @@ class TvWorkflowMixin:
     def _candidate_language_status(title: str, preferred_language: str) -> str:
         """Return preferred/non_preferred/unknown from release-title evidence only.
 
-        Subtitles are not audio fallbacks, and Spanish is never inferred as an
-        acceptable media fallback from subtitle settings.
+        Subtitles are not audio fallbacks. Unknown language evidence is kept as
+        unknown so background TV automation can ask instead of guessing.
         """
-        text = f" {title.casefold()} "
-        pref = preferred_language.casefold().strip()
-        preferred_markers = {
-            "italian": [" ita ", ".ita.", " italian ", " italiano ", " iTa ".casefold()],
-            "english": [" eng ", ".eng.", " english "],
-        }.get(pref, [f" {pref} ", f".{pref}."])
-        if any(marker in text for marker in preferred_markers):
+        import re
+
+        text = f" {re.sub(r'[^a-z0-9]+', ' ', str(title or '').casefold())} "
+        raw_pref = str(preferred_language or "").casefold()
+        pref_tokens = [token.strip() for token in re.split(r"[,/;|+]+|\band\b|\be\b", raw_pref) if token.strip()]
+        aliases = {
+            "ita": "italian",
+            "italiano": "italian",
+            "italian": "italian",
+            "eng": "english",
+            "english": "english",
+        }
+        canonical_prefs = {aliases.get(token, token) for token in pref_tokens if token}
+        marker_map = {
+            "italian": [" ita ", " italian ", " italiano "],
+            "english": [" eng ", " english "],
+            "spanish": [" spa ", " spanish ", " latino "],
+            "hindi": [" hin ", " hindi "],
+        }
+        if not canonical_prefs:
+            return "unknown"
+        if any(marker in text for pref in canonical_prefs for marker in marker_map.get(pref, [f" {pref} "])):
             return "preferred"
-        if any(marker in text for marker in [" multi ", ".multi.", " multi-audio ", " dlmux ", " mux "]):
+        if any(marker in text for marker in [" multi ", " multi audio ", " dual audio ", " dlmux ", " mux "]):
             return "preferred"
-        non_pref_markers = [" hindi ", " hin ", ".hin.", " spanish ", " spa ", ".spa.", " latino "]
-        if any(marker in text for marker in non_pref_markers):
+        detected_known_language = any(marker in text for markers in marker_map.values() for marker in markers)
+        if detected_known_language:
             return "non_preferred"
         return "unknown"
 
@@ -449,6 +475,15 @@ class TvWorkflowMixin:
                 ),
             ],
         )
+
+    def build_torrent_selection_guidance(self) -> str:
+        """Return TV torrent guidance from the category prompt-file skill."""
+        skill = self.prompt_file_torrent_skill()
+        return (
+            "TV torrent-selection skill is category-owned. Use the prompt-file sections below as the source of truth; "
+            "do not rely on generic video or pack heuristics when they conflict with these rules.\n"
+            f"{skill}"
+        ).strip()
 
     def ui_sections(self) -> list[CategoryUiSection]:
         """Return UI sections for TV dashboards and item details."""
@@ -937,29 +972,71 @@ class TvWorkflowMixin:
         if workflow_name in {"download_next_missing_episode", "download_next_missing_unit", "scheduled_check"}:
             if not title:
                 return self._workflow_failed(workflow_name, "A TV item id is required.")
-            progress = await context.db.media.get_item_progress(self.category_id, title) or {}
-            season = int(arguments.get("season") or progress.get("last_season") or 1)
-            episode = int(arguments.get("episode") or progress.get("last_episode") or 0) + 1
             tracked = next(
                 (tracked_item for tracked_item in getattr(context.settings, "tracked_items", [])
                  if getattr(tracked_item, "item_type", None) == self.category_id and tracked_item.key == title),
                 None,
             )
             item = tracked or self.create_item(title, language=getattr(context.settings, "language", "English"))
-            # Scheduled checks must respect global/per-item auto_download settings.
-            # Explicit user workflows may force queueing; background checks may not.
-            force_download = workflow_name != "scheduled_check"
+            if workflow_name == "scheduled_check":
+                if hasattr(self, "background_discovery_allowed") and not self.background_discovery_allowed(item, context.settings):
+                    return ActionReceipt(
+                        category_id=self.category_id,
+                        action_name=workflow_name,
+                        status="success",
+                        user_message=f"TV scheduled workflow skipped for {title}; auto-download is off.",
+                        data={"queued": False, "reason": "auto_download_off"},
+                    )
+                plan = await self.build_watch_plan(item, context) if hasattr(self, "build_watch_plan") else None
+                watch_units = [str(getattr(watch, "unit_key", "") or "") for watch in getattr(plan, "release_watches", []) or []]
+                unit_key = next((unit for unit in watch_units if unit), "")
+                season, episode = self._unit_coordinates(unit_key)
+                if not unit_key or not season or not episode:
+                    return ActionReceipt(
+                        category_id=self.category_id,
+                        action_name=workflow_name,
+                        status="success",
+                        user_message=f"TV scheduled workflow found no concrete released unit for {title}.",
+                        data={"queued": False, "reason": "no_category_watch_unit"},
+                    )
+                ok = await context.pipeline.run_discovery(item, episode_label=unit_key, force=False)
+                return ActionReceipt(
+                    category_id=self.category_id,
+                    action_name=workflow_name,
+                    status="success" if ok else "partial",
+                    user_message=f"TV scheduled workflow completed for {title}.",
+                    data={"queued": ok, "season": season, "episode": episode, "unit_key": unit_key, "auto_download_respected": True},
+                )
+            explicit_season = arguments.get("season")
+            explicit_episode = arguments.get("episode")
+            if explicit_season and explicit_episode:
+                season = int(explicit_season)
+                episode = int(explicit_episode)
+                unit_key = f"S{season:02d}E{episode:02d}"
+            else:
+                plan = await self.build_watch_plan(item, context) if hasattr(self, "build_watch_plan") else None
+                watch_units = [str(getattr(watch, "unit_key", "") or "") for watch in getattr(plan, "release_watches", []) or []]
+                unit_key = next((unit for unit in watch_units if unit), "")
+                season, episode = self._unit_coordinates(unit_key)
+                if not unit_key or not season or not episode:
+                    return ActionReceipt(
+                        category_id=self.category_id,
+                        action_name=workflow_name,
+                        status="partial",
+                        user_message=f"TV workflow found no concrete released/missing unit for {title}.",
+                        data={"queued": False, "reason": "no_category_watch_unit", "auto_download_respected": False},
+                    )
             ok = await context.pipeline.run_discovery(
                 item,
-                episode_label=f"S{season:02d}E{episode:02d}",
-                force=force_download,
+                episode_label=unit_key,
+                force=True,
             )
             return ActionReceipt(
                 category_id=self.category_id,
                 action_name=workflow_name,
                 status="success" if ok else "partial",
-                user_message=f"TV scheduled workflow completed for {title}.",
-                data={"queued": ok, "season": season, "episode": episode, "auto_download_respected": not force_download},
+                user_message=f"TV workflow completed for {title}.",
+                data={"queued": ok, "season": season, "episode": episode, "unit_key": unit_key, "auto_download_respected": False},
             )
 
         if workflow_name in {"search_download_candidates", "search_upgrade"}:
@@ -988,7 +1065,7 @@ class TvWorkflowMixin:
                     category_id=self.category_id,
                     affected_paths=affected_paths,
                     risk_level="destructive",
-                    user_message=f"Confirm deletion of {title}. Files will be quarantined, not permanently removed.",
+                    user_message=f"Confirm deletion of {title}. Files will be permanently deleted from disk if delete_files is enabled.",
                 )
                 return self._confirmation_service.receipt_for_request(request)
             token = str(arguments.get("confirmation_token") or "")
@@ -1010,7 +1087,7 @@ class TvWorkflowMixin:
                 status="success",
                 user_message=f"Deleted TV item {title}.",
                 changed_entities=[ChangedEntity(entity_type="category_item", entity_id=title, display_name=title, change="deleted")],
-                data={"files_quarantined": files_deleted, "affected_paths": affected_paths},
+                data={"files_deleted": files_deleted, "affected_paths": affected_paths},
             )
 
         return self._workflow_failed(workflow_name, f"Unsupported TV workflow: {workflow_name}")

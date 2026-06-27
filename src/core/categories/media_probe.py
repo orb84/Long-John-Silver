@@ -3,7 +3,7 @@ Gentle media metadata probing for local library scans.
 
 The library scanner needs actual stream metadata (audio/subtitle languages,
 video codec, runtime, bitrate) but must not stampede the user's disk.  This
-module centralizes ffprobe usage behind a process-wide semaphore and an
+module centralizes ffprobe usage behind a serialized service and an
 unchanged-file cache so category scanners can enrich local file observations
 without each category inventing its own probing behavior.
 """
@@ -25,12 +25,6 @@ _CACHE_PATH = Path("data/cache/media_probe_cache.json")
 _PROBE_TIMEOUT_SECONDS = 15.0
 _MAX_CACHE_ENTRIES = 20000
 _PROBE_PARSER_VERSION = 3
-_probe_semaphore: asyncio.Semaphore | None = None
-_cache_lock: asyncio.Lock | None = None
-_cache_loaded = False
-_cache_dirty = False
-_cache: dict[str, dict[str, Any]] = {}
-_ffprobe_available: bool | None = None
 
 _ISO_LANGUAGE_MAP: dict[str, str] = {
     "ita": "Italian",
@@ -79,6 +73,129 @@ _ISO_LANGUAGE_MAP: dict[str, str] = {
 _UNKNOWN_LANGUAGE_CODES = {"", "und", "unk", "unknown", "none", "mul"}
 
 
+class MediaProbeValueParser:
+    """Small value conversions shared by media probe parsing and cache reads."""
+
+    @staticmethod
+    def unique(values: Iterable[str]) -> list[str]:
+        """Return unique non-empty strings while preserving order."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+        return out
+
+    @staticmethod
+    def safe_int(value: Any) -> int | None:
+        """Convert ffprobe/cache numeric values to int when possible."""
+        try:
+            if value is None or value == "":
+                return None
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def safe_float(value: Any) -> float | None:
+        """Convert ffprobe/cache numeric values to float when possible."""
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+
+class MediaProbeResolution:
+    """Resolution labels derived only from probed video dimensions."""
+
+    @staticmethod
+    def label_from_dimensions(width: Any, height: Any) -> str | None:
+        """Return a conventional resolution label from video stream dimensions.
+
+        File size is deliberately ignored here. Size/duration can estimate bitrate;
+        it cannot identify video resolution. Width thresholds handle cropped
+        widescreen files where ffprobe reports e.g. 1920x800 for a 1080p source.
+        """
+        w = MediaProbeValueParser.safe_int(width) or 0
+        h = MediaProbeValueParser.safe_int(height) or 0
+        if h >= 2000 or w >= 3800:
+            return "2160p"
+        if h >= 1000 or w >= 1900:
+            return "1080p"
+        if h >= 700 or w >= 1200:
+            return "720p"
+        if h >= 400 or w >= 700:
+            return "480p"
+        return None
+
+    @staticmethod
+    def label_from_payload(probe: dict[str, Any] | None) -> str | None:
+        """Return a resolution label from serialized ffprobe payload dimensions."""
+        if not isinstance(probe, dict):
+            return None
+        return MediaProbeResolution.label_from_dimensions(
+            probe.get("width") or probe.get("video_width"),
+            probe.get("height") or probe.get("video_height"),
+        )
+
+
+class MediaProbeLanguageNormalizer:
+    """Normalize ffprobe language tags and loose audio/subtitle track titles."""
+
+    _TOKEN_HINTS = [
+        ("italian", "Italian"), ("italiano", "Italian"), (" ita", "Italian"), ("ita ", "Italian"),
+        ("english", "English"), (" inglese", "English"), (" eng", "English"), ("eng ", "English"),
+        ("french", "French"), ("français", "French"), (" francais", "French"),
+        ("german", "German"), ("deutsch", "German"),
+        ("spanish", "Spanish"), ("español", "Spanish"), ("espanol", "Spanish"),
+        ("japanese", "Japanese"), ("jpn", "Japanese"),
+        ("korean", "Korean"), ("kor", "Korean"),
+        ("chinese", "Chinese"), ("mandarin", "Chinese"), ("cantonese", "Chinese"),
+        ("portuguese", "Portuguese"), ("russian", "Russian"), ("polish", "Polish"),
+        ("dutch", "Dutch"), ("swedish", "Swedish"), ("norwegian", "Norwegian"),
+        ("danish", "Danish"), ("finnish", "Finnish"),
+    ]
+
+    @staticmethod
+    def name(raw: Any) -> str:
+        """Return a display language name for an ISO-ish ffprobe tag."""
+        text = str(raw or "").strip().lower()
+        if text in _UNKNOWN_LANGUAGE_CODES:
+            return ""
+        return _ISO_LANGUAGE_MAP.get(text, text.capitalize() if text else "")
+
+    @classmethod
+    def from_tags(cls, tags: dict[str, Any]) -> str:
+        """Return a language from ffprobe tags, including loose title hints.
+
+        Many local files have audio streams tagged as ``und`` even though the
+        track title says things like ``Italian DTS 5.1`` or ``English AAC``.
+        Filename language guesses are not good enough for library ownership, so
+        stream tags are parsed more carefully before falling back to unknown.
+        """
+        direct = cls.name(tags.get("language"))
+        if direct:
+            return direct
+        haystack = " ".join(str(tags.get(key) or "") for key in ("title", "handler_name", "variant_bitrate"))
+        lower = haystack.lower()
+        padded = f" {lower} "
+        for token, language in cls._TOKEN_HINTS:
+            if token.strip() in {"ita", "eng"}:
+                if token in padded:
+                    return language
+            elif token in lower:
+                return language
+        return ""
+
+
 @dataclass(slots=True)
 class AudioTrackInfo:
     """One audio stream extracted from ffprobe metadata."""
@@ -120,12 +237,12 @@ class MediaProbeInfo:
     @property
     def audio_languages(self) -> list[str]:
         """Return unique known audio languages preserving stream order."""
-        return _unique(track.language for track in self.audio_tracks if track.language)
+        return MediaProbeValueParser.unique(track.language for track in self.audio_tracks if track.language)
 
     @property
     def subtitle_languages(self) -> list[str]:
         """Return unique known subtitle languages preserving stream order."""
-        return _unique(track.language for track in self.subtitle_tracks if track.language)
+        return MediaProbeValueParser.unique(track.language for track in self.subtitle_tracks if track.language)
 
     @property
     def primary_audio_language(self) -> str:
@@ -134,15 +251,8 @@ class MediaProbeInfo:
 
     @property
     def video_resolution_label(self) -> str:
-        """Return a conventional resolution label from probed video dimensions.
-
-        This is intentionally derived from ffprobe stream width/height, not
-        file size. File size plus duration can estimate bitrate, but it cannot
-        tell whether a file is 720p, 1080p, or 2160p. Width checks are included
-        because many cropped films have heights such as 800px while still being
-        1080p releases.
-        """
-        return resolution_label_from_dimensions(self.width, self.height) or ""
+        """Return a conventional resolution label from probed video dimensions."""
+        return MediaProbeResolution.label_from_dimensions(self.width, self.height) or ""
 
     def language_display(self) -> str:
         """Return a compact display string for all known audio languages."""
@@ -182,7 +292,7 @@ class MediaProbeInfo:
                 language=str(row.get("language") or ""),
                 codec=str(row.get("codec") or ""),
                 title=str(row.get("title") or ""),
-                channels=_safe_int(row.get("channels")),
+                channels=MediaProbeValueParser.safe_int(row.get("channels")),
             )
             for row in list(data.get("audio_tracks") or [])
             if isinstance(row, dict)
@@ -201,11 +311,11 @@ class MediaProbeInfo:
             path=str(data.get("path") or ""),
             size_bytes=int(data.get("size_bytes") or 0),
             mtime_ns=int(data.get("mtime_ns") or 0),
-            duration_seconds=_safe_float(data.get("duration_seconds")),
-            bit_rate_kbps=_safe_int(data.get("bit_rate_kbps")),
+            duration_seconds=MediaProbeValueParser.safe_float(data.get("duration_seconds")),
+            bit_rate_kbps=MediaProbeValueParser.safe_int(data.get("bit_rate_kbps")),
             video_codecs=[str(v) for v in list(data.get("video_codecs") or []) if v],
-            width=_safe_int(data.get("width") or data.get("video_width")),
-            height=_safe_int(data.get("height") or data.get("video_height")),
+            width=MediaProbeValueParser.safe_int(data.get("width") or data.get("video_width")),
+            height=MediaProbeValueParser.safe_int(data.get("height") or data.get("video_height")),
             audio_tracks=audio_tracks,
             subtitle_tracks=subtitle_tracks,
             probed_at=str(data.get("probed_at") or ""),
@@ -213,242 +323,309 @@ class MediaProbeInfo:
         )
 
 
-def _get_probe_semaphore() -> asyncio.Semaphore:
-    """Return the process-wide probe semaphore.
+class MediaProbeProcessSuppressor:
+    """Tiny local suppressor to avoid leaking process-kill cleanup failures."""
 
-    One probe at a time is the safe default. ffprobe normally reads headers and
-    stream tables, but serializing it avoids a burst of random reads when a fresh
-    install scans a large library.
-    """
-    global _probe_semaphore
-    if _probe_semaphore is None:
-        _probe_semaphore = asyncio.Semaphore(1)
-    return _probe_semaphore
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return True
 
 
-def _get_cache_lock() -> asyncio.Lock:
-    """Return the process-wide cache lock."""
-    global _cache_lock
-    if _cache_lock is None:
-        _cache_lock = asyncio.Lock()
-    return _cache_lock
+class MediaProbeService:
+    """Serialized ffprobe runner with owned cache state and parsing policy."""
+
+    def __init__(
+        self,
+        *,
+        cache_path: Path = _CACHE_PATH,
+        timeout_seconds: float = _PROBE_TIMEOUT_SECONDS,
+        max_cache_entries: int = _MAX_CACHE_ENTRIES,
+        parser_version: int = _PROBE_PARSER_VERSION,
+        command_policy: CommandPolicy | None = None,
+    ) -> None:
+        self._cache_path = cache_path
+        self._timeout_seconds = timeout_seconds
+        self._max_cache_entries = max_cache_entries
+        self._parser_version = parser_version
+        self._command_policy = command_policy or CommandPolicy()
+        self._probe_semaphore: asyncio.Semaphore | None = None
+        self._cache_lock: asyncio.Lock | None = None
+        self._cache_loaded = False
+        self._cache_dirty = False
+        self._cache: dict[str, dict[str, Any]] = {}
+        self._ffprobe_available: bool | None = None
+
+    def cache_is_current(self, cached: dict[str, Any] | None, size_bytes: int, mtime_ns: int) -> bool:
+        """Return true when a cached probe can be trusted by this parser version."""
+        if not cached:
+            return False
+        if int(cached.get("size_bytes") or 0) != size_bytes or int(cached.get("mtime_ns") or 0) != mtime_ns:
+            return False
+        return int(cached.get("parser_version") or 0) >= self._parser_version
+
+    async def flush_cache(self) -> None:
+        """Persist cache updates in one small write after a scan batch."""
+        async with self._get_cache_lock():
+            if not self._cache_dirty:
+                return
+            try:
+                self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+                entries = list(self._cache.items())[-self._max_cache_entries:]
+                payload = {
+                    "schema_version": 1,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "files": dict(entries),
+                }
+                await asyncio.to_thread(
+                    self._cache_path.write_text,
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                self._cache_dirty = False
+            except Exception as exc:
+                logger.debug(f"Failed to save media probe cache: {exc}")
+
+    async def probe_file(self, path: Path) -> MediaProbeInfo | None:
+        """Return stream metadata for one file using a serialized, cached ffprobe."""
+        await self._load_cache()
+        normalized = Path(path).expanduser()
+        signature = self._stat_signature(normalized)
+        if signature is None:
+            return None
+        size_bytes, mtime_ns = signature
+        cache_key = str(normalized.resolve(strict=False))
+
+        cached = self._cache.get(cache_key)
+        if self.cache_is_current(cached, size_bytes, mtime_ns):
+            return MediaProbeInfo.from_dict(cached)
+        if self._ffprobe_available is False:
+            return None
+
+        async with self._get_probe_semaphore():
+            if self._ffprobe_available is False:
+                return None
+            cached = self._cache.get(cache_key)
+            if self.cache_is_current(cached, size_bytes, mtime_ns):
+                return MediaProbeInfo.from_dict(cached)
+
+            info = await self._run_ffprobe(normalized, size_bytes=size_bytes, mtime_ns=mtime_ns)
+            if info is not None:
+                self._cache[cache_key] = info.to_dict()
+                self._cache_dirty = True
+            return info
+
+    async def probe_files_serial(self, paths: Iterable[Path]) -> dict[str, MediaProbeInfo]:
+        """Probe files sequentially and flush cache once."""
+        results: dict[str, MediaProbeInfo] = {}
+        try:
+            for path in paths:
+                info = await self.probe_file(path)
+                if info is not None:
+                    results[str(Path(path).resolve(strict=False))] = info
+        finally:
+            await self.flush_cache()
+        return results
+
+    async def _load_cache(self) -> None:
+        """Load the media probe cache once per process."""
+        async with self._get_cache_lock():
+            if self._cache_loaded:
+                return
+            try:
+                if self._cache_path.exists():
+                    text = await asyncio.to_thread(self._cache_path.read_text, encoding="utf-8")
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        self._cache = {
+                            str(k): v for k, v in parsed.get("files", parsed).items() if isinstance(v, dict)
+                        }
+            except Exception as exc:
+                logger.debug(f"Failed to load media probe cache: {exc}")
+                self._cache = {}
+            self._cache_loaded = True
+
+    async def _run_ffprobe(self, path: Path, *, size_bytes: int, mtime_ns: int) -> MediaProbeInfo | None:
+        """Launch ffprobe for one file and parse stream metadata."""
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(path),
+        ]
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await self._command_policy.create_subprocess_exec(
+                cmd,
+                purpose="media_probe.ffprobe",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self._timeout_seconds)
+            self._ffprobe_available = True
+            if proc.returncode != 0:
+                return MediaProbeInfo(
+                    path=str(path),
+                    size_bytes=size_bytes,
+                    mtime_ns=mtime_ns,
+                    probe_status=f"ffprobe_exit_{proc.returncode}",
+                    probed_at=datetime.now(timezone.utc).isoformat(),
+                )
+            data = json.loads(stdout or b"{}")
+            return self.parse_probe_payload(data, path=path, size_bytes=size_bytes, mtime_ns=mtime_ns)
+        except asyncio.TimeoutError:
+            if proc is not None:
+                with MediaProbeProcessSuppressor():
+                    proc.kill()
+            logger.warning(f"Media probe timed out for {path.name}; skipping stream metadata for this scan")
+            return MediaProbeInfo(
+                path=str(path),
+                size_bytes=size_bytes,
+                mtime_ns=mtime_ns,
+                probe_status="timeout",
+                probed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except FileNotFoundError:
+            self._ffprobe_available = False
+            logger.warning("ffprobe is not installed; stream language extraction is unavailable")
+            return None
+        except Exception as exc:
+            logger.debug(f"Media probe failed for {path.name}: {exc}")
+            return MediaProbeInfo(
+                path=str(path),
+                size_bytes=size_bytes,
+                mtime_ns=mtime_ns,
+                probe_status="error",
+                probed_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+    def parse_probe_payload(self, data: dict[str, Any], *, path: Path, size_bytes: int, mtime_ns: int) -> MediaProbeInfo:
+        """Parse one ffprobe JSON payload into stable stream facts."""
+        format_info = data.get("format") if isinstance(data.get("format"), dict) else {}
+        streams = data.get("streams") if isinstance(data.get("streams"), list) else []
+        audio_tracks: list[AudioTrackInfo] = []
+        subtitle_tracks: list[SubtitleTrackInfo] = []
+        video_codecs: list[str] = []
+        width: int | None = None
+        height: int | None = None
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            stream_type = str(stream.get("codec_type") or "")
+            tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
+            if stream_type == "audio":
+                audio_tracks.append(AudioTrackInfo(
+                    index=int(stream.get("index") or len(audio_tracks)),
+                    language=MediaProbeLanguageNormalizer.from_tags(tags),
+                    codec=str(stream.get("codec_name") or ""),
+                    title=str(tags.get("title") or tags.get("handler_name") or ""),
+                    channels=MediaProbeValueParser.safe_int(stream.get("channels")),
+                ))
+            elif stream_type == "subtitle":
+                subtitle_tracks.append(SubtitleTrackInfo(
+                    index=int(stream.get("index") or len(subtitle_tracks)),
+                    language=MediaProbeLanguageNormalizer.from_tags(tags),
+                    codec=str(stream.get("codec_name") or ""),
+                    title=str(tags.get("title") or tags.get("handler_name") or ""),
+                ))
+            elif stream_type == "video":
+                codec = str(stream.get("codec_name") or "").lower()
+                if codec:
+                    video_codecs.append(codec)
+                width = width or MediaProbeValueParser.safe_int(stream.get("width"))
+                height = height or MediaProbeValueParser.safe_int(stream.get("height"))
+        bit_rate = MediaProbeValueParser.safe_int(format_info.get("bit_rate"))
+        return MediaProbeInfo(
+            path=str(path),
+            size_bytes=size_bytes,
+            mtime_ns=mtime_ns,
+            duration_seconds=MediaProbeValueParser.safe_float(format_info.get("duration")),
+            bit_rate_kbps=int(bit_rate / 1000) if bit_rate else None,
+            video_codecs=MediaProbeValueParser.unique(video_codecs),
+            width=width,
+            height=height,
+            audio_tracks=audio_tracks,
+            subtitle_tracks=subtitle_tracks,
+            probed_at=datetime.now(timezone.utc).isoformat(),
+            probe_status="ok",
+        )
+
+    def _get_probe_semaphore(self) -> asyncio.Semaphore:
+        """Return the owned probe semaphore."""
+        if self._probe_semaphore is None:
+            self._probe_semaphore = asyncio.Semaphore(1)
+        return self._probe_semaphore
+
+    def _get_cache_lock(self) -> asyncio.Lock:
+        """Return the owned cache lock."""
+        if self._cache_lock is None:
+            self._cache_lock = asyncio.Lock()
+        return self._cache_lock
+
+    @staticmethod
+    def _stat_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+            return int(stat.st_size), int(stat.st_mtime_ns)
+        except OSError:
+            return None
 
 
+_DEFAULT_MEDIA_PROBE_SERVICE = MediaProbeService()
+
+
+# Backwards-compatible module API. The wrappers intentionally contain no parsing
+# or cache policy; those responsibilities live on the classes above.
 def _unique(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        text = str(value or "").strip()
-        if not text:
-            continue
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(text)
-    return out
+    return MediaProbeValueParser.unique(values)
 
 
 def _safe_int(value: Any) -> int | None:
-    try:
-        if value is None or value == "":
-            return None
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
+    return MediaProbeValueParser.safe_int(value)
 
 
 def _safe_float(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return MediaProbeValueParser.safe_float(value)
 
 
 def resolution_label_from_dimensions(width: Any, height: Any) -> str | None:
-    """Return a resolution label from video stream dimensions only.
-
-    File size is deliberately ignored here. Size/duration can estimate bitrate;
-    it cannot identify video resolution. Width thresholds handle cropped
-    widescreen files where ffprobe reports e.g. 1920x800 for a 1080p source.
-    """
-    w = _safe_int(width) or 0
-    h = _safe_int(height) or 0
-    if h >= 2000 or w >= 3800:
-        return "2160p"
-    if h >= 1000 or w >= 1900:
-        return "1080p"
-    if h >= 700 or w >= 1200:
-        return "720p"
-    if h >= 400 or w >= 700:
-        return "480p"
-    return None
+    return MediaProbeResolution.label_from_dimensions(width, height)
 
 
 def resolution_label_from_probe_payload(probe: dict[str, Any] | None) -> str | None:
-    """Return resolution from serialized ffprobe payload dimensions."""
-    if not isinstance(probe, dict):
-        return None
-    return resolution_label_from_dimensions(
-        probe.get("width") or probe.get("video_width"),
-        probe.get("height") or probe.get("video_height"),
-    )
+    return MediaProbeResolution.label_from_payload(probe)
 
 
 def _language_name(raw: Any) -> str:
-    text = str(raw or "").strip().lower()
-    if text in _UNKNOWN_LANGUAGE_CODES:
-        return ""
-    return _ISO_LANGUAGE_MAP.get(text, text.capitalize() if text else "")
+    return MediaProbeLanguageNormalizer.name(raw)
 
 
 def _language_from_tags(tags: dict[str, Any]) -> str:
-    """Return a language from ffprobe tags, including loose track-title hints.
-
-    Many local files have audio streams tagged as ``und`` even though the track
-    title says things like ``Italian DTS 5.1`` or ``English AAC``.  Filename
-    language guesses are not good enough for library ownership, so stream tags
-    are parsed more carefully before falling back to unknown.
-    """
-    direct = _language_name(tags.get("language"))
-    if direct:
-        return direct
-    haystack = " ".join(str(tags.get(key) or "") for key in ("title", "handler_name", "variant_bitrate"))
-    lower = haystack.lower()
-    # Prefer longer/name tokens before short ISO tokens to avoid accidental hits.
-    token_map = [
-        ("italian", "Italian"), ("italiano", "Italian"), (" ita", "Italian"), ("ita ", "Italian"),
-        ("english", "English"), (" inglese", "English"), (" eng", "English"), ("eng ", "English"),
-        ("french", "French"), ("français", "French"), (" francais", "French"),
-        ("german", "German"), ("deutsch", "German"),
-        ("spanish", "Spanish"), ("español", "Spanish"), ("espanol", "Spanish"),
-        ("japanese", "Japanese"), ("jpn", "Japanese"),
-        ("korean", "Korean"), ("kor", "Korean"),
-        ("chinese", "Chinese"), ("mandarin", "Chinese"), ("cantonese", "Chinese"),
-        ("portuguese", "Portuguese"), ("russian", "Russian"), ("polish", "Polish"),
-        ("dutch", "Dutch"), ("swedish", "Swedish"), ("norwegian", "Norwegian"),
-        ("danish", "Danish"), ("finnish", "Finnish"),
-    ]
-    padded = f" {lower} "
-    for token, language in token_map:
-        if token.strip() in {"ita", "eng"}:
-            if token in padded:
-                return language
-        elif token in lower:
-            return language
-    return ""
+    return MediaProbeLanguageNormalizer.from_tags(tags)
 
 
 def _cached_probe_is_current(cached: dict[str, Any] | None, size_bytes: int, mtime_ns: int) -> bool:
-    """Return true when a cached probe can be trusted by this parser version."""
-    if not cached:
-        return False
-    if int(cached.get("size_bytes") or 0) != size_bytes or int(cached.get("mtime_ns") or 0) != mtime_ns:
-        return False
-    # Round 83 tightened probed video-dimension handling and resolution-source
-    # fields. Older cache rows are still stream probes, but rebuilding them lets
-    # canonical units reliably prefer ffprobe width/height over filename tags.
-    return int(cached.get("parser_version") or 0) >= _PROBE_PARSER_VERSION
+    return _DEFAULT_MEDIA_PROBE_SERVICE.cache_is_current(cached, size_bytes, mtime_ns)
 
 
 def _stat_signature(path: Path) -> tuple[int, int] | None:
-    try:
-        stat = path.stat()
-        return int(stat.st_size), int(stat.st_mtime_ns)
-    except OSError:
-        return None
-
-
-async def _load_cache() -> None:
-    """Load the media probe cache once per process."""
-    global _cache_loaded, _cache
-    async with _get_cache_lock():
-        if _cache_loaded:
-            return
-        try:
-            if _CACHE_PATH.exists():
-                text = await asyncio.to_thread(_CACHE_PATH.read_text, encoding="utf-8")
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    _cache = {str(k): v for k, v in parsed.get("files", parsed).items() if isinstance(v, dict)}
-        except Exception as exc:
-            logger.debug(f"Failed to load media probe cache: {exc}")
-            _cache = {}
-        _cache_loaded = True
+    return MediaProbeService._stat_signature(path)
 
 
 async def flush_probe_cache() -> None:
-    """Persist cache updates in one small write after a scan batch."""
-    global _cache_dirty
-    async with _get_cache_lock():
-        if not _cache_dirty:
-            return
-        try:
-            _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            # Keep cache bounded and biased toward most recently probed entries.
-            entries = list(_cache.items())[-_MAX_CACHE_ENTRIES:]
-            payload = {
-                "schema_version": 1,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "files": dict(entries),
-            }
-            await asyncio.to_thread(
-                _CACHE_PATH.write_text,
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            _cache_dirty = False
-        except Exception as exc:
-            logger.debug(f"Failed to save media probe cache: {exc}")
+    await _DEFAULT_MEDIA_PROBE_SERVICE.flush_cache()
 
 
 async def probe_media_file(path: Path) -> MediaProbeInfo | None:
-    """Return stream metadata for one file using a serialized, cached ffprobe.
-
-    The cache key includes absolute path, size, and mtime. If a file is unchanged
-    between scans, no subprocess is launched and the disk is not touched beyond a
-    cheap stat call.
-    """
-    await _load_cache()
-    normalized = Path(path).expanduser()
-    signature = _stat_signature(normalized)
-    if signature is None:
-        return None
-    size_bytes, mtime_ns = signature
-    cache_key = str(normalized.resolve(strict=False))
-
-    cached = _cache.get(cache_key)
-    if _cached_probe_is_current(cached, size_bytes, mtime_ns):
-        return MediaProbeInfo.from_dict(cached)
-
-    global _ffprobe_available
-    if _ffprobe_available is False:
-        return None
-
-    async with _get_probe_semaphore():
-        if _ffprobe_available is False:
-            return None
-        # Another waiting scan may have populated the cache while we waited.
-        cached = _cache.get(cache_key)
-        if _cached_probe_is_current(cached, size_bytes, mtime_ns):
-            return MediaProbeInfo.from_dict(cached)
-
-        info = await _run_ffprobe(normalized, size_bytes=size_bytes, mtime_ns=mtime_ns)
-        if info is not None:
-            global _cache_dirty
-            _cache[cache_key] = info.to_dict()
-            _cache_dirty = True
-        return info
+    return await _DEFAULT_MEDIA_PROBE_SERVICE.probe_file(path)
 
 
 async def probe_media_files_serial(paths: Iterable[Path]) -> dict[str, MediaProbeInfo]:
-    """Probe files sequentially and flush cache once.
-
-    This helper deliberately awaits each file in order.  It exists so category
-    scans do not accidentally create one ffprobe task per file.
-    """
     results: dict[str, MediaProbeInfo] = {}
     try:
         for path in paths:
@@ -460,122 +637,10 @@ async def probe_media_files_serial(paths: Iterable[Path]) -> dict[str, MediaProb
     return results
 
 
-async def _run_ffprobe(path: Path, *, size_bytes: int, mtime_ns: int) -> MediaProbeInfo | None:
-    """Launch ffprobe for one file and parse stream metadata."""
-    global _ffprobe_available
-    cmd = [
-        "ffprobe",
-        "-v",
-        "quiet",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        str(path),
-    ]
-    proc: asyncio.subprocess.Process | None = None
-    try:
-        proc = await CommandPolicy().create_subprocess_exec(
-            cmd,
-            purpose="media_probe.ffprobe",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_PROBE_TIMEOUT_SECONDS)
-        _ffprobe_available = True
-        if proc.returncode != 0:
-            return MediaProbeInfo(
-                path=str(path),
-                size_bytes=size_bytes,
-                mtime_ns=mtime_ns,
-                probe_status=f"ffprobe_exit_{proc.returncode}",
-                probed_at=datetime.now(timezone.utc).isoformat(),
-            )
-        data = json.loads(stdout or b"{}")
-        return _parse_probe_payload(data, path=path, size_bytes=size_bytes, mtime_ns=mtime_ns)
-    except asyncio.TimeoutError:
-        if proc is not None:
-            with contextlib_suppress_process_errors():
-                proc.kill()
-        logger.warning(f"Media probe timed out for {path.name}; skipping stream metadata for this scan")
-        return MediaProbeInfo(
-            path=str(path),
-            size_bytes=size_bytes,
-            mtime_ns=mtime_ns,
-            probe_status="timeout",
-            probed_at=datetime.now(timezone.utc).isoformat(),
-        )
-    except FileNotFoundError:
-        _ffprobe_available = False
-        logger.warning("ffprobe is not installed; stream language extraction is unavailable")
-        return None
-    except Exception as exc:
-        logger.debug(f"Media probe failed for {path.name}: {exc}")
-        return MediaProbeInfo(
-            path=str(path),
-            size_bytes=size_bytes,
-            mtime_ns=mtime_ns,
-            probe_status="error",
-            probed_at=datetime.now(timezone.utc).isoformat(),
-        )
-
-
-class contextlib_suppress_process_errors:
-    """Tiny local suppressor to avoid importing contextlib in hot code."""
-
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
-        return True
-
-
 def _parse_probe_payload(data: dict[str, Any], *, path: Path, size_bytes: int, mtime_ns: int) -> MediaProbeInfo:
-    format_info = data.get("format") if isinstance(data.get("format"), dict) else {}
-    streams = data.get("streams") if isinstance(data.get("streams"), list) else []
-    audio_tracks: list[AudioTrackInfo] = []
-    subtitle_tracks: list[SubtitleTrackInfo] = []
-    video_codecs: list[str] = []
-    width: int | None = None
-    height: int | None = None
-    for stream in streams:
-        if not isinstance(stream, dict):
-            continue
-        stream_type = str(stream.get("codec_type") or "")
-        tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
-        if stream_type == "audio":
-            audio_tracks.append(AudioTrackInfo(
-                index=int(stream.get("index") or len(audio_tracks)),
-                language=_language_from_tags(tags),
-                codec=str(stream.get("codec_name") or ""),
-                title=str(tags.get("title") or tags.get("handler_name") or ""),
-                channels=_safe_int(stream.get("channels")),
-            ))
-        elif stream_type == "subtitle":
-            subtitle_tracks.append(SubtitleTrackInfo(
-                index=int(stream.get("index") or len(subtitle_tracks)),
-                language=_language_from_tags(tags),
-                codec=str(stream.get("codec_name") or ""),
-                title=str(tags.get("title") or tags.get("handler_name") or ""),
-            ))
-        elif stream_type == "video":
-            codec = str(stream.get("codec_name") or "").lower()
-            if codec:
-                video_codecs.append(codec)
-            width = width or _safe_int(stream.get("width"))
-            height = height or _safe_int(stream.get("height"))
-    bit_rate = _safe_int(format_info.get("bit_rate"))
-    return MediaProbeInfo(
-        path=str(path),
+    return _DEFAULT_MEDIA_PROBE_SERVICE.parse_probe_payload(
+        data,
+        path=path,
         size_bytes=size_bytes,
         mtime_ns=mtime_ns,
-        duration_seconds=_safe_float(format_info.get("duration")),
-        bit_rate_kbps=int(bit_rate / 1000) if bit_rate else None,
-        video_codecs=_unique(video_codecs),
-        width=width,
-        height=height,
-        audio_tracks=audio_tracks,
-        subtitle_tracks=subtitle_tracks,
-        probed_at=datetime.now(timezone.utc).isoformat(),
-        probe_status="ok",
     )

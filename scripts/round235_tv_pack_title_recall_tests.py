@@ -39,7 +39,10 @@ class _Item:
 def test_media_title_repair_recovers_dropped_inner_stopword() -> None:
     prompt = "Can you please grab me A Knight of the Seven Kingdoms in italian ? Full first season"
     assert MediaTitleRepair.recover_literal_title("A Knight the Seven Kingdoms", prompt) == "A Knight of the Seven Kingdoms"
-    assert MediaTitleRepair.recover_literal_title("A Knight the Seven Kingdoms Season 1", prompt) == "A Knight of the Seven Kingdoms"
+    tv = _TvHarness()
+    normalized = tv.normalize_agent_search_name_argument("A Knight the Seven Kingdoms Season 1", user_prompt=prompt)
+    assert normalized == "A Knight the Seven Kingdoms"
+    assert MediaTitleRepair.recover_literal_title(normalized, prompt) == "A Knight of the Seven Kingdoms"
 
 
 def test_tv_title_match_allows_missing_stopword_but_not_single_token_article_titles() -> None:

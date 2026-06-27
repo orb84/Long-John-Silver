@@ -20,27 +20,42 @@ if TYPE_CHECKING:
     from src.integrations.tvmaze import TVMazeClient
 
 
-def _resolve_title(arguments: dict[str, Any]) -> str | None:
-    """Resolve a media title from common category-neutral argument names."""
-    for key in ("title", "query", "name", "item_name", "movie_name", "series_title", "q", "search"):
-        value = arguments.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    for value in arguments.values():
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
+class MetadataLookupArgumentNormalizer:
+    """Normalize agent-facing metadata lookup arguments without module helpers."""
 
+    _TITLE_ARGUMENT_KEYS = (
+        "title",
+        "query",
+        "name",
+        "item_name",
+        "movie_name",
+        "series_title",
+        "q",
+        "search",
+    )
 
-def _safe_int(value: Any) -> int | None:
-    """Convert common numeric inputs to int, returning ``None`` on failure."""
-    if isinstance(value, bool):
+    @classmethod
+    def resolve_title(cls, arguments: dict[str, Any]) -> str | None:
+        """Resolve a media title from common category-neutral argument names."""
+        for key in cls._TITLE_ARGUMENT_KEYS:
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in arguments.values():
+            if isinstance(value, str) and value.strip():
+                return value.strip()
         return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
+
+    @staticmethod
+    def safe_int(value: Any) -> int | None:
+        """Convert common numeric inputs to int, returning ``None`` on failure."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return None
 
 
 @dataclass(frozen=True)
@@ -61,7 +76,7 @@ class MetadataLookupRequest:
     @classmethod
     def from_arguments(cls, arguments: dict[str, Any]) -> "MetadataLookupRequest | dict[str, Any]":
         """Build a request or return a serializable validation error."""
-        query = _resolve_title(arguments)
+        query = MetadataLookupArgumentNormalizer.resolve_title(arguments)
         if not query:
             return {"ok": False, "error": "Missing required argument: query"}
 
@@ -77,8 +92,8 @@ class MetadataLookupRequest:
 
         question = str(arguments.get("question") or "").strip() or None
         coordinate_text = " ".join(v for v in (query, question or "") if v)
-        season = _safe_int(arguments.get("season")) or MetadataLookupRequest.infer_season_number(coordinate_text)
-        episode = _safe_int(arguments.get("episode")) or MetadataLookupRequest.infer_episode_number(coordinate_text)
+        season = MetadataLookupArgumentNormalizer.safe_int(arguments.get("season")) or MetadataLookupRequest.infer_season_number(coordinate_text)
+        episode = MetadataLookupArgumentNormalizer.safe_int(arguments.get("episode")) or MetadataLookupRequest.infer_episode_number(coordinate_text)
         include_episodes = bool(arguments.get("include_episodes", season is not None or episode is not None))
         question_blob = f"{query} {question or ''}".casefold()
         if not include_episodes and any(term in question_blob for term in (
@@ -97,8 +112,8 @@ class MetadataLookupRequest:
             query=query,
             media_type=media_type,
             service=service,
-            tmdb_id=_safe_int(arguments.get("tmdb_id")),
-            tvmaze_id=_safe_int(arguments.get("tvmaze_id")),
+            tmdb_id=MetadataLookupArgumentNormalizer.safe_int(arguments.get("tmdb_id")),
+            tvmaze_id=MetadataLookupArgumentNormalizer.safe_int(arguments.get("tvmaze_id")),
             season=season,
             episode=episode,
             question=question,

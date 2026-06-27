@@ -250,6 +250,19 @@ class TMDBMetadataEnricher(MetadataEnricher):
             logger.warning(f"TMDB enrich failed for show '{item_name}': {e}")
             return CategoryMediaMetadata(display_name=clean_release_title(item_name, fallback=item_name), enriched_at=now)
 
+    @staticmethod
+    def _safe_year_from_date(value: object) -> int | None:
+        """Extract a sane release year from a provider date string."""
+        text = str(value or "").strip()
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+        if not match:
+            return None
+        try:
+            year = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        return year if 1900 <= year <= 2100 else None
+
     async def enrich_feature(self, item_name: str) -> CategoryMediaMetadata | None:
         """Fetch feature-item metadata from TMDB."""
         now = datetime.now(timezone.utc).isoformat()
@@ -274,6 +287,9 @@ class TMDBMetadataEnricher(MetadataEnricher):
 
             return CategoryMediaMetadata(
                 display_name=details.get("title") or details.get("name") or clean_item_name,
+                original_title=details.get("original_title"),
+                title_aliases=list(details.get("title_aliases") or []),
+                localized_titles=list(details.get("localized_titles") or []),
                 tmdb_id=details.get("id"),
                 genres=details.get("genres", []),
                 overview=details.get("overview", ""),
@@ -284,6 +300,7 @@ class TMDBMetadataEnricher(MetadataEnricher):
                 rating=details.get("rating"),
                 vote_count=details.get("vote_count", 0),
                 first_release_date=details.get("release_date", ""),
+                release_year=self._safe_year_from_date(details.get("release_date")),
                 runtime_minutes=details.get("runtime_minutes"),
                 poster_path=details.get("poster_path", ""),
                 enriched_at=now,

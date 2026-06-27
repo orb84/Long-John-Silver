@@ -251,8 +251,8 @@ class TorrentRacer:
                 download_root = Path(getattr(self._downloader, "_download_dir", file_path.parent)).resolve()
                 resolver = SafePathResolver(allowed_roots=[download_root])
                 if file_path.exists():
-                    resolver.safe_unlink(file_path, purpose="torrent_race.cleanup", move_to_trash=True)
-                    logger.info(f"Race: quarantined partial file {file_path}")
+                    resolver.safe_unlink(file_path, purpose="torrent_race.cleanup", move_to_trash=False)
+                    logger.info(f"Race: deleted partial file {file_path}")
         except Exception as e:
             logger.debug(f"Race: could not clean up files for {download_id}: {e}")
 

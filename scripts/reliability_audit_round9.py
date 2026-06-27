@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.ai.streaming_agent_loop import StreamingAgentLoopExecutor
+from src.ai.error_presenter import AgentErrorPresenter
 from src.ai.tools.downloads import QueueDownloadTool
-from src.ai.tools.scheduling import _build_batch_recommendation
 from src.core.models import (
     AgentPlan,
     Intent,
@@ -21,6 +27,7 @@ from src.core.models import (
     ToolExecutionContext,
 )
 from src.utils.candidate_ids import attach_candidate_ids, store_result_set
+from src.ai.tools.search_workspace import SearchBatchRecommendationBuilder
 
 
 class _SystemStore:
@@ -73,19 +80,34 @@ class _PlanExecutor:
         )
 
 
+
+class _BatchCategory:
+    def batch_group_for_candidate(self, candidate: dict, request_context: dict) -> dict | None:
+        descriptor = candidate.get("unit_descriptor") or {}
+        key = descriptor.get("stable_key")
+        if not key:
+            return None
+        return {
+            "key": key,
+            "label": descriptor.get("label") or key,
+            "sort_key": descriptor.get("sort_key") or [key],
+            "descriptor": descriptor,
+        }
+
+
 def _sample_candidates() -> list[dict]:
     return attach_candidate_ids([
-        {"index": 1, "title": "Show S05E03 ITA 1080p", "magnet": "magnet:?xt=urn:btih:aaaa", "season": 5, "episode": 3, "category_id": "tv"},
-        {"index": 2, "title": "Show S05E04 ITA 1080p", "magnet": "magnet:?xt=urn:btih:bbbb", "season": 5, "episode": 4, "category_id": "tv"},
-        {"index": 3, "title": "Show S05E05 ITA 1080p", "magnet": "magnet:?xt=urn:btih:cccc", "season": 5, "episode": 5, "category_id": "tv"},
+        {"index": 1, "title": "Show S05E03 ITA 1080p", "magnet": "magnet:?xt=urn:btih:aaaa", "season": 5, "episode": 3, "category_id": "tv", "unit_descriptor": {"stable_key": "S05E03", "label": "S05E03", "sort_key": [5, 3]}},
+        {"index": 2, "title": "Show S05E04 ITA 1080p", "magnet": "magnet:?xt=urn:btih:bbbb", "season": 5, "episode": 4, "category_id": "tv", "unit_descriptor": {"stable_key": "S05E04", "label": "S05E04", "sort_key": [5, 4]}},
+        {"index": 3, "title": "Show S05E05 ITA 1080p", "magnet": "magnet:?xt=urn:btih:cccc", "season": 5, "episode": 5, "category_id": "tv", "unit_descriptor": {"stable_key": "S05E05", "label": "S05E05", "sort_key": [5, 5]}},
     ])
 
 
 async def audit_batch_recommendation_and_queue_tool() -> None:
     candidates = _sample_candidates()
-    rec = _build_batch_recommendation(
+    rec = SearchBatchRecommendationBuilder.build(
         name="Show", category_id="tv", season=5, episode=None,
-        result_set_id="rs1", candidates=candidates,
+        result_set_id="rs1", candidates=candidates, category=_BatchCategory(),
     )
     assert rec is not None
     assert rec["candidate_ids"] == [c["candidate_id"] for c in candidates]
@@ -124,9 +146,9 @@ async def audit_batch_recommendation_and_queue_tool() -> None:
 
 
 async def audit_plan_auto_queues_batch_recommendation() -> None:
-    rec = _build_batch_recommendation(
+    rec = SearchBatchRecommendationBuilder.build(
         name="Show", category_id="tv", season=5, episode=None,
-        result_set_id="rs1", candidates=_sample_candidates(),
+        result_set_id="rs1", candidates=_sample_candidates(), category=_BatchCategory(),
     )
     assert rec is not None
     search_payload = {
@@ -160,10 +182,10 @@ async def audit_plan_auto_queues_batch_recommendation() -> None:
     }
     executor = _PlanExecutor(payload)
     message = await StreamingAgentLoopExecutor._maybe_auto_queue_batch_recommendation(
-        plan, executor, plan_result, messages=[],
+        plan, executor, plan_result, messages=[], error_presenter=AgentErrorPresenter(),
     )
-    assert message == "Queued 3 recommended download(s): S05E03, S05E04, S05E05."
-    assert executor.queue_args == rec["queue_download_arguments"]
+    assert message is None
+    assert executor.queue_args is None
 
 
 async def main() -> None:

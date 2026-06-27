@@ -1,9 +1,8 @@
 """Generic repair helpers for LLM-provided media titles.
 
 The LLM sometimes optimizes a title for a search query and drops tiny title
-words (for example "A Knight the Seven Kingdoms" instead of the literal user
-phrase "A Knight of the Seven Kingdoms").  Search tooling should preserve the
-user's literal title when it can recover it generically from the current prompt.
+words from the user's literal phrase. Search tooling should preserve the user's
+literal title when it can recover it generically from the current prompt.
 """
 
 from __future__ import annotations
@@ -58,20 +57,15 @@ class MediaTitleRepair:
 
     @classmethod
     def _candidate_title_variants(cls, title: str) -> list[str]:
-        """Return progressively looser title candidates for prompt-span recovery.
+        """Return generic title candidates for prompt-span recovery.
 
-        LLMs sometimes pass a search-shaped title such as
-        ``A Knight the Seven Kingdoms Season 1`` while the user's prompt says
-        ``A Knight of the Seven Kingdoms ... full first season``.  The actual
-        media title should still be recoverable without knowing TV semantics.
+        This helper intentionally does not strip category-specific suffixes such
+        as seasons, volumes, albums, editions, or packs.  If a category needs to
+        normalize its own structured unit words before literal-title recovery,
+        it should do so through a category hook before this generic repair runs.
         """
-        base = str(title or "").strip()
-        variants: list[str] = []
-        for candidate in [base, re.sub(r"\b(?:season|series|full|complete|pack)\b\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)?\s*$", "", base, flags=re.IGNORECASE), re.sub(r"\bS\d{1,2}(?:E\d{1,2})?(?:[-_. ]*E?\d{1,2})?\b.*$", "", base, flags=re.IGNORECASE)]:
-            cleaned = str(candidate or "").strip(" \t\n\r.,;:!?()[]{}\"'")
-            if cleaned and cleaned not in variants:
-                variants.append(cleaned)
-        return variants
+        base = str(title or "").strip(" \t\n\r.,;:!?()[]{}\"'")
+        return [base] if base else []
 
     @classmethod
     def _recover_from_tokens(cls, title: str, prompt: str, *, significant_only: bool = False) -> str | None:

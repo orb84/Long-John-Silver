@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
 from types import SimpleNamespace
 from loguru import logger
 from src.core.models import CategoryItem, DownloadPriority, SearchResult, QualityProfile
+from src.core.library_objects import CanonicalLibraryObjectBuilder
 
 if TYPE_CHECKING:
     from src.search.aggregator import SearchAggregator
@@ -67,6 +68,7 @@ class SearchPipeline:
         self._categories = category_registry
         self._torrent_selection = torrent_selection
         self._settings_manager = settings_manager
+        self._library_objects = CanonicalLibraryObjectBuilder(db, category_registry)
         self._scheduler = None
 
     def set_scheduler(self, scheduler: object) -> None:
@@ -82,7 +84,13 @@ class SearchPipeline:
             settings=self._settings_manager.settings if self._settings_manager else None,
             settings_manager=self._settings_manager,
             category_registry=self._categories,
+            library_objects=self._library_objects,
+            library_object_builder=self._library_objects,
         )
+
+    def category_search_context(self) -> SimpleNamespace:
+        """Return the public category search context for scheduler/category checks."""
+        return self._category_search_context()
 
     async def run_search(
         self, item: CategoryItem, episode_label: str | None = None,
@@ -190,7 +198,7 @@ class SearchPipeline:
         # ranking facet: a strict first query such as "Show S05E10 ITA" may
         # return zero even though the exact episode exists under bare/MULTI
         # titles that should be presented or require confirmation.
-        if category and episode_label and not primary_timed_out:
+        if category and not primary_timed_out:
             alt_queries = category.build_alternative_search_queries(item, episode_label, target_lang)
             seen_queries = {query.strip().casefold()}
             alt_validated: list[SearchResult] = []
@@ -449,15 +457,18 @@ class SearchPipeline:
         Used by the scheduler and batch download endpoints.
         """
         settings = self._settings_manager.settings
-        item_auto = getattr(item, 'auto_download', None)
-        can_download = item_auto if item_auto is not None else settings.auto_download
-
-        if not can_download and not force:
-            logger.trace(f'Discovery: skipping {item.key} (auto_download disabled)')
-            return False
-
         category_id = item.item_type
         category = self._categories.get(category_id)
+
+        if category and hasattr(category, "background_discovery_allowed"):
+            can_download = bool(category.background_discovery_allowed(item, settings))
+        else:
+            item_auto = getattr(item, 'auto_download', None)
+            can_download = item_auto if item_auto is not None else settings.auto_download
+
+        if not can_download and not force:
+            logger.info(f'Discovery: skipping {item.key} {episode_label or ""} (category background discovery disabled)')
+            return False
 
         if category and await category.discovery_already_satisfied(item, episode_label, self._category_search_context()):
             logger.debug(f'Discovery: skipping {item.key} {episode_label or ""} (already satisfied by category library state)')

@@ -325,7 +325,8 @@ class AgentToolPolicy:
         """Return category workflow tool names filtered by risk and routed intent."""
         allowed: set[str] = set()
         for workflow in category.declare_workflows():
-            if intent is not None and workflow.intent != intent:
+            workflow_intent = getattr(workflow, "intent", None)
+            if intent is not None and workflow_intent != intent:
                 continue
             risk = workflow.risk_level
             if risk not in allowed_risks:

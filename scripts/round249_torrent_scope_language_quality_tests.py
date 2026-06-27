@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.ai.download_candidate_adjudicator import DownloadCandidateAdjudicator
-from src.ai.tools.scheduling import _quality_choice_policy
 from src.core.categories.tv import TvShowCategory
 from src.core.categories.tv_bundle import TVBundleKnowledge
+from src.ai.tools.search_workspace import SearchQualityChoicePolicy
 
 
 @dataclass
@@ -141,7 +141,7 @@ def test_tv_pack_workspace_accepts_adjacent_requested_season_range() -> None:
 
 
 def test_quality_policy_does_not_compare_different_episodes_as_alternatives() -> None:
-    policy = _quality_choice_policy([
+    policy = SearchQualityChoicePolicy.evaluate([
         _episode_candidate("s01e01", 1, 13483, 5_180_000_000),
         _episode_candidate("s01e04", 4, 1340, 537_081_088),
         _episode_candidate("s01e08", 8, 1300, 698_544_832),
@@ -150,7 +150,7 @@ def test_quality_policy_does_not_compare_different_episodes_as_alternatives() ->
 
 
 def test_quality_policy_still_compares_same_episode_variants() -> None:
-    policy = _quality_choice_policy([
+    policy = SearchQualityChoicePolicy.evaluate([
         _same_episode_variant("compact", 1300, 700_000_000),
         _same_episode_variant("remux", 13000, 6_000_000_000),
     ], {})
@@ -160,7 +160,7 @@ def test_quality_policy_still_compares_same_episode_variants() -> None:
 
 
 def test_quality_policy_collapses_equivalent_season_pack_mirrors() -> None:
-    policy = _quality_choice_policy([
+    policy = SearchQualityChoicePolicy.evaluate([
         _season_pack("adjacent-range", 3670, 15_139_760_128, 36),
         _season_pack("dash-range", 3683, 15_193_446_400, 6),
     ], {})
@@ -170,27 +170,29 @@ def test_quality_policy_collapses_equivalent_season_pack_mirrors() -> None:
 def test_download_prompts_apply_configured_language_silently() -> None:
     guidance = (ROOT / "src/ai/task_prompt_guidance.py").read_text(encoding="utf-8")
     assistant = (ROOT / "src/ai/assistant.py").read_text(encoding="utf-8")
-    assert "silently apply that preference" in guidance
-    assert "Do not ask whether the user wants other languages" in guidance
-    assert "Apply the configured media language as a constraint" in assistant
+    assert "configured media language" in guidance
+    assert "owning category's language-tag skill" in guidance
+    assert "Use category guidance for language-tag semantics" in assistant
 
 
-def test_adjudicator_language_and_scope_prompt_rules_are_explicit() -> None:
+def test_adjudicator_language_and_scope_prompt_rules_are_category_owned() -> None:
+    tv_guidance = TvShowCategory().build_torrent_selection_guidance()
     prompt = DownloadCandidateAdjudicator()._build_prompt(
         request={
             "user_prompt": "Can you please grab me For All Mankind season 1?",
             "effective_search": {"language": "English", "season": 1, "search_scope": "bundle_preferred"},
         },
         rows=[],
-        category_guidance="TV guidance",
+        category_guidance=tv_guidance,
         review_stage="budget_probe",
         chunk_index=1,
         chunk_count=1,
         context_limit_tokens=8192,
     )
-    assert "If the preferred/requested language is English, ITA+ENG/MULTI is a fallback only" in prompt
-    assert "S01e01 06" in prompt
-    assert "wrong seasons" in prompt
+    assert "Use the owning category guidance" in prompt
+    assert "If the configured language is English, ITA+ENG or MULTI is only a fallback" in prompt
+    assert "S01E01-06" in prompt
+    assert "TV full-season requests" not in prompt
 
 
 def main() -> None:
@@ -202,7 +204,7 @@ def main() -> None:
     test_quality_policy_still_compares_same_episode_variants()
     test_quality_policy_collapses_equivalent_season_pack_mirrors()
     test_download_prompts_apply_configured_language_silently()
-    test_adjudicator_language_and_scope_prompt_rules_are_explicit()
+    test_adjudicator_language_and_scope_prompt_rules_are_category_owned()
     print("round249_torrent_scope_language_quality_tests: OK")
 
 

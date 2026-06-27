@@ -21,6 +21,10 @@ class DownloadManager extends Component {
         this._pollTimer = null;
         this._expandedFilePanels = new Set();
         this._statMemory = new Map();
+        this._pendingStats = new Map();
+        this._statsFlushScheduled = false;
+        this._renderScheduled = false;
+        this._needsRenderOnVisible = false;
         
         if (this.gridContainer) {
             this._init();
@@ -33,15 +37,30 @@ class DownloadManager extends Component {
      */
     _init() {
         // Subscribe to central WebSocket push events
-        shipEvents.subscribe('dl_stats', (e) => this._updateStats(e.id, e.stats));
+        shipEvents.subscribe('dl_stats', (e) => this._queueStatsUpdate(e.id, e.stats));
         shipEvents.subscribe('dl_event', (e) => this._handleEvent(e));
+        shipEvents.subscribe('ui:visibility', (state) => this._handleVisibilityState(state));
+        shipEvents.subscribe('view:changed', () => {
+            if (this._shouldPoll()) this.load({ silent: true });
+        });
         
         this.load();
         // slskd/Soulseek transfers do not currently emit torrent telemetry events.
-        // Poll the unified downloads endpoint so Soulseek progress, speed, and
-        // completed/cleared state update without a full browser refresh.
+        // Poll the unified downloads endpoint only when the tab/view can use the
+        // data.  WebSocket torrent telemetry keeps the visible cards live.
         if (!this._pollTimer) {
-            this._pollTimer = window.setInterval(() => this.load({ silent: true }), 5000);
+            if (window.ljsPerf) {
+                this._pollTimer = window.ljsPerf.registerAdaptiveInterval(() => this.load({ silent: true }), {
+                    foregroundMs: 5000,
+                    backgroundMs: 60000,
+                    initialDelayMs: 5000,
+                    shouldRun: () => this._shouldPoll()
+                });
+            } else {
+                this._pollTimer = window.setInterval(() => {
+                    if (this._shouldPoll()) this.load({ silent: true });
+                }, 5000);
+            }
         }
     }
 
@@ -58,7 +77,7 @@ class DownloadManager extends Component {
             } else {
                 this.downloads.clear();
                 incoming.forEach((d, id) => this.downloads.set(id, d));
-                this.render();
+                this._scheduleRender({ force: true });
             }
         } catch (err) {
             if (!options.silent) console.error('[DownloadManager] Failed to load downloads:', err);
@@ -92,7 +111,12 @@ class DownloadManager extends Component {
             }
         });
         if (structuralChange) {
-            this.render();
+            this._scheduleRender();
+            return;
+        }
+        if (!this._canTouchDownloadDom()) {
+            this._needsRenderOnVisible = true;
+            this._updateBadge();
             return;
         }
         this.downloads.forEach((dl, id) => {
@@ -100,6 +124,65 @@ class DownloadManager extends Component {
             if (card) DownloadStatsPatcher.patch(card, dl);
         });
         this._updateBadge();
+    }
+
+    _shouldPoll() {
+        if (window.ljsPerf && !window.ljsPerf.isVisible()) return false;
+        if (window.ljsPerf && window.ljsPerf.isViewActive('hold')) return true;
+        return Array.from(this.downloads.values()).some(dl => {
+            const source = String(dl.source || dl.backend || '').toLowerCase();
+            const status = String(dl.status || '').toLowerCase();
+            return (source === 'slskd' || source === 'soulseek') && ['downloading', 'queued', 'paused'].includes(status);
+        });
+    }
+
+    _handleVisibilityState(state) {
+        if (!state) return;
+        if (state.visible) {
+            if (this._needsRenderOnVisible) {
+                this._needsRenderOnVisible = false;
+                this._scheduleRender({ force: true });
+            }
+            if (this._shouldPoll()) this.load({ silent: true });
+        }
+    }
+
+    _canTouchDownloadDom() {
+        if (window.ljsPerf && !window.ljsPerf.isViewActive('hold')) return false;
+        return Boolean(this.gridContainer && document.body.contains(this.gridContainer));
+    }
+
+    _scheduleRender(options = {}) {
+        if (!this.gridContainer) return;
+        if (window.ljsPerf && !window.ljsPerf.isVisible()) {
+            this._needsRenderOnVisible = true;
+            return;
+        }
+        if (!options.force && this._renderScheduled) return;
+        this._renderScheduled = true;
+        const run = () => {
+            this._renderScheduled = false;
+            this.render();
+        };
+        if (window.ljsPerf) window.ljsPerf.scheduleFrame(run);
+        else window.setTimeout(run, 16);
+    }
+
+    _queueStatsUpdate(id, stats) {
+        if (!id || !this.downloads.has(id)) return;
+        this._pendingStats.set(id, { ...(this._pendingStats.get(id) || {}), ...(stats || {}) });
+        if (this._statsFlushScheduled) return;
+        this._statsFlushScheduled = true;
+        const flush = () => this._flushQueuedStats();
+        if (window.ljsPerf) window.ljsPerf.scheduleFrame(flush);
+        else window.setTimeout(flush, 16);
+    }
+
+    _flushQueuedStats() {
+        this._statsFlushScheduled = false;
+        const updates = Array.from(this._pendingStats.entries());
+        this._pendingStats.clear();
+        updates.forEach(([id, stats]) => this._applyStatsUpdate(id, stats));
     }
 
     _preserveLiveTelemetry(id, current, fresh) {
@@ -136,7 +219,7 @@ class DownloadManager extends Component {
         } else if (e.download) {
             this.downloads.set(e.id, e.download);
         }
-        this.render();
+        this._scheduleRender();
     }
 
     _smoothIncomingStats(id, current, stats) {
@@ -189,7 +272,7 @@ class DownloadManager extends Component {
      * Update progress and speed values in real-time.
      * @private
      */
-    _updateStats(id, stats) {
+    _applyStatsUpdate(id, stats) {
         if (!this.downloads.has(id)) return;
         const dl = this.downloads.get(id);
         const hadFiles = Array.isArray(dl.files) && dl.files.length > 0;
@@ -205,7 +288,11 @@ class DownloadManager extends Component {
         const nowHasFiles = Array.isArray(dl.files) && dl.files.length > 0;
         const structuralStatus = ['paused', 'queued', 'downloading', 'complete', 'seeding'].includes(dl.status);
         if ((!hadFiles && nowHasFiles) || (oldStatus !== dl.status && structuralStatus)) {
-            this.render();
+            this._scheduleRender();
+            return;
+        }
+        if (!this._canTouchDownloadDom()) {
+            this._needsRenderOnVisible = true;
             return;
         }
         const card = document.querySelector(`.download-card[data-id="${id}"]`);
@@ -322,6 +409,7 @@ class DownloadManager extends Component {
     render() {
         if (!this.gridContainer) return;
         this.gridContainer.innerHTML = '';
+        const fragment = document.createDocumentFragment();
 
         let filterVal = 'all';
         if (window.holdPanel && window.holdPanel._currentFilter) {
@@ -347,8 +435,9 @@ class DownloadManager extends Component {
             const list = DOM.el('div', { className: 'download-state-list' });
             group.items.forEach(dl => list.appendChild(this._buildCard(dl)));
             section.appendChild(list);
-            this.gridContainer.appendChild(section);
+            fragment.appendChild(section);
         });
+        this.gridContainer.appendChild(fragment);
 
         this._updateBadge();
     }

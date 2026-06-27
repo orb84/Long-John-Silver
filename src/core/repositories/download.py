@@ -43,14 +43,57 @@ def _load_import_context(value: str | None) -> DownloadImportContext | None:
         return None
 
 
-def _import_contexts_overlap(wanted: DownloadImportContext, other: DownloadImportContext) -> bool:
-    """Return True when two provider contexts represent the same library unit.
+def _descriptor_coordinates(context: DownloadImportContext) -> tuple[int | None, int | None, str]:
+    """Return conventional descriptor coordinates without category branching."""
+    descriptor = context.unit_descriptor or {}
+    coordinates = descriptor.get("coordinates") if isinstance(descriptor.get("coordinates"), dict) else {}
 
-    Prefer category-owned ``unit_descriptor`` keys. The legacy season/episode
-    comparison remains only for old rows that predate descriptors. This keeps
-    the repository generic: it compares opaque stable keys instead of deciding
-    what an episode, chapter, DLC, or edition means.
+    def as_int(value):
+        try:
+            parsed = int(value)
+            return parsed if parsed > 0 else None
+        except Exception:
+            return None
+
+    return (
+        as_int(coordinates.get("season")) if coordinates else context.season,
+        as_int(coordinates.get("episode")) if coordinates else context.episode,
+        str(descriptor.get("granularity") or "").strip().casefold(),
+    )
+
+
+def _descriptor_overlap(wanted: DownloadImportContext, other: DownloadImportContext) -> bool:
+    """Return True when category-owned descriptors represent overlapping units.
+
+    Stable descriptor keys are exact identity.  Conventional coordinates let a
+    season-scoped queued row suppress duplicate episode rows for that same item,
+    and vice versa, without the repository learning TV-specific field names.
     """
+    wanted_desc = wanted.unit_descriptor or {}
+    other_desc = other.unit_descriptor or {}
+    wanted_key = str(wanted_desc.get("stable_key") or "").strip()
+    other_key = str(other_desc.get("stable_key") or "").strip()
+    if wanted_key and other_key and wanted_key == other_key:
+        return True
+    wanted_season, wanted_episode, wanted_granularity = _descriptor_coordinates(wanted)
+    other_season, other_episode, other_granularity = _descriptor_coordinates(other)
+    if wanted_season is None or other_season is None or wanted_season != other_season:
+        return False
+    if wanted_episode is not None and other_episode is not None:
+        return wanted_episode == other_episode
+    season_like = {"season", "bundle", "pack"}
+    return wanted_granularity in season_like or other_granularity in season_like
+
+
+def _import_contexts_overlap(wanted: DownloadImportContext, other: DownloadImportContext) -> bool:
+    """Return True when two provider/category contexts represent the same unit.
+
+    Prefer provider identity when available.  If provider IDs are not present,
+    ``DownloadImportContext.stable_provider_key`` falls back to the category item
+    key so release-watch and LLM-queued rows still dedupe by descriptor.
+    """
+    if not wanted.stable_provider_key or not other.stable_provider_key:
+        return False
     if other.stable_provider_key != wanted.stable_provider_key:
         return False
     if (other.season_order_type or "official") != (wanted.season_order_type or "official"):
@@ -60,7 +103,7 @@ def _import_contexts_overlap(wanted: DownloadImportContext, other: DownloadImpor
     if wanted_has_descriptor or other_has_descriptor:
         if not (wanted_has_descriptor and other_has_descriptor):
             return False
-        return wanted.stable_unit_key == other.stable_unit_key
+        return _descriptor_overlap(wanted, other)
     if wanted.season is None or other.season is None:
         # Item-level contexts are only duplicate-safe against item-level rows.
         return wanted.season is None and other.season is None

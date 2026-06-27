@@ -209,7 +209,7 @@ move
 hardlink
 unlink
 delete tree
-trash/quarantine
+explicit quarantine when deliberately requested
 cleanup temporary files
 log cleanup
 browser artifact cleanup
@@ -769,3 +769,20 @@ This order keeps the system understandable and prevents accidental global specia
 ## Category Artwork Cache
 
 Provider artwork discovered by a category is cached under `data/categories/<category_id>/metadata/artwork/<item_id>/`. The web app exposes this read-only via `/category-data/...`, and UI view models prefer `local_poster_url` before remote TMDB image URLs. Generic UI code should not download or reinterpret artwork directly; category metadata hooks own the discovery and cache step.
+
+## Definition-Backed Category Cleanup Rules
+
+When a definition-backed category needs local scan shaping, keep the behavior in
+`LocalObjectReconstructor` and focused builders under `src/core/categories/`.
+Do not add scanner/scheduler branches for albums, chapters, ebook formats,
+volumes, or other category-local units.
+
+When a definition-backed category needs a provider/source preference, declare it
+in the category YAML, preferably under `source_strategy`. The generic
+`DefinitionBackedCategory` may read the declaration, but it must not branch on a
+concrete category id such as Music or Audiobooks to change runtime behavior.
+
+Planner cleanup rule: generic planner repair may consume structured fields that
+the LLM or tool schema already emitted, but it must not parse user-language
+phrases to infer category unit scope. Improve category prompt skills and
+structured tool arguments instead.

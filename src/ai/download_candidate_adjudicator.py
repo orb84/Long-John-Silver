@@ -38,7 +38,7 @@ class DownloadCandidateAdjudicator:
     _OUTPUT_TOKEN_BUDGET = 550
     _PROMPT_SAFETY_TOKENS = 650
     _CHARS_PER_TOKEN_ESTIMATE = 4
-    _MAX_CATEGORY_GUIDANCE_CHARS = 1800
+    _MAX_CATEGORY_GUIDANCE_CHARS = 6000
     _MAX_RECOMMENDED = 8
     _MAX_REJECTED = 20
 
@@ -225,7 +225,7 @@ class DownloadCandidateAdjudicator:
                     context_limit_tokens=context_limit_tokens,
                     extra_instruction=(
                         "These candidates are winners from earlier chunk reviews. Pick the best overall match. "
-                        "If a strong requested-language pack/range candidate is present, prefer it over scattered single episodes."
+                        "If category guidance identifies a strong complete-unit bundle/range candidate, compare it carefully against scattered lower-scope alternatives."
                     ),
                 )
                 payload = await self._call_llm(prompt)
@@ -252,7 +252,7 @@ class DownloadCandidateAdjudicator:
                     context_limit_tokens=context_limit_tokens,
                     extra_instruction=(
                         "This is a finalist-reduction round. Recommend at most three candidate_id values from this chunk. "
-                        "Do not let a single-episode result beat a valid requested-language season/range pack."
+                        "Do not let a lower-scope result beat a valid category-approved bundle/range candidate when the user requested the broader unit."
                     ),
                 )
                 payload = await self._call_llm(prompt)
@@ -436,18 +436,14 @@ class DownloadCandidateAdjudicator:
             f"{chunk_note}"
             f"{extra_instruction}\n\n"
             "Rules:\n"
-            "- Preserve the user's exact requested title, season/episode scope, and media language.\n"
-            "- For TV full-season requests, prefer one season pack/range release over scattered episodes when it covers the requested season and matches language.\n"
-            "- Treat title stopwords/articles (of/the/a) as semantically important in the answer, but do not reject a candidate merely because another layer dropped one in a search query.\n"
-            "- Recognize release language tags: ITA/Italian/Italiano means Italian; ENG means English; MULTI/dual means possible multi-audio but weaker than an explicit preferred-language tag unless the title also names that preferred language.\n"
-            "- If the preferred/requested language is English, ITA+ENG/MULTI is a fallback only: prefer English-only or language-unknown scene releases when coverage is comparable, and do not turn extra audio into a language question for the user.\n"
-            "- Once the requested unit and preferred/acceptable language are satisfied, seeder availability outranks marginal bitrate or extra audio tracks. Do not recommend a weak dual-audio row over much healthier English or language-unknown equivalents.\n"
-            "- Episode ranges like S01E01-06, S01e01-06, or S01e01 06 are season-pack evidence.\n"
-            "- Reject obvious title collisions, wrong seasons, unrelated episode-title collisions, and candidates without magnets already removed by the tool.\n"
-            "- If a clear requested-language season pack exists, recommend it above a single Italian episode.\n"
-            "- If a candidate has requested_season_coverage=full_requested_season, treat it as the complete requested season; do not describe it as partial.\n"
+            "- Preserve the user's exact requested title, unit scope, and media language.\n"
+            "- Use the owning category guidance below to interpret category-specific release names, bundle/range notation, language tags, unit coverage, and fallback strategy.\n"
+            "- Treat title stopwords/articles as semantically important in the answer, but do not reject a candidate merely because another layer dropped one in a search query.\n"
+            "- Respect category-owned annotations such as unit_descriptor, bundle_context, language_preference_status, request-fit fields, coverage notes, and selection warnings.\n"
+            "- Reject obvious title collisions, wrong requested units, unrelated title collisions, and rows the candidate annotations mark as hard blockers.\n"
+            "- If a candidate declares complete requested-unit coverage through category-owned fields, treat that coverage as authoritative unless another row contradicts it.\n"
             "- If the request/effective_search includes quality_choice_policy.requires_user_choice=true, recommend the best few option candidate_ids, set should_queue_now=false, needs_user_choice=true, and tell the assistant to present quality/size options.\n"
-            "- If multiple requested-language season packs trade resolution/codec/bitrate/size, do not collapse them into one proposal unless the user already gave that preference.\n"
+            "- If multiple plausible candidates trade resolution/codec/bitrate/size in materially different ways, do not collapse them into one proposal unless the user already gave that preference.\n"
             "- If only weak or ambiguous candidates exist, set should_queue_now=false and explain what to ask/inspect.\n"
             "- Seeder count matters among otherwise equivalent candidates.\n\n"
             f"Category guidance:\n{(category_guidance or '')[: self._MAX_CATEGORY_GUIDANCE_CHARS]}\n\n"

@@ -105,6 +105,10 @@ class CategoryMediaMetadata(BaseModel):
     category_id: str = ""
     item_id: str = ""
     display_name: str = ""
+    original_title: str = ""
+    """Provider original title when it differs from the display/canonical title."""
+    release_year: int | None = None
+    """Provider release/first-air year when available for category-owned matching."""
     title_aliases: list[str] = Field(default_factory=list)
     """Provider-known canonical/original/alternative names for title matching."""
     localized_titles: list[dict[str, Any]] = Field(default_factory=list)

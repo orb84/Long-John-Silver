@@ -59,11 +59,14 @@ class DownloadsRouter:
         return result.data
 
     async def _get_download_queue(self):
-        """Return the current torrent and Soulseek queue ordered by priority."""
-        queued = await self._deps.downloader.get_queued_downloads()
-        rows = [self._view_model_builder.build(d) for d in queued]
+        """Return every non-terminal transfer the queue/hold panel must surface."""
+        active = await self._deps.downloader.get_active_downloads()
+        rows = [self._view_model_builder.build(d) for d in active]
         rows.extend(await self._soulseek_rows(include_completed=False))
-        return {"queue": [row for row in rows if str(row.get("status") or "").lower() == "queued"]}
+        visible_statuses = {"queued", "downloading", "paused", "stalled"}
+        visible = [row for row in rows if str(row.get("status") or "").lower() in visible_statuses]
+        queued_only = [row for row in visible if str(row.get("status") or "").lower() == "queued"]
+        return {"queue": visible, "queued_only": queued_only, "active": visible}
 
     async def _get_download(self, download_id: str):
         """Return details for a single torrent or Soulseek download."""

@@ -6,13 +6,15 @@ file renaming, and seeding lifecycle management.
 
 import asyncio
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from loguru import logger
 from typing import Any, Callable, Optional
+from types import SimpleNamespace
 from src.core.models import DownloadImportContext, DownloadItem, DownloadStatus, DownloadPriority, TaskCriticality
 from src.core.task_supervisor import TaskSupervisor
-from src.core.downloader_lifecycle import SeedingPolicy
+from src.core.downloader_lifecycle import SeedingPolicy, TorrentRuntimePriorityController
 from src.core.downloader_monitor_registry import DownloadMonitorRegistry
 from src.core.downloader_progress_cache import DownloadFileProgressCache
 from src.core.downloader_start_coordinator import DownloadStartCoordinator
@@ -82,6 +84,7 @@ class DownloadManager(DownloadSharingMixin):
     async def initialize(self) -> None:
         """Initialize the engine and start the queue manager."""
         await self._engine.initialize()
+        await self._cancel_duplicate_active_media_identity_rows()
         self._supervisor.spawn_restartable(
             "download_queue_manager",
             lambda: self._queue.run_loop(self._start_download, self.pause_download, self._can_start_queued_download),
@@ -98,6 +101,68 @@ class DownloadManager(DownloadSharingMixin):
             TaskCriticality.IMPORTANT,
         )
         logger.info("Download manager initialized.")
+
+
+    async def _cancel_duplicate_active_media_identity_rows(self) -> None:
+        """Cancel duplicate active/queued rows for the same category unit.
+
+        This is a startup safety brake for old builds that allowed multiple
+        magnets for the same episode/season to coexist.  It keeps the most useful
+        row and cancels the rest without deleting payload files, preventing LJS
+        from consuming disk with duplicate transfers as soon as the app boots.
+        """
+        try:
+            from src.core.repositories.download import _import_contexts_overlap
+            rows = await self._db.downloads.get_active_downloads()
+        except Exception as exc:
+            logger.debug("Could not scan active downloads for duplicate identities: {}", exc)
+            return
+        with_context = [row for row in rows if getattr(row, "import_context", None) is not None]
+        duplicate_ids: set[str] = set()
+        keepers: list[DownloadItem] = []
+
+        def rank(row: DownloadItem) -> tuple[int, float, int, str]:
+            status_rank = {
+                DownloadStatus.DOWNLOADING: 4,
+                DownloadStatus.SEEDING: 3,
+                DownloadStatus.QUEUED: 2,
+                DownloadStatus.PAUSED: 1,
+                DownloadStatus.STALLED: 0,
+            }.get(row.status, 0)
+            return (
+                status_rank,
+                float(getattr(row, "progress", 0.0) or 0.0),
+                int(getattr(row, "source_seeders", None) or getattr(row, "num_seeds", 0) or 0),
+                str(getattr(row, "created_at", "") or ""),
+            )
+
+        for row in with_context:
+            if row.id in duplicate_ids:
+                continue
+            matched_index = None
+            for index, keeper in enumerate(keepers):
+                try:
+                    if _import_contexts_overlap(row.import_context, keeper.import_context):
+                        matched_index = index
+                        break
+                except Exception:
+                    continue
+            if matched_index is None:
+                keepers.append(row)
+                continue
+            keeper = keepers[matched_index]
+            if rank(row) > rank(keeper):
+                duplicate_ids.add(keeper.id)
+                keepers[matched_index] = row
+            else:
+                duplicate_ids.add(row.id)
+
+        for download_id in sorted(duplicate_ids):
+            try:
+                await self.cancel_download(download_id, cleanup_files=False)
+                logger.warning("Cancelled duplicate active download identity at startup: {}", download_id)
+            except Exception as exc:
+                logger.warning("Failed to cancel duplicate active download identity {}: {}", download_id, exc)
 
     async def close(self) -> None:
         """Shut down the download subsystem without exposing partial files.
@@ -153,25 +218,20 @@ class DownloadManager(DownloadSharingMixin):
         if not item:
             return False
 
-        handle = self._engine.get_handle(download_id)
-        if handle and handle.has_metadata():
-            try:
-                tf = handle.torrent_file()
-                current = handle.file_priorities() if hasattr(handle, 'file_priorities') else None
-                if current is None:
-                    current = [4] * tf.num_files()
-                current[file_index] = priority
-                handle.prioritize_files(current)
-                logger.info(f'Set file {file_index} priority to {priority} for {download_id}')
-            except Exception as e:
-                logger.error(f'Failed to set file priority for {download_id}: {e}')
-
-        # Update the model even if engine is not available (for queued/paused)
+        # Update the model even if engine is not available (for queued/paused).
+        # The live handle is then reconciled from the persisted model so distinct
+        # per-file priorities use the same staged semantics as freshly parsed
+        # torrent metadata.
         for f in item.files:
             if f.file_index == file_index:
                 f.priority = priority
                 break
         await self._db.downloads.upsert_download(item)
+
+        handle = self._engine.get_handle(download_id)
+        if handle and handle.has_metadata():
+            TorrentRuntimePriorityController().apply(download_id, handle, item)
+            logger.info(f'Set file {file_index} priority to {priority} for {download_id}')
         return True
 
     def get_file_progress(self, download_id: str) -> list[dict]:
@@ -451,6 +511,17 @@ class DownloadManager(DownloadSharingMixin):
 
         download_id = hashlib.md5(magnet_link.encode()).hexdigest()[:12]
         explicit_user_request = self._is_explicit_user_reason(reason)
+        if not explicit_user_request and not await self._can_create_background_download_row(
+            category_id=category_id,
+            item_id=item_id or item_name,
+            item_name=item_name,
+            import_context=normalized_context,
+            reason=reason,
+        ):
+            raise ValueError(
+                f"Background download blocked by category policy for '{item_name}'. "
+                "Use an explicit manual/user-approved action or enable the item's automation setting."
+            )
 
         lock = self._start_coordinator.get_add_lock(download_id)
         async with lock:
@@ -466,17 +537,28 @@ class DownloadManager(DownloadSharingMixin):
                     )
                     return existing
                 if existing.status in (DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.STALLED):
-                    if explicit_user_request:
-                        existing.reason = reason or existing.reason
+                    auto_start_allowed = bool(
+                        existing.status == DownloadStatus.QUEUED
+                        and await self._can_start_queued_download(existing)
+                    )
+                    if explicit_user_request or auto_start_allowed:
+                        if reason:
+                            existing.reason = reason
                         existing.priority = priority
                         if normalized_context and not existing.import_context:
                             existing.import_context = normalized_context
                         await self._db.downloads.upsert_download(existing)
                         item = existing
-                        logger.info(
-                            f"User-approved duplicate magnet {download_id} is already {existing.status.value}; "
-                            f"promoting it for immediate queue processing."
-                        )
+                        if explicit_user_request:
+                            logger.info(
+                                f"User-approved duplicate magnet {download_id} is already {existing.status.value}; "
+                                f"promoting it for immediate queue processing."
+                            )
+                        else:
+                            logger.info(
+                                f"Auto-download duplicate magnet {download_id} is already queued; "
+                                f"promoting it because the tracked item allows automation."
+                            )
                     else:
                         logger.info(
                             f'Skipping duplicate magnet {download_id} '
@@ -494,17 +576,31 @@ class DownloadManager(DownloadSharingMixin):
                     self._db.downloads, normalized_context, download_id=download_id
                 )
                 if duplicate:
-                    if duplicate.status in (DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.STALLED) and explicit_user_request:
-                        duplicate.reason = reason or duplicate.reason
+                    auto_start_allowed = bool(
+                        duplicate.status == DownloadStatus.QUEUED
+                        and await self._can_start_queued_download(duplicate)
+                    )
+                    if duplicate.status in (DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.STALLED) and (
+                        explicit_user_request or auto_start_allowed
+                    ):
+                        if reason:
+                            duplicate.reason = reason
                         duplicate.priority = priority
                         await self._db.downloads.upsert_download(duplicate)
                         item = duplicate
                         download_id = duplicate.id
-                        logger.info(
-                            f"User-approved duplicate media identity "
-                            f"{normalized_context.stable_unit_key or normalized_context.stable_provider_key} "
-                            f"is already {duplicate.status.value}; promoting it for immediate queue processing."
-                        )
+                        if explicit_user_request:
+                            logger.info(
+                                f"User-approved duplicate media identity "
+                                f"{normalized_context.stable_unit_key or normalized_context.stable_provider_key} "
+                                f"is already {duplicate.status.value}; promoting it for immediate queue processing."
+                            )
+                        else:
+                            logger.info(
+                                f"Auto-download duplicate media identity "
+                                f"{normalized_context.stable_unit_key or normalized_context.stable_provider_key} "
+                                f"is already queued; promoting it because the tracked item allows automation."
+                            )
                     else:
                         logger.info(
                             f"Skipping duplicate media identity "
@@ -526,6 +622,11 @@ class DownloadManager(DownloadSharingMixin):
 
         if explicit_user_request:
             self._explicit_start_allowed.add(download_id)
+            await self._maybe_enable_category_auto_download_after_user_download(
+                category_id=category_id,
+                item_id=item_id or item_name,
+                import_context=normalized_context,
+            )
 
         bundle_context = (normalized_context.candidate_snapshot or {}).get('bundle_context') if normalized_context else None
         descriptor = normalized_context.unit_descriptor if normalized_context else {}
@@ -581,6 +682,7 @@ class DownloadManager(DownloadSharingMixin):
                 pattern = item.torrent_title or item.magnet
                 if pattern:
                     await self._deps.blacklist.add(pattern=pattern, reason="Stalled download automatically blacklisted upon cancellation")
+            await self._cancel_matching_release_watch_for_download(item)
             if cleanup_files:
                 # Clean up all known files (for multi-file torrents)
                 dl_dir = Path(self._download_dir).resolve()
@@ -598,7 +700,7 @@ class DownloadManager(DownloadSharingMixin):
                             continue
                         if path.exists():
                             try:
-                                resolver.safe_unlink(path, purpose="download.cancel.cleanup", move_to_trash=True)
+                                resolver.safe_unlink(path, purpose="download.cancel.cleanup", move_to_trash=False)
                                 cleaned += 1
                             except Exception:
                                 pass
@@ -606,7 +708,7 @@ class DownloadManager(DownloadSharingMixin):
                         dl_path = Path(str(path) + '.downloading')
                         if dl_path.exists():
                             try:
-                                resolver.safe_unlink(dl_path, purpose="download.cancel.cleanup_partial", move_to_trash=True)
+                                resolver.safe_unlink(dl_path, purpose="download.cancel.cleanup_partial", move_to_trash=False)
                                 cleaned += 1
                             except Exception:
                                 pass
@@ -614,6 +716,48 @@ class DownloadManager(DownloadSharingMixin):
                     await self._cleanup_partial_files(item.file_path, download_id)
                 if cleaned:
                     logger.info(f'Cleaned up {cleaned} file(s) for cancelled download {download_id}')
+
+    async def _cancel_matching_release_watch_for_download(self, item: DownloadItem) -> None:
+        """Suppress release-watch retries for a user-cancelled queued/download row.
+
+        The download layer stays category-neutral by using the category-owned
+        unit descriptor carried in the import context.  If a user cancels an
+        auto-discovered episode, the matching release-watch row must not turn
+        around and requeue the same unit later.
+        """
+        repo = getattr(self._db, "release_watches", None) if self._db is not None else None
+        if repo is None or not hasattr(repo, "cancel_unit"):
+            return
+        context = getattr(item, "import_context", None)
+        category_id = str(getattr(item, "category_id", "") or getattr(context, "category_id", "") or "").strip()
+        item_id = str(getattr(item, "item_id", "") or getattr(context, "item_id", "") or getattr(item, "item_name", "") or "").strip()
+        descriptor = getattr(context, "unit_descriptor", None) if context is not None else None
+        unit_key = ""
+        if isinstance(descriptor, dict):
+            unit_key = str(descriptor.get("stable_key") or descriptor.get("label") or "").strip()
+        if not unit_key:
+            season = getattr(context, "season", None) if context is not None else getattr(item, "season", None)
+            episode = getattr(context, "episode", None) if context is not None else getattr(item, "episode", None)
+            try:
+                if season and episode:
+                    unit_key = f"S{int(season):02d}E{int(episode):02d}"
+                elif season:
+                    unit_key = f"S{int(season):02d}"
+            except Exception:
+                unit_key = ""
+        if not category_id or not item_id or not unit_key:
+            return
+        try:
+            await repo.cancel_unit(
+                category_id,
+                item_id,
+                unit_key,
+                error="matching download was cancelled by user",
+                outcome={"status": "cancelled_by_user", "download_id": item.id},
+            )
+            logger.info("Cancelled matching release watch for user-cancelled download: {}/{}/{}", category_id, item_id, unit_key)
+        except Exception as exc:
+            logger.debug("Could not cancel matching release watch for {}: {}", item.id, exc)
 
     async def pause_download(self, download_id: str, requeue: bool = False, keep_start_allowed: bool = False) -> DownloadItem | None:
         """Pause a download.
@@ -939,11 +1083,13 @@ class DownloadManager(DownloadSharingMixin):
             item.num_peers = 0
             item.num_seeds = 0
             await self._db.downloads.upsert_download(item)
-            # If it was actively transferring before shutdown, or if it is a
-            # persisted user-approved/manual queue item, it should continue even
-            # while global auto-download remains disabled.
-            if original_status == DownloadStatus.DOWNLOADING or (
-                original_status == DownloadStatus.SEEDING and item.sharing_enabled
+            # Only explicit/manual or currently-allowed category automation may
+            # resume automatically after restart.  A background TV row that was
+            # already DOWNLOADING in an older unsafe build must not become
+            # implicitly user-approved forever.
+            if self._is_explicit_user_reason(getattr(item, "reason", None)) or (
+                (original_status == DownloadStatus.SEEDING and item.sharing_enabled)
+                and await self._can_start_queued_download(item)
             ):
                 self._explicit_start_allowed.add(item.id)
             if await self._can_start_queued_download(item):
@@ -992,17 +1138,259 @@ class DownloadManager(DownloadSharingMixin):
         )
         return text in explicit_reasons or any(text.startswith(prefix) for prefix in explicit_prefixes)
 
+
+    async def _maybe_enable_category_auto_download_after_user_download(
+        self,
+        *,
+        category_id: str,
+        item_id: str,
+        import_context: DownloadImportContext | None,
+    ) -> None:
+        """Let the owning category react to an explicit user download.
+
+        Generic download code does not decide what an ongoing season, book
+        series, game version, or album feed means.  It only offers a hook after
+        an explicit user-approved queue action so the category can opt into
+        future automation when that is safe.
+        """
+        if not category_id or import_context is None:
+            return
+        try:
+            category = self._deps.category_registry.get(category_id) if self._deps.category_registry else None
+        except Exception:
+            category = None
+        hook = getattr(category, "maybe_enable_auto_download_after_user_download", None)
+        if not callable(hook):
+            return
+        try:
+            context = SimpleNamespace(
+                db=self._db,
+                settings=self._settings_manager.settings if self._settings_manager else None,
+                settings_manager=self._settings_manager,
+                category_registry=self._deps.category_registry,
+            )
+            await hook(
+                item_id=item_id,
+                import_context=import_context,
+                settings_manager=self._settings_manager,
+                context=context,
+            )
+        except Exception as exc:
+            logger.debug("Category auto-download activation hook failed for %s/%s: %s", category_id, item_id, exc)
+
+    @staticmethod
+    def _normalized_item_identity(value: object) -> str:
+        """Normalize generic item names/keys for envelope-level matching."""
+        text = str(value or "").strip().casefold()
+        text = re.sub(r"[^\w]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _download_item_identity_candidates(self, item: DownloadItem) -> set[str]:
+        """Return generic item identity candidates carried by a download row."""
+        candidates = {
+            self._normalized_item_identity(getattr(item, "item_id", "")),
+            self._normalized_item_identity(getattr(item, "item_name", "")),
+        }
+        context = getattr(item, "import_context", None)
+        if context is not None:
+            candidates.update({
+                self._normalized_item_identity(getattr(context, "item_id", "")),
+                self._normalized_item_identity(getattr(context, "canonical_title", "")),
+                self._normalized_item_identity(getattr(context, "display_title", "")),
+                self._normalized_item_identity(getattr(context, "localized_title", "")),
+                self._normalized_item_identity(getattr(context, "original_title", "")),
+            })
+        return {candidate for candidate in candidates if candidate}
+
+    @staticmethod
+    def _iter_tracked_items(settings: Any) -> list[Any]:
+        """Return tracked items from either modern ItemList or legacy plain list settings."""
+        tracked = getattr(settings, "tracked_items", []) if settings is not None else []
+        return list(getattr(tracked, "items", tracked) or [])
+
+    async def _reconcile_tracked_item_download_policy(self, category: object | None, tracked: object, category_id: str) -> None:
+        """Let the owning category reconcile visible state before queue decisions."""
+        hook = getattr(category, "reconcile_settings_item_with_persisted_state", None)
+        if not callable(hook):
+            return
+        media_repo = getattr(self._db, "media", None)
+        item_key = str(getattr(tracked, "key", "") or "")
+        persisted = None
+        if media_repo and item_key:
+            try:
+                persisted = await media_repo.get_category_item(category_id, item_key)
+            except Exception as exc:
+                logger.debug("Download policy persisted-state lookup failed for {}/{}: {}", category_id, item_key, exc)
+        try:
+            changed = bool(hook(tracked, persisted, self._settings_manager.settings))
+        except Exception as exc:
+            logger.debug("Category download-policy reconciliation failed for {}/{}: {}", category_id, item_key, exc)
+            return
+        if not changed:
+            return
+        try:
+            await asyncio.to_thread(self._settings_manager.save, self._settings_manager.settings)
+        except Exception as exc:
+            logger.debug("Could not persist reconciled download policy for {}/{}: {}", category_id, item_key, exc)
+        if media_repo and item_key:
+            try:
+                payload = tracked.model_dump(mode="json") if hasattr(tracked, "model_dump") else dict(getattr(tracked, "__dict__", {}) or {})
+                payload.setdefault("category_id", category_id)
+                payload.setdefault("item_id", item_key)
+                payload.setdefault("key", item_key)
+                payload.setdefault("item_type", category_id)
+                await media_repo.upsert_category_item(category_id, item_key, payload)
+            except Exception as exc:
+                logger.debug("Could not persist reconciled category item policy for {}/{}: {}", category_id, item_key, exc)
+        logger.warning(
+            "Reconciled queued download policy for {}/{} before background queue/start decision.",
+            category_id,
+            item_key,
+        )
+
+    async def _tracked_item_auto_download_policy(self, item: DownloadItem) -> tuple[bool, bool]:
+        """Return whether a queued/background row has item policy and whether it may start.
+
+        Download rows carry category/item identity but the queue manager must not
+        know category semantics.  When a row maps to a tracked item, the owning
+        category interprets the conventional automation field.  If a category has
+        an explicit queue hook but no matching tracked item, background work is
+        denied instead of inheriting a global switch.
+        """
+        try:
+            settings = self._settings_manager.settings
+            category_id = str(getattr(item, "category_id", "") or getattr(getattr(item, "import_context", None), "category_id", "") or "")
+            wanted_category = category_id.strip().casefold()
+            category_for_row = None
+            try:
+                category_for_row = self._deps.category_registry.get(category_id) if (self._deps.category_registry and category_id) else None
+            except Exception:
+                category_for_row = None
+            row_has_category_policy = callable(getattr(category_for_row, "queued_background_start_allowed", None))
+            wanted_names = self._download_item_identity_candidates(item)
+            for tracked in self._iter_tracked_items(settings):
+                tracked_category_id = str(getattr(tracked, "item_type", "") or category_id or "")
+                tracked_category = tracked_category_id.strip().casefold()
+                if wanted_category and tracked_category and tracked_category != wanted_category:
+                    continue
+                tracked_names = {
+                    self._normalized_item_identity(getattr(tracked, "key", "")),
+                    self._normalized_item_identity(getattr(tracked, "display_name", "")),
+                }
+                tracked_names = {name for name in tracked_names if name}
+                if wanted_names and tracked_names and wanted_names.isdisjoint(tracked_names):
+                    continue
+                category = None
+                try:
+                    category = self._deps.category_registry.get(tracked_category_id) if self._deps.category_registry else None
+                except Exception:
+                    category = None
+                await self._reconcile_tracked_item_download_policy(category, tracked, tracked_category_id)
+                hook = getattr(category, "queued_background_start_allowed", None)
+                if callable(hook):
+                    return True, bool(hook(tracked, settings))
+                value = getattr(tracked, "auto_download", None)
+                if value is not None:
+                    return True, bool(value)
+            if row_has_category_policy:
+                return True, False
+        except Exception as exc:
+            logger.debug("Tracked item auto-download policy lookup failed: {}", exc)
+            return False, False
+        return False, False
+
+    def _tracked_item_auto_download_override(self, item: DownloadItem) -> bool | None:
+        """Compatibility wrapper for older tests/callers.
+
+        Runtime queue decisions use the async policy path so categories can read
+        persisted visible state.  This wrapper preserves the previous synchronous
+        inspection surface for deterministic unit tests; it is intentionally a
+        no-I/O approximation.
+        """
+        try:
+            settings = self._settings_manager.settings
+            category_id = str(getattr(item, "category_id", "") or getattr(getattr(item, "import_context", None), "category_id", "") or "")
+            wanted_category = category_id.strip().casefold()
+            category_for_row = None
+            try:
+                category_for_row = self._deps.category_registry.get(category_id) if (self._deps.category_registry and category_id) else None
+            except Exception:
+                category_for_row = None
+            row_has_category_policy = callable(getattr(category_for_row, "queued_background_start_allowed", None))
+            wanted_names = self._download_item_identity_candidates(item)
+            for tracked in self._iter_tracked_items(settings):
+                tracked_category_id = str(getattr(tracked, "item_type", "") or category_id or "")
+                tracked_category = tracked_category_id.strip().casefold()
+                if wanted_category and tracked_category and tracked_category != wanted_category:
+                    continue
+                tracked_names = {
+                    self._normalized_item_identity(getattr(tracked, "key", "")),
+                    self._normalized_item_identity(getattr(tracked, "display_name", "")),
+                }
+                tracked_names = {name for name in tracked_names if name}
+                if wanted_names and tracked_names and wanted_names.isdisjoint(tracked_names):
+                    continue
+                category = None
+                try:
+                    category = self._deps.category_registry.get(tracked_category_id) if self._deps.category_registry else None
+                except Exception:
+                    category = None
+                hook = getattr(category, "queued_background_start_allowed", None)
+                if callable(hook):
+                    return bool(hook(tracked, settings))
+                value = getattr(tracked, "auto_download", None)
+                return None if value is None else bool(value)
+            if row_has_category_policy:
+                return False
+        except Exception:
+            return None
+        return None
+
+    async def _can_create_background_download_row(
+        self,
+        *,
+        category_id: str,
+        item_id: str,
+        item_name: str,
+        import_context: DownloadImportContext | None,
+        reason: str,
+    ) -> bool:
+        """Return whether unattended code may create a new download row at all."""
+        pseudo = SimpleNamespace(
+            id="",
+            category_id=category_id,
+            item_id=item_id,
+            item_name=item_name,
+            import_context=import_context,
+            reason=reason,
+        )
+        has_policy, allowed = await self._tracked_item_auto_download_policy(pseudo)  # type: ignore[arg-type]
+        if has_policy:
+            return allowed
+        try:
+            return bool(self._settings_manager.settings.auto_download)
+        except Exception:
+            return False
+
     async def _can_start_queued_download(self, item: DownloadItem) -> bool:
         """Return whether a queued item may consume a download slot now.
 
-        Fresh user/manual work should start immediately. Background discovery
-        and stale recovered queue rows must respect the global auto-download
-        switch, including after restarts.
+        Fresh user/manual work starts immediately.  Background discovery first
+        honors the tracked item's own automation policy, then falls back to the
+        global automation setting for older rows and categories without an
+        item-level override.
         """
         if getattr(item, "id", None) in self._explicit_start_allowed:
             return True
         if self._is_explicit_user_reason(getattr(item, "reason", None)):
             return True
+        if not hasattr(self, "_db"):
+            legacy_override = self._tracked_item_auto_download_override(item)
+            if legacy_override is not None:
+                return legacy_override
+        has_policy, override = await self._tracked_item_auto_download_policy(item)
+        if has_policy:
+            return override
         try:
             return bool(self._settings_manager.settings.auto_download)
         except Exception:
@@ -1022,7 +1410,7 @@ class DownloadManager(DownloadSharingMixin):
             config=self._deps.settings_manager.settings.security,
         )
         try:
-            resolver.safe_unlink(path, purpose="download.partial_cleanup", move_to_trash=True)
+            resolver.safe_unlink(path, purpose="download.partial_cleanup", move_to_trash=False)
             parent = path.parent
             if parent != dl_dir and not any(parent.iterdir()):
                 parent.rmdir()

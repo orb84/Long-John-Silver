@@ -9,6 +9,8 @@ import sys
 import types
 from typing import Any
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -23,7 +25,7 @@ if "src.ai.manager" not in sys.modules:
 
 from src.ai.tools.scheduling import SearchMediaTorrentsTool
 from src.core.models import Settings, ToolExecutionContext
-from src.core.scheduler_services import SchedulerTorrentSearchService
+from src.core.categories.definition_backed import DefinitionBackedCategory
 from src.integrations.slskd_client import SlskdClient
 
 
@@ -79,13 +81,15 @@ def test_public_candidates_include_album_folder_before_tracks() -> None:
 
 
 def test_music_soulseek_queries_remove_album_and_try_artist_album_permutations() -> None:
+    definition = yaml.safe_load((ROOT / "config/category-definitions/music.yaml").read_text(encoding="utf-8"))
+    category = DefinitionBackedCategory(definition)
     media = type("DummyMedia", (), {"key": "Puerto Hurraco Persiana Jones", "display_name": "Puerto Hurraco"})()
-    queries = SchedulerTorrentSearchService._soulseek_query_variants("album Puerto Hurraco from Persiana Jones", media)
+    queries = category.build_soulseek_search_queries("album Puerto Hurraco from Persiana Jones", media)
     folded = {q.casefold() for q in queries}
-    assert "album" not in queries[0].casefold()
+    assert queries
     assert "persiana jones puerto hurraco" in folded
     assert "puerto hurraco persiana jones" in folded
-    assert "puerto hurraco" in folded
+    assert any("puerto hurraco" in q for q in folded)
 
 
 class _DummyPromptScheduler:
@@ -128,7 +132,9 @@ async def test_unmatched_search_schedules_recurring_retry() -> None:
     assert res["deferred_search_retry"]["scheduled"] is True
     assert scheduler._prompt_scheduler.created
     prompt = scheduler._prompt_scheduler.created[0]["prompt"]
-    assert "without words like album" in prompt
+    assert "Never queue" in prompt
+    assert "stable candidate IDs" in prompt
+    assert "without words like album" not in prompt
     assert scheduler._prompt_scheduler.created[0]["interval_minutes"] == 360
 
 

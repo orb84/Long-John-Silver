@@ -290,13 +290,20 @@ class NotificationService:
     async def send_download_complete(self, item_name: str, season: int | None = None,
                                      episode: int | None = None, *,
                                      download_id: str = "",
-                                     category_id: str = "") -> None:
-        """Notify about a completed download."""
-        if season is not None and episode is not None:
+                                     category_id: str = "",
+                                     unit_label: str = "") -> None:
+        """Notify about a completed download using category-owned unit labels."""
+        label = str(unit_label or "").strip()
+        if label:
+            body = f"Download complete: {item_name} {label}"
+        elif season is not None and episode is not None:
+            # Compatibility for legacy rows that predate category-owned unit
+            # descriptors. New rows should pass ``unit_label`` instead of
+            # relying on conventional structured coordinates.
             body = f"Download complete: {item_name} S{season:02d}E{episode:02d}"
         else:
             body = f"Download complete: {item_name}"
-        resolved_category = category_id or ("tv" if season is not None else "")
+        resolved_category = category_id or "media"
         dedupe_key = self._download_complete_dedupe_key(
             item_name=item_name,
             season=season,

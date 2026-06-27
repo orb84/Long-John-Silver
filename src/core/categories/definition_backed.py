@@ -21,11 +21,7 @@ from src.core.categories.base import CategoryMedia
 from src.core.categories.audio_conversion import AudioConversionService
 from src.core.categories.candidate_validation import DANGEROUS_FILE_SUFFIXES, DefinitionCandidateValidator
 from src.core.categories.identity import clean_display_title, clean_path_fragment, canonical_item_key, basename_from_pathish
-from src.core.categories.local_object_reconstruction import (
-    category_units_from_local_object,
-    enrich_item_payload,
-    scan_local_object,
-)
+from src.core.categories.local_object_reconstruction import LocalObjectReconstructor
 from src.core.categories.types import ParsedMedia, ScannedFileObservation, ScannedItem
 from src.core.models import (
     ActionReceipt,
@@ -74,6 +70,7 @@ class DefinitionBackedCategory(CategoryMedia):
         self.metadata_provider_names = self._metadata_provider_names()
         self.accepted_file_patterns = self._accepted_file_patterns()
         self.category_tool_names = self._configured_tool_names()
+        self.prompt_file = self._prompt_file_from_definition()
         try:
             self.router_priority = int(self._definition.get("router_priority", 0) or 0)
         except (TypeError, ValueError):
@@ -91,6 +88,23 @@ class DefinitionBackedCategory(CategoryMedia):
         """Return one definition section as a mapping."""
         value = self._definition.get(name)
         return value if isinstance(value, dict) else {}
+
+    def _prompt_file_from_definition(self) -> str | None:
+        """Return the category-owned prompt skill file, when one exists.
+
+        Concrete Python categories set ``prompt_file`` as a class attribute.
+        Definition-backed categories should get the same skill-file behavior by
+        convention so YAML-only domains such as Music, Ebooks, and Audiobooks
+        can teach the LLM their release naming without editing generic prompt
+        code.  A definition may override the filename with ``prompt_file``;
+        otherwise ``<category_id>.md`` is used when present.
+        """
+        declared = str(self._definition.get("prompt_file") or "").strip()
+        candidate = declared or (f"{self.category_id}.md" if self.category_id else "")
+        if not candidate:
+            return None
+        prompt_path = Path(__file__).parent / "prompts" / candidate
+        return candidate if prompt_path.exists() else None
 
     @staticmethod
     def _string_list(value: Any, *, default: list[str] | None = None) -> list[str]:
@@ -429,14 +443,26 @@ class DefinitionBackedCategory(CategoryMedia):
         settings: Any | None = None,
         default_preference: str = "torrent_first",
     ) -> dict[str, Any]:
-        """Return this definition-backed category's preferred Soulseek strategy."""
-        preference = default_preference
+        """Return this definition-backed category's preferred Soulseek strategy.
+
+        Source preference is declarative category data. The definition-backed
+        base must not know that one concrete category is usually better served
+        by Soulseek for small/default searches while another is not.
+        """
+        _ = (settings,)
         profile = self._section("download_profile")
-        if self.category_id == "music":
-            text = str(item_name or "").lower()
-            is_large_bundle = any(term in text for term in ("discography", "complete", "catalog", "catalogue", "collection"))
-            if not is_large_bundle and search_scope in {None, "", "default"}:
-                preference = "soulseek_first"
+        strategy = self._section("source_strategy")
+        preference = str(strategy.get("download_preference") or default_preference)
+        default_scope_preference = str(strategy.get("default_scope_download_preference") or "").strip()
+        if default_scope_preference and str(search_scope or "default") in {"", "default"}:
+            preference = default_scope_preference
+
+        large_bundle_terms = self._string_list(strategy.get("large_bundle_terms"))
+        large_bundle_preference = str(strategy.get("large_bundle_download_preference") or "").strip()
+        if large_bundle_terms and large_bundle_preference:
+            text = str(item_name or "").casefold()
+            if any(term.casefold() in text for term in large_bundle_terms):
+                preference = large_bundle_preference
         return {"download_preference": preference, "download_profile": profile}
 
     def _clean_soulseek_query(self, value: str) -> str:
@@ -516,6 +542,9 @@ class DefinitionBackedCategory(CategoryMedia):
             rules.append("Do not use global spoken-language preferences as torrent-search constraints for this category.")
         if not self.uses_global_quality_profile():
             rules.append("Ignore quality facets that are not declared by this category unless the user explicitly requested a companion item from another category.")
+        skill = self.prompt_file_torrent_skill()
+        if skill:
+            rules.append("Category prompt file torrent skill:\n" + skill)
         body = " ".join(rule.strip() for rule in rules if str(rule).strip())
         return (
             f"This is a {self.display_name} download. Expected payload formats/patterns: {accepted}. "
@@ -705,17 +734,17 @@ class DefinitionBackedCategory(CategoryMedia):
             detected_language=sorted(languages)[0] if languages else "",
             detected_languages=sorted(languages),
         )
-        scanned.local_object_model = scan_local_object(self.category_id, scanned)
+        scanned.local_object_model = LocalObjectReconstructor.scan(self.category_id, scanned)
         return scanned
 
     def library_item_from_scan(self, scanned: Any) -> dict[str, Any]:
         """Attach definition-backed local object evidence to the generic item envelope."""
         payload = super().library_item_from_scan(scanned)
-        return enrich_item_payload(self.category_id, payload, scanned)
+        return LocalObjectReconstructor.enrich_item_payload(self.category_id, payload, scanned)
 
     def library_units_from_scan(self, scanned: Any) -> list[dict[str, Any]]:
         """Build rich Music/Ebook/Audiobook units when local object evidence is available."""
-        units = category_units_from_local_object(self.category_id, scanned)
+        units = LocalObjectReconstructor.category_units(self.category_id, scanned)
         if units is not None:
             return units
         return super().library_units_from_scan(scanned)
@@ -725,9 +754,10 @@ class DefinitionBackedCategory(CategoryMedia):
         progress = super().library_progress_from_scan(scanned, units)
         if not progress:
             return None
-        if self.category_id in {"music", "audiobooks", "ebooks"}:
+        local_model = getattr(scanned, "local_object_model", {}) or {}
+        if isinstance(local_model, dict) and local_model.get("model_type"):
             progress = dict(progress)
-            progress["local_model_type"] = (getattr(scanned, "local_object_model", {}) or {}).get("model_type", "")
+            progress["local_model_type"] = local_model.get("model_type", "")
             progress["downloaded_unit_types"] = sorted({str(unit.get("unit_type") or "") for unit in units if unit.get("status") == "downloaded"})
         return progress
 

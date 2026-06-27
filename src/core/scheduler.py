@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import os
 from pathlib import Path
+from urllib.parse import quote_plus
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from loguru import logger
@@ -1467,6 +1468,7 @@ class MediaScheduler:
             category = self._categories.get(item.item_type) if self._categories else None
             if not category:
                 continue
+            await self._reconcile_category_item_runtime_state(category, item, reason="scheduled_check")
             category_config = (settings.category_settings or {}).get(category.category_id, {})
             scheduler_config = category_config.get("scheduler") if isinstance(category_config, dict) else {}
             if isinstance(scheduler_config, dict) and scheduler_config.get("enabled") is False:
@@ -1691,6 +1693,46 @@ class MediaScheduler:
         if self._lifecycle:
             await self._lifecycle.invalidate_item(category_id, item_id, reason=reason)
 
+    async def _reconcile_category_item_runtime_state(self, category: object, item: object, *, reason: str) -> bool:
+        """Let the owning category repair settings/repository drift before background work."""
+        hook = getattr(category, "reconcile_settings_item_with_persisted_state", None)
+        if not callable(hook):
+            return False
+        category_id = str(getattr(category, "category_id", getattr(item, "item_type", "")) or "")
+        item_id = str(getattr(item, "key", "") or "")
+        if not category_id or not item_id:
+            return False
+        persisted: dict[str, Any] | None = None
+        media_repo = getattr(self._db, "media", None)
+        if media_repo is not None and hasattr(media_repo, "get_category_item"):
+            try:
+                row = await media_repo.get_category_item(category_id, item_id)
+                if isinstance(row, dict):
+                    persisted = dict(row)
+            except Exception as exc:
+                logger.debug("Category item reconciliation read failed for {}/{}: {}", category_id, item_id, exc)
+        changed = False
+        try:
+            changed = bool(hook(item, persisted, self._settings_manager.settings))
+        except Exception as exc:
+            logger.debug("Category item reconciliation hook failed for {}/{}: {}", category_id, item_id, exc)
+            return False
+        if not changed:
+            return False
+        self._settings_manager.save(self._settings_manager.settings)
+        if media_repo is not None and hasattr(media_repo, "upsert_category_item"):
+            try:
+                payload = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(getattr(item, "__dict__", {}) or {})
+                await media_repo.upsert_category_item(category_id, item_id, payload)
+            except Exception as exc:
+                logger.debug("Category item reconciliation persist failed for {}/{}: {}", category_id, item_id, exc)
+        await self.invalidate_item_lifecycle(category_id, item_id, reason=f"category_item_reconciled:{reason}")
+        logger.warning(
+            "Reconciled category item runtime state for {}/{} before {}. Background automation now follows the persisted visible item state.",
+            category_id, item_id, reason,
+        )
+        return True
+
     async def sync_all_category_watch_policies(self, *, reason: str = "startup") -> None:
         """Rebuild RSS/release-watch state for all enabled tracked items.
 
@@ -1709,18 +1751,28 @@ class MediaScheduler:
             category = self._categories.get(category_id) if self._categories else None
             if not category:
                 continue
-            plan = await self._build_category_watch_plan(category, item)
             item_name = str(getattr(item, "key", "") or "")
-            if item_name:
-                item_names.append(item_name)
-                item_categories[item_name] = category_id
-            await self._apply_release_watches_from_plan(plan, item)
-            for feed in getattr(plan, "rss_feeds", []) or []:
-                url = self._rss_url_for_query(str(getattr(feed, "query", "") or ""))
-                target = str(getattr(feed, "target_name", "") or item_name).strip()
-                if url and target:
-                    feed_urls.append(url)
-                    feed_targets.setdefault(url, []).append(target)
+            try:
+                await self._reconcile_category_item_runtime_state(category, item, reason="watch_policy_sync")
+                plan = await self._build_category_watch_plan(category, item)
+                if item_name:
+                    item_names.append(item_name)
+                    item_categories[item_name] = category_id
+                await self._apply_release_watches_from_plan(plan, item)
+                for feed in getattr(plan, "rss_feeds", []) or []:
+                    url = self._rss_url_for_query(str(getattr(feed, "query", "") or ""))
+                    target = str(getattr(feed, "target_name", "") or item_name).strip()
+                    if url and target:
+                        feed_urls.append(url)
+                        feed_targets.setdefault(url, []).append(target)
+            except Exception as exc:
+                logger.error(
+                    "Category watch policy sync failed for {}/{}; stale feeds for this item will not be retained: {}",
+                    category_id,
+                    item_name,
+                    exc,
+                )
+                continue
         self._update_rss_monitor(feed_urls, feed_targets, item_names, item_categories)
         logger.info(f"Category watch policy sync complete ({reason}): {len(feed_urls)} RSS feed(s)")
 
@@ -1756,10 +1808,12 @@ class MediaScheduler:
             return
         category_id = str(getattr(plan, "category_id", "") or getattr(item, "item_type", "") or "")
         item_id = str(getattr(plan, "item_id", "") or getattr(item, "key", "") or "")
+        active_unit_keys: set[str] = set()
         for watch in getattr(plan, "release_watches", []) or []:
             unit_key = str(getattr(watch, "unit_key", "") or "").strip()
             if not unit_key:
                 continue
+            active_unit_keys.add(unit_key)
             await repo.upsert(
                 category_id=category_id,
                 item_id=item_id,
@@ -1773,6 +1827,20 @@ class MediaScheduler:
                 requirements=dict(getattr(watch, "requirements", {}) or {}),
                 payload=dict(getattr(watch, "payload", {}) or {}),
             )
+        if hasattr(repo, "retire_missing_for_item"):
+            retired = await repo.retire_missing_for_item(
+                category_id,
+                item_id,
+                active_unit_keys,
+                error="category watch plan no longer includes this unit",
+            )
+            if retired:
+                logger.info(
+                    "Retired {} stale release watch(es) for {}/{} after watch-plan rebuild",
+                    retired,
+                    category_id,
+                    item_id,
+                )
 
     def _rss_url_for_query(self, query: str) -> str:
         query = str(query or "").strip()
@@ -1958,6 +2026,75 @@ class MediaScheduler:
                 watch.get("category_id"), watch.get("item_id"), watch.get("unit_key"), reason,
             )
 
+
+    def _release_watch_auto_download_allowed(self, requirements: dict[str, Any], item: object, category: object | None = None) -> bool:
+        """Return whether a due release watch may auto-queue now.
+
+        Stored watch requirements are snapshots.  The owning category is the
+        authority for interpreting per-item automation policy; this prevents
+        stale release-watch rows from overriding a safer category default.
+        """
+        hook = getattr(category, "release_watch_auto_download_allowed", None)
+        if callable(hook):
+            return bool(hook(item, requirements or {}, getattr(self._settings_manager, "settings", None)))
+        item_auto = getattr(item, "auto_download", None)
+        if item_auto is False:
+            return False
+        if item_auto is True:
+            if "auto_download" in requirements:
+                return bool(requirements.get("auto_download"))
+            return True
+        if "auto_download" in requirements:
+            return bool(requirements.get("auto_download"))
+        try:
+            return bool(self._settings_manager.settings.auto_download)
+        except Exception:
+            return False
+
+
+    def _release_watch_search_allowed(self, requirements: dict[str, Any], item: object, category: object | None = None) -> bool:
+        """Return whether a due release watch may perform any unattended search.
+
+        Categories own this because notification-only searches can still be
+        noisy and can still produce false positives. TV uses this to make
+        per-show opt-in the hard gate for both searches and downloads.
+        """
+        hook = getattr(category, "release_watch_search_allowed", None)
+        if callable(hook):
+            return bool(hook(item, requirements or {}, getattr(self._settings_manager, "settings", None)))
+        return True
+
+    async def _release_watch_unit_already_satisfied(self, category: object | None, item: object, unit_key: str) -> bool:
+        """Ask the category whether a due release-watch unit is already local."""
+        hook = getattr(category, "discovery_already_satisfied", None)
+        if not callable(hook):
+            return False
+        context_builder = getattr(self._pipeline, "category_search_context", None)
+        context = context_builder() if callable(context_builder) else None
+        try:
+            return bool(await hook(item, unit_key, context))
+        except Exception as exc:
+            logger.debug(
+                "Release-watch satisfaction check failed for {}/{}: {}",
+                getattr(item, "key", ""), unit_key, exc,
+            )
+            return False
+
+    async def _mark_release_watch_satisfied(self, repo: object, watch: dict[str, Any], category_id: str, item_id: str, unit_key: str) -> None:
+        """Record a due watch as completed because the category says it is local."""
+        outcome = {"status": "already_satisfied", "source": "category_library_state"}
+        if hasattr(repo, "complete"):
+            try:
+                await repo.complete(category_id, item_id, unit_key, outcome=outcome)
+            except TypeError:
+                await repo.complete(category_id, item_id, unit_key)
+        else:
+            await repo.record_attempt(int(watch["id"]), status="completed", outcome=outcome)
+        logger.info(
+            "Release watch satisfied without search for {}/{}/{} because the category library state already contains it.",
+            category_id, item_id, unit_key,
+        )
+
     async def process_release_watches(self) -> None:
         """Retry due category release watches until queued/completed/expired.
 
@@ -1991,6 +2128,7 @@ class MediaScheduler:
             if not category or not item:
                 await repo.record_attempt(int(watch["id"]), status="cancelled", error="tracked item disappeared")
                 continue
+            await self._reconcile_category_item_runtime_state(category, item, reason="release_watch_retry")
             try:
                 requirements = dict(watch.get("requirements") or {})
                 preferred_language = str(
@@ -1999,13 +2137,36 @@ class MediaScheduler:
                     or getattr(item, "language", "")
                     or self._settings_manager.settings.language
                 )
-                item_auto = getattr(item, "auto_download", None)
-                can_auto_download = bool(
-                    requirements.get("auto_download")
-                    if "auto_download" in requirements
-                    else (item_auto if item_auto is not None else self._settings_manager.settings.auto_download)
-                )
+                can_auto_download = self._release_watch_auto_download_allowed(requirements, item, category)
+                can_search = self._release_watch_search_allowed(requirements, item, category)
                 interval = float(watch.get("interval_hours") or 2.0)
+
+                if await self._release_watch_unit_already_satisfied(category, item, unit_key):
+                    await self._mark_release_watch_satisfied(repo, watch, category_id, item_id, unit_key)
+                    continue
+
+                if not can_search:
+                    outcome = {"status": "search_disabled_by_category_policy", "auto_download": can_auto_download}
+                    if hasattr(repo, "cancel_unit"):
+                        await repo.cancel_unit(
+                            category_id,
+                            item_id,
+                            unit_key,
+                            error="release-watch search disabled by category policy",
+                            outcome=outcome,
+                        )
+                    else:
+                        await repo.record_attempt(
+                            int(watch["id"]),
+                            status="cancelled",
+                            error="release-watch search disabled by category policy",
+                            outcome=outcome,
+                        )
+                    logger.info(
+                        "Release watch cancelled without search for {}/{}/{} because the category policy blocks background search.",
+                        category_id, item_id, unit_key,
+                    )
+                    continue
 
                 if not can_auto_download:
                     candidate = await self._pipeline.run_search(
@@ -2083,13 +2244,50 @@ class MediaScheduler:
                         outcome={"status": "no_candidate"},
                     )
             except Exception as exc:
+                error_text = str(exc)
                 logger.warning("Release watch retry failed for {}/{}/{}: {}", category_id, item_id, unit_key, exc)
+                if self._notifications and (
+                    "insufficient storage" in error_text.lower()
+                    or "critically low" in error_text.lower()
+                    or "not writable" in error_text.lower()
+                    or "unavailable" in error_text.lower()
+                ):
+                    try:
+                        from src.core.models import NotificationMessage
+                        await self._notifications.notify(
+                            NotificationMessage(
+                                title=f"{item_id} {unit_key} download blocked",
+                                body=(
+                                    f"I found a release for {item_id} {unit_key}, but could not queue/start it: "
+                                    f"{error_text}"
+                                ),
+                                level="warning",
+                            ),
+                            category_id=category_id,
+                            item_id=item_id,
+                            event_type="release_watch_queue_blocked",
+                            metadata={
+                                "unit_key": unit_key,
+                                "preferred_language": preferred_language,
+                                "watch_id": watch.get("id"),
+                                "error": error_text,
+                            },
+                            dedupe_key=f"release_watch_blocked:{category_id}:{item_id}:{unit_key}",
+                        )
+                    except Exception as notify_exc:
+                        logger.debug(
+                            "Release-watch blocked notification failed for {}/{}/{}: {}",
+                            category_id,
+                            item_id,
+                            unit_key,
+                            notify_exc,
+                        )
                 await repo.record_attempt(
                     int(watch["id"]),
                     status="failed_retryable",
-                    error=str(exc),
+                    error=error_text,
                     interval_hours=float(watch.get("interval_hours") or 2.0),
-                    outcome={"status": "error", "error": str(exc)},
+                    outcome={"status": "error", "error": error_text},
                 )
 
     @staticmethod
@@ -2171,7 +2369,30 @@ class MediaScheduler:
             torrent_title=torrent_title, source_seeders=source_seeders,
             import_context=import_context,
         )
-        return {"status": "queued", "download_id": item.id}
+        return self._queue_download_receipt(item)
+
+    def _queue_download_receipt(self, item: Any) -> dict[str, Any]:
+        """Return a truthful queue receipt for the assistant/tool layer."""
+        status = getattr(item, "status", None)
+        status_value = getattr(status, "value", str(status or ""))
+        receipt = {"download_id": getattr(item, "id", None), "download_status": status_value}
+        if status == DownloadStatus.QUEUED:
+            return {"status": "queued", **receipt}
+        if status in {DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED, DownloadStatus.STALLED, DownloadStatus.SEEDING}:
+            return {"status": "already_active", "already_existing": True, **receipt}
+        if status == DownloadStatus.COMPLETE:
+            return {
+                "status": "already_complete",
+                "already_existing": True,
+                "error": "A matching download is already complete; no new queue row was created.",
+                **receipt,
+            }
+        return {
+            "status": "not_queued",
+            "already_existing": True,
+            "error": f"A matching download row is {status_value or 'not queueable'}; no new queue row was created.",
+            **receipt,
+        }
 
     def get_last_scan_result(self) -> object:
         """Return the last library scan result, or None if no scan has run."""

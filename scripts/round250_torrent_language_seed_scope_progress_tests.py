@@ -15,9 +15,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.ai.tools.scheduling import _annotate_selection_policy, _quality_choice_policy
 from src.core.categories.tv import TvShowCategory
 from src.web.view_models.download_view_model import DownloadViewModelBuilder
+from src.ai.tools.search_workspace import SearchQualityChoicePolicy
+from src.ai.tools.search_workspace import SelectionPolicyAnnotator
 
 
 @dataclass
@@ -117,8 +118,8 @@ def test_quality_options_do_not_promote_low_seed_dual_audio_over_healthy_languag
     high_seed_unknown = _season_candidate("unknown-high-seed", "S01", 900, [], 4_000)
     mid_seed_english = _season_candidate("english-mid-seed", "S01", 300, ["English"], 5_000)
     candidates = [low_seed_dual, high_seed_unknown, mid_seed_english]
-    _annotate_selection_policy(candidates, preferred_language="English")
-    policy = _quality_choice_policy(candidates, {})
+    SelectionPolicyAnnotator.annotate(candidates, preferred_language="English")
+    policy = SearchQualityChoicePolicy.evaluate(candidates, {})
     assert policy["requires_user_choice"] is True
     assert policy["candidate_ids"][0] in {"english-mid-seed", "unknown-high-seed"}
     assert policy["candidate_ids"].index("dual-low-seed") > 0

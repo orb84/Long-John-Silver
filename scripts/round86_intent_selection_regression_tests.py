@@ -33,8 +33,8 @@ from src.ai.pending_actions import PendingActionContextBuilder
 from src.ai.plan_coordinator import PlanCoordinator
 from src.ai.tool_policy import AgentToolPolicy
 from src.ai.tools.queue_download_support import CachedCandidateResolver
-from src.ai.tools.scheduling import _build_batch_recommendation
 from src.core.models import AgentPlan, Intent, PlanStep
+from src.ai.tools.search_workspace import SearchBatchRecommendationBuilder
 
 
 
@@ -173,7 +173,7 @@ def test_batch_recommendation_uses_seeders_for_equivalent_candidates() -> None:
             title="For All Mankind S05E06 No Sudden Moves 1080p ATVP WEB-DL DDP5.1 H265-TheBlackKing",
         ),
     ]
-    recommendation = _build_batch_recommendation(
+    recommendation = SearchBatchRecommendationBuilder.build(
         name="For All Mankind",
         category_id="tv",
         season=5,

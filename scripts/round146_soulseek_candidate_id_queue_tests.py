@@ -13,10 +13,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.ai.tools.soulseek import EnqueueSoulseekDownloadTool
-from src.ai.tools.scheduling import _compact_soulseek_candidates
 from src.core.models import Settings, SoulseekSettings, ToolExecutionContext
 from src.integrations.slskd_client import SlskdClient, SoulseekCandidate
 from src.utils.candidate_ids import store_result_set
+from src.ai.tools.search_workspace import SearchWorkspaceFormatter
 
 
 class _SystemStore:
@@ -63,7 +63,7 @@ def test_public_candidates_have_stable_ids_and_folder_payloads() -> None:
 
 
 def test_compact_candidates_keep_id_not_long_filename_array() -> None:
-    compact = _compact_soulseek_candidates([
+    compact = SearchWorkspaceFormatter.compact_soulseek_candidates([
         {
             "candidate_id": "abc123",
             "candidate_type": "folder",

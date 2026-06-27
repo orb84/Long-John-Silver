@@ -91,7 +91,7 @@ class DownloadStatsPatcher {
 
     static _patchFileRows(card, dl) {
         const filesDiv = card.querySelector('.dl-files');
-        if (!filesDiv || !Array.isArray(dl.files) || dl.files.length < 1) return;
+        if (!filesDiv || filesDiv.style.display === 'none' || !Array.isArray(dl.files) || dl.files.length < 1) return;
         dl.files.forEach((file, idx) => this._patchFileRow(filesDiv, dl, file, idx));
     }
 

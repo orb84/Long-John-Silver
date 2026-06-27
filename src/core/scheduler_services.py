@@ -17,6 +17,7 @@ from loguru import logger
 from src.integrations.slskd_client import SlskdClient
 from src.core.models import CategoryItem, DownloadPriority, GenericMediaItem, ScannedLibraryItem, SearchResult
 from src.core.library_objects import CanonicalLibraryObjectBuilder
+from src.core.categories.search_scope import SearchScopePolicy
 
 if TYPE_CHECKING:
     from src.core.config import SettingsManager
@@ -116,25 +117,6 @@ class SchedulerCatalogService:
             return int(value.strip())
         return None
 
-    @classmethod
-    def extract_structured_unit_from_name(cls, name: str, season: int | None, episode: int | None) -> tuple[str, int | None, int | None]:
-        """Recover obvious structured unit hints from an under-structured name.
-
-        The public assistant schema currently exposes ``season``/``episode`` as
-        generic unit coordinates.  This parser only extracts coordinates; the
-        registered categories decide whether those coordinates mean anything.
-        """
-        season = cls.safe_structured_unit_int(season)
-        episode = cls.safe_structured_unit_int(episode)
-        cleaned = (name or "").strip()
-        if not cleaned:
-            return cleaned, season, episode
-        cleaned, season, episode = cls._extract_episode_pattern(cleaned, season, episode)
-        cleaned, season = cls._extract_season_pattern(cleaned, season, episode)
-        cleaned = re.sub(r"\b(?:complete|pack|torrent|torrents|missing|episodes?|episodi|serie|series)\b", " ", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_.,")
-        return cleaned or name, season, episode
-
     async def _media_row(self, media: CategoryItem) -> dict[str, Any]:
         """Build one list_media row from the canonical category object."""
         canonical = await self._canonical_object(media)
@@ -202,64 +184,6 @@ class SchedulerCatalogService:
         """Sort category units by season and episode fields."""
         return sorted(items, key=lambda item: (item.get("season") or 0, item.get("episode") or 0))
 
-    @classmethod
-    def _extract_episode_pattern(cls, cleaned: str, season: int | None, episode: int | None) -> tuple[str, int | None, int | None]:
-        """Extract compact two-coordinate unit notation from free text."""
-        match = re.search(r"\bS0*(\d{1,2})\s*E0*(\d{1,3})\b", cleaned, re.IGNORECASE)
-        if not match:
-            return cleaned, season, episode
-        season = season or int(match.group(1))
-        episode = episode or int(match.group(2))
-        return re.sub(r"\bS0*\d{1,2}\s*E0*\d{1,3}\b", " ", cleaned, flags=re.IGNORECASE), season, episode
-
-    @classmethod
-    def _extract_season_pattern(cls, cleaned: str, season: int | None, episode: int | None) -> tuple[str, int | None]:
-        """Extract first-coordinate references from free text.
-
-        Keep this parser intentionally small and category-neutral: it only
-        extracts a numeric coordinate and removes the human season phrase from
-        the title.  TV owns what the coordinate means later.  Natural requests
-        such as "the first season of The Boys" must not be left as a literal
-        title because that bypasses TV's season-pack workflow.
-        """
-        ordinal_map = {
-            "first": 1, "1st": 1,
-            "second": 2, "2nd": 2,
-            "third": 3, "3rd": 3,
-            "fourth": 4, "4th": 4,
-            "fifth": 5, "5th": 5,
-            "sixth": 6, "6th": 6,
-            "seventh": 7, "7th": 7,
-            "eighth": 8, "8th": 8,
-            "ninth": 9, "9th": 9,
-            "tenth": 10, "10th": 10,
-        }
-        ordinal_pattern = re.compile(
-            r"\b(?:the\s+)?("
-            + "|".join(re.escape(key) for key in sorted(ordinal_map, key=len, reverse=True))
-            + r")\s+(?:season|stagione)\s*(?:of\s+)?\b",
-            re.IGNORECASE,
-        )
-        ordinal = ordinal_pattern.search(cleaned)
-        if ordinal:
-            season = season or ordinal_map.get(ordinal.group(1).lower())
-            cleaned = ordinal_pattern.sub(" ", cleaned, count=1)
-
-        match = re.search(r"\b(?:season|stagione)\s*0*(\d{1,2})\b", cleaned, re.IGNORECASE)
-        if match:
-            season = season or int(match.group(1))
-            cleaned = re.sub(r"\b(?:season|stagione)\s*0*\d{1,2}\b", " ", cleaned, flags=re.IGNORECASE)
-        compact = re.search(r"\bS0*(\d{1,2})\b", cleaned, re.IGNORECASE)
-        if compact and episode is None:
-            season = season or int(compact.group(1))
-            cleaned = re.sub(r"\bS0*\d{1,2}\b", " ", cleaned, flags=re.IGNORECASE)
-        # If the user wrote ``season 1 of <title>``, the season phrase removal
-        # above can leave a leading ``of``.  Strip only that leading connector.
-        # Never remove interior title words: titles such as
-        # ``A Knight of the Seven Kingdoms`` must survive intact for tracker
-        # search, category matching, and LLM candidate adjudication.
-        cleaned = re.sub(r"^\s*of\s+", "", cleaned, count=1, flags=re.IGNORECASE)
-        return cleaned, season
 
 
 class SchedulerTorrentSearchService:
@@ -283,7 +207,9 @@ class SchedulerTorrentSearchService:
     ) -> dict[str, Any]:
         """Search for torrents for a specific media item via the unified pipeline."""
         settings = self._context.settings_manager.settings
-        normalized_name, season, episode = self._catalog.extract_structured_unit_from_name(name, season, episode)
+        normalized_name = str(name or "").strip()
+        season = self._catalog.safe_structured_unit_int(season)
+        episode = self._catalog.safe_structured_unit_int(episode)
         normalized_scope = self._normalize_search_scope(search_scope)
         explicit_category_id = str(category_id or "").strip() or None
         if explicit_category_id and (not self._context.categories or not self._context.categories.get(explicit_category_id)):
@@ -303,8 +229,13 @@ class SchedulerTorrentSearchService:
             }
         requested_category = explicit_category_id or self._category_for_units(season, episode)
         if not requested_category:
+            requested_category = self._category_for_search_text(normalized_name)
+        if not requested_category:
             requested_category = self._category_for_search_scope(normalized_scope)
         initial_category = self._context.categories.get(requested_category) if requested_category and self._context.categories else None
+        normalized_name, season, episode = self._category_normalized_search_units(
+            initial_category, normalized_name, season, episode, normalized_scope
+        )
         initial_lang = self._effective_search_language(
             initial_category,
             requested_language=language,
@@ -336,7 +267,7 @@ class SchedulerTorrentSearchService:
             media, category_id, season, episode, normalized_scope, settings,
         )
         constraints = self._normalize_search_constraints(search_constraints)
-        companion_query = self._preliminary_query_summary(media, season, episode)
+        companion_query = self._preliminary_query_summary(media, category, season, episode, normalized_scope)
         logger.info(
             f"Starting Soulseek companion task before torrent search: category={category_id} "
             f"query={companion_query!r} scope={normalized_scope!r}"
@@ -364,9 +295,9 @@ class SchedulerTorrentSearchService:
             # torrent block instead of raising back through the websocket.
             logger.exception("Torrent search failed for %s; preserving companion fallback result.", media.key)
             results = []
-            query_summary = self._preliminary_query_summary(media, season, episode)
+            query_summary = self._preliminary_query_summary(media, category, season, episode, normalized_scope)
             torrent_error = str(exc)
-        response = self._response(media, category_id, season, episode, target_lang, results, query_summary, normalized_scope)
+        response = self._response(media, category_id, season, episode, target_lang, results, query_summary, normalized_scope, settings=settings, search_constraints=constraints)
         if torrent_error:
             response["torrent_status"] = "error"
             response["torrent_error"] = torrent_error
@@ -385,14 +316,14 @@ class SchedulerTorrentSearchService:
             response["companion_soulseek"] = {"enabled": True, "status": "error", "candidate_count": 0, "candidates": [], "error": str(exc)}
         return response
 
-    def _preliminary_query_summary(self, media: CategoryItem, season: int | None, episode: int | None) -> str:
+    def _preliminary_query_summary(self, media: CategoryItem, category: object | None, season: int | None, episode: int | None, search_scope: str | None = None) -> str:
         """Return a stable search summary before torrent fanout finishes.
 
         Soulseek must not wait behind a long Jackett ladder.  This early query
         lets the companion backend run in parallel while the category-owned
         torrent search explores its own candidate schemas.
         """
-        label = self._request_unit_label(season, episode)
+        label = self._request_unit_label(category, season, episode, search_scope=search_scope)
         return f"{getattr(media, 'key', '')} {label or ''}".strip()
 
     def _normalize_search_constraints(self, constraints: dict[str, Any] | None) -> dict[str, Any]:
@@ -514,7 +445,7 @@ class SchedulerTorrentSearchService:
                     "error": getattr(cfg, "account_status_message", "Soulseek rejected these credentials."),
                 }
         category = self._context.categories.get(category_id) if self._context.categories else None
-        unit_label = self._request_unit_label(season, episode)
+        unit_label = self._request_unit_label(category, season, episode, search_scope=search_scope)
         context = self._category_workflow_context(settings, search_constraints)
         query_builder = getattr(category, "build_soulseek_search_queries", None)
         if callable(query_builder):
@@ -610,6 +541,46 @@ class SchedulerTorrentSearchService:
             "error": result.get("error") if isinstance(result, dict) else None,
         }
 
+    def _category_for_search_text(self, name: str) -> str | None:
+        """Resolve a category from router/parser evidence without parsing units in scheduler core."""
+        registry = self._context.categories
+        if not registry:
+            return None
+        try:
+            routed = registry.resolve_from_text(name) if hasattr(registry, "resolve_from_text") else None
+            if routed is not None:
+                return str(getattr(routed, "category_id", "") or "") or None
+        except Exception:
+            pass
+        try:
+            classified = registry.classify(name) if hasattr(registry, "classify") else None
+            if classified:
+                return str(getattr(classified[0], "category_id", "") or "") or None
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _category_normalized_search_units(
+        category: object | None,
+        name: str,
+        season: int | None,
+        episode: int | None,
+        search_scope: str,
+    ) -> tuple[str, int | None, int | None]:
+        """Let the owning category extract any structured unit words from a title."""
+        hook = getattr(category, "normalize_agent_search_units_from_name", None)
+        if not callable(hook):
+            return name, season, episode
+        try:
+            normalized = hook(name, season=season, episode=episode, search_scope=search_scope)
+        except Exception:
+            return name, season, episode
+        if not isinstance(normalized, tuple) or len(normalized) != 3:
+            return name, season, episode
+        normalized_name, normalized_season, normalized_episode = normalized
+        return str(normalized_name or name).strip() or name, normalized_season, normalized_episode
+
     def _category_for_units(self, season: int | None, episode: int | None) -> str | None:
         """Return the first category that accepts requested structured unit arguments."""
         if season is None and episode is None:
@@ -660,7 +631,7 @@ class SchedulerTorrentSearchService:
 
     def _category_for_search_scope(self, search_scope: str | None) -> str | None:
         """Resolve a category for category-neutral pack search scopes."""
-        if search_scope not in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
+        if not SearchScopePolicy.is_bundle_scope(search_scope):
             return None
         for category in (self._context.categories.list_all() if self._context.categories else []):
             try:
@@ -788,15 +759,25 @@ class SchedulerTorrentSearchService:
 
 
     async def _temporary_media(self, normalized_name: str, category_id: str | None, language: str) -> CategoryItem:
-        """Create an in-memory item using category-aware classification when possible."""
-        if not category_id:
+        """Create an in-memory item through category-owned routing when possible."""
+        registry = self._context.categories
+        if not category_id and registry:
             try:
-                from src.utils.media_classifier import MediaClassifier
-                category_id = await MediaClassifier(self._context.settings_manager).classify(normalized_name)
+                routed = registry.resolve_from_text(normalized_name) if hasattr(registry, "resolve_from_text") else None
+                if routed is not None:
+                    category_id = str(getattr(routed, "category_id", "") or "") or None
             except Exception as exc:
-                logger.warning("Media classification failed for %s: %s; using generic media.", normalized_name, exc)
-                category_id = "media"
-        category = self._context.categories.get(category_id) if self._context.categories else None
+                logger.debug("Category router could not resolve %s: %s", normalized_name, exc)
+        if not category_id and registry:
+            try:
+                classified = registry.classify(normalized_name) if hasattr(registry, "classify") else None
+                if classified:
+                    category_id = str(getattr(classified[0], "category_id", "") or "") or None
+            except Exception as exc:
+                logger.debug("Category parser could not classify %s: %s", normalized_name, exc)
+        if not category_id:
+            category_id = "media"
+        category = registry.get(category_id) if registry else None
         if category:
             return category.create_item(normalized_name, language=language)
         return GenericMediaItem(key=normalized_name, category_id=category_id, language=language)
@@ -813,7 +794,7 @@ class SchedulerTorrentSearchService:
         """Let the category resolve omitted season coordinates for pack searches."""
         if season is not None or episode is not None:
             return season
-        if search_scope not in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
+        if not SearchScopePolicy.is_bundle_scope(search_scope):
             return season
         category = self._context.categories.get(category_id) if self._context.categories else None
         if not category or not hasattr(category, "resolve_agent_pack_season"):
@@ -856,52 +837,56 @@ class SchedulerTorrentSearchService:
                 logger.exception("Category-owned search recursed for %s; falling back to pipeline.", media.key)
             except Exception as exc:
                 logger.warning("Category-owned search failed for %s: %s; falling back to pipeline.", media.key, exc)
-        return await self._fallback_search(media, season, episode, target_lang)
+        return await self._fallback_search(media, category, season, episode, target_lang)
 
-    async def _fallback_search(self, media: CategoryItem, season: int | None, episode: int | None, target_lang: str) -> tuple[list[SearchResult], str]:
-        """Run the generic search pipeline for a media item and unit label."""
-        episode_label = self._fallback_episode_label(season, episode)
-        results = await self._context.pipeline.run_search(media, episode_label, mode='llm', language=target_lang)
-        return results, f'{media.key} {episode_label or ""}'.strip()
+    async def _fallback_search(self, media: CategoryItem, category: object | None, season: int | None, episode: int | None, target_lang: str) -> tuple[list[SearchResult], str]:
+        """Run the generic search pipeline with a category-owned unit label."""
+        unit_label = self._request_unit_label(category, season, episode)
+        results = await self._context.pipeline.run_search(media, unit_label, mode='llm', language=target_lang)
+        return results, f'{media.key} {unit_label or ""}'.strip()
 
-    def _fallback_episode_label(self, season: int | None, episode: int | None) -> str | None:
-        """Return a season/episode label for generic pipeline searches."""
-        if season is not None and episode is None:
-            return f'Season {season}'
-        if season is not None and episode is not None:
-            return f'S{int(season):02d}E{int(episode):02d}'
-        return None
 
     @staticmethod
     def _normalize_search_scope(value: str | None) -> str:
         """Normalize category-neutral assistant search scope hints."""
-        aliases = {
-            "": "default",
-            "broad": "default",
-            "default": "default",
-            "pack_preferred": "bundle_preferred",
-            "season_pack_preferred": "bundle_preferred",
-            "bundle_preferred": "bundle_preferred",
-            "pack_only": "bundle_only",
-            "season_pack_only": "bundle_only",
-            "bundle_only": "bundle_only",
-            "individual_units": "individual_units_only",
-            "individual_unit_only": "individual_units_only",
-            "individual_units_only": "individual_units_only",
-        }
-        text = str(value or "default").strip().lower()
-        return aliases.get(text, "default")
+        if str(value or "").strip().lower() in {"individual_units", "individual_unit_only"}:
+            return SearchScopePolicy.INDIVIDUAL_UNITS_ONLY
+        if str(value or "").strip().lower() == "broad":
+            return SearchScopePolicy.DEFAULT
+        return SearchScopePolicy.normalize(value)
 
-    def _response(self, media: CategoryItem, category_id: str, season: int | None, episode: int | None, target_lang: str, results: list[SearchResult], query_summary: str, search_scope: str = "default") -> dict[str, Any]:
+    def _response(
+        self,
+        media: CategoryItem,
+        category_id: str,
+        season: int | None,
+        episode: int | None,
+        target_lang: str,
+        results: list[SearchResult],
+        query_summary: str,
+        search_scope: str = "default",
+        *,
+        settings: object | None = None,
+        search_constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Build the final search_media_torrents response payload."""
         candidates = []
         category = self._context.categories.get(category_id) if self._context.categories else None
+        context = self._category_workflow_context(settings, search_constraints) if settings is not None else None
+        response_facts = self._category_response_facts(
+            category,
+            item=media,
+            season=season,
+            episode=episode,
+            query_summary=query_summary,
+            search_scope=search_scope,
+            context=context,
+        )
         projector = TorrentCandidateProjector()
-        expected_episode_count = self._expected_episode_count_from_query_summary(query_summary, season) if season is not None and episode is None else None
+        request_label = self._request_unit_label(category, season, episode, search_scope=search_scope)
         for result in (results or []):
             try:
                 payload = projector.payload(result, category_id=category_id)
-                request_label = self._request_unit_label(season, episode)
                 if category and hasattr(category, "unit_descriptor_from_search_result"):
                     descriptor = category.unit_descriptor_from_search_result(result, media, request_label)
                     payload["unit_descriptor"] = descriptor
@@ -920,12 +905,22 @@ class SchedulerTorrentSearchService:
                         payload["bundle_scope"] = bundle_context.get("scope")
                         payload["pack_type"] = bundle_context.get("pack_type")
                         payload["bundle_unit_count"] = bundle_context.get("unit_count")
-                        if expected_episode_count:
-                            self._annotate_requested_season_coverage(payload, int(season), int(expected_episode_count))
                 if category and hasattr(category, "search_candidate_quality_facts"):
-                    facts = category.search_candidate_quality_facts(result, item=media, unit_label=request_label, context=None)
+                    facts = category.search_candidate_quality_facts(result, item=media, unit_label=request_label, context=context)
                     if isinstance(facts, dict):
                         payload.update({k: v for k, v in facts.items() if v not in (None, "", [], {})})
+                payload = self._category_annotated_candidate_payload(
+                    category,
+                    payload,
+                    result,
+                    item=media,
+                    unit_label=request_label,
+                    season=season,
+                    episode=episode,
+                    search_scope=search_scope,
+                    response_facts=response_facts,
+                    context=context,
+                )
                 candidates.append(payload)
             except RecursionError:
                 logger.exception("Skipping candidate that recursed during payload projection: %s", getattr(result, "title", result))
@@ -940,65 +935,97 @@ class SchedulerTorrentSearchService:
             "display_name": getattr(media, "display_name", None) or media.key,
             "season": season,
             "episode": episode,
-            "expected_episode_count": expected_episode_count,
+            **response_facts,
             "metadata_snapshot": self._media_identity_snapshot(media, category_id),
             "search_scope": search_scope,
             "candidates": candidates,
         }
 
-    @staticmethod
-    def _expected_episode_count_from_query_summary(query_summary: str, season: int | None) -> int | None:
-        """Extract category-provided season length from TV pack query summaries.
-
-        TV pack search builds episode-range queries from provider metadata, for
-        example ``S01E01-E06``.  The generic response builder may carry that
-        number forward as opaque evidence for the LLM, but it must not infer TV
-        structure on its own.
-        """
-        if season is None or not query_summary:
-            return None
-        import re
-        pattern = rf"S0*{int(season)}E0*1\s*(?:-|[-_. ]?E)\s*E?0*(\d{{1,3}})"
-        values: list[int] = []
-        for match in re.finditer(pattern, str(query_summary), flags=re.IGNORECASE):
-            try:
-                value = int(match.group(1))
-            except (TypeError, ValueError):
-                continue
-            if value > 1:
-                values.append(value)
-        return max(values) if values else None
-
-    @staticmethod
-    def _annotate_requested_season_coverage(payload: dict[str, Any], season: int, expected_episode_count: int) -> None:
-        """Mark whether a bundle candidate covers the category-known season range."""
-        context = payload.get("bundle_context") if isinstance(payload.get("bundle_context"), dict) else {}
-        if not context or not expected_episode_count:
-            return
+    def _category_response_facts(
+        self,
+        category: object | None,
+        *,
+        item: CategoryItem,
+        season: int | None,
+        episode: int | None,
+        query_summary: str,
+        search_scope: str,
+        context: object | None,
+    ) -> dict[str, Any]:
+        """Return category-owned response facts without parsing domain names in scheduler."""
+        hook = getattr(category, "agent_search_response_facts", None)
+        if not callable(hook):
+            return {}
         try:
-            start = int(context.get("start") or 0)
-            end = int(context.get("end") or 0)
-            candidate_season = int(context.get("season") or context.get("season_start") or 0)
-        except (TypeError, ValueError):
-            return
-        if str(context.get("scope") or "") != "episode_range" or candidate_season != int(season):
-            return
-        payload["expected_episode_count"] = expected_episode_count
-        if start == 1 and end == int(expected_episode_count):
-            payload["requested_season_coverage"] = "full_requested_season"
-            payload["coverage_note"] = f"covers S{int(season):02d}E01-E{int(end):02d}; category expected season length is {int(expected_episode_count)}"
-        elif start and end:
-            payload["requested_season_coverage"] = "partial_requested_season"
-            payload["coverage_note"] = f"covers S{int(season):02d}E{int(start):02d}-E{int(end):02d}; category expected season length is {int(expected_episode_count)}"
+            facts = hook(
+                item=item,
+                season=season,
+                episode=episode,
+                query_summary=query_summary,
+                search_scope=search_scope,
+                context=context,
+            )
+        except Exception as exc:
+            logger.debug("Category response fact hook failed for %s: %s", getattr(item, "key", ""), exc)
+            return {}
+        return facts if isinstance(facts, dict) else {}
 
-    @staticmethod
-    def _request_unit_label(season: int | None, episode: int | None) -> str | None:
-        """Return an opaque TV-compatible label for category descriptor hooks."""
-        if season is None:
+    def _category_annotated_candidate_payload(
+        self,
+        category: object | None,
+        payload: dict[str, Any],
+        result: SearchResult,
+        *,
+        item: CategoryItem,
+        unit_label: str | None,
+        season: int | None,
+        episode: int | None,
+        search_scope: str,
+        response_facts: dict[str, Any],
+        context: object | None,
+    ) -> dict[str, Any]:
+        """Let the owning category add final candidate payload annotations."""
+        hook = getattr(category, "annotate_agent_search_candidate_payload", None)
+        if not callable(hook):
+            return payload
+        try:
+            annotated = hook(
+                payload,
+                result,
+                item=item,
+                unit_label=unit_label,
+                season=season,
+                episode=episode,
+                search_scope=search_scope,
+                response_facts=response_facts,
+                context=context,
+            )
+            return annotated if isinstance(annotated, dict) else payload
+        except Exception as exc:
+            logger.debug("Category candidate annotation hook failed for %s: %s", getattr(item, "key", ""), exc)
+            return payload
+
+    def _request_unit_label(
+        self,
+        category: object | None,
+        season: int | None,
+        episode: int | None,
+        *,
+        search_scope: str | None = None,
+    ) -> str | None:
+        """Return a category-owned label for transitional structured unit args."""
+        if season is None and episode is None:
             return None
-        if episode is None:
-            return f"Season {int(season)}"
-        return f"S{int(season):02d}E{int(episode):02d}"
+        hook = getattr(category, "agent_unit_label_from_args", None)
+        if callable(hook):
+            try:
+                label = hook(season=season, episode=episode, search_scope=search_scope)
+                text = str(label or "").strip()
+                if text:
+                    return text
+            except Exception:
+                return None
+        return None
 
     def _media_identity_snapshot(self, media: CategoryItem, category_id: str) -> dict[str, Any]:
         """Return stable item/provider metadata for later download import."""

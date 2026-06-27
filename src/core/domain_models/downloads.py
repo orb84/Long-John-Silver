@@ -167,11 +167,23 @@ class DownloadImportContext(BaseModel):
 
     @property
     def stable_provider_key(self) -> str:
-        """Return provider/media/id identity, or an empty string if incomplete."""
-        if not self.provider or not self.provider_id:
-            return ""
-        media_type = self.provider_media_type or self.category_id
-        return f"{self.provider}:{media_type}:{self.provider_id}"
+        """Return the stable item identity used by duplicate checks.
+
+        Provider IDs are strongest.  Some queue paths, especially release-watch
+        retries and cached LLM candidate queues, only know the category item key
+        plus a category-owned unit descriptor.  Those rows must still dedupe;
+        otherwise the same episode can be queued repeatedly through different
+        magnets or stale watches.
+        """
+        if self.provider and self.provider_id:
+            media_type = self.provider_media_type or self.category_id
+            return f"{self.provider}:{media_type}:{self.provider_id}"
+        category = str(self.category_id or "").strip().casefold()
+        item = str(self.item_id or self.canonical_title or self.display_title or "").strip().casefold()
+        item = re.sub(r"\s+", " ", item)
+        if category and item:
+            return f"category:{category}:{item}"
+        return ""
 
     @property
     def stable_unit_key(self) -> str:

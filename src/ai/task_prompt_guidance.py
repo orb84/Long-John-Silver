@@ -62,18 +62,18 @@ class TaskPromptGuidance:
             "- Queue/status/control requests: call list_downloads first, then manage_downloads or priority tools; do not search torrents.\n"
             "- Fresh media discovery: use category context/enquire_about_media, then search_media_torrents. Use structured category/unit args, not prose-only names.\n"
             "- Preserve titles literally in tool args. Do not remove title stopwords such as 'of', 'the', or 'a' to make search keywords.\n"
-            "- TV show title with no specific episode usually means a season/show bundle. Search pack-preferred with a season when category metadata can resolve it; episode-range pack names like S01E01-06 are common and often better than the word 'Complete'.\n"
+            "- For category requests that ask for a whole unit or many missing units, let the owning category guidance decide whether bundles/ranges are better than individual files.\n"
             "- If the user explicitly asks for a media language, mark language_is_explicit=true and keep searching/inspecting until language evidence is resolved; do not conclude 'not found in language X' from one broad non-language query.\n"
-            "- If the tool reports a configured media language such as English, silently apply that preference. Do not ask whether the user wants other languages just because a dual/MULTI row also advertises them; for English installs, prefer English-only or language-unknown scene releases over ITA+ENG/MULTI rows and mention extra audio only when the selected candidate actually has it.\n"
+            "- If the tool reports a configured media language, apply that category preference. Do not invent a different language rule; use the owning category's language-tag skill and candidate annotations.\n"
             "- Untracked requested item: verify with metadata/research first; if the user asks to add/track/follow it, call track_category_item.\n"
             "- Future/next-season download tracking: gather provider/category_web_research evidence, track the item if needed, then create_web_information_watch with allow_download_queueing=true only when the user explicitly asked for future download action.\n"
             "- Candidate choice: queue only by candidate_id/result_set_id when the result is an exact, safe match. Inspect bundles or ask when coverage/language/quality/size/seeders are ambiguous.\n"
             "- If search_media_torrents returns quality_choice_policy.requires_user_choice, present the listed quality/size options by candidate_id; do not queue one candidate or imply only one proposal exists.\n"
             "- If search_media_torrents returns llm_candidate_review/recommended_candidate_id and llm_next_action says queue_download, follow that tool evidence for grab/download requests; do not override it with lower-ranked batch/episode alternatives. If quality_choice_policy is present, it overrides auto-queue.\n"
-            "- Never infer missing or extra TV episodes from candidate groups. Use category metadata/tool fields for season length, and treat a recommended S01E01-06 pack as the season candidate when it matches the requested full-season scope.\n"
+            "- Never infer missing or extra category units from candidate groups. Use category metadata/tool fields for unit counts and treat category-approved bundle/range coverage as evidence only when the tool exposes it.\n"
             "- Hard filters before preference: requested unit/pack coverage, category language rules, magnet/downloadability, quality/format facets, size/bitrate/storage, and seeders.\n"
             "- Public web evidence never directly authorizes a download; category/download tools must prove release and availability.\n"
-            "- Confirm success only from queue tool receipts, not from search results."
+            "- Confirm success only from queue tool receipts, not from search results. If queue_download reports not_queued, already_complete, partial_failure, or fewer queued_count entries than requested, say exactly what succeeded/failed and do not claim the missing downloads started."
         )
 
     @staticmethod

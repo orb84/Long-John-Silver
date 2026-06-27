@@ -1277,6 +1277,91 @@ class CategoryContractMixin(CategoryContextMixin):
         """
         return []
 
+    def reconcile_settings_item_with_persisted_state(self, item: Any, persisted_payload: dict[str, Any] | None, settings: Any | None = None) -> bool:
+        """Repair runtime item state from the category item repository before background work.
+
+        Settings and the category item repository can drift after older builds or
+        legacy mutation paths. The scheduler calls this hook before unattended
+        work so categories with strict automation semantics can make visible
+        persisted user choices authoritative again without core code learning
+        category fields. Return ``True`` when ``item`` was changed and should be
+        persisted back to both stores.
+        """
+        return False
+
+    def release_watch_auto_download_allowed(self, item: Any, requirements: dict[str, Any], settings: Any | None = None) -> bool:
+        """Return whether a stored release-watch row may auto-queue now.
+
+        The generic scheduler owns retry timing, but categories own the policy
+        meaning of their per-item automation switches.  The default preserves
+        legacy behavior for categories that still inherit the global automation
+        setting; stricter categories such as TV may require an explicit item
+        opt-in and ignore stale requirements snapshots.
+        """
+        item_auto = getattr(item, "auto_download", None)
+        if item_auto is False:
+            return False
+        if item_auto is True:
+            if "auto_download" in (requirements or {}):
+                return bool((requirements or {}).get("auto_download"))
+            return True
+        if "auto_download" in (requirements or {}):
+            return bool((requirements or {}).get("auto_download"))
+        return bool(getattr(settings, "auto_download", False))
+
+    def queued_background_start_allowed(self, item: Any, settings: Any | None = None) -> bool | None:
+        """Return a category-owned queue-start override for background rows.
+
+        ``True``/``False`` are authoritative for a matched tracked item. ``None``
+        lets generic code fall back to the global automation switch for legacy
+        categories or rows that do not map to a configured item.
+        """
+        value = getattr(item, "auto_download", None)
+        if value is None:
+            return None
+        return bool(value)
+
+    def background_discovery_allowed(self, item: Any, settings: Any | None = None) -> bool:
+        """Return whether unattended discovery may search and queue for this item.
+
+        Search/discovery services own execution, but the category owns the
+        meaning of per-item automation fields. The default preserves legacy
+        behavior for categories that intentionally inherit the global automation
+        switch when the item has no explicit preference. Strict categories can
+        override this to require an explicit per-item opt-in.
+        """
+        value = getattr(item, "auto_download", None)
+        if value is None:
+            return bool(getattr(settings, "auto_download", False))
+        return bool(value)
+
+    def release_watch_search_allowed(self, item: Any, requirements: dict[str, Any], settings: Any | None = None) -> bool:
+        """Return whether a release watch may perform unattended searches now.
+
+        This is separate from auto-download permission because some legacy
+        categories use release-watch searches only to notify the user. Categories
+        with high false-positive risk may override this and refuse even
+        notification-only background searches unless the item is explicitly
+        opted in.
+        """
+        return True
+
+    def ready_import_file_allowed(
+        self,
+        source_path: Path,
+        item: Any | None = None,
+        file_info: Any | None = None,
+        settings: Any | None = None,
+    ) -> bool:
+        """Return whether a completed payload file should become library media.
+
+        The download handler must not know whether a category treats images,
+        samples, sidecars, or documents as primary media. Categories that need
+        to preserve bundle structure or skip non-media payload files should
+        override this hook.
+        """
+        return True
+
     def validate_search_result_for_request(self, result: Any, item: Any, unit_label: str | None) -> bool:
         """Return whether a candidate result matches the category request.
 
@@ -1342,6 +1427,72 @@ class CategoryContractMixin(CategoryContextMixin):
         this hook and expose a descriptor matching their own object spec.
         """
         return {"granularity": "item", "label": "", "coordinates": {}}
+
+    def agent_unit_label_from_args(
+        self,
+        *,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+    ) -> str | None:
+        """Return a category-owned textual unit label for assistant searches.
+
+        Generic scheduler/search code may still receive transitional ``season``
+        and ``episode`` arguments from the public tool schema, but it must not
+        format them as TV labels itself. Categories that accept those arguments
+        expose the label through their descriptor; categories that do not accept
+        them stay item-level.
+        """
+        _ = search_scope
+        descriptor = self.unit_descriptor_from_agent_args(season=season, episode=episode)
+        if not isinstance(descriptor, dict):
+            return None
+        label = str(descriptor.get("label") or descriptor.get("stable_key") or "").strip()
+        return label or None
+
+    def agent_search_response_facts(
+        self,
+        *,
+        item: Any,
+        season: int | None = None,
+        episode: int | None = None,
+        query_summary: str | None = None,
+        search_scope: str | None = None,
+        context: Any | None = None,
+    ) -> dict[str, Any]:
+        """Return category-owned response-level facts for a search workspace.
+
+        Core search services should not parse category release names to produce
+        facts such as expected episode counts, disc counts, track ranges, DLC
+        coverage, or edition coverage. Categories can return compact facts here
+        after their own search fanout has built provider/query evidence.
+        """
+        _ = (item, season, episode, query_summary, search_scope, context)
+        return {}
+
+    def annotate_agent_search_candidate_payload(
+        self,
+        payload: dict[str, Any],
+        result: Any,
+        *,
+        item: Any,
+        unit_label: str | None = None,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+        response_facts: dict[str, Any] | None = None,
+        context: Any | None = None,
+    ) -> dict[str, Any] | None:
+        """Let the category add final candidate annotations to one payload.
+
+        The payload already contains shared projection fields plus optional
+        category bundle/descriptor facts.  Categories may annotate coverage,
+        exact-match warnings, edition/format notes, or other domain-specific
+        facts without teaching scheduler core what those fields mean.
+        Returning ``None`` means the payload was mutated in place.
+        """
+        _ = (result, item, unit_label, season, episode, search_scope, response_facts, context)
+        return payload
 
     def sort_cached_download_candidates(self, entries: list[dict[str, Any]], request_context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Return category-owned ordering for queued cached candidates.
@@ -1571,6 +1722,43 @@ class CategoryContractMixin(CategoryContextMixin):
         on category ids.
         """
         return False
+
+    def normalize_agent_search_name_argument(
+        self,
+        name: str,
+        *,
+        user_prompt: str | None = None,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+    ) -> str:
+        """Return a category-approved item title before generic literal repair.
+
+        Generic agent tools must not strip category-specific unit words from a
+        title argument.  Categories that understand structured units may remove
+        their own trailing unit/scope qualifiers here, while the shared tool
+        keeps the user's literal title wording via ``MediaTitleRepair``.
+        """
+        _ = (user_prompt, season, episode, search_scope)
+        return str(name or "").strip()
+
+    def normalize_agent_search_units_from_name(
+        self,
+        name: str,
+        *,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+    ) -> tuple[str, int | None, int | None]:
+        """Return category-owned title/unit normalization for search requests.
+
+        Scheduler core must not parse words such as season, volume, disc,
+        chapter, track, pack, or edition.  Categories that understand a
+        structured unit vocabulary can extract their own coordinates here after
+        routing has selected them.
+        """
+        _ = search_scope
+        return str(name or "").strip(), season, episode
 
     async def build_agent_search_labels(
         self,

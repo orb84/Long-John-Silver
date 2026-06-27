@@ -350,8 +350,9 @@ class QueueDownloadService:
             return {"error": payload["error"]}
         try:
             result = await self._scheduler.queue_download(**payload["scheduler_kwargs"])
-            if isinstance(result, dict) and result.get("error"):
-                return {"error": result.get("error")}
+            validation_error = self._queue_result_error(result)
+            if validation_error:
+                return {"error": validation_error, "raw_result": result}
             await self._record_candidate_quality_choice(entry, payload)
             return self._queued_entry_receipt(entry, payload["candidate_name"], result, entry["candidate"], payload)
         except Exception as exc:
@@ -495,6 +496,18 @@ class QueueDownloadService:
         }
 
 
+    def _queue_result_error(self, result: object) -> str | None:
+        """Return a tool-safe error if the scheduler did not verify a queueable row."""
+        if not isinstance(result, dict):
+            return "Queue operation returned no structured receipt."
+        if result.get("error"):
+            return str(result.get("error"))
+        if not result.get("download_id"):
+            return "Queue operation returned no verified download_id."
+        if result.get("status") not in {"queued", "already_active"}:
+            return f"Queue operation did not create or expose an active download (status={result.get('status') or 'unknown'})."
+        return None
+
     def _import_context_for_candidate(self, request: QueueDownloadRequest, candidate_name: str, candidate: dict[str, Any], cache: dict[str, Any], season: int | None, episode: int | None, unit_descriptor: dict[str, Any] | None = None) -> dict[str, Any]:
         """Build a persisted provider/import snapshot for one cached candidate."""
         metadata = dict(cache.get("metadata_snapshot") or {})
@@ -505,11 +518,23 @@ class QueueDownloadService:
             or metadata.get("tvmaze_id") or metadata.get("imdb_id")
             or (metadata.get("id") if provider else None)
         )
+        descriptor = unit_descriptor or self._candidate_unit_descriptor(candidate, request, cache)
+        release_title = str(candidate.get("title") or request.selected_torrent_title or "").strip()
+        provider_identity_present = bool(provider and provider_id)
+        descriptor_key = str((descriptor or {}).get("stable_key") or "").strip()
+        has_structured_unit = bool(descriptor_key or season is not None or episode is not None)
+        item_identity = cache.get("item_id") or metadata.get("item_id") or candidate_name
+        display_title = cache.get("display_name") or metadata.get("title") or candidate_name
+        canonical_title = metadata.get("title") or cache.get("display_name") or candidate_name
+        if release_title and not provider_identity_present and not has_structured_unit:
+            item_identity = release_title
+            display_title = release_title
+            canonical_title = release_title
         overrides = {
             "category_id": request.category_id or cache.get("category_id") or candidate.get("category_id") or metadata.get("category_id") or "",
-            "item_id": cache.get("item_id") or metadata.get("item_id") or candidate_name,
-            "display_title": cache.get("display_name") or metadata.get("title") or candidate_name,
-            "canonical_title": metadata.get("title") or cache.get("display_name") or candidate_name,
+            "item_id": item_identity,
+            "display_title": display_title,
+            "canonical_title": canonical_title,
             "provider": provider,
             "provider_media_type": metadata.get("provider_media_type") or request.category_id or cache.get("category_id") or candidate.get("category_id") or "",
             "provider_id": provider_id,
@@ -520,12 +545,12 @@ class QueueDownloadService:
         context = DownloadImportContext.from_selection(
             category_id=str(overrides.get("category_id") or ""),
             item_id=str(overrides.get("item_id") or candidate_name),
-            item_name=candidate_name,
+            item_name=str(display_title or candidate_name),
             season=season,
             episode=episode,
-            unit_descriptor=unit_descriptor or self._candidate_unit_descriptor(candidate, request, cache),
+            unit_descriptor=descriptor,
             language=str(cache.get("language") or request.raw_arguments.get("language") or ""),
-            release_title=str(candidate.get("title") or request.selected_torrent_title or ""),
+            release_title=release_title,
             metadata=metadata,
             candidate=candidate,
             overrides=overrides,
@@ -601,10 +626,9 @@ class QueueDownloadService:
                 source_seeders=request.selected_source_seeders,
                 import_context=self._import_context_for_direct(request),
             )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            if not (isinstance(result, dict) and result.get("status") == "queued" and result.get("download_id")):
-                return {"error": "Queue operation returned no verified download_id.", "raw_result": result}
+            validation_error = self._queue_result_error(result)
+            if validation_error:
+                return {"error": validation_error, "raw_result": result}
             return result
         except Exception as exc:
             logger.error(f"Queue download tool error: {exc}")
@@ -688,9 +712,13 @@ class QueueDownloadService:
     ) -> dict[str, Any]:
         """Build the per-candidate queue receipt returned to the LLM."""
         scheduler_kwargs = (payload or {}).get("scheduler_kwargs", {}) if isinstance(payload, dict) else {}
+        receipt = result if isinstance(result, dict) else {}
         return {
             "candidate_id": str(entry["candidate_id"]),
-            "download_id": result.get("download_id") if isinstance(result, dict) else None,
+            "download_id": receipt.get("download_id"),
+            "queue_status": receipt.get("status"),
+            "download_status": receipt.get("download_status"),
+            "already_existing": bool(receipt.get("already_existing")),
             "name": candidate_name,
             "season": scheduler_kwargs.get("season", candidate.get("season")),
             "episode": scheduler_kwargs.get("episode", candidate.get("episode")),

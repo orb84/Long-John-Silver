@@ -50,3 +50,24 @@ storage:
   context_max_volumes: 5
   ui_refresh_seconds: 60
 ```
+
+## Download cleanup and legacy `.ljs-trash` folders
+
+Routine download cleanup, cancellation cleanup, partial-file cleanup, and post-import
+source cleanup permanently delete files after safe-path validation. They must not
+move payloads into a hidden `.ljs-trash` folder inside the download root because
+that silently consumes disk space and makes the UI look like deletion succeeded.
+
+Round 257 keeps explicit quarantine support in `SafePathResolver` for future
+workflows that ask for it deliberately, but the default delete policy is
+permanent deletion. Existing legacy `.ljs-trash` folders can be audited with:
+
+```bash
+python scripts/round257_purge_ljs_trash.py /path/to/downloads
+```
+
+After checking the dry-run report, delete them with:
+
+```bash
+python scripts/round257_purge_ljs_trash.py /path/to/downloads --execute
+```

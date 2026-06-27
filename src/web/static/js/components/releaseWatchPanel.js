@@ -12,6 +12,8 @@ class ReleaseWatchPanel extends Component {
         this._eventBus = eventBus;
         this._refreshTimer = null;
         this._statusFilter = '';
+        this._inFlightLoad = null;
+        this._needsRefreshOnVisible = false;
         if (this.container) {
             this.render();
             this.load();
@@ -63,34 +65,67 @@ class ReleaseWatchPanel extends Component {
         if (this._eventBus && typeof this._eventBus.subscribe === 'function') {
             this._eventBus.subscribe('system', (event) => {
                 if (!event || !['category_item_added', 'category_item_removed', 'download_completed'].includes(event.subtype)) return;
-                this.load({ quiet: true });
+                if (this._isVisible()) this.load({ quiet: true });
+                else this._needsRefreshOnVisible = true;
+            });
+            this._eventBus.subscribe('ui:visibility', (state) => {
+                if (state && state.visible && this._needsRefreshOnVisible && this._isVisible()) {
+                    this._needsRefreshOnVisible = false;
+                    this.load({ quiet: true });
+                }
+            });
+            this._eventBus.subscribe('view:changed', () => {
+                if (this._needsRefreshOnVisible && this._isVisible()) {
+                    this._needsRefreshOnVisible = false;
+                    this.load({ quiet: true });
+                }
             });
         }
-        this._refreshTimer = setInterval(() => {
-            const suggestions = document.getElementById('suggestions');
-            if (suggestions && suggestions.classList.contains('active')) this.load({ quiet: true });
-        }, 60000);
+        if (window.ljsPerf) {
+            this._refreshTimer = window.ljsPerf.registerAdaptiveInterval(() => this.load({ quiet: true }), {
+                foregroundMs: 60000,
+                backgroundMs: 180000,
+                initialDelayMs: 60000,
+                shouldRun: () => this._isVisible()
+            });
+        } else {
+            this._refreshTimer = setInterval(() => {
+                if (this._isVisible()) this.load({ quiet: true });
+            }, 60000);
+        }
     }
 
     async load({ quiet = false } = {}) {
         const list = document.getElementById('release-watch-list');
         if (!list || typeof APIClient === 'undefined') return;
+        if (this._inFlightLoad) return this._inFlightLoad;
         if (!quiet) {
             list.innerHTML = '';
             list.appendChild(DOM.el('p', { className: 'empty-msg' }, ['Loading release watches...']));
         }
-        try {
-            const params = new URLSearchParams({ limit: '100' });
-            if (this._statusFilter) params.set('status', this._statusFilter);
-            const data = await APIClient.get(`/api/release-watches?${params.toString()}`);
-            this._renderSummary(data.status_counts || {}, data.count || 0);
-            this._renderList(Array.isArray(data.watches) ? data.watches : []);
-        } catch (err) {
-            list.innerHTML = '';
-            list.appendChild(DOM.el('div', { className: 'release-watch-error' }, [
-                `Release watches unavailable: ${err.message || err}`
-            ]));
-        }
+        this._inFlightLoad = (async () => {
+            try {
+                const params = new URLSearchParams({ limit: '100' });
+                if (this._statusFilter) params.set('status', this._statusFilter);
+                const data = await APIClient.get(`/api/release-watches?${params.toString()}`);
+                this._renderSummary(data.status_counts || {}, data.count || 0);
+                this._renderList(Array.isArray(data.watches) ? data.watches : []);
+            } catch (err) {
+                list.innerHTML = '';
+                list.appendChild(DOM.el('div', { className: 'release-watch-error' }, [
+                    `Release watches unavailable: ${err.message || err}`
+                ]));
+            } finally {
+                this._inFlightLoad = null;
+            }
+        })();
+        return this._inFlightLoad;
+    }
+
+    _isVisible() {
+        const suggestions = document.getElementById('suggestions');
+        if (!suggestions || !suggestions.classList.contains('active')) return false;
+        return !window.ljsPerf || window.ljsPerf.isVisible();
     }
 
     _renderSummary(counts, count) {
@@ -118,7 +153,9 @@ class ReleaseWatchPanel extends Component {
             list.appendChild(DOM.el('p', { className: 'empty-msg' }, ['No release watches match this filter.']));
             return;
         }
-        watches.forEach(watch => list.appendChild(this._watchCard(watch)));
+        const fragment = document.createDocumentFragment();
+        watches.forEach(watch => fragment.appendChild(this._watchCard(watch)));
+        list.appendChild(fragment);
     }
 
     _watchCard(watch) {

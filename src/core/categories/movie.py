@@ -18,6 +18,7 @@ from loguru import logger
 from src.core.categories.base import CategoryMedia
 from src.core.categories.search_patterns import SearchPatterns
 from src.core.categories.identity import clean_display_title, clean_release_title, extract_release_year, canonical_item_key, clean_path_fragment, basename_from_pathish
+from src.core.categories.title_authority import CategoryTitleAuthority
 from src.core.categories.types import ParsedMedia, ScannedItem, ScannedFileObservation
 from src.core.categories.media_probe import probe_media_files_serial, resolution_label_from_probe_payload
 from src.core.categories.video_sidecars import plan_video_sidecar_imports
@@ -41,7 +42,6 @@ if TYPE_CHECKING:
 
 _MOVIE_YEAR_RE = re.compile(r'(?P<title>.+?)(?:\s*[\[(]\s*|\s+)(?P<year>19\d{2}|20\d{2})(?:\s*[\])]|\b)')
 _VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.mpg', '.mpeg', '.wmv'}
-_COLLECTION_MARKER_RE = re.compile(r'\b(?:trilogia|trilogy|quadrilogia|quadrilogy|saga|collection|collezione|duologia|duology|tetralogia|box\s*set|complete)\b', re.IGNORECASE)
 _TV_EPISODE_HINT_RE = re.compile(r'\b(?:S\d{1,2}E\d{1,3}|S\d{1,2}\s*[-–]\s*\d{1,2}|\d{1,2}x\d{1,3})\b', re.IGNORECASE)
 _TV_SEASON_DIR_HINT_RE = re.compile(r'^(?:season|stagione)\s*\d{1,2}$|^S\d{1,2}$', re.IGNORECASE)
 _IGNORED_MOVIE_SUBDIRS = {'sample', 'samples', 'extra', 'extras', 'subs', 'subtitles', 'proof'}
@@ -88,6 +88,158 @@ class MovieCategory(CategoryMedia):
     capabilities = ["metadata", "downloadable", "file_organization", "subtitles", "ratings", "quality_upgrades"]
     metadata_provider_names = ["tmdb"]
     supported_operations = ["search", "download", "scan", "organize", "refresh_metadata", "search_upgrade"]
+
+    async def search_agent_candidates(
+        self,
+        item: Any,
+        *,
+        season: int | None = None,
+        episode: int | None = None,
+        language: str | None = None,
+        search_scope: str | None = None,
+        context: Any,
+    ) -> tuple[list[Any], str]:
+        """Run movie-owned interactive search with title-authority validation.
+
+        Movie searches must not expose broad keyword hits such as
+        ``The Best Exotic Marigold Hotel`` for a request named ``Hotel
+        Exotica``.  The category first enriches provider title authority when
+        possible, then searches a bounded title/year ladder and validates every
+        row against exact provider/user title phrases before the LLM can see or
+        queue it.
+        """
+        item = await self._ensure_agent_title_authority(item, context)
+        queries = self._agent_movie_search_queries(item, language=language)
+        merged: list[Any] = []
+        seen: set[str] = set()
+        quality_profile = getattr(item, "quality", None)
+        for query in queries:
+            try:
+                results = await context.aggregator.search(
+                    query,
+                    category=self.category_id,
+                    quality_profile=quality_profile,
+                    preferred_language=language,
+                )
+            except Exception as exc:
+                logger.debug(f"Movie agent query failed for {getattr(item, 'key', '')}: {query}: {exc}")
+                continue
+            valid = [result for result in (results or []) if self.validate_search_result_for_request(result, item, None)]
+            self._log_movie_search_filter_audit(item=item, query=query, language=language, raw_results=results or [], valid_results=valid)
+            self._merge_movie_results(merged, seen, valid)
+            if len(merged) >= 40:
+                break
+        ranked = self._rank_movie_agent_results(merged, item=item, language=language)
+        return ranked, "; ".join(queries[:4]) or str(getattr(item, "key", "") or "movie")
+
+    async def _ensure_agent_title_authority(self, item: Any, context: Any | None) -> Any:
+        """Attach TMDB-backed title aliases before movie search when available."""
+        if item is None or CategoryTitleAuthority.authoritative_aliases_for_item(item):
+            return item
+        title = str(getattr(item, "key", "") or "").strip()
+        if not title or context is None:
+            return item
+        metadata: dict[str, Any] = dict(getattr(item, "metadata", {}) or {})
+        enricher = getattr(context, "metadata_enricher", None)
+        if enricher and hasattr(enricher, "enrich_feature"):
+            try:
+                record = await enricher.enrich_feature(title)
+            except Exception as exc:
+                logger.debug(f"Movie title authority TMDB lookup failed for {title}: {exc}")
+                record = None
+            if record is not None:
+                payload = record.model_dump() if hasattr(record, "model_dump") else dict(record)
+                payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
+                metadata.update(payload)
+                display_name = payload.get("display_name")
+                if display_name and hasattr(item, "display_name"):
+                    try:
+                        item.display_name = str(display_name)
+                    except Exception:
+                        pass
+                year = self._safe_year(getattr(item, "year", None))
+                if year is None:
+                    release_year = self._safe_year(payload.get("release_year") or payload.get("year") or self._year_from_release_date(payload.get("first_release_date")))
+                    if release_year is not None and hasattr(item, "year"):
+                        try:
+                            item.year = release_year
+                        except Exception:
+                            pass
+        if metadata:
+            try:
+                item.metadata = metadata
+            except Exception:
+                pass
+        return item
+
+    def _agent_movie_search_queries(self, item: Any, *, language: str | None = None) -> list[str]:
+        """Return bounded movie query variants from title authority."""
+        titles = CategoryTitleAuthority.query_titles_for_item(item, preferred_language=language, limit=6)
+        if not titles:
+            titles = [str(getattr(item, "key", "") or "").strip()]
+        year = self._requested_movie_year(item)
+        raw: list[str] = []
+        for title in titles:
+            title = str(title or "").strip()
+            if not title:
+                continue
+            if year:
+                raw.append(self._append_search_language(f"{title} {year}", language))
+            raw.append(self._append_search_language(title, language))
+            # English is rarely advertised in public movie torrent titles.  For
+            # explicit English, the language facet is a rank/validation signal,
+            # not a reason to skip bare exact-title queries.
+            if language and self._append_search_language(title, language) != title:
+                if year:
+                    raw.append(f"{title} {year}")
+                raw.append(title)
+        out: list[str] = []
+        seen: set[str] = set()
+        for query in raw:
+            normalized = re.sub(r"\s+", " ", str(query or "")).strip()
+            marker = normalized.casefold()
+            if normalized and marker not in seen:
+                seen.add(marker)
+                out.append(normalized)
+        return out[:12]
+
+    @staticmethod
+    def _merge_movie_results(merged: list[Any], seen: set[str], results: list[Any] | None) -> None:
+        """Append unique search rows by magnet/source/title identity."""
+        for result in results or []:
+            identity = str(getattr(result, "magnet", None) or f"{getattr(result, 'source', '')}|{getattr(result, 'title', '')}").casefold()
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            merged.append(result)
+
+    def _rank_movie_agent_results(self, results: list[Any], *, item: Any, language: str | None = None) -> list[Any]:
+        """Deterministically rank validated movie candidates before LLM review."""
+        requested_year = self._requested_movie_year(item)
+
+        def rank(result: Any) -> tuple[int, int, int, int, str]:
+            title = str(getattr(result, "title", "") or "")
+            lang_status = self._movie_language_status(title, language)
+            lang_rank = 0 if lang_status == "preferred" else (1 if lang_status == "unknown" else 2)
+            candidate_year = extract_release_year(title)
+            year_rank = 0 if requested_year and candidate_year == requested_year else (1 if not requested_year or not candidate_year else 3)
+            try:
+                seeders = int(getattr(result, "seeders", None) if getattr(result, "seeders", None) is not None else -1)
+            except (TypeError, ValueError):
+                seeders = -1
+            res_rank = {"2160p": 0, "4k": 0, "1080p": 1, "720p": 2, "480p": 3}.get(str(self._extract_resolution(title) or "").lower(), 4)
+            return (lang_rank, year_rank, -seeders, res_rank, title.casefold())
+
+        return sorted(results or [], key=rank)
+
+    def _log_movie_search_filter_audit(self, *, item: Any, query: str, language: str | None, raw_results: list[Any], valid_results: list[Any]) -> None:
+        """Log compact movie search filter evidence for future debugging."""
+        if raw_results and not valid_results:
+            sample = [str(getattr(row, "title", "") or "")[:160] for row in raw_results[:8]]
+            logger.info(
+                "MOVIE_SEARCH_FILTER_AUDIT item=%r query=%r language=%r raw=%d valid=0 rejected_sample=%r",
+                getattr(item, "key", ""), query, language, len(raw_results), sample,
+            )
     category_tool_names = [
         "movie.resolve_metadata",
         "movie.refresh_metadata",
@@ -516,7 +668,7 @@ class MovieCategory(CategoryMedia):
                     category_id=self.category_id,
                     affected_paths=affected_paths,
                     risk_level="destructive",
-                    user_message=f"Confirm deletion of {title}. Files will be quarantined, not permanently removed.",
+                    user_message=f"Confirm deletion of {title}. Files will be permanently deleted from disk if delete_files is enabled.",
                 )
                 return self._confirmation_service.receipt_for_request(request)
             token = str(arguments.get("confirmation_token") or "")
@@ -538,7 +690,7 @@ class MovieCategory(CategoryMedia):
                 status="success",
                 user_message=f"Deleted movie item {title}.",
                 changed_entities=[ChangedEntity(entity_type="category_item", entity_id=title, display_name=title, change="deleted")],
-                data={"files_quarantined": files_deleted, "affected_paths": affected_paths},
+                data={"files_deleted": files_deleted, "affected_paths": affected_paths},
             )
 
         return self._workflow_failed(workflow_name, f"Unsupported movie workflow: {workflow_name}")
@@ -600,6 +752,82 @@ class MovieCategory(CategoryMedia):
                 seen.add(key)
                 out.append(cleaned)
         return out[:4]
+
+    def build_search_query(self, item: Any, unit_label: str | None, language: str | None) -> str:
+        """Return a movie torrent query preserving title/year identity."""
+        title = str(getattr(item, "key", "") or "").strip()
+        year = self._requested_movie_year(item)
+        base = f"{title} {year}".strip() if year else title
+        if unit_label:
+            base = f"{base} {unit_label}".strip()
+        return self._append_search_language(base, language)
+
+    def build_alternative_search_queries(self, item: Any, unit_label: str | None, language: str | None) -> list[str]:
+        """Return movie-owned fallback queries from title authority."""
+        queries = self._agent_movie_search_queries(item, language=language)
+        primary = self.build_search_query(item, unit_label, language).casefold()
+        return [query for query in queries if query.casefold() != primary]
+
+    def validate_search_result_for_request(self, result: Any, item: Any, unit_label: str | None) -> bool:
+        """Validate that a torrent row names the requested movie.
+
+        This gate is intentionally stricter than token-overlap scoring.  A movie
+        result must contain a known title phrase (provider title/alias first,
+        user title as fallback) and, when both sides advertise a year, the year
+        must not contradict the request.
+        """
+        title = str(getattr(result, "title", "") or "")
+        if not title:
+            return False
+        if _TV_EPISODE_HINT_RE.search(title):
+            return False
+        if self._looks_like_non_movie_payload(title):
+            return False
+        aliases = CategoryTitleAuthority.aliases_for_item(item, preferred_language=getattr(item, "language", None), include_user_key=True)
+        if not aliases:
+            aliases = [str(getattr(item, "key", "") or "").strip()]
+        if not CategoryTitleAuthority.matches_any_alias(title, aliases):
+            return False
+        requested_year = self._requested_movie_year(item)
+        candidate_year = extract_release_year(title)
+        if requested_year and candidate_year and int(candidate_year) != int(requested_year):
+            return False
+        return True
+
+    def filter_agent_candidate_payloads_for_request(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+        language: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Final fail-safe filter before movie candidates reach the LLM/user.
+
+        Candidate payloads carry the requested item descriptor.  If generic
+        search ever lets unrelated rows through, drop them here rather than
+        letting the LLM decide that keyword-overlap rows are safe to queue.
+        """
+        filtered: list[dict[str, Any]] = []
+        for candidate in candidates or []:
+            descriptor = candidate.get("unit_descriptor") if isinstance(candidate.get("unit_descriptor"), dict) else {}
+            coords = descriptor.get("coordinates") if isinstance(descriptor.get("coordinates"), dict) else {}
+            requested_title = str(coords.get("title") or descriptor.get("label") or "").strip()
+            if not requested_title:
+                filtered.append(candidate)
+                continue
+            title = str(candidate.get("title") or "")
+            if not title or self._looks_like_non_movie_payload(title):
+                continue
+            if not CategoryTitleAuthority.matches_any_alias(title, [requested_title]):
+                continue
+            requested_year = self._safe_year(coords.get("year"))
+            candidate_year = extract_release_year(title)
+            if requested_year and candidate_year and int(requested_year) != int(candidate_year):
+                continue
+            filtered.append(candidate)
+        return filtered
 
     def soulseek_search_limit(
         self,
@@ -705,6 +933,41 @@ class MovieCategory(CategoryMedia):
             return year if 1900 <= year <= 2100 else None
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _year_from_release_date(cls, value: Any) -> int | None:
+        """Extract a release year from an ISO-ish metadata date."""
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", str(value or ""))
+        return cls._safe_year(match.group(1)) if match else None
+
+    @classmethod
+    def _requested_movie_year(cls, item: Any) -> int | None:
+        """Return the requested/provider movie year from the item envelope."""
+        metadata = getattr(item, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        for value in (
+            getattr(item, "year", None),
+            metadata.get("year"),
+            metadata.get("release_year"),
+            cls._year_from_release_date(metadata.get("first_release_date")),
+            cls._year_from_release_date(metadata.get("release_date")),
+        ):
+            year = cls._safe_year(value)
+            if year is not None:
+                return year
+        return None
+
+    @staticmethod
+    def _looks_like_non_movie_payload(title: str) -> bool:
+        """Reject obvious non-feature rows before LLM/user presentation."""
+        text = str(title or "")
+        lowered = text.lower()
+        if re.search(r"\b(?:extras?|samples?|soundtrack|ost|discography|book|ebook|comic|game|software)\b", lowered):
+            return True
+        if re.search(r"\bS\d{1,2}E\d{1,3}\b|\b\d{1,2}x\d{1,3}\b", text, re.IGNORECASE):
+            return True
+        return False
 
     @staticmethod
     def _soulseek_candidate_extensions(candidate: dict[str, Any]) -> set[str]:
@@ -1102,9 +1365,14 @@ class MovieCategory(CategoryMedia):
         return item_copy
 
 
-    def build_prompt_guidance(self, for_intent: str, settings: object | None = None) -> str:
-        """Return compact movie profile guidance for the active intent."""
-        return self.llm_profile_for_settings(settings).format_for_prompt(for_intent)
+    def build_torrent_selection_guidance(self) -> str:
+        """Return movie torrent guidance from the category prompt-file skill."""
+        skill = self.prompt_file_torrent_skill()
+        return (
+            "Movie torrent-selection skill is category-owned. Use the prompt-file sections below as the source of truth; "
+            "do not rely on generic video or collection heuristics when they conflict with these rules.\n"
+            f"{skill}"
+        ).strip()
 
     async def scan(self, root_path: str, existing_keys: set[str] | None = None) -> list[ScannedItem]:
         """Scan a movie directory. Movies are folders or flat files."""
@@ -1257,9 +1525,6 @@ class MovieCategory(CategoryMedia):
             return False
         child_dirs = [child for child in children if child.is_dir() and child.name.lower() not in _IGNORED_MOVIE_SUBDIRS]
         video_files = [child for child in children if child.is_file() and child.suffix.lower() in _VIDEO_EXTENSIONS]
-        if _COLLECTION_MARKER_RE.search(path.name) and (len(child_dirs) + len(video_files)) >= 1:
-            return True
-
         child_identities: set[tuple[str, int | None]] = set()
         for child in child_dirs[:12]:
             files = self._video_files_in_movie_dir(child)
@@ -1401,18 +1666,77 @@ class MovieCategory(CategoryMedia):
         }
 
     def torrent_bundle_candidate_context(self, result: Any, item: Any | None = None, unit_label: str | None = None) -> dict[str, Any] | None:
-        """Describe movie collection torrents as bundles."""
-        title = str(getattr(result, 'title', '') or '')
-        if not _COLLECTION_MARKER_RE.search(title):
+        """Describe movie collection torrents only from payload/file evidence.
+
+        A movie collection is a structural fact: the torrent/file-list contains
+        multiple primary video payloads with distinct parsed movie identities.
+        Do not infer this from marketing words in the torrent title.
+        """
+        files = self._candidate_file_entries(result)
+        if not self._file_entries_indicate_collection(files):
             return None
         return {
             'is_bundle': True,
             'bundle_type': 'movie_collection',
             'scope': 'item_collection',
-            'unit_count': None,
+            'unit_count': self._distinct_movie_identity_count_from_entries(files),
             'can_select_files_after_metadata': True,
-            'selection_note': 'May contain multiple films or extras; the movie category will select files matching the requested title/year after torrent metadata arrives.',
+            'selection_note': 'Torrent file-list shows multiple distinct primary movie payloads; preserve collection structure and import each movie file by its own source filename.',
         }
+
+
+    @staticmethod
+    def _candidate_file_entries(result: Any) -> list[Any]:
+        """Return cached torrent file entries when a search provider exposes them."""
+        if result is None:
+            return []
+        for attr in ("files", "file_list"):
+            value = getattr(result, attr, None)
+            if isinstance(value, list):
+                return value
+        if isinstance(result, dict):
+            for key in ("files", "file_list"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
+    def _file_entries_indicate_collection(self, files: list[Any]) -> bool:
+        """Return True when file-list evidence shows multiple movie identities."""
+        return self._distinct_movie_identity_count_from_entries(files) >= 2
+
+    def _distinct_movie_identity_count_from_entries(self, files: list[Any]) -> int:
+        identities: set[tuple[str, int | None]] = set()
+        for entry in files or []:
+            raw_path = self._file_entry_path(entry)
+            if not raw_path:
+                continue
+            path = Path(raw_path.replace("\\", "/"))
+            if path.suffix.lower() not in _VIDEO_EXTENSIONS:
+                continue
+            lower_parts = {part.lower() for part in path.parts}
+            if "sample" in lower_parts or lower_parts.intersection(_IGNORED_MOVIE_SUBDIRS):
+                continue
+            parsed = self.parse_name(path.stem)
+            key = canonical_item_key(parsed.title or path.stem)
+            if key:
+                identities.add((key, parsed.year))
+        return len(identities)
+
+    @staticmethod
+    def _file_entry_path(entry: Any) -> str:
+        if isinstance(entry, dict):
+            return str(entry.get("path") or entry.get("file_path") or entry.get("name") or "")
+        for attr in ("path", "file_path", "name"):
+            value = getattr(entry, attr, None)
+            if value:
+                return str(value)
+        return str(entry or "")
+
+    def _download_files_indicate_collection(self, item: Any) -> bool:
+        files = list(getattr(item, "files", []) or [])
+        entries = [{"file_path": getattr(file_info, "file_path", "")} for file_info in files]
+        return self._file_entries_indicate_collection(entries)
 
     def unit_descriptor_from_file(self, file_path: str, parsed: Any | None = None, item_descriptor: dict[str, Any] | None = None) -> dict[str, Any]:
         """Describe a file inside a movie torrent by parsed title/year."""
@@ -1493,6 +1817,14 @@ class MovieCategory(CategoryMedia):
         metadata and the source file.
         """
         data = dict(metadata or {})
+        if self._is_movie_collection_download(item, source_name=source_name, source=source):
+            return self._collection_target_path(
+                source=source,
+                item=item,
+                settings=settings,
+                source_name=source_name or source.name,
+                file_info=file_info,
+            )
         return self.compute_target_path(
             source_name=source_name or source.name,
             item_name=clean_display_title(data.get("title") or getattr(item, "item_name", "") or source.stem, fallback="Unknown"),
@@ -1500,6 +1832,71 @@ class MovieCategory(CategoryMedia):
             settings=settings,
             library_root=self.get_root_path(settings),
         )
+
+    def ready_import_file_allowed(
+        self,
+        source_path: Path,
+        item: Any | None = None,
+        file_info: Any | None = None,
+        settings: Any | None = None,
+    ) -> bool:
+        """Import only actual movie payload files as primary library media."""
+        return Path(str(source_path or "")).suffix.lower() in _VIDEO_EXTENSIONS
+
+    def _is_movie_collection_download(self, item: Any, *, source_name: str | None = None, source: Path | None = None) -> bool:
+        """Return whether a movie download should preserve collection structure.
+
+        This is based on category-owned payload structure, not title keywords:
+        multiple primary video files with distinct parsed movie identities mean
+        this download is a collection container.
+        """
+        context = getattr(item, "import_context", None)
+        candidate = getattr(context, "candidate_snapshot", {}) if context is not None else {}
+        bundle = candidate.get("bundle_context") if isinstance(candidate, dict) else None
+        if isinstance(bundle, dict) and str(bundle.get("bundle_type") or "").strip() == "movie_collection":
+            return True
+        return self._download_files_indicate_collection(item)
+
+    def _collection_folder_title(self, item: Any, source_name: str | None = None) -> str:
+        """Return a stable folder title for a downloaded movie collection."""
+        context = getattr(item, "import_context", None)
+        candidate = getattr(context, "candidate_snapshot", {}) if context is not None else {}
+        for value in (
+            candidate.get("title") if isinstance(candidate, dict) else "",
+            getattr(context, "release_title", "") if context is not None else "",
+            getattr(item, "torrent_title", ""),
+            source_name or "",
+            getattr(item, "item_name", ""),
+        ):
+            text = clean_release_title(str(value or "")).strip()
+            if text:
+                return text
+        return clean_display_title(getattr(item, "item_name", "") or source_name or "Movie Collection", fallback="Movie Collection")
+
+    def _collection_target_path(
+        self,
+        *,
+        source: Path,
+        item: Any,
+        settings: "Settings",
+        source_name: str,
+        file_info: Any | None = None,
+    ) -> Path:
+        """Preserve collection folder plus each source filename for movie bundles."""
+        root = Path(self.get_root_path(settings))
+        collection_folder = clean_path_fragment(self._collection_folder_title(item, source_name), fallback="Movie Collection")
+        raw_relative = str(getattr(file_info, "file_path", "") or source_name or source.name).replace("\\", "/")
+        parts = [part for part in raw_relative.split("/") if part not in {"", ".", ".."}]
+        if not parts:
+            parts = [source.name]
+        if len(parts) > 1:
+            first = clean_path_fragment(parts[0], fallback="")
+            if first and first.casefold() == collection_folder.casefold():
+                parts = parts[1:]
+        safe_parts = [clean_path_fragment(part, fallback="file") for part in parts]
+        if not safe_parts:
+            safe_parts = [basename_from_pathish(source.name, fallback="movie.mkv")]
+        return root.joinpath(collection_folder, *safe_parts)
 
     def compute_target_path(self, source_name: str, item_name: str,
                             season: int = 0, episode: int = 0, **kwargs: Any) -> Path:
@@ -1553,7 +1950,7 @@ class MovieCategory(CategoryMedia):
         for d in root.iterdir():
             if d.is_dir() and name.lower() in d.name.lower():
                 try:
-                    resolver.safe_rmtree(d, purpose="movie.delete", move_to_trash=True)
+                    resolver.safe_rmtree(d, purpose="movie.delete", move_to_trash=False)
                     return True
                 except SecurityPolicyError as exc:
                     logger.warning(f"Movie delete blocked unsafe path: {exc}")

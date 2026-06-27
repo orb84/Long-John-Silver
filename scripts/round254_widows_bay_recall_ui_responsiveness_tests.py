@@ -12,9 +12,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.ai.tools.scheduling import _annotate_selection_policy
 from src.core.categories.tv import TvShowCategory
 from src.core.categories.tv_agent import TvAgentSearchMixin
+from src.ai.tools.search_workspace import SelectionPolicyAnnotator
 
 
 @dataclass
@@ -114,7 +114,7 @@ def test_explicit_non_english_unknown_rows_are_not_auto_queueable() -> None:
         languages=[],
     )
     rows = [italian, unknown]
-    _annotate_selection_policy(rows, preferred_language="Italian", language_is_explicit=True)
+    SelectionPolicyAnnotator.annotate(rows, preferred_language="Italian", language_is_explicit=True)
     assert italian["auto_queue_allowed"] is True
     assert unknown["auto_queue_allowed"] is False
     assert "language not advertised" in unknown["auto_queue_blocked_reason"]

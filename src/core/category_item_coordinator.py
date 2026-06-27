@@ -222,15 +222,37 @@ class CategoryItemCoordinator:
 
     def _apply_item_updates(self, item: Any, kwargs: Mapping[str, Any]) -> None:
         ignored = {"category_id", "item_id", "name", "key", "source", "enrich_metadata", "sync_watch", "invalidate_lifecycle"}
-        for key, value in dict(kwargs).items():
+        for key, raw_value in dict(kwargs).items():
             if key in ignored:
                 continue
+            value = self._coerce_item_update_value(key, raw_value)
             if hasattr(item, key):
                 setattr(item, key, value)
             else:
                 if not hasattr(item, "properties") or getattr(item, "properties") is None:
                     setattr(item, "properties", {})
                 item.properties[key] = value
+
+    def _coerce_item_update_value(self, key: str, value: Any) -> Any:
+        if key == "auto_download":
+            return self._coerce_optional_bool(value)
+        return value
+
+    @staticmethod
+    def _coerce_optional_bool(value: Any) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().casefold()
+            if text in {"true", "1", "yes", "y", "on", "enabled"}:
+                return True
+            if text in {"false", "0", "no", "n", "off", "disabled", ""}:
+                return False
+        return False
 
     async def _upsert_repo_item(self, category_id: str, item_id: str, item: Any) -> None:
         if self._repo_available() and hasattr(self._db.media, "upsert_category_item"):

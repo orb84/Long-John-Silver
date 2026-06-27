@@ -22,6 +22,7 @@ from src.ai.public_web_requirements import PublicWebEvidencePolicy
 from src.ai.runtime_date_grounding import RuntimeDateGrounding
 from src.ai.tools.metadata_lookup_support import (
     LibraryMetadataSnapshotLookup,
+    MetadataLookupArgumentNormalizer,
     MetadataClientResolver,
     MetadataLookupRequest,
     MetadataResultNormalizer,
@@ -36,29 +37,6 @@ try:
     from imdb import Cinemagoer
 except ImportError:  # pragma: no cover - optional dependency
     Cinemagoer = None
-
-
-def _resolve_title(arguments: dict[str, Any]) -> str | None:
-    """Resolve a media title from common category-neutral argument names."""
-    for key in ("title", "query", "name", "item_name", "movie_name", "series_title", "q", "search"):
-        value = arguments.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    for value in arguments.values():
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _safe_int(value: Any) -> int | None:
-    """Convert common numeric inputs to int, returning None on failure."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
 
 
 class MetadataLookupTool:
@@ -248,7 +226,7 @@ class MetadataLookupTool:
                 if not matches:
                     return None
                 selected = MetadataResultNormalizer.select_tmdb_match(matches, request.media_type)
-                tmdb_id = _safe_int(selected.get("id")) if selected else None
+                tmdb_id = MetadataLookupArgumentNormalizer.safe_int(selected.get("id")) if selected else None
             if not tmdb_id:
                 return None
 
@@ -289,7 +267,7 @@ class MetadataLookupTool:
         for season in seasons:
             if not isinstance(season, dict):
                 continue
-            value = _safe_int(season.get("season_number"))
+            value = MetadataLookupArgumentNormalizer.safe_int(season.get("season_number"))
             if value is not None and value > 0:
                 numbers.append(value)
         return max(numbers) if numbers else None
@@ -308,7 +286,7 @@ class MetadataLookupTool:
                 if not matches:
                     return None
                 selected = matches[0]
-                tvmaze_id = _safe_int(selected.get("id"))
+                tvmaze_id = MetadataLookupArgumentNormalizer.safe_int(selected.get("id"))
             if not tvmaze_id:
                 return None
             details = await client.get_show_details(tvmaze_id)
@@ -387,8 +365,8 @@ class MetadataLookupTool:
         for ep in episodes:
             if not isinstance(ep, dict):
                 continue
-            ep_no = _safe_int(ep.get("episode_number") or ep.get("number"))
-            ep_season = _safe_int(ep.get("season") or season_details.get("season_number"))
+            ep_no = MetadataLookupArgumentNormalizer.safe_int(ep.get("episode_number") or ep.get("number"))
+            ep_season = MetadataLookupArgumentNormalizer.safe_int(ep.get("season") or season_details.get("season_number"))
             if ep_no != episode:
                 continue
             if season is not None and ep_season is not None and ep_season != season:
@@ -589,7 +567,7 @@ class GetIMDBDetailsTool:
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
         """Retrieve details about a media title from IMDb."""
-        title = _resolve_title(arguments)
+        title = MetadataLookupArgumentNormalizer.resolve_title(arguments)
         if not title:
             return {"error": "Missing required argument: title"}
         if not self._ia:

@@ -16,13 +16,8 @@ config/*secret*.yaml
 !config/category-config-templates/*.yaml
 
 # Runtime key stores, local databases, caches, and diagnostics
-data/api_keys.json
-data/*.db
-data/*.sqlite*
-data/*.jsonl
-data/logs/
-data/cache/
-data/embedding_models/
+data/
+logs/
 diagnostics/
 *.log
 

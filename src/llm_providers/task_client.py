@@ -355,7 +355,13 @@ class TaskLLMClient:
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     response = await client.post(url, json=payload, headers=headers)
                     if response.status_code == 200:
-                        data = response.json()
+                        candidate_data = response.json()
+                        if not isinstance(candidate_data, dict) or not candidate_data.get("choices"):
+                            raise ValueError(
+                                "NVIDIA NIM response missing choices: "
+                                f"{str(candidate_data.get('error') if isinstance(candidate_data, dict) else candidate_data)[:500]}"
+                            )
+                        data = candidate_data
                         break
                     
                     is_transient = response.status_code in (502, 503, 504, 429)

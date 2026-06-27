@@ -23,6 +23,9 @@ class BootyPanel extends Component {
         this._catalogLoadToken = 0;
         this._loadingCategories = new Set();
         this._lastCatalogLoadedAt = 0;
+        this._renderScheduled = false;
+        this._needsRenderOnVisible = false;
+        this._filterGridDebounced = null;
 
         if (this.container) {
             this.render();
@@ -42,7 +45,7 @@ class BootyPanel extends Component {
                     type: 'text',
                     placeholder: 'Search the library...',
                     id: 'library-search',
-                    onkeyup: (e) => this.filterGrid(e.target.value)
+                    oninput: (e) => this.filterGrid(e.target.value)
                 })
             ])
         ]);
@@ -92,6 +95,15 @@ class BootyPanel extends Component {
 
     /** Subscribe to events and load catalog entries. */
     _init() {
+        this._filterGridDebounced = window.ljsPerf ? window.ljsPerf.debounce((value) => this._applyGridFilter(value), 120) : null;
+        if (this._eventBus && typeof this._eventBus.subscribe === 'function') {
+            this._eventBus.subscribe('ui:visibility', (state) => {
+                if (state && state.visible && this._needsRenderOnVisible) {
+                    this._needsRenderOnVisible = false;
+                    this._scheduleCatalogRender({ force: true });
+                }
+            });
+        }
         this.loadCatalog();
         this._eventBus.subscribe('system', (e) => {
             if (['category_item_added', 'category_item_removed', 'category_item_updated', 'category_item_paused', 'category_item_resumed', 'category_action_completed', 'library_scan_completed', 'library_reconciled', 'library_metadata_refresh_completed'].includes(e.subtype)) {
@@ -121,7 +133,7 @@ class BootyPanel extends Component {
                 this._items = [];
                 this._loadingCategories = new Set(this._categories.map(category => category.category_id).filter(Boolean));
                 this._populateCategorySelect();
-                this.renderCatalogGrid();
+                this._scheduleCatalogRender({ force: true });
 
                 const loadedItems = [];
                 const jobs = this._categories.map(async (category) => {
@@ -139,7 +151,7 @@ class BootyPanel extends Component {
                         if (token === this._catalogLoadToken) {
                             this._loadingCategories.delete(categoryId);
                             this._items = loadedItems.slice();
-                            this.renderCatalogGrid();
+                            this._scheduleCatalogRender({ force: true });
                         }
                     }
                 });
@@ -151,7 +163,7 @@ class BootyPanel extends Component {
                 this._loadingCategories.clear();
                 this._lastCatalogLoadedAt = Date.now();
                 this._loadAttempts = 0;
-                this.renderCatalogGrid();
+                this._scheduleCatalogRender({ force: true });
 
                 if (!this._hasLoadedCatalogOnce && this._categories.length && loadedItems.length === 0) {
                     this._hasLoadedCatalogOnce = true;
@@ -185,12 +197,28 @@ class BootyPanel extends Component {
         if (selected) select.value = selected;
     }
 
+    _scheduleCatalogRender(options = {}) {
+        if (window.ljsPerf && !window.ljsPerf.isVisible()) {
+            this._needsRenderOnVisible = true;
+            return;
+        }
+        if (!options.force && this._renderScheduled) return;
+        this._renderScheduled = true;
+        const run = () => {
+            this._renderScheduled = false;
+            this.renderCatalogGrid();
+        };
+        if (window.ljsPerf) window.ljsPerf.scheduleFrame(run);
+        else window.setTimeout(run, 16);
+    }
+
     /** Render grouped category item cards. */
     renderCatalogGrid() {
         const grid = document.getElementById('library-grid-container');
         if (!grid) return;
 
         grid.innerHTML = '';
+        const fragment = document.createDocumentFragment();
         if (!this._categories.length) {
             grid.appendChild(DOM.el('p', { className: 'empty-msg' }, ['No categories are available yet.']));
             return;
@@ -247,13 +275,14 @@ class BootyPanel extends Component {
                 list.forEach(item => mediaGrid.appendChild(viewMode === 'list' ? this._renderListRow(categoryId, manifest, item) : this._renderCard(categoryId, manifest, item)));
             }
             section.appendChild(mediaGrid);
-            grid.appendChild(section);
+            fragment.appendChild(section);
         });
+        grid.appendChild(fragment);
     }
 
     _setCategoryViewMode(categoryId, mode) {
         this._categoryViewModes.set(categoryId, mode === 'list' ? 'list' : 'icons');
-        this.renderCatalogGrid();
+        this._scheduleCatalogRender({ force: true });
     }
 
     _categoryIcon(manifest) {
@@ -270,7 +299,7 @@ class BootyPanel extends Component {
         const icon = this._categoryIcon(manifest);
         return DOM.el('div', {
             className: 'media-card media-list-row glass-panel',
-            dataset: { item: itemId, category: categoryId },
+            dataset: { item: itemId, category: categoryId, search: `${itemTitle} ${manifest.display_name || categoryId} ${item.language || ''}`.toLowerCase() },
             ondblclick: (event) => { event.preventDefault(); this.showDetails(categoryId, itemId); },
             style: { display: 'grid', gridTemplateColumns: '44px minmax(0, 1fr) auto', alignItems: 'center', gap: '14px', minHeight: '58px', padding: '12px 14px' }
         }, [
@@ -310,7 +339,7 @@ class BootyPanel extends Component {
 
         return DOM.el('div', {
             className: 'media-card',
-            dataset: { item: itemId, category: categoryId },
+            dataset: { item: itemId, category: categoryId, search: `${itemTitle} ${manifest.display_name || categoryId} ${item.language || ''}`.toLowerCase() },
             ondblclick: (event) => {
                 event.preventDefault();
                 this.showDetails(categoryId, itemId);
@@ -377,11 +406,21 @@ class BootyPanel extends Component {
 
     /** Filter grids dynamically based on typing inputs. */
     filterGrid(val) {
-        const query = val.toLowerCase();
+        if (this._filterGridDebounced) {
+            this._filterGridDebounced(val);
+            return;
+        }
+        this._applyGridFilter(val);
+    }
+
+    _applyGridFilter(val) {
+        const query = String(val || '').toLowerCase().trim();
         const cards = document.querySelectorAll('#library-grid-container .media-card');
         cards.forEach(card => {
-            const h3 = card.querySelector('h3');
-            card.style.display = h3 && h3.textContent.toLowerCase().includes(query) ? 'block' : 'none';
+            const text = card.dataset.search || card.textContent.toLowerCase();
+            const visible = !query || text.includes(query);
+            card.classList.toggle('is-filter-hidden', !visible);
+            card.style.display = visible ? '' : 'none';
         });
     }
 

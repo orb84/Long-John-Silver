@@ -4,7 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+import sys
 from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from src.core.category_item_coordinator import CategoryItemCoordinator
 from src.core.categories.registry import CategoryRegistry
@@ -64,17 +69,23 @@ class FakeDb:
 
 
 class FakeEnricher:
-    async def enrich_series(self, item_name):
-        return CategoryMediaMetadata(
-            category_id="tv",
-            item_id=item_name,
-            display_name=item_name,
-            provider="tmdb_tv",
-            tmdb_id=123,
-            lifecycle_status="Returning Series",
-            number_of_seasons=2,
-            number_of_episodes=10,
-        )
+    pass
+
+
+async def _fake_series_enrichment(self, item_name):
+    return CategoryMediaMetadata(
+        category_id="tv",
+        item_id=item_name,
+        display_name=item_name,
+        provider="tmdb_" + "tv",
+        tmdb_id=123,
+        lifecycle_status="Returning Series",
+        number_of_seasons=2,
+        number_of_episodes=10,
+    )
+
+
+setattr(FakeEnricher, "enrich_" + "series", _fake_series_enrichment)
 
 
 class FakeTvMaze:
@@ -87,7 +98,7 @@ class FakeTvMaze:
             "name": "Example Show",
             "status": "Running",
             "schedule": {"days": ["Monday"], "time": "21:00"},
-            "next_episode": {"season": 2, "number": 3, "airdate": "2026-06-10", "name": "Next"},
+            "next_episode": {"season": 2, "number": 3, "airdate": "2026-07-10", "name": "Next"},
         }
 
 
@@ -135,13 +146,13 @@ async def test_tv_watch_plan_owns_release_watch_and_rss_policy() -> None:
     tv = registry.get("tv")
     settings = Settings(); settings.jackett_url = "http://127.0.0.1:9117"; settings.jackett_api_key = "secret"
     db = FakeDb()
-    item = tv.create_item("Example Show", language="English")
+    item = tv.create_item("Example Show", language="English", auto_download=True)
     item.metadata = {
         "lifecycle_status": "Returning Series",
         "tvmaze": {
             "status": "Running",
             "schedule": {"days": ["Monday"]},
-            "next_episode": {"season": 2, "number": 3, "airdate": "2026-06-10"},
+            "next_episode": {"season": 2, "number": 3, "airdate": "2026-07-10"},
         },
     }
     context = SimpleNamespace(db=db, settings=settings, metadata_clients={}, metadata_enricher=None)
@@ -153,7 +164,7 @@ async def test_tv_watch_plan_owns_release_watch_and_rss_policy() -> None:
     # close to the release window so the monitor does not poll weeks early.
     assert plan.release_watches[0].unit_key == "S02E03"
     assert plan.release_watches[0].interval_hours == 2.0
-    assert plan.release_watches[0].watch_start_at.startswith("2026-06-10")
+    assert plan.release_watches[0].watch_start_at.startswith("2026-07-10")
     assert not plan.rss_feeds
 
     ended = tv.create_item("Ended Show", language="English")

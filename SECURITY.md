@@ -9,7 +9,7 @@ LJS treats every assistant request, user-provided path, downloaded filename, met
 - Package-install commands require explicit approval from a UI/system action.
 - Filesystem mutations must go through `SafePathResolver`.
 - Category operations are scoped to the category library root and download roots.
-- Deletes are quarantined into `.ljs-trash` by default instead of permanently removed.
+- Deletes are permanently removed by default after safe-path validation and any required confirmation. Explicit quarantine remains available only for workflows that deliberately request recoverability; routine download cleanup must never hide media in `.ljs-trash` inside the downloads folder.
 - Risky/destructive actions can produce a two-phase confirmation receipt with exact affected paths.
 - Security-sensitive operations can be written to `./data/security_audit.jsonl`.
 - `scripts/check_security_architecture.py` fails CI if raw unsafe primitives are reintroduced outside `src/core/security/`.

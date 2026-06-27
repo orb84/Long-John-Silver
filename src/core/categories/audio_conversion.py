@@ -26,6 +26,51 @@ AUDIO_SOURCE_SUFFIXES = {".flac", ".alac", ".m4a", ".m4b", ".mp3", ".aac", ".ogg
 LOSSLESS_AUDIO_SUFFIXES = {".flac", ".alac", ".wav", ".aiff", ".ape"}
 
 
+class AudioConversionPolicy:
+    """Interpret category-owned audio conversion preferences.
+
+    The policy is derived from the category download profile instead of concrete
+    category ids.  Music-like categories can prefer ALAC/M4A, audiobook-like
+    categories can prefer M4B, and future audio categories can opt in by
+    declaring the same profile fields.
+    """
+
+    LOSSLESS_ALAC_VALUES = {"alac", "alac_m4a", "apple_lossless_m4a", "m4a_alac"}
+    LOSSY_AAC_VALUES = {"aac", "aac_m4a", "apple_aac_m4a", "m4a_aac", "m4b_aac"}
+    M4B_VALUES = {"m4b", "m4b_aac"}
+
+    def __init__(self, profile: dict[str, Any]) -> None:
+        self.profile = profile if isinstance(profile, dict) else {}
+
+    def automatic_sidecar_for_lossless(self) -> tuple[str, str] | None:
+        """Return conversion profile/suffix for a lossless source, when desired."""
+        preferred_lossless = self._profile_token("preferred_lossless_format")
+        if preferred_lossless in self.LOSSLESS_ALAC_VALUES:
+            return ("apple_lossless_m4a", ".m4a")
+        auto = bool(self.profile.get("auto_convert_lossless_to_preferred", False))
+        if not auto:
+            return None
+        preferred_audio = self._profile_token("preferred_audio_format")
+        preferred_lossy = self._profile_token("preferred_lossy_format")
+        if preferred_audio in self.M4B_VALUES or preferred_lossy in self.M4B_VALUES:
+            return ("apple_aac_m4a", ".m4b")
+        if preferred_audio in {"m4a", "aac_m4a", "apple_aac_m4a"} or preferred_lossy in self.LOSSY_AAC_VALUES:
+            return ("apple_aac_m4a", ".m4a")
+        return None
+
+    def default_target_suffix(self, source: Path) -> str:
+        """Return the default sidecar extension for an explicit conversion."""
+        preferred_audio = self._profile_token("preferred_audio_format")
+        preferred_lossy = self._profile_token("preferred_lossy_format")
+        if preferred_audio in self.M4B_VALUES or preferred_lossy in self.M4B_VALUES or source.suffix.lower() == ".m4b":
+            return ".m4b"
+        return ".m4a"
+
+    def _profile_token(self, key: str) -> str:
+        """Return one normalized download-profile token."""
+        return str(self.profile.get(key) or "").strip().lower()
+
+
 class AudioConversionService:
     """Run or preview FFmpeg conversions for one category instance."""
 
@@ -53,7 +98,7 @@ class AudioConversionService:
             source = resolver.require(source_arg, purpose="audio_conversion:source", must_exist=True)
             if source.suffix.lower() not in AUDIO_SOURCE_SUFFIXES:
                 return self._workflow_error("convert_audio_for_apple", f"Unsupported audio source extension: {source.suffix}")
-            target = self._conversion_target(source, arguments, resolver)
+            target = self._conversion_target(source, arguments, resolver, settings)
         except SecurityPolicyError as exc:
             return self._workflow_error("convert_audio_for_apple", f"Unsafe conversion path: {exc}")
 
@@ -122,32 +167,17 @@ class AudioConversionService:
 
     def automatic_conversion_decision(self, imported_path: Path, settings: "Settings") -> tuple[str, str] | None:
         """Return ``(target_profile, suffix)`` when preferences require a sidecar."""
-        suffix = imported_path.suffix.lower()
-        if suffix not in LOSSLESS_AUDIO_SUFFIXES:
+        if imported_path.suffix.lower() not in LOSSLESS_AUDIO_SUFFIXES:
             return None
-        profile = self.category.category_download_profile(settings)
-        if self.category.category_id == "music":
-            preferred_lossless = str(profile.get("preferred_lossless_format") or "flac").lower()
-            preferred_lossy = str(profile.get("preferred_lossy_format") or "").lower()
-            auto = bool(profile.get("auto_convert_lossless_to_preferred", False))
-            if preferred_lossless in {"alac", "alac_m4a", "apple_lossless_m4a", "m4a_alac"}:
-                return ("apple_lossless_m4a", ".m4a")
-            if auto and preferred_lossy in {"aac", "aac_m4a", "apple_aac_m4a", "m4a_aac"}:
-                return ("apple_aac_m4a", ".m4a")
-        if self.category.category_id == "audiobooks":
-            preferred = str(profile.get("preferred_audio_format") or "m4b").lower()
-            auto = bool(profile.get("auto_convert_lossless_to_preferred", True))
-            if auto and preferred in {"m4b", "m4b_aac", "m4a", "aac_m4a"}:
-                return ("apple_aac_m4a", ".m4b" if preferred.startswith("m4b") else ".m4a")
-        return None
+        return AudioConversionPolicy(self.category.category_download_profile(settings)).automatic_sidecar_for_lossless()
 
-    def _conversion_target(self, source: Path, arguments: dict[str, Any], resolver: SafePathResolver) -> Path:
+    def _conversion_target(self, source: Path, arguments: dict[str, Any], resolver: SafePathResolver, settings: "Settings") -> Path:
         """Resolve a safe conversion destination path."""
         requested = str(arguments.get("target_path") or "").strip()
         overwrite = bool(arguments.get("overwrite", False))
         if requested:
             return resolver.ensure_destination(requested, purpose="audio_conversion:target", allow_overwrite=overwrite)
-        suffix = ".m4b" if self.category.category_id == "audiobooks" and source.suffix.lower() == ".m4b" else ".m4a"
+        suffix = AudioConversionPolicy(self.category.category_download_profile(settings)).default_target_suffix(source)
         default_name = source.with_name(f"{source.stem}.apple{suffix}")
         return resolver.ensure_destination(default_name, purpose="audio_conversion:target", allow_overwrite=overwrite)
 

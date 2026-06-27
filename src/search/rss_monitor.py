@@ -144,9 +144,9 @@ class RSSMonitor:
 
         Earlier versions polled Jackett's ``/all`` RSS endpoint with an empty
         query, then substring-matched every returned release against every
-        tracked show. That produced false positives (for example a title ending
-        in "Beyond the Wire" matching the show "The Wire") and heavy event-loop
-        stalls. Feeds are now expected to be item-scoped, and matching is limited
+        tracked show. That produced false positives from episode/subtitle words
+        matching unrelated item names and heavy event-loop stalls. Feeds are now
+        expected to be item-scoped, and matching is limited
         to the names associated with the feed being polled.
         """
         urls = self._feeds_for_cycle()
@@ -304,8 +304,8 @@ class RSSMonitor:
 
         Category-scoped feeds must match the parser's extracted title, not an
         arbitrary substring in the full release title. This avoids false
-        positives such as "Wicked Attraction ... Beyond the Wire" matching the
-        show "The Wire".
+        positives where episode/subtitle words happen to contain another item
+        name.
         """
         if category_scoped:
             return self._canonical_title(parsed_name) == self._canonical_title(name)

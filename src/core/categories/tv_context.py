@@ -184,10 +184,10 @@ class TvContextMixin:
             item_id=item_id, item=item, settings=settings, db=db, artwork_manager=artwork_manager,
         )
         if payload.get("auto_download") is None:
-            # TV new-episode automation is default-on; the inspector presents a
-            # simple enabled/disabled checkbox rather than leaking the legacy
-            # global-inherit null state.
-            payload["auto_download"] = True
+            # TV new-episode automation is safe-by-default. The inspector
+            # presents an explicit opt-in checkbox rather than leaking the
+            # legacy global-inherit null state.
+            payload["auto_download"] = False
         canonical = payload.get("canonical_object") or {}
         canonical_seasons = list(canonical.get("seasons") or [])
 

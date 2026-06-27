@@ -162,8 +162,8 @@ class CategoryItemDetailModal extends Component {
                 DOM.el('span', { className: 'detail-toggle-copy' }, [
                     DOM.el('strong', {}, ['Automatically download new episodes']),
                     DOM.el('small', { className: 'muted' }, [
-                        'Enabled by default. Turn this off for this show to keep release-watch checks ',
-                        'in notify-only mode.'
+                        'Off by default for library shows. Enable it to automatically download ',
+                        'new episodes for this show.'
                     ])
                 ])
             ])
@@ -177,7 +177,7 @@ class CategoryItemDetailModal extends Component {
     }
 
     _autoDownloadEnabled(item) {
-        return item.auto_download !== false;
+        return item.auto_download === true;
     }
 
     async _setAutoDownloadForCurrentItem(enabled) {

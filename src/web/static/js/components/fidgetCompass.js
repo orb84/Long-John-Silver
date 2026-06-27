@@ -18,6 +18,8 @@ class FidgetCompass extends Component {
         this._isSpinning = false;
         this._dragState = null;
         this._dragThreshold = 4;
+        this._cursorPointFrame = null;
+        this._lastCursorPoint = null;
         
         if (this.container && this._needle) {
             this._restorePosition();
@@ -37,7 +39,15 @@ class FidgetCompass extends Component {
 
         document.addEventListener('mousemove', (e) => {
             if (this._isSpinning || this._dragState) return;
-            this._pointNeedleAtCursor(e.clientX, e.clientY);
+            if (window.ljsPerf && !window.ljsPerf.allowAmbientAnimation()) return;
+            this._lastCursorPoint = { x: e.clientX, y: e.clientY };
+            if (this._cursorPointFrame) return;
+            const run = () => {
+                this._cursorPointFrame = null;
+                if (!this._lastCursorPoint) return;
+                this._pointNeedleAtCursor(this._lastCursorPoint.x, this._lastCursorPoint.y);
+            };
+            this._cursorPointFrame = window.ljsPerf ? window.ljsPerf.scheduleFrame(run) : setTimeout(run, 16);
         });
 
         document.addEventListener('mouseleave', () => {

@@ -9,11 +9,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.ai.tool_result_compactor import ToolResultCompactor
-from src.ai.tools.scheduling import _candidate_picker_rows
+from src.ai.tools.search_workspace import SearchWorkspaceFormatter
 
 
 def test_candidate_picker_rows_preserve_llm_recommended_and_candidate_id_alias() -> None:
-    rows = _candidate_picker_rows([
+    rows = SearchWorkspaceFormatter.candidate_picker_rows([
         {
             "candidate_id": "cand-pack",
             "index": 1,
@@ -54,7 +54,7 @@ def test_compactor_keeps_late_llm_recommended_candidate_outside_top_eight() -> N
         "query": "A Knight of the Seven Kingdoms season pack",
         "result_set_id": "rs1",
         "candidates": candidates,
-        "candidate_picker": _candidate_picker_rows(candidates, limit=60),
+        "candidate_picker": SearchWorkspaceFormatter.candidate_picker_rows(candidates, limit=60),
         "llm_candidate_review_status": "reviewed",
         "recommended_candidate_id": "cand-12",
         "llm_candidate_review": {

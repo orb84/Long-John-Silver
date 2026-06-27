@@ -370,17 +370,6 @@ class StreamingAgentLoopExecutor:
             self.last_content = fallback
             yield fallback
 
-
-    @staticmethod
-    def _download_goal_requests_batch(plan: AgentPlan) -> bool:
-        """Return True when the original DOWNLOAD goal is explicitly multi-unit."""
-        text = f"{plan.user_goal or ''} {getattr(plan, 'constraints', {})}".lower()
-        markers = (
-            "remaining", "missing", "all ", "all_", "every", "batch",
-            "season", "episodes", "episodi", "mancanti", "rimanenti",
-        )
-        return any(marker in text for marker in markers)
-
     @classmethod
     async def _maybe_auto_queue_batch_recommendation(
         cls,

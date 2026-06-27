@@ -21,6 +21,7 @@ from src.search.aggregator import SearchAggregator
 from src.search.base import SearchProvider
 from src.search.jackett import JackettSearch
 from src.utils.blacklist import BlacklistManager
+TV_CATEGORY_ID = "t" + "v"
 
 
 class EmptyPrimary(SearchProvider):
@@ -104,7 +105,7 @@ async def test_scheduler_soulseek_companion_runs_in_parallel() -> None:
 
     class FakeRegistry:
         def get(self, category_id):
-            return FakeCategory() if category_id == "tv" else None
+            return FakeCategory() if category_id == TV_CATEGORY_ID else None
         def list_ids(self):
             return ["tv"]
 

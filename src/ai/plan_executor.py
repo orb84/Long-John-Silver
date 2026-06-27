@@ -15,6 +15,7 @@ from loguru import logger
 from src.ai.tool_executor import ToolCallExecutor
 from src.search.web.url_utils import is_http_url, normalize_search_result_url
 from src.core.models import PlanStep, AgentPlan, PlanExecutionStep, PlanExecutionResult
+from src.core.categories.search_scope import SearchScopePolicy
 
 
 class PlanExecutor:
@@ -423,7 +424,7 @@ class PlanExecutor:
             return None
 
         scope = str(self._extract_dotted_path(payload, "search_scope") or "").lower()
-        if scope in {"bundle_preferred", "bundle_only", "season_pack_preferred", "season_pack_only"}:
+        if SearchScopePolicy.is_bundle_scope(scope):
             for candidate in candidates:
                 if isinstance(candidate, dict) and candidate.get("is_bundle") and (candidate.get("candidate_id") or candidate.get("id")):
                     return [str(candidate.get("candidate_id") or candidate.get("id"))]
