@@ -134,11 +134,17 @@ The wizard walks you through the essentials. There are really only two things LJ
 
 ### 1. A language model (required)
 
-LJS needs an OpenAI-compatible chat endpoint to do its thinking. You have three honest paths:
+LJS does its thinking through any **OpenAI-compatible** chat endpoint — and that "any" is the whole point. You're not locked to one company, one bill, or one privacy trade-off. Pick whichever path fits you, and switch any time:
 
-- **Free, to start with → NVIDIA NIM.** NVIDIA hosts capable models for free through their developer program and API catalogue. It's the easiest way to try LJS without spending anything. Grab a key from [build.nvidia.com](https://build.nvidia.com/) ([NIM docs](https://docs.nvidia.com/nim/index.html)), point the wizard at the NIM base URL, and go.
-- **Fully local → LM Studio, Ollama, vLLM, llama.cpp.** Run a model on your own machine and nothing leaves the house. LJS is a *tool-using* assistant, not just a chatbot, so give it a reasonably capable model and a decent context window.
-- **Hosted → OpenRouter and other OpenAI-compatible providers.** LJS can route different jobs to different models — a fast cheap one for understanding what you said, a stronger one for the tricky download decisions.
+- **Free to run → hosted models with free tiers.** Several providers give away capable models (rate-limited, but **more than enough to run LJS**). The standout is **NVIDIA NIM** — genuinely free, fast, and stable enough for everyday use. Grab a key at [build.nvidia.com](https://build.nvidia.com/) ([docs](https://docs.nvidia.com/nim/index.html)) and point the wizard at it. OpenRouter and others also expose free models you can start on without a credit card. You can run LJS indefinitely without paying a cent.
+- **Fully private → local models.** Run a model on your own machine with **LM Studio, Ollama, vLLM, or llama.cpp**, and *nothing leaves the house* — no prompts, no library names, no usage, no bill. If privacy is the reason you're self-hosting in the first place, this is the path. LJS is a *tool-using* assistant, not just a chatbot, so give it a reasonably capable model and a decent context window.
+- **Paid hosted → OpenRouter, OpenAI-compatible commercial providers.** Maximum capability when you want it, pennies per request.
+
+Because everything speaks the same protocol, **mixing endpoints is easy and encouraged** — for cost, for privacy, and for redundancy:
+
+- route cheap/fast (or free, or local) models to the simple jobs and a stronger model to the tricky download decisions;
+- keep a **backup endpoint** configured so a rate-limit or an outage on one provider doesn't take LJS down;
+- swap providers whenever you like — it's just a base URL, a key, and a model name in the Compass. No code changes, no lock-in.
 
 > LJS reads the real context window from your provider when it can, and budgets prompts to fit it. When a conversation gets long it **compresses** old history rather than silently forgetting it.
 
@@ -157,7 +163,7 @@ None of these are mandatory, but they make LJS noticeably smarter:
 | **Soulseek / slskd** | Optional companion source (see below) — great for music, audiobooks, ebooks, and rare releases. |
 | **TVMaze** | TV episode schedules and aired/upcoming checks. |
 | **Trakt** | Watch-state and taste signals. LJS ships a public app ID, so you just link your account with a PIN. |
-| **Plex** | Optional library refresh and watch-state sync. |
+| **Plex** | Turns the library LJS fills into a polished, Netflix-style app you stream to any TV, phone, or browser (see [Watching it back](#watching-it-back-pair-it-with-plex) below). LJS also keeps Plex refreshed and syncs watch-state. |
 | **OpenSubtitles** | Subtitle search (handling is still rough — see honesty section). |
 | **SearXNG** | Optional, self-managed web research — lets the assistant look things up online (titles, schedules, ambiguous releases) without sending you to a search engine. LJS can install and run it for you; auto-install is tested on Linux so far. |
 | **MusicBrainz · Cover Art Archive · Discogs · AcoustID** | Music metadata and cover art. |
@@ -179,6 +185,19 @@ Out of the box:
 - **Audiobooks** — narrator, abridged/unabridged, chapters, M4B/M4A/MP3. Knows it is *not* the same as an ebook.
 - **Ebooks** — EPUB, PDF, AZW3, MOBI, DJVU, plus comics (CBZ/CBR). Author/ISBN/edition/translator aware.
 - **General Files** — the careful catch-all for things that don't fit a richer category: manuals, datasets, public-domain archives, lectures. Deliberately conservative; preserves original filenames; inspects anything ambiguous before queueing.
+
+---
+
+## Watching it back: pair it with Plex
+
+LJS is the crew that *finds, fetches, and files* your media — it doesn't stream to your telly itself. For that, the easy and free pairing is **[Plex](https://www.plex.tv/)**: point Plex at the same library folders LJS fills, and you get a slick, Netflix-style app — posters, descriptions, resume-where-you-left-off — on your **TV, phone, tablet, or browser**.
+
+Think of it as a whole home cinema in two pieces you set up once:
+
+- one quiet box at home — an **old computer, a mini-PC, or a NAS** — running **LJS** (gets and organizes the media) and **Plex** (streams it);
+- everyone else — including non-technical family abroad — just opens the Plex app and presses play.
+
+LJS keeps Plex's library refreshed after each download, so new episodes and films appear on their own. No one but you ever has to see a tracker, a torrent, or a terminal again. This is, honestly, the setup LJS was built to make possible.
 
 ---
 
