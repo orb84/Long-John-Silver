@@ -81,6 +81,8 @@ class MovieSearchPatterns(SearchPatterns):
 class MovieCategory(CategoryMedia):
     """Films and movies."""
 
+    _AGENT_SEARCH_SUFFICIENT_RESULTS = 8
+
     category_id = "movie"
     display_name = "Movies"
     default_folder = "Movies"
@@ -88,6 +90,44 @@ class MovieCategory(CategoryMedia):
     capabilities = ["metadata", "downloadable", "file_organization", "subtitles", "ratings", "quality_upgrades"]
     metadata_provider_names = ["tmdb"]
     supported_operations = ["search", "download", "scan", "organize", "refresh_metadata", "search_upgrade"]
+
+    async def identify_agent_item(
+        self,
+        name: str,
+        *,
+        settings: "Settings",
+        db: "Database" | None = None,
+        metadata_clients: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return TMDB evidence that ``name`` identifies a movie."""
+        key = settings.category_service_value(self.category_id, "tmdb", "api_key")
+        if not key or not self.metadata_provider_enabled(settings, "tmdb", True):
+            return []
+        from src.integrations.tmdb import TMDBClient
+
+        clients = metadata_clients or {}
+        tmdb = clients.get("tmdb") or TMDBClient(key)
+        owns_tmdb = "tmdb" not in clients
+        evidence: list[dict[str, Any]] = []
+        try:
+            for row in await tmdb.search(name, media_type="movie"):
+                title = str(row.get("title") or "").strip()
+                if title:
+                    evidence.append({
+                        "category_id": self.category_id,
+                        "title": title,
+                        "source": "tmdb_movie",
+                        "base_score": 0.24,
+                        "external_id": str(row.get("id") or ""),
+                        "year": str(row.get("year") or "")[:4] or None,
+                        "evidence": [],
+                    })
+        except Exception as exc:
+            logger.debug("Movie identity TMDB probe failed for {!r}: {}", name, exc)
+        finally:
+            if owns_tmdb:
+                await tmdb.close()
+        return evidence
 
     async def search_agent_candidates(
         self,
@@ -112,8 +152,10 @@ class MovieCategory(CategoryMedia):
         queries = self._agent_movie_search_queries(item, language=language)
         merged: list[Any] = []
         seen: set[str] = set()
+        executed_queries: list[str] = []
         quality_profile = getattr(item, "quality", None)
         for query in queries:
+            executed_queries.append(query)
             try:
                 results = await context.aggregator.search(
                     query,
@@ -127,10 +169,10 @@ class MovieCategory(CategoryMedia):
             valid = [result for result in (results or []) if self.validate_search_result_for_request(result, item, None)]
             self._log_movie_search_filter_audit(item=item, query=query, language=language, raw_results=results or [], valid_results=valid)
             self._merge_movie_results(merged, seen, valid)
-            if len(merged) >= 40:
+            if self._agent_search_pool_is_sufficient(merged, language=language):
                 break
         ranked = self._rank_movie_agent_results(merged, item=item, language=language)
-        return ranked, "; ".join(queries[:4]) or str(getattr(item, "key", "") or "movie")
+        return ranked, "; ".join(executed_queries) or str(getattr(item, "key", "") or "movie")
 
     async def _ensure_agent_title_authority(self, item: Any, context: Any | None) -> Any:
         """Attach TMDB-backed title aliases before movie search when available."""
@@ -174,7 +216,12 @@ class MovieCategory(CategoryMedia):
 
     def _agent_movie_search_queries(self, item: Any, *, language: str | None = None) -> list[str]:
         """Return bounded movie query variants from title authority."""
-        titles = CategoryTitleAuthority.query_titles_for_item(item, preferred_language=language, limit=6)
+        titles = CategoryTitleAuthority.query_titles_for_item(
+            item,
+            preferred_language=language,
+            limit=4 if language else 6,
+            strict_preferred_language=bool(str(language or "").strip()),
+        )
         if not titles:
             titles = [str(getattr(item, "key", "") or "").strip()]
         year = self._requested_movie_year(item)
@@ -212,6 +259,29 @@ class MovieCategory(CategoryMedia):
                 continue
             seen.add(identity)
             merged.append(result)
+
+    def _agent_search_pool_is_sufficient(self, results: list[Any], *, language: str | None) -> bool:
+        """Return whether movie search has enough useful constrained candidates.
+
+        Identity count alone is not sufficient when the user requested a
+        language.  Indexers can return dozens of exact-title rows while ignoring
+        the language token in the query.  In that case the category must keep
+        walking its bounded query ladder until at least one candidate carries
+        explicit preferred-language evidence.
+        """
+        if str(language or "").strip():
+            # For an explicit media-language request, one provider/year-backed
+            # candidate that explicitly advertises that language is useful
+            # evidence.  Do not keep walking aliases merely to reach an arbitrary
+            # candidate-count target; that caused simple searches to fan out into
+            # unrelated localized titles.
+            return any(
+                self._movie_language_status(
+                    str(getattr(result, "title", "") or ""), language
+                ) == "preferred"
+                for result in results
+            )
+        return len(results) >= self._AGENT_SEARCH_SUFFICIENT_RESULTS
 
     def _rank_movie_agent_results(self, results: list[Any], *, item: Any, language: str | None = None) -> list[Any]:
         """Deterministically rank validated movie candidates before LLM review."""
@@ -269,7 +339,7 @@ class MovieCategory(CategoryMedia):
                 "manual_refresh", "policy_version_changed",
             ],
             "missing_check_interval_days": 14,
-            "upgrade_scan_interval_days": 30,
+            "upgrade_scan_interval_days": 180,
             "metadata_repair_interval_days": 7,
             "default_check_interval_days": 180,
             "llm_policy_description": (
@@ -296,8 +366,8 @@ class MovieCategory(CategoryMedia):
             days = int(policy.get("metadata_repair_interval_days") or 7)
             reason = "Movie metadata identity is incomplete; metadata repair remains useful."
         else:
-            days = int(policy.get("upgrade_scan_interval_days") or 30)
-            reason = "Movie present; periodic quality/language upgrade check."
+            days = int(policy.get("upgrade_scan_interval_days") or policy.get("default_check_interval_days") or 180)
+            reason = "Movie present with stable identity; quality/language upgrade checks are deliberately infrequent."
         check_at = now + timedelta(days=max(days, 1))
         return {
             "next_check_at": check_at.isoformat(),
@@ -613,7 +683,7 @@ class MovieCategory(CategoryMedia):
             if not title:
                 return self._workflow_failed(workflow_name, "A movie title is required.")
             item = self.create_item(title, year=year, language=getattr(context.settings, "language", "English"))
-            results = await context.pipeline.run_search(item, episode_label=None, mode="llm")
+            results = await context.pipeline.run_search(item, episode_label=None, mode="llm", rank_candidates=False)
             return ActionReceipt(
                 category_id=self.category_id,
                 action_name=workflow_name,
@@ -720,6 +790,27 @@ class MovieCategory(CategoryMedia):
         )
 
 
+    def soulseek_source_strategy(
+        self,
+        *,
+        item_name: str,
+        search_scope: str | None = None,
+        settings: Any | None = None,
+        default_preference: str = "torrent_first",
+    ) -> dict[str, Any]:
+        """Keep movie Soulseek as a fallback instead of a foreground blocker.
+
+        Public torrent indexes are the primary movie source.  Running slskd in
+        parallel is useful only when torrent discovery is empty; waiting for a
+        slow companion search after dozens of validated torrent candidates makes
+        an ordinary movie request needlessly take minutes.
+        """
+        _ = (item_name, search_scope, settings)
+        return {
+            "download_preference": default_preference,
+            "foreground_companion_mode": "fallback_if_primary_empty",
+        }
+
     def build_soulseek_search_queries(
         self,
         query_summary: str,
@@ -786,13 +877,67 @@ class MovieCategory(CategoryMedia):
         aliases = CategoryTitleAuthority.aliases_for_item(item, preferred_language=getattr(item, "language", None), include_user_key=True)
         if not aliases:
             aliases = [str(getattr(item, "key", "") or "").strip()]
-        if not CategoryTitleAuthority.matches_any_alias(title, aliases):
-            return False
         requested_year = self._requested_movie_year(item)
+        if not CategoryTitleAuthority.matches_any_alias(
+            title, aliases, disambiguating_year=requested_year
+        ):
+            return False
         candidate_year = extract_release_year(title)
         if requested_year and candidate_year and int(candidate_year) != int(requested_year):
             return False
         return True
+
+    def annotate_agent_search_candidate_payload(
+        self,
+        payload: dict[str, Any],
+        result: Any,
+        *,
+        item: Any,
+        unit_label: str | None = None,
+        season: int | None = None,
+        episode: int | None = None,
+        search_scope: str | None = None,
+        response_facts: dict[str, Any] | None = None,
+        context: Any | None = None,
+    ) -> dict[str, Any]:
+        """Publish the movie-owned title/year verdict once for downstream consumers.
+
+        ``search_agent_candidates`` has already applied provider-backed aliases
+        and the requested release year.  Generic result workspaces should carry
+        that verdict rather than re-parse release names with a weaker title-only
+        heuristic.
+        """
+        _ = (unit_label, season, episode, search_scope, response_facts, context)
+        title = str(getattr(result, "title", "") or payload.get("title") or "")
+        requested_year = self._requested_movie_year(item)
+        aliases = CategoryTitleAuthority.aliases_for_item(
+            item, preferred_language=getattr(item, "language", None), include_user_key=True
+        )
+        matches = bool(
+            title
+            and not self._looks_like_non_movie_payload(title)
+            and CategoryTitleAuthority.matches_any_alias(
+                title, aliases, disambiguating_year=requested_year
+            )
+        )
+        candidate_year = extract_release_year(title)
+        if requested_year and candidate_year and int(candidate_year) != int(requested_year):
+            matches = False
+        payload["title_identity"] = {
+            "matches_item": matches,
+            "source": "movie_provider_alias_and_year",
+            "requested_year": requested_year,
+            "candidate_year": candidate_year,
+        }
+        if not matches:
+            blockers = list(payload.get("selection_blockers") or [])
+            note = "candidate title/year does not match the provider-verified movie identity"
+            if note not in blockers:
+                blockers.append(note)
+            payload["selection_blockers"] = blockers
+            payload["auto_queue_allowed"] = False
+            payload["auto_queue_blocked_reason"] = note
+        return payload
 
     def filter_agent_candidate_payloads_for_request(
         self,
@@ -820,9 +965,14 @@ class MovieCategory(CategoryMedia):
             title = str(candidate.get("title") or "")
             if not title or self._looks_like_non_movie_payload(title):
                 continue
-            if not CategoryTitleAuthority.matches_any_alias(title, [requested_title]):
-                continue
+            title_identity = candidate.get("title_identity") if isinstance(candidate.get("title_identity"), dict) else {}
             requested_year = self._safe_year(coords.get("year"))
+            if title_identity.get("matches_item") is False:
+                continue
+            if title_identity.get("matches_item") is not True and not CategoryTitleAuthority.matches_any_alias(
+                title, [requested_title], disambiguating_year=requested_year
+            ):
+                continue
             candidate_year = extract_release_year(title)
             if requested_year and candidate_year and int(requested_year) != int(candidate_year):
                 continue

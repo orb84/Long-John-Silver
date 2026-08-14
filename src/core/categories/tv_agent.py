@@ -13,6 +13,8 @@ from loguru import logger
 from src.core.categories.title_authority import CategoryTitleAuthority
 from src.core.categories.search_scope import SearchScopePolicy
 from src.core.categories.language import LanguageTokenPolicy
+from src.core.categories.tv_agent_availability import TVAgentAvailabilityFactsBuilder
+from src.utils.async_boundary import AsyncBoundary
 
 
 class TvAgentSearchMixin:
@@ -414,14 +416,15 @@ class TvAgentSearchMixin:
     ) -> str:
         """Choose TV's default assistant search phase for underspecified downloads.
 
-        A torrent search tool call for a TV title with no episode coordinate is
-        a request for a season/show unit, not an invitation to mix unrelated
-        single episodes from broad title search results.  TV therefore starts
-        pack-preferred unless the LLM/user explicitly selected another phase.
+        TV starts pack-preferred only after the request identifies a concrete
+        season or supplies a structured unit scope. A bare title is not enough
+        authority to guess "latest season"; it remains unresolved so the agent
+        can ask which units the user wants.
         """
-        _ = (item, language, context)
+        _ = (item, language)
         scope = SearchScopePolicy.normalize(search_scope)
-        if scope == SearchScopePolicy.DEFAULT and season is None and episode is None:
+        unit_scope = self._requested_agent_unit_scope(context)
+        if scope == SearchScopePolicy.DEFAULT and episode is None and (season is not None or unit_scope):
             return SearchScopePolicy.BUNDLE_PREFERRED
         return scope
 
@@ -435,17 +438,14 @@ class TvAgentSearchMixin:
         search_scope: str | None = None,
         context: Any | None = None,
     ) -> dict[str, Any]:
-        """Expose TV-owned response facts from TV-built search evidence.
-
-        The generic scheduler must not parse TV range notation. TV pack search
-        already emits query labels such as S01E01-E06 from provider/category
-        knowledge; this hook converts that TV-owned evidence into compact facts
-        for the candidate workspace.
-        """
-        _ = (item, search_scope, context)
+        """Expose released-frontier facts without conflating them with season order size."""
+        _ = (item, search_scope)
         season_i = self._safe_positive_int(season)
         if not season_i or episode is not None:
             return {}
+        facts = dict(getattr(context, "agent_search_facts", None) or {})
+        if facts and self._safe_positive_int(facts.get("season_number")) == season_i:
+            return facts
         expected = self._expected_episode_count_from_agent_query_summary(str(query_summary or ""), season_i)
         return {"expected_episode_count": expected} if expected else {}
 
@@ -462,13 +462,31 @@ class TvAgentSearchMixin:
         response_facts: dict[str, Any] | None = None,
         context: Any | None = None,
     ) -> dict[str, Any] | None:
-        """Annotate TV pack coverage on a candidate payload.
+        """Annotate TV identity and pack coverage on a candidate payload.
 
         Coverage labels such as ``full_requested_season`` are TV facts derived
         from TV bundle parsing and the TV response-level expected episode count.
-        They stay category-owned instead of living in scheduler core.
+        They stay category-owned instead of living in scheduler core.  The same
+        hook also publishes a TV-owned title-identity verdict so later compact
+        candidate workspace filters do not have to re-parse series names.
         """
-        _ = (result, item, unit_label, episode, search_scope, context)
+        _ = (unit_label, episode, search_scope, context)
+        title = str(getattr(result, "title", "") or payload.get("title") or "")
+        matches_item = self._title_matches_item_series(title, item) if title and item is not None else None
+        if matches_item is not None:
+            payload["title_identity"] = {
+                "matches_item": bool(matches_item),
+                "series_scope": self._series_title_scope(title),
+            }
+            if not matches_item:
+                blockers = list(payload.get("selection_blockers") or [])
+                note = "candidate title names a different TV series"
+                if note not in blockers:
+                    blockers.append(note)
+                payload["selection_blockers"] = blockers
+                payload["auto_queue_allowed"] = False
+                payload["auto_queue_blocked_reason"] = note
+
         expected = self._safe_positive_int((response_facts or {}).get("expected_episode_count"))
         season_i = self._safe_positive_int(season)
         bundle = payload.get("bundle_context") if isinstance(payload.get("bundle_context"), dict) else {}
@@ -486,11 +504,11 @@ class TvAgentSearchMixin:
         if start == 1 and end == expected:
             payload["requested_bundle_coverage"] = "full_requested_bundle"
             payload["requested_season_coverage"] = "full_requested_season"
-            payload["coverage_note"] = f"covers S{season_i:02d}E01-E{end:02d}; category expected season length is {expected}"
+            payload["coverage_note"] = f"covers S{season_i:02d}E01-E{end:02d}; current released/searchable frontier is E{expected:02d}"
         elif start and end:
             payload["requested_bundle_coverage"] = "partial_requested_bundle"
             payload["requested_season_coverage"] = "partial_requested_season"
-            payload["coverage_note"] = f"covers S{season_i:02d}E{start:02d}-E{end:02d}; category expected season length is {expected}"
+            payload["coverage_note"] = f"covers S{season_i:02d}E{start:02d}-E{end:02d}; current released/searchable frontier is E{expected:02d}"
         return payload
 
     @staticmethod
@@ -550,6 +568,48 @@ class TvAgentSearchMixin:
             labels.append(f"S{int(season):02d}E{int(ep):02d}")
         return labels or [season_label]
 
+    @staticmethod
+    def _requested_agent_unit_scope(context: Any | None) -> str:
+        """Return the model-supplied category-neutral unit scope.
+
+        The LLM interprets multilingual user language and supplies a structured
+        scope. TV owns what that scope means for seasons and episodes. Literal
+        English/Italian keyword lists are deliberately not used as an authority.
+        """
+        constraints = getattr(context, "search_constraints", None)
+        value = str((constraints or {}).get("unit_scope") or "").strip().lower()
+        return value if value in {"available_units", "missing_units", "all_units"} else ""
+
+    async def _prepare_agent_season_availability(
+        self,
+        item: Any,
+        season: int,
+        context: Any,
+    ) -> dict[str, Any]:
+        """Populate one authoritative released/target frontier for this TV search."""
+        total = await self._expected_episode_count(item.key, int(season), {}, context)
+        aired = await self._aired_episode_numbers_for_season(item.key, int(season), context)
+        targets = await self._infer_missing_or_likely_episodes_for_agent(
+            item,
+            int(season),
+            context,
+            aired_episode_numbers=aired,
+        )
+        facts = TVAgentAvailabilityFactsBuilder.build(
+            season=int(season),
+            season_total_episode_count=total,
+            aired_episode_numbers=aired,
+            target_episode_numbers=targets,
+            requested_unit_scope=self._requested_agent_unit_scope(context),
+        )
+        store = getattr(context, "agent_search_facts", None)
+        if isinstance(store, dict):
+            store.clear()
+            store.update(facts)
+        else:
+            setattr(context, "agent_search_facts", dict(facts))
+        return facts
+
     async def search_agent_candidates(
         self,
         item: Any,
@@ -569,10 +629,20 @@ class TvAgentSearchMixin:
         """
         item = await self._ensure_agent_title_authority(item, context)
         scope = SearchScopePolicy.normalize(search_scope)
-        if SearchScopePolicy.is_bundle_scope(scope) and season is None and episode is None:
+        unit_scope = self._requested_agent_unit_scope(context)
+        if season is None and episode is None and (
+            SearchScopePolicy.is_bundle_scope(scope) or unit_scope
+        ):
             resolved = await self.resolve_agent_pack_season(item, context)
             if resolved is not None:
                 season = int(resolved)
+        if season is None and episode is None:
+            return [], (
+                "TV search needs a season, episode, or structured unit_scope. "
+                "Ask which units the user wants instead of running a broad title search."
+            )
+        if season is not None and episode is None:
+            await self._prepare_agent_season_availability(item, int(season), context)
 
         # Season-only TV requests are bundle-first by default.  A user asking for
         # "Season 1" wants a season/series pack if one exists; fanning out into
@@ -611,7 +681,7 @@ class TvAgentSearchMixin:
                 )
                 return ranked, f"{pack_summary}; {fallback_summary}; extra-language pack candidates were kept as fallback only"
             if pack_results and fallback_results:
-                return fallback_results, f"{pack_summary}; {fallback_summary}; extra-language pack candidates were suppressed because configured media language is English"
+                return fallback_results, f"{pack_summary}; {fallback_summary}; non-matching or unverified-language pack candidates were suppressed because requested-language episode candidates were available"
             return fallback_results, fallback_summary
         if season is not None and episode is not None:
             exact_label = f"S{int(season):02d}E{int(episode):02d}"
@@ -655,7 +725,8 @@ class TvAgentSearchMixin:
         merged: list[Any] = []
         seen: set[str] = set()
         for label in labels or [None]:
-            if self._unit_coordinates(str(label or "")) != (None, None):
+            label_season, label_episode = self._unit_coordinates(str(label or ""))
+            if label_season > 0 and label_episode > 0:
                 await self._run_agent_exact_label_ladder(
                     item=item,
                     label=str(label),
@@ -665,7 +736,13 @@ class TvAgentSearchMixin:
                     seen=seen,
                 )
             else:
-                results = await context.pipeline.run_search(item, label, mode="llm", language=language)
+                results = await context.pipeline.run_search(
+                    item,
+                    label,
+                    mode="llm",
+                    language=language,
+                    rank_candidates=False,
+                )
                 self._merge_agent_results(merged, seen, results)
         ranked = await self.rank_agent_search_results(
             merged, item=item, language=language, season=season, episode=episode, context=context,
@@ -685,54 +762,157 @@ class TvAgentSearchMixin:
         merged: list[Any],
         seen: set[str],
     ) -> None:
-        """Search exact episode label variants until language-aware recall is adequate."""
-        quality_profile = getattr(item, "quality", None)
+        """Search exact variants, keeping bundles as subordinate fallback evidence."""
+        exact_rows: list[Any] = []
+        bundle_rows: list[Any] = []
+        exact_seen: set[str] = set()
+        bundle_seen: set[str] = set()
         attempted_language_query = False
         for query in self._agent_exact_label_queries(item, label, language):
-            if self._query_has_language_token(query, language):
-                attempted_language_query = True
-            try:
-                results = await context.aggregator.search(
-                    query,
-                    category=self.category_id,
-                    quality_profile=quality_profile,
-                    preferred_language=language,
+            attempted_language_query |= self._query_has_language_token(query, language)
+            results = await self._search_exact_label_query(item, query, language, context)
+            accepted = self._audit_exact_label_query(item, label, query, language, results)
+            for result, reason in accepted:
+                target, target_seen = (
+                    (exact_rows, exact_seen)
+                    if reason == "accept_exact_episode"
+                    else (bundle_rows, bundle_seen)
                 )
-            except Exception as exc:
-                logger.debug(f"TV exact episode query failed for {getattr(item, 'key', '')}: {query}: {exc}")
-                continue
-            valid = []
-            audit_rows: list[dict[str, Any]] = []
-            for idx, result in enumerate(results or [], start=1):
-                try:
-                    accepted, reason = self._exact_label_decision_reason(result, item=item, label=label)
-                except Exception as exc:
-                    accepted, reason = False, f"reject_validation_exception:{type(exc).__name__}"
-                audit_rows.append(self._search_audit_row(
-                    result, index=idx, status=("accepted" if accepted else "rejected"), reason=reason,
-                    item=item, language=language, season=self._unit_coordinates(str(label or ""))[0],
-                ))
-                if accepted:
-                    valid.append(result)
-            self._log_tv_search_filter_audit(
-                phase="exact_label_ladder", item=item, query=query, language=language,
-                season=self._unit_coordinates(str(label or ""))[0], label=label, rows=audit_rows,
-            )
-            before = len(merged)
-            self._merge_agent_results(merged, seen, valid)
-            added = len(merged) - before
-            if added:
-                logger.info(
-                    "TV exact query %r added %d valid candidate(s) for %s %s (total=%d, preferred_language=%r)",
-                    query, added, getattr(item, "key", ""), label, len(merged), language,
-                )
-            if len(merged) >= 40 and (not language or attempted_language_query or self._has_preferred_language_result(merged, language)):
+                self._merge_agent_results(target, target_seen, [result])
+            if self._exact_label_ladder_is_complete(
+                exact_rows, bundle_rows, language, attempted_language_query
+            ):
                 break
             if not results and self._aggregator_degraded(context):
                 logger.warning(
-                    f"TV exact query ladder degraded after query {query!r}; stopping for fallback sources."
+                    "TV exact query ladder degraded after query %r; stopping for fallback sources.",
+                    query,
                 )
                 break
+        selected = self._select_exact_label_results(exact_rows, bundle_rows, language)
+        before = len(merged)
+        self._merge_agent_results(merged, seen, selected)
+        logger.info(
+            "TV exact ladder selected %d candidate(s) for %s %s "
+            "(exact=%d, bundles=%d, preferred_language=%r)",
+            len(merged) - before,
+            getattr(item, "key", ""),
+            label,
+            len(exact_rows),
+            len(bundle_rows),
+            language,
+        )
+
+    async def _search_exact_label_query(
+        self, item: Any, query: str, language: str | None, context: Any
+    ) -> list[Any]:
+        """Run one exact-label provider query without LLM ranking."""
+        try:
+            return list(await context.aggregator.search(
+                query,
+                category=self.category_id,
+                quality_profile=getattr(item, "quality", None),
+                preferred_language=language,
+            ) or [])
+        except Exception as exc:
+            logger.debug(
+                "TV exact episode query failed for %s: %s: %s",
+                getattr(item, "key", ""),
+                query,
+                exc,
+            )
+            return []
+
+    def _audit_exact_label_query(
+        self,
+        item: Any,
+        label: str,
+        query: str,
+        language: str | None,
+        results: list[Any],
+    ) -> list[tuple[Any, str]]:
+        """Validate and audit one exact-label query result set."""
+        accepted: list[tuple[Any, str]] = []
+        audit_rows: list[dict[str, Any]] = []
+        season = self._unit_coordinates(str(label or ""))[0]
+        for index, result in enumerate(results, start=1):
+            try:
+                is_valid, reason = self._exact_label_decision_reason(result, item=item, label=label)
+            except Exception as exc:
+                is_valid, reason = False, f"reject_validation_exception:{type(exc).__name__}"
+            audit_rows.append(self._search_audit_row(
+                result,
+                index=index,
+                status=("accepted" if is_valid else "rejected"),
+                reason=reason,
+                item=item,
+                language=language,
+                season=season,
+            ))
+            if is_valid:
+                accepted.append((result, reason))
+        self._log_tv_search_filter_audit(
+            phase="exact_label_ladder",
+            item=item,
+            query=query,
+            language=language,
+            season=season,
+            label=label,
+            rows=audit_rows,
+        )
+        return accepted
+
+    def _exact_label_ladder_is_complete(
+        self,
+        exact_rows: list[Any],
+        bundle_rows: list[Any],
+        language: str | None,
+        attempted_language_query: bool,
+    ) -> bool:
+        """Bound provider fan-out after enough direct or fallback evidence exists."""
+        rows = [*exact_rows, *bundle_rows]
+        if len(rows) < 40:
+            return False
+        return bool(
+            not language
+            or attempted_language_query
+            or self._has_preferred_language_result(rows, language)
+        )
+
+    def _select_exact_label_results(
+        self,
+        exact_rows: list[Any],
+        bundle_rows: list[Any],
+        language: str | None,
+    ) -> list[Any]:
+        """Prefer direct requested-language units over weaker bundle evidence.
+
+        A bundle containing an episode is useful when no direct release exists.
+        It must not be presented as equivalent to an explicit requested-language
+        episode merely because an alternative exact query happened to return it.
+        Requested-language bundles remain valid alongside direct releases.
+        """
+        if not exact_rows:
+            return bundle_rows
+        if not language:
+            return [*exact_rows, *bundle_rows]
+        preferred_exact = [
+            row for row in exact_rows
+            if self._preferred_language_status_for_agent(
+                str(getattr(row, "title", "") or ""),
+                self._canonical_language_token(language),
+            ) in {"preferred_only", "preferred_with_extra"}
+        ]
+        if not preferred_exact:
+            return [*exact_rows, *bundle_rows]
+        preferred_bundles = [
+            row for row in bundle_rows
+            if self._preferred_language_status_for_agent(
+                str(getattr(row, "title", "") or ""),
+                self._canonical_language_token(language),
+            ) in {"preferred_only", "preferred_with_extra"}
+        ]
+        return [*exact_rows, *preferred_bundles]
 
     def _agent_exact_label_queries(self, item: Any, label: str, language: str | None) -> list[str]:
         """Return bounded exact-episode torrent query variants for one TV label."""
@@ -773,36 +953,63 @@ class TvAgentSearchMixin:
         labels: list[str] = []
         for ep in await self._infer_missing_or_likely_episodes_for_agent(item, int(season), context):
             labels.append(f"S{int(season):02d}E{int(ep):02d}")
-        if labels or context is None:
-            return labels
-        try:
-            count = await self._expected_episode_count(str(getattr(item, "key", "") or ""), int(season), {}, context)
-        except Exception:
-            count = None
-        try:
-            total = int(count or 0)
-        except (TypeError, ValueError):
-            total = 0
-        if total <= 0 or total > 40:
-            return []
-        return [f"S{int(season):02d}E{ep:02d}" for ep in range(1, total + 1)]
+        # ``episode_count`` is catalogue capacity, not release evidence.  A
+        # future/current season may expose its full ordered episode count before
+        # those episodes air.  Only the aired/local frontier inferred above may
+        # fan out into exact download queries; otherwise remain conservative
+        # and let the pack result or a later metadata refresh carry the request.
+        return labels
 
     def _pack_results_need_individual_fallback(self, results: list[Any], *, language: str | None) -> bool:
-        """Return true when pack candidates are only extra-language fallbacks.
+        """Return true when pack candidates do not satisfy language recall.
 
         For an English-configured install, a title explicitly tagged
         ``ITA+ENG``/``MULTI`` is queueable only as a fallback.  It must not stop
         the season search before exact English/unknown-language episode
         releases are considered.  Unknown-language scene releases are kept in
         the ordinary pool because many English releases omit an ENG tag.
+
+        For a non-English preference, the inverse recall rule applies: an
+        unknown-language or differently tagged season pack is not evidence that
+        no preferred-language episodes exist.  Continue to exact episode
+        queries unless at least one pack actually advertises the requested
+        language.  Without this rule an arbitrary untagged pack could stop the
+        ladder before ``SxxEyy ITA``/localized queries were ever attempted.
         """
         preferred = self._canonical_language_token(language) if language else ""
-        if preferred != "english" or not results:
+        if not results:
             return False
+
+        # Broad season/range queries may return individual same-season episodes.
+        # Those rows are useful fallback candidates, but they are not evidence
+        # that the requested season/available-unit set is covered. Only actual
+        # category-detected bundle rows may decide that pack-first search is
+        # complete; otherwise continue to the exact aired-unit ladder.
+        from src.core.categories.tv_bundle import TVBundleKnowledge
+
+        actual_packs = [
+            result
+            for result in results
+            if TVBundleKnowledge.detect_season_pack(str(getattr(result, "title", "") or ""))
+        ]
+        if not actual_packs:
+            return True
+        if not preferred:
+            return False
+
+        statuses = [
+            self._preferred_language_status_for_agent(
+                str(getattr(result, "title", "") or ""),
+                preferred,
+            )
+            for result in actual_packs
+        ]
+        if preferred != "english":
+            return not any(status in {"preferred_only", "preferred_with_extra"} for status in statuses)
+
         has_primary_or_unknown = False
         has_extra_language = False
-        for result in results:
-            status = self._preferred_language_status_for_agent(str(getattr(result, "title", "") or ""), preferred)
+        for status in statuses:
             if status == "preferred_only" or status == "unknown":
                 has_primary_or_unknown = True
             elif status == "preferred_with_extra":
@@ -1030,7 +1237,10 @@ class TvAgentSearchMixin:
         checker = getattr(getattr(context, "aggregator", None), "last_search_degraded", None)
         if callable(checker):
             try:
-                return bool(checker())
+                verdict = checker()
+                if AsyncBoundary.close_if_awaitable(verdict):
+                    return False
+                return bool(verdict)
             except Exception:
                 return False
         return False
@@ -1082,10 +1292,21 @@ class TvAgentSearchMixin:
                 seasons.append(latest)
         return max(seasons) if seasons else None
 
-    @staticmethod
-    def _latest_season_from_payload(payload: dict[str, object]) -> int | None:
+    def _latest_season_from_payload(self, payload: dict[str, object]) -> int | None:
+        """Return the latest season with release evidence, not a future order.
+
+        Metadata providers may announce a future season in ``number_of_seasons``
+        or include it in the seasons list long before any episode airs.  That is
+        useful catalogue data but is not a valid download-search frontier.  If
+        dated season rows are available, only seasons whose first air date is
+        today or earlier are eligible.  Undated legacy payloads retain the
+        previous numeric fallback so offline/older caches remain usable.
+        """
         seasons = payload.get("seasons") or []
-        values: list[int] = []
+        dated_values: list[int] = []
+        undated_values: list[int] = []
+        saw_dated_season = False
+        today = datetime.now(timezone.utc).date()
         if isinstance(seasons, list):
             for season_payload in seasons:
                 if not isinstance(season_payload, dict):
@@ -1094,8 +1315,25 @@ class TvAgentSearchMixin:
                     number = int(season_payload.get("season_number") or season_payload.get("number") or -1)
                 except (TypeError, ValueError):
                     continue
-                if number > 0:
-                    values.append(number)
+                if number <= 0:
+                    continue
+                air_date = str(season_payload.get("air_date") or season_payload.get("first_air_date") or "").strip()
+                if air_date:
+                    saw_dated_season = True
+                    if self._date_has_aired(air_date, today):
+                        dated_values.append(number)
+                else:
+                    undated_values.append(number)
+
+        if dated_values:
+            return max(dated_values)
+        if saw_dated_season:
+            # Explicit dates existed, but all positive-numbered seasons are in
+            # the future. Do not reinterpret a provider's total season count as
+            # an aired/downloadable frontier.
+            return None
+
+        values: list[int] = list(undated_values)
         for key in ("latest_season", "number_of_seasons", "last_season"):
             try:
                 value = int(payload.get(key) or 0)
@@ -1126,37 +1364,47 @@ class TvAgentSearchMixin:
             titles = [str(getattr(item, "key", "") or "").strip()]
         title = titles[0]
         s = int(season)
-        episode_count = await self._expected_episode_count(title, s, {}, context) if context is not None else None
+        search_facts = dict(getattr(context, "agent_search_facts", None) or {}) if context is not None else {}
+        episode_count = self._safe_positive_int(search_facts.get("release_frontier_episode"))
+        if episode_count is None and context is not None and not search_facts:
+            episode_count = await self._expected_episode_count(title, s, {}, context)
         latest_season = await self.resolve_agent_pack_season(item, context) if context is not None else None
         language_tokens = self._language_query_tokens(language)
 
         raw: list[str] = []
-        for idx, title_variant in enumerate(titles[:4]):
-            if not title_variant:
-                continue
-            exact = f"{title_variant} S{s:02d}"
-            season_words = f"{title_variant} Season {s}"
+        title_variants = [title_variant for title_variant in titles[:4] if title_variant]
+        primary_title = title_variants[0] if title_variants else title
 
-            if episode_count and episode_count > 1:
-                range_queries = [
-                    f"{title_variant} S{s:02d}E01-E{int(episode_count):02d}",
-                    f"{title_variant} S{s:02d}E01-{int(episode_count):02d}",
-                    f"{title_variant} {s}x01-{int(episode_count):02d}",
-                ]
-                raw.extend(range_queries)
-                if idx == 0:
-                    for token in language_tokens[:2]:
-                        raw.extend(f"{query} {token}" for query in range_queries[:2])
+        if episode_count and episode_count > 1 and primary_title:
+            range_queries = [
+                f"{primary_title} S{s:02d}E01-E{int(episode_count):02d}",
+                f"{primary_title} S{s:02d}E01-{int(episode_count):02d}",
+                f"{primary_title} {s}x01-{int(episode_count):02d}",
+            ]
+            raw.extend(range_queries)
+            for token in language_tokens[:2]:
+                raw.extend(f"{query} {token}" for query in range_queries[:2])
 
+        # Identity-first phase: keep the ladder bounded, but make sure provider
+        # aliases are represented before spending the whole budget on pack-word
+        # variants for only the first spelling.
+        if primary_title:
+            exact = f"{primary_title} S{s:02d}"
             raw.append(exact)
-            if idx == 0:
-                for token in language_tokens[:2]:
-                    raw.append(f"{exact} {token}")
-            raw.append(season_words)
-            if idx == 0:
-                for token in language_tokens[:2]:
-                    raw.append(f"{season_words} {token}")
+            for token in language_tokens[:2]:
+                raw.append(f"{exact} {token}")
+        for title_variant in title_variants[1:4]:
+            raw.append(f"{title_variant} S{s:02d}")
 
+        if primary_title:
+            season_words = f"{primary_title} Season {s}"
+            raw.append(season_words)
+            for token in language_tokens[:2]:
+                raw.append(f"{season_words} {token}")
+        for title_variant in title_variants[1:4]:
+            raw.append(f"{title_variant} Season {s}")
+
+        for idx, title_variant in enumerate(title_variants):
             # Pack-first recall.  Season pack forms beat per-episode fanout for a
             # season-only request because selecting files from one torrent is often
             # faster and cleaner than issuing N episode searches.
@@ -1174,9 +1422,10 @@ class TvAgentSearchMixin:
                     f"{title_variant} Complete Series",
                     f"{title_variant} All Seasons",
                 ])
-            # Broad title is only a final recall fallback and is included only if it
-            # fits in the bounded interactive ladder.
-            raw.append(f"{title_variant}")
+            if idx == 0:
+                # Broad title is only a final recall fallback and is included
+                # only if it fits in the bounded interactive ladder.
+                raw.append(f"{title_variant}")
 
         seen: set[str] = set()
         queries: list[str] = []
@@ -1408,9 +1657,12 @@ class TvAgentSearchMixin:
         result = re.sub(r"[^a-z0-9]+", " ", result_scope.lower()).strip()
         if not requested:
             return True
+        tokens = requested.split()
+        result_tokens = result.split()
+        if len(tokens) == 1:
+            return CategoryTitleAuthority._one_word_alias_matches_candidate(result_tokens, tokens[0])
         if re.search(rf"(?:^| ){re.escape(requested)}(?: |$)", result):
             return True
-        tokens = requested.split()
         if tokens and tokens[0] in {"the", "a", "an"}:
             trimmed = tokens[1:]
             if len(trimmed) >= 2:
@@ -1493,7 +1745,14 @@ class TvAgentSearchMixin:
 
         return bool(TVBundleKnowledge.detect_season_pack(str(getattr(result, "title", "") or "")))
 
-    async def _infer_missing_or_likely_episodes_for_agent(self, item: Any, season: int, context: Any | None) -> list[int]:
+    async def _infer_missing_or_likely_episodes_for_agent(
+        self,
+        item: Any,
+        season: int,
+        context: Any | None,
+        *,
+        aired_episode_numbers: set[int] | None = None,
+    ) -> list[int]:
         """Infer TV episode fanout targets from category metadata and library state."""
         if context is None or not getattr(context, "db", None):
             # Without metadata/library state, do not invent a 10-episode season.
@@ -1520,7 +1779,9 @@ class TvAgentSearchMixin:
             if _as_int(unit.get("season")) == season and _as_int(unit.get("episode")) > 0
         }
         try:
-            aired = await self._aired_episode_numbers_for_season(item.key, season, context)
+            aired = aired_episode_numbers
+            if aired is None:
+                aired = await self._aired_episode_numbers_for_season(item.key, season, context)
             if aired:
                 return [ep for ep in sorted(aired) if ep not in downloaded_set]
         except Exception as exc:
@@ -1900,6 +2161,10 @@ class TvAgentSearchMixin:
             if match:
                 candidate_season = self._safe_positive_int(match.group(1))
                 candidate_episode = self._safe_positive_int(match.group(2)) or candidate_episode
+
+        title_identity = candidate.get("title_identity") if isinstance(candidate.get("title_identity"), dict) else {}
+        if title_identity.get("matches_item") is False:
+            return "reject_title_mismatch"
 
         if self._bundle_context_contains_request(
             candidate.get("bundle_context") if isinstance(candidate.get("bundle_context"), dict) else {},

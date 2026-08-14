@@ -30,7 +30,6 @@ from src.core.download_import_identity import (
     _normalize_import_context,
 )
 
-
 class DownloadManager(DownloadSharingMixin):
     """Orchestrates torrent downloads by coordinating the engine and queue."""
 
@@ -81,13 +80,20 @@ class DownloadManager(DownloadSharingMixin):
         if not availability.available_for_writes:
             logger.warning(f"Download directory is unavailable at startup: {availability.reason}")
 
+    async def _start_download_guarded(self, item: DownloadItem) -> None:
+        """Serialize engine registration for one logical download ID."""
+        coordinator = getattr(self, "_start_coordinator", None)
+        if coordinator is None:
+            await self._start_download(item)
+            return
+        await coordinator.run_start_once(item.id, lambda: self._start_download(item))
     async def initialize(self) -> None:
         """Initialize the engine and start the queue manager."""
         await self._engine.initialize()
         await self._cancel_duplicate_active_media_identity_rows()
         self._supervisor.spawn_restartable(
             "download_queue_manager",
-            lambda: self._queue.run_loop(self._start_download, self.pause_download, self._can_start_queued_download),
+            lambda: self._queue.run_loop(self._start_download_guarded, self.pause_download, self._can_start_queued_download),
             TaskCriticality.CRITICAL,
         )
         self._supervisor.spawn_restartable(
@@ -101,7 +107,6 @@ class DownloadManager(DownloadSharingMixin):
             TaskCriticality.IMPORTANT,
         )
         logger.info("Download manager initialized.")
-
 
     async def _cancel_duplicate_active_media_identity_rows(self) -> None:
         """Cancel duplicate active/queued rows for the same category unit.
@@ -413,7 +418,7 @@ class DownloadManager(DownloadSharingMixin):
             item.status = DownloadStatus.QUEUED
             await self._db.downloads.upsert_download(item)
             if self._queue.active_count() < self._max_concurrent and await self._can_start_queued_download(item):
-                await self._start_download(item)
+                await self._start_download_guarded(item)
                 refreshed = await self._db.downloads.get_download(download_id)
                 return refreshed or item
         return item
@@ -466,7 +471,8 @@ class DownloadManager(DownloadSharingMixin):
                            item_id: str = "",
                            estimated_size_bytes: int | None = None,
                            source_seeders: int | None = None,
-                           import_context: DownloadImportContext | dict[str, Any] | None = None) -> DownloadItem:
+                           import_context: DownloadImportContext | dict[str, Any] | None = None,
+                           retry_completed_if_unsatisfied: bool = False) -> DownloadItem:
         """Add a magnet link and queue it after storage-capacity preflight."""
         if not magnet_link:
             raise ValueError("Magnet link cannot be None or empty")
@@ -527,16 +533,28 @@ class DownloadManager(DownloadSharingMixin):
         async with lock:
             existing = await self._db.downloads.get_download(download_id)
             if existing:
-                if existing.status in (
-                    DownloadStatus.DOWNLOADING,
-                    DownloadStatus.COMPLETE,
-                ):
+                if existing.status == DownloadStatus.COMPLETE and retry_completed_if_unsatisfied:
+                    item = await self._revive_completed_download(
+                        existing,
+                        item_name=item_name,
+                        category_id=category_id,
+                        item_id=item_id,
+                        season=season,
+                        episode=episode,
+                        language=language,
+                        torrent_title=torrent_title,
+                        source_seeders=source_seeders,
+                        priority=priority,
+                        reason=reason,
+                        import_context=normalized_context,
+                    )
+                elif existing.status in (DownloadStatus.DOWNLOADING, DownloadStatus.COMPLETE):
                     logger.info(
                         f'Skipping duplicate magnet {download_id} '
                         f"(status={existing.status.value}) for '{item_name}'"
                     )
                     return existing
-                if existing.status in (DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.STALLED):
+                elif existing.status in (DownloadStatus.QUEUED, DownloadStatus.PAUSED, DownloadStatus.STALLED):
                     auto_start_allowed = bool(
                         existing.status == DownloadStatus.QUEUED
                         and await self._can_start_queued_download(existing)
@@ -573,7 +591,10 @@ class DownloadManager(DownloadSharingMixin):
                     return existing
             else:
                 duplicate = await _find_duplicate_import_context(
-                    self._db.downloads, normalized_context, download_id=download_id
+                    self._db.downloads,
+                    normalized_context,
+                    download_id=download_id,
+                    ignore_completed=retry_completed_if_unsatisfied,
                 )
                 if duplicate:
                     auto_start_allowed = bool(
@@ -650,7 +671,7 @@ class DownloadManager(DownloadSharingMixin):
             await self._sync_active_slots_from_state()
             if self._queue.active_count() < self._max_concurrent:
                 if await self._can_start_queued_download(item):
-                    await self._start_download(item)
+                    await self._start_download_guarded(item)
                 else:
                     logger.info(
                         f"Queued '{item_name}' but held start because auto_download is disabled "
@@ -659,6 +680,65 @@ class DownloadManager(DownloadSharingMixin):
         # Starting a batch can race with stale state from previous runs.  Always
         # re-apply the slot gate after queueing so max_concurrent is authoritative.
         await self._enforce_concurrency_limit()
+        return item
+
+    async def _revive_completed_download(
+        self,
+        item: DownloadItem,
+        *,
+        item_name: str,
+        category_id: str,
+        item_id: str,
+        season: int | None,
+        episode: int | None,
+        language: str,
+        torrent_title: str,
+        source_seeders: int | None,
+        priority: DownloadPriority,
+        reason: str,
+        import_context: DownloadImportContext | None,
+    ) -> DownloadItem:
+        """Reset a stale completed transfer after canonical absence is verified."""
+        if coordinator := getattr(self, "_start_coordinator", None):
+            coordinator.release_start(item.id)
+        try:
+            await self._engine.remove_torrent(item.id)
+        except Exception as exc:
+            logger.debug("Completed retry had no removable engine handle for {}: {}", item.id, exc)
+        item.item_name = item_name or item.item_name
+        item.category_id = category_id or item.category_id
+        item.item_id = item_id or item.item_id or item.item_name
+        item.season = season
+        item.episode = episode
+        item.language = language or item.language
+        item.torrent_title = torrent_title or item.torrent_title or item.item_name
+        item.source_seeders = source_seeders
+        item.priority = priority
+        item.reason = reason or "manual"
+        item.import_context = import_context or item.import_context
+        item.status = DownloadStatus.QUEUED
+        item.progress = 0.0
+        item.download_rate = 0.0
+        item.upload_rate = 0.0
+        item.num_peers = 0
+        item.num_seeds = 0
+        item.total_size = 0
+        item.downloaded_bytes = 0
+        item.uploaded_bytes = 0
+        item.seed_ratio = 0.0
+        item.sharing_enabled = False
+        item.eta_seconds = 0.0
+        item.file_path = None
+        item.files = []
+        item.completed_at = None
+        item.stalled_notified = False
+        item.stalled_cancel_asked = False
+        item.created_at = datetime.now(timezone.utc)
+        await self._db.downloads.upsert_download(item)
+        logger.warning(
+            "Revived completed download row {} because canonical library verification proved the requested unit is absent",
+            item.id,
+        )
         return item
 
     async def cancel_download(self, download_id: str, cleanup_files: bool = True) -> None:
@@ -671,6 +751,8 @@ class DownloadManager(DownloadSharingMixin):
         self._supervisor.cancel(f"dl_monitor_{download_id}")
         self._monitor_registry.unregister(download_id)
         self._start_coordinator.unregister_selective(download_id)
+        if coordinator := getattr(self, "_start_coordinator", None):
+            coordinator.release_start(download_id)
         self._progress_cache.clear(download_id)
 
         item = await self._db.downloads.get_download(download_id)
@@ -854,7 +936,7 @@ class DownloadManager(DownloadSharingMixin):
             item.status = DownloadStatus.QUEUED
             await self._db.downloads.upsert_download(item)
             try:
-                await self._start_download(item)
+                await self._start_download_guarded(item)
             except Exception as e:
                 logger.error(f"Failed to start resumed download {download_id}: {e}")
                 # A direct resume should not strand a paused item as failed just
@@ -1105,7 +1187,7 @@ class DownloadManager(DownloadSharingMixin):
             if started >= self._max_concurrent:
                 continue
             try:
-                await self._start_download(item)
+                await self._start_download_guarded(item)
                 started += 1
             except Exception:
                 pass

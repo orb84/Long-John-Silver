@@ -14,7 +14,7 @@ class TestClarificationBuilder:
         """A message with 'download' gets a download-specific question."""
         result = ClarificationBuilder.build("download it", intent_hint=Intent.DOWNLOAD)
         assert "download" in result.lower()
-        assert "show" in result.lower() or "episode" in result.lower()
+        assert "download" in result.lower()
 
     def test_fetch_keyword_gets_download_clarification(self):
         """A message with 'fetch' gets a download-specific question."""
@@ -34,7 +34,7 @@ class TestClarificationBuilder:
     def test_add_keyword_gets_config_clarification(self):
         """A message with 'add' gets a config-specific question."""
         result = ClarificationBuilder.build("add a new one", intent_hint=Intent.CONFIG)
-        assert "add" in result.lower() or "watch list" in result.lower()
+        assert "settings" in result.lower()
 
     def test_setting_keyword_gets_config_clarification(self):
         """A message with 'setting' gets a config-specific question."""
@@ -54,17 +54,16 @@ class TestClarificationBuilder:
     def test_no_hint_gets_generic_clarification(self):
         """No intent hint gets the generic multi-option clarification."""
         result = ClarificationBuilder.build("hmm")
-        assert "Download" in result
-        assert "Search" in result
-        assert "Configure" in result
+        assert "search" in result.lower()
+        assert "download" in result.lower()
+        assert "settings" in result.lower()
 
     def test_none_hint_gets_generic_clarification(self):
         """None hint explicitly gets generic clarification."""
         result = ClarificationBuilder.build("hmm", intent_hint=None)
-        assert "Download" in result
+        assert "download" in result.lower()
 
     def test_generic_message_with_download_hint_not_matching_keywords(self):
         """Message like 'do it' with DOWNLOAD hint uses the fallback download question."""
         result = ClarificationBuilder.build("do it", intent_hint=Intent.DOWNLOAD)
-        assert "show" in result.lower()
         assert "download" in result.lower()

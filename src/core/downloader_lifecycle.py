@@ -241,6 +241,7 @@ class TorrentRuntimePriorityController:
             return False
 
     def clear(self, download_id: str) -> None:
+        """Remove all runtime priority state for a completed or removed torrent."""
         self._last_signature_by_download.pop(download_id, None)
 
     def _desired_priorities(self, files: list[DownloadFileInfo], num_files: int) -> list[int]:
@@ -459,9 +460,13 @@ class SeedingPolicy:
         if item.sharing_enabled:
             if seeded_hours < self._seed_duration_hours:
                 return False
+            # A non-positive ratio disables the ratio requirement; the minimum
+            # duration remains the complete fair-share obligation. When a ratio
+            # is configured, stop after the minimum duration once either the
+            # target is met or no peers are currently accepting uploads.
             if self._seed_ratio_target <= 0:
-                return False
-            return seed_ratio >= self._seed_ratio_target
+                return True
+            return seed_ratio >= self._seed_ratio_target or upload_rate == 0
 
         if self._seed_ratio_target <= 0:
             return upload_rate == 0

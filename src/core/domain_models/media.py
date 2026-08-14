@@ -126,26 +126,14 @@ class MediaCategoryItem(CategoryItem):
 class TvShowItem(MediaCategoryItem):
     """A television show being tracked for new episodes.
 
-    TV new-episode automation is opt-in by default.  A show may be enabled
-    explicitly from the inspector, or TV may enable it after the user manually
-    downloads an episode from an actively airing season.  Existing library shows
-    with missing/null automation values must not start background downloads just
-    because they are present in the library.
+    New items keep ``auto_download`` unset until the TV category has provider
+    lifecycle evidence.  The category may then default an active/returning show
+    on or an ended show off.  Once the user sets the checkbox explicitly, that
+    literal boolean remains authoritative.
     """
 
-    auto_download: bool | None = False
+    auto_download: bool | None = None
     """Whether release-watch automation may auto-download new TV episodes."""
-
-    @model_validator(mode="after")
-    def _default_new_episode_auto_download(self) -> "TvShowItem":
-        """Normalize legacy null automation values to the safe TV default.
-
-        Returns:
-            The normalized TV show item.
-        """
-        if self.auto_download is None:
-            self.auto_download = False
-        return self
 
     @property
     def item_type(self) -> str:

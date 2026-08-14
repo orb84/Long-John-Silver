@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from loguru import logger
+from src.core.operation_trace import OperationTraceLogEnricher
 import uvicorn
 
 from src.core.config import SettingsManager
@@ -48,6 +49,7 @@ from src.core.torrent_racer import TorrentRacer
 from src.utils.library_scanner import LibraryScanner
 from src.web.app import create_app
 from src.web.access_logs import install_quiet_polling_access_log_filter
+from src.web.readiness import LJSWebReadinessGate
 from src.web.comms import create_registry
 from src.core.state_coordinator import StateCoordinator
 from src.search.jackett_manager import JackettManager
@@ -149,63 +151,6 @@ def _category_service_enabled(
     if callable(enabled):
         return bool(enabled(category_id, service_id, default=default))
     return bool(default)
-
-
-async def _probe_http_live(host: str, port: int, *, timeout: float = 0.75) -> str:
-    """Return the raw response prefix from LJS's lightweight live endpoint."""
-    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-    try:
-        request = (
-            "GET /api/live HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Connection: close\r\n"
-            "User-Agent: ljs-startup-probe\r\n"
-            "\r\n"
-        )
-        writer.write(request.encode("ascii"))
-        await asyncio.wait_for(writer.drain(), timeout=timeout)
-        data = await asyncio.wait_for(reader.read(512), timeout=timeout)
-        return data.decode("utf-8", errors="replace")
-    finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-
-
-async def _wait_for_web_server_ready(host: str, port: int, task: asyncio.Task, timeout_seconds: float = 15.0) -> None:
-    """Wait until the LJS web app answers HTTP, not merely until a port accepts TCP.
-
-    Round 50 only proved that *something* accepted a connection.  That can mask
-    a stale process already bound to the port, or a socket that bound but whose
-    event loop is too busy to answer requests.  The readiness gate now calls the
-    app-owned /api/live endpoint and requires an HTTP 200 response containing the
-    LJS marker before startup jobs are allowed to begin.
-    """
-    connect_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
-    last_error: Exception | str | None = None
-
-    while asyncio.get_running_loop().time() < deadline:
-        if task.done():
-            exc = task.exception()
-            if exc:
-                raise RuntimeError(f"web server task exited before answering /api/live on port {port}: {exc}") from exc
-            raise RuntimeError(f"web server task exited before answering /api/live on port {port}")
-        try:
-            response = await _probe_http_live(connect_host, port)
-            if "200" in response.split("\r\n", 1)[0] and "ljs-live" in response:
-                return
-            last_error = f"unexpected readiness response: {response[:120]!r}"
-        except Exception as exc:  # noqa: BLE001 - readiness probes intentionally retry broadly.
-            last_error = exc
-        await asyncio.sleep(0.1)
-
-    raise RuntimeError(
-        f"web server did not answer LJS /api/live on {connect_host}:{port} "
-        f"within {timeout_seconds:.1f}s; last probe error: {last_error}"
-    )
 
 
 async def _event_loop_watchdog(interval_seconds: float = 1.0, warn_after_seconds: float = 3.0) -> None:
@@ -401,7 +346,15 @@ async def _run_deferred_startup_jobs(
 
 async def main():
     """Main async entry point: initialize services and run concurrently."""
-    logger.add("logs/ljs.log", rotation="10 MB")
+    logger.add(
+        "logs/ljs.log",
+        rotation="10 MB",
+        filter=OperationTraceLogEnricher(),
+        format=(
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} | "
+            "session={extra[session_id]} turn={extra[turn_id]} elapsed_ms={extra[turn_elapsed_ms]} - {message}\n{exception}"
+        ),
+    )
     logger.info("Starting LJS: AI-Powered Torrent Automation")
 
     # --- Initialize Detailed Logging Subsystem ---
@@ -759,6 +712,7 @@ async def main():
         )
 
         # --- Initialize scheduler (with all deps including suggestion_compiler) ---
+        web_reader = WebReader()
         scheduler = MediaScheduler(SchedulerDependencies(
             settings_manager=settings_manager,
             db=db,
@@ -778,6 +732,7 @@ async def main():
             torrent_racer=torrent_racer,
             metadata_enricher=metadata_enricher,
             artwork_manager=artwork_manager,
+            web_reader=web_reader,
         ))
         completion_handler.set_library_reconciler(scheduler)
 
@@ -822,6 +777,7 @@ async def main():
             comms_registry=comms_registry,
             storage_monitor=storage_monitor,
             taste_profiler=taste_profiler,
+            task_supervisor=supervisor,
         ))
 
         # --- Initialize tool catalog with domain ToolProviders ---
@@ -833,6 +789,7 @@ async def main():
                 search_aggregator=aggregator,
                 settings_manager=settings_manager,
                 category_registry=cat_registry,
+                action_event_store=action_event_store,
             ),
             LibraryToolProvider(
                 settings_manager=settings_manager,
@@ -862,7 +819,7 @@ async def main():
                 llm_client=task_llm_client,
             ),
             WebToolProvider(
-                web_reader=WebReader(),
+                web_reader=web_reader,
                 browser_runtime=browser_runtime,
                 settings_manager=settings_manager,
                 database=db,
@@ -913,6 +870,8 @@ async def main():
             supervisor=supervisor,
             action_event_store=action_event_store,
             llm_manager=llm_manager,
+            llm_activity_monitor=task_llm_client.activity_monitor,
+            turn_logger=detailed_logger.turn_logger,
             scanner=scanner,
             librarian=librarian,
             torrent_racer=torrent_racer,
@@ -958,10 +917,22 @@ async def main():
             logger.info("Uvicorn access logs disabled by LJS_ACCESS_LOGS.")
         server = uvicorn.Server(config)
         web_task = supervisor.spawn_restartable("web_server", server.serve, TaskCriticality.CRITICAL)
-        await _wait_for_web_server_ready(web_host, port, web_task)
+        readiness_gate = LJSWebReadinessGate()
+        await readiness_gate.wait(
+            web_host,
+            port,
+            web_task,
+            expected_build_id=app.state.runtime_build_id,
+            expected_asset_version=app.state.static_asset_version,
+        )
 
         access_urls = _format_access_urls(web_host, port)
-        logger.info("LJS web UI answered /api/live. Try: " + ", ".join(access_urls))
+        logger.info(
+            "LJS web UI answered /api/live for build={} assets={}. Try: {}",
+            app.state.runtime_build_id,
+            app.state.static_asset_version,
+            ", ".join(access_urls),
+        )
         if (
             getattr(settings.web_search, "enabled", True)
             and getattr(settings.web_search, "provider", "") == "searxng"

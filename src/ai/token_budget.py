@@ -95,12 +95,29 @@ class TokenBudgetManager:
                     total += 2
         return total
 
+    def estimate_tools(self, tools: list[dict] | None) -> int:
+        """Estimate serialized function-schema tokens included in the request.
+
+        Tool definitions are part of the same provider context window as chat
+        messages.  Earlier budgeting ignored them, so a 20-tool DOWNLOAD turn
+        could exceed the measured prompt by tens of thousands of tokens.
+        """
+        if not tools:
+            return 0
+        try:
+            serialized = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            serialized = str(tools)
+        return self.estimate_tokens_for_text(serialized, is_json=True) + (8 * len(tools))
+
     def trim_messages(
         self,
         messages: list[dict],
         context_limit: int | None = None,
         reserved_output_tokens: int = DEFAULT_OUTPUT_RESERVE,
         raw_recent_context_percent: int = DEFAULT_RAW_RECENT_CONTEXT_PERCENT,
+        tools: list[dict] | None = None,
+        allow_target_overflow: bool = False,
     ) -> list[dict]:
         """Compatibility wrapper for the old name.
 
@@ -113,6 +130,8 @@ class TokenBudgetManager:
             context_limit=context_limit,
             reserved_output_tokens=reserved_output_tokens,
             raw_recent_context_percent=raw_recent_context_percent,
+            tools=tools,
+            allow_target_overflow=allow_target_overflow,
         )
 
     def compress_messages(
@@ -121,6 +140,8 @@ class TokenBudgetManager:
         context_limit: int | None = None,
         reserved_output_tokens: int = DEFAULT_OUTPUT_RESERVE,
         raw_recent_context_percent: int = DEFAULT_RAW_RECENT_CONTEXT_PERCENT,
+        tools: list[dict] | None = None,
+        allow_target_overflow: bool = False,
     ) -> list[dict]:
         """Compress messages to fit a model context budget.
 
@@ -135,7 +156,14 @@ class TokenBudgetManager:
         5. drops only as an explicit last-resort safety fallback.
         """
         limit = self._default_context_limit if context_limit is None else int(context_limit)
-        available = max(0, limit - int(reserved_output_tokens or 0))
+        tool_tokens = self.estimate_tools(tools)
+        available = max(0, limit - int(reserved_output_tokens or 0) - tool_tokens)
+        if tool_tokens:
+            logger.debug(
+                "LLM prompt budget reserved {} estimated tokens for {} tool schema(s)",
+                tool_tokens,
+                len(tools or []),
+            )
         if not messages:
             return messages
 
@@ -175,13 +203,26 @@ class TokenBudgetManager:
         # Last resort only: keep the primary system prompt, current user turn,
         # and live tool exchange where possible.  This should be rare and logs a
         # warning so it is visible during testing.
-        final = self._last_resort_drop(compressed, available)
+        final = self._last_resort_drop(
+            compressed,
+            available,
+            soft_target=allow_target_overflow,
+        )
         final_estimate = self.estimate_messages(final)
         if final_estimate > available:
-            logger.warning(
-                f"Token budget still over limit after last-resort safety fallback: "
-                f"{final_estimate} tokens vs {available} prompt budget"
-            )
+            if allow_target_overflow:
+                logger.info(
+                    "Irreducible prompt exceeds the interactive soft target: "
+                    "{} tokens vs {} target budget; returning it for the "
+                    "runtime hard-ceiling audit",
+                    final_estimate,
+                    available,
+                )
+            else:
+                logger.warning(
+                    f"Token budget still over limit after last-resort safety fallback: "
+                    f"{final_estimate} tokens vs {available} prompt budget"
+                )
         return final
 
     def compact_tool_result(
@@ -351,7 +392,13 @@ class TokenBudgetManager:
         if len(text) <= max_chars:
             return text
         if max_chars < 200:
-            return text[:max_chars]
+            marker = f"...[{label}]..."
+            if max_chars <= len(marker):
+                return marker[:max_chars]
+            remaining = max_chars - len(marker)
+            head = max(1, remaining // 2)
+            tail = max(0, remaining - head)
+            return text[:head] + marker + (text[-tail:] if tail else "")
         head = int(max_chars * 0.65)
         tail = max(80, max_chars - head - 80)
         omitted = len(text) - head - tail
@@ -403,13 +450,25 @@ class TokenBudgetManager:
                 return working
         return working
 
-    def _last_resort_drop(self, messages: list[dict], available: int) -> list[dict]:
+    def _last_resort_drop(
+        self,
+        messages: list[dict],
+        available: int,
+        *,
+        soft_target: bool = False,
+    ) -> list[dict]:
         working = [dict(m) for m in messages]
         protected = self._protected_indices(working)
-        logger.warning(
-            "Context compression could not fit the prompt; applying last-resort "
-            "oldest-message drop. This should be investigated."
-        )
+        if soft_target:
+            logger.debug(
+                "Context exceeds the interactive soft target; dropping oldest "
+                "optional messages before the runtime hard-ceiling audit"
+            )
+        else:
+            logger.warning(
+                "Context compression could not fit the prompt; applying last-resort "
+                "oldest-message drop. This should be investigated."
+            )
         changed = True
         while changed and self.estimate_messages(working) > available and len(working) > 2:
             changed = False

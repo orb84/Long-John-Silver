@@ -229,9 +229,26 @@ class SchedulerTorrentSearchService:
             }
         requested_category = explicit_category_id or self._category_for_units(season, episode)
         if not requested_category:
-            requested_category = self._category_for_search_text(normalized_name)
-        if not requested_category:
             requested_category = self._category_for_search_scope(normalized_scope)
+        if not requested_category:
+            return {
+                "error": (
+                    f"Could not resolve a concrete category for '{normalized_name}'. "
+                    "TV, movie, music, book, and general-file searches require their owning category."
+                ),
+                "error_code": "category_resolution_required",
+                "ok": False,
+                "recoverable": True,
+                "item_name": normalized_name,
+                "available_categories": self._context.categories.list_ids() if self._context.categories else [],
+                "next_actions": [
+                    {
+                        "action": "clarify_or_supply_registered_category",
+                        "tool": "search_media_torrents",
+                        "reason": "The abstract media base cannot safely interpret identity, units, packs, or language evidence.",
+                    }
+                ],
+            }
         initial_category = self._context.categories.get(requested_category) if requested_category and self._context.categories else None
         normalized_name, season, episode = self._category_normalized_search_units(
             initial_category, normalized_name, season, episode, normalized_scope
@@ -254,6 +271,7 @@ class SchedulerTorrentSearchService:
             category_id=category_id,
             tracked_language=getattr(media, "language", None),
         )
+        constraints = self._normalize_search_constraints(search_constraints)
         normalized_scope = self._category_default_search_scope(
             category,
             media=media,
@@ -262,32 +280,44 @@ class SchedulerTorrentSearchService:
             search_scope=normalized_scope,
             language=target_lang,
             settings=settings,
+            search_constraints=constraints,
         )
         season = await self._resolve_category_default_season(
-            media, category_id, season, episode, normalized_scope, settings,
+            media, category_id, season, episode, normalized_scope, settings, constraints,
         )
-        constraints = self._normalize_search_constraints(search_constraints)
         companion_query = self._preliminary_query_summary(media, category, season, episode, normalized_scope)
-        logger.info(
-            f"Starting Soulseek companion task before torrent search: category={category_id} "
-            f"query={companion_query!r} scope={normalized_scope!r}"
-        )
-        companion_task = asyncio.create_task(
-            self._soulseek_companion_search(
-                query_summary=companion_query,
-                media=media,
-                category_id=category_id,
-                search_scope=normalized_scope,
-                settings=settings,
-                season=season,
-                episode=episode,
-                language=target_lang,
-                search_constraints=constraints,
+        source_strategy = self._source_strategy(category_id, normalized_name, normalized_scope, settings)
+        category_strategy = source_strategy.get("category_strategy") if isinstance(source_strategy.get("category_strategy"), dict) else {}
+        companion_mode = str(category_strategy.get("foreground_companion_mode") or "parallel").strip().lower()
+        companion_task: asyncio.Task[dict[str, Any]] | None = None
+        if companion_mode == "parallel":
+            logger.info(
+                f"Starting Soulseek companion task before torrent search: category={category_id} "
+                f"query={companion_query!r} scope={normalized_scope!r}"
             )
-        )
+            companion_task = asyncio.create_task(
+                self._soulseek_companion_search(
+                    query_summary=companion_query,
+                    media=media,
+                    category_id=category_id,
+                    search_scope=normalized_scope,
+                    settings=settings,
+                    season=season,
+                    episode=episode,
+                    language=target_lang,
+                    search_constraints=constraints,
+                )
+            )
+        else:
+            logger.debug(
+                "Soulseek foreground companion deferred by category strategy: category={} mode={} query={!r}",
+                category_id, companion_mode, companion_query,
+            )
         torrent_error: str | None = None
         try:
-            results, query_summary = await self._search(media, category_id, season, episode, target_lang, settings, normalized_scope, constraints)
+            results, query_summary, category_search_facts = await self._search(
+                media, category_id, season, episode, target_lang, settings, normalized_scope, constraints,
+            )
         except Exception as exc:
             # A torrent-side provider/tool failure must not abort the whole
             # assistant turn.  Soulseek is an independent companion source and
@@ -296,8 +326,21 @@ class SchedulerTorrentSearchService:
             logger.exception("Torrent search failed for %s; preserving companion fallback result.", media.key)
             results = []
             query_summary = self._preliminary_query_summary(media, category, season, episode, normalized_scope)
+            category_search_facts = {}
             torrent_error = str(exc)
-        response = self._response(media, category_id, season, episode, target_lang, results, query_summary, normalized_scope, settings=settings, search_constraints=constraints)
+        response = self._response(
+            media,
+            category_id,
+            season,
+            episode,
+            target_lang,
+            results,
+            query_summary,
+            normalized_scope,
+            settings=settings,
+            search_constraints=constraints,
+            category_search_facts=category_search_facts,
+        )
         if torrent_error:
             response["torrent_status"] = "error"
             response["torrent_error"] = torrent_error
@@ -308,9 +351,29 @@ class SchedulerTorrentSearchService:
             })
         if constraints:
             response["search_constraints"] = constraints
-        response["source_strategy"] = self._source_strategy(category_id, normalized_name, normalized_scope, settings)
+        response["source_strategy"] = source_strategy
         try:
-            response["companion_soulseek"] = await companion_task
+            if companion_task is not None:
+                response["companion_soulseek"] = await companion_task
+            elif companion_mode == "fallback_if_primary_empty" and not results:
+                response["companion_soulseek"] = await self._soulseek_companion_search(
+                    query_summary=companion_query,
+                    media=media,
+                    category_id=category_id,
+                    search_scope=normalized_scope,
+                    settings=settings,
+                    season=season,
+                    episode=episode,
+                    language=target_lang,
+                    search_constraints=constraints,
+                )
+            else:
+                response["companion_soulseek"] = {
+                    "enabled": True,
+                    "status": "not_needed_primary_sufficient",
+                    "candidate_count": 0,
+                    "candidates": [],
+                }
         except Exception as exc:
             logger.warning("Soulseek companion task failed for %s: %s", media.key, exc)
             response["companion_soulseek"] = {"enabled": True, "status": "error", "candidate_count": 0, "candidates": [], "error": str(exc)}
@@ -362,6 +425,12 @@ class SchedulerTorrentSearchService:
         mode = str(constraints.get("size_mode") or "").strip().lower()
         if mode:
             normalized["size_mode"] = mode
+        unit_scope = str(constraints.get("unit_scope") or "").strip().lower()
+        if unit_scope in {"available_units", "missing_units", "all_units"}:
+            normalized["unit_scope"] = unit_scope
+        request_text = str(constraints.get("request_text") or "").strip()
+        if request_text:
+            normalized["request_text"] = request_text[:2000]
         return normalized
 
     def _source_strategy(self, category_id: str, name: str, search_scope: str, settings: object) -> dict[str, Any]:
@@ -541,25 +610,6 @@ class SchedulerTorrentSearchService:
             "error": result.get("error") if isinstance(result, dict) else None,
         }
 
-    def _category_for_search_text(self, name: str) -> str | None:
-        """Resolve a category from router/parser evidence without parsing units in scheduler core."""
-        registry = self._context.categories
-        if not registry:
-            return None
-        try:
-            routed = registry.resolve_from_text(name) if hasattr(registry, "resolve_from_text") else None
-            if routed is not None:
-                return str(getattr(routed, "category_id", "") or "") or None
-        except Exception:
-            pass
-        try:
-            classified = registry.classify(name) if hasattr(registry, "classify") else None
-            if classified:
-                return str(getattr(classified[0], "category_id", "") or "") or None
-        except Exception:
-            pass
-        return None
-
     @staticmethod
     def _category_normalized_search_units(
         category: object | None,
@@ -582,16 +632,17 @@ class SchedulerTorrentSearchService:
         return str(normalized_name or name).strip() or name, normalized_season, normalized_episode
 
     def _category_for_units(self, season: int | None, episode: int | None) -> str | None:
-        """Return the first category that accepts requested structured unit arguments."""
+        """Return a category only when structured-unit ownership is unique."""
         if season is None and episode is None:
             return None
+        matches: list[str] = []
         for category in (self._context.categories.list_all() if self._context.categories else []):
             try:
                 if category.accepts_agent_unit_args(season=season, episode=episode):
-                    return category.category_id
+                    matches.append(str(category.category_id))
             except Exception:
                 continue
-        return None
+        return matches[0] if len(matches) == 1 else None
 
     def _category_default_search_scope(
         self,
@@ -603,13 +654,14 @@ class SchedulerTorrentSearchService:
         search_scope: str,
         language: str | None,
         settings: object,
+        search_constraints: dict[str, Any] | None = None,
     ) -> str:
         """Allow the owning category to refine an omitted search phase."""
         hook = getattr(category, "default_agent_search_scope", None)
         if not callable(hook):
             return search_scope
         try:
-            context = self._category_workflow_context(settings)
+            context = self._category_workflow_context(settings, search_constraints)
             resolved = hook(
                 media,
                 season=season,
@@ -630,17 +682,18 @@ class SchedulerTorrentSearchService:
             return search_scope
 
     def _category_for_search_scope(self, search_scope: str | None) -> str | None:
-        """Resolve a category for category-neutral pack search scopes."""
+        """Resolve bundle ownership only when exactly one category supports it."""
         if not SearchScopePolicy.is_bundle_scope(search_scope):
             return None
+        matches: list[str] = []
         for category in (self._context.categories.list_all() if self._context.categories else []):
             try:
                 brief = category.router_brief()
                 if "season_pack" in set(brief.item_types or []):
-                    return category.category_id
+                    matches.append(str(category.category_id))
             except Exception:
                 continue
-        return None
+        return matches[0] if len(matches) == 1 else None
 
     async def _media_for_request(self, name: str, normalized_name: str, category_id: str | None, language: str) -> CategoryItem:
         """Return a tracked or temporary media item for one torrent search."""
@@ -761,22 +814,10 @@ class SchedulerTorrentSearchService:
     async def _temporary_media(self, normalized_name: str, category_id: str | None, language: str) -> CategoryItem:
         """Create an in-memory item through category-owned routing when possible."""
         registry = self._context.categories
-        if not category_id and registry:
-            try:
-                routed = registry.resolve_from_text(normalized_name) if hasattr(registry, "resolve_from_text") else None
-                if routed is not None:
-                    category_id = str(getattr(routed, "category_id", "") or "") or None
-            except Exception as exc:
-                logger.debug("Category router could not resolve %s: %s", normalized_name, exc)
-        if not category_id and registry:
-            try:
-                classified = registry.classify(normalized_name) if hasattr(registry, "classify") else None
-                if classified:
-                    category_id = str(getattr(classified[0], "category_id", "") or "") or None
-            except Exception as exc:
-                logger.debug("Category parser could not classify %s: %s", normalized_name, exc)
         if not category_id:
-            category_id = "media"
+            raise ValueError(
+                f"Cannot create an abstract media search item for {normalized_name!r}; a concrete category is required."
+            )
         category = registry.get(category_id) if registry else None
         if category:
             return category.create_item(normalized_name, language=language)
@@ -790,17 +831,19 @@ class SchedulerTorrentSearchService:
         episode: int | None,
         search_scope: str,
         settings: object,
+        search_constraints: dict[str, Any] | None = None,
     ) -> int | None:
         """Let the category resolve omitted season coordinates for pack searches."""
         if season is not None or episode is not None:
             return season
-        if not SearchScopePolicy.is_bundle_scope(search_scope):
+        unit_scope = str((search_constraints or {}).get("unit_scope") or "").strip().lower()
+        if not SearchScopePolicy.is_bundle_scope(search_scope) and not unit_scope:
             return season
         category = self._context.categories.get(category_id) if self._context.categories else None
         if not category or not hasattr(category, "resolve_agent_pack_season"):
             return season
         try:
-            context = self._category_workflow_context(settings)
+            context = self._category_workflow_context(settings, search_constraints)
             resolved = await category.resolve_agent_pack_season(media, context)
             return int(resolved) if resolved is not None else season
         except Exception as exc:
@@ -823,26 +866,38 @@ class SchedulerTorrentSearchService:
             search_constraints=search_constraints or {},
         )
 
-    async def _search(self, media: CategoryItem, category_id: str, season: int | None, episode: int | None, target_lang: str, settings: object, search_scope: str | None = None, search_constraints: dict[str, Any] | None = None) -> tuple[list[SearchResult], str]:
-        """Run category-owned search with safe fallback to the pipeline."""
+    async def _search(
+        self,
+        media: CategoryItem,
+        category_id: str,
+        season: int | None,
+        episode: int | None,
+        target_lang: str,
+        settings: object,
+        search_scope: str | None = None,
+        search_constraints: dict[str, Any] | None = None,
+    ) -> tuple[list[SearchResult], str, dict[str, Any]]:
+        """Run category-owned search and return its structured response facts."""
         category = self._context.categories.get(category_id) if self._context.categories else None
         if category and hasattr(category, "search_agent_candidates"):
             try:
                 context = self._category_workflow_context(settings, search_constraints)
-                return await category.search_agent_candidates(
+                results, summary = await category.search_agent_candidates(
                     media, season=season, episode=episode, language=target_lang,
                     search_scope=search_scope, context=context,
                 )
+                return results, summary, dict(context.agent_search_facts or {})
             except RecursionError:
                 logger.exception("Category-owned search recursed for %s; falling back to pipeline.", media.key)
             except Exception as exc:
                 logger.warning("Category-owned search failed for %s: %s; falling back to pipeline.", media.key, exc)
-        return await self._fallback_search(media, category, season, episode, target_lang)
+        results, summary = await self._fallback_search(media, category, season, episode, target_lang)
+        return results, summary, {}
 
     async def _fallback_search(self, media: CategoryItem, category: object | None, season: int | None, episode: int | None, target_lang: str) -> tuple[list[SearchResult], str]:
         """Run the generic search pipeline with a category-owned unit label."""
         unit_label = self._request_unit_label(category, season, episode)
-        results = await self._context.pipeline.run_search(media, unit_label, mode='llm', language=target_lang)
+        results = await self._context.pipeline.run_search(media, unit_label, mode='llm', language=target_lang, rank_candidates=False)
         return results, f'{media.key} {unit_label or ""}'.strip()
 
 
@@ -868,11 +923,14 @@ class SchedulerTorrentSearchService:
         *,
         settings: object | None = None,
         search_constraints: dict[str, Any] | None = None,
+        category_search_facts: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the final search_media_torrents response payload."""
         candidates = []
         category = self._context.categories.get(category_id) if self._context.categories else None
         context = self._category_workflow_context(settings, search_constraints) if settings is not None else None
+        if context is not None and category_search_facts:
+            context.agent_search_facts.update(category_search_facts)
         response_facts = self._category_response_facts(
             category,
             item=media,

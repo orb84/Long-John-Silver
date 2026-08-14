@@ -73,6 +73,8 @@ class PendingActionContextBuilder:
                     "languages": candidate.get("languages") or candidate.get("language"),
                     "resolution": candidate.get("resolution"),
                     "unit_label": candidate.get("unit_label"),
+                    "manual_confirmation_reasons": candidate.get("manual_confirmation_reasons") or [],
+                    "hard_queue_blockers": candidate.get("hard_queue_blockers") or [],
                 })
             packet = {
                 "type": "recent_torrent_candidates",
@@ -84,6 +86,8 @@ class PendingActionContextBuilder:
                 "quality_choice_policy": self._compact_quality_choice(data.get("quality_choice_policy")),
                 "llm_candidate_review": self._compact_llm_review(data.get("llm_candidate_review")),
                 "recommended_candidate_id": data.get("recommended_candidate_id"),
+                "awaiting_user_choice": bool(data.get("awaiting_user_choice")),
+                "origin_user_prompt": data.get("origin_user_prompt"),
                 "fresh_request_guard": fresh_request_guard,
                 "fresh_request_guard_rule": (
                     "This result set is still actionable for corrections/refinements/selections/confirmations, "
@@ -101,6 +105,9 @@ class PendingActionContextBuilder:
             "The following recent result sets remain actionable. If the user semantically "
             "refers to choosing, continuing, correcting, confirming, changing, or queueing one of these, "
             "the LLM should route/plan using the listed result_set_id and candidate_id values. "
+            "When awaiting_user_choice=true and the current user selects one of those stable candidate IDs, "
+            "call queue_download for that candidate; the queue layer recognizes that prior-result-set selection "
+            "as the user's confirmation of soft quality/availability warnings. Hard queue blockers remain non-overridable. "
             "If a packet has fresh_request_guard=true, treat it as a guarded prior workspace: do not queue "
             "from it for an unrelated new title, but do use it to understand complaints/corrections/refinements.\n"
             + json.dumps(packets, ensure_ascii=False, indent=2, default=str)

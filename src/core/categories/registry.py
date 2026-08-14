@@ -181,37 +181,61 @@ class CategoryRegistry:
         """Return compact router briefs for all registered categories."""
         return [category.router_brief() for category in self._categories.values()]
 
-    def resolve_from_text(self, text: str, tracked_items: object | None = None) -> Optional[MediaCategory]:
-        """Resolve the most likely category for a user prompt.
+    def routing_evidence(self, text: str, tracked_items: object | None = None) -> list[dict[str, object]]:
+        """Return deterministic routing evidence without treating vocabulary as truth.
 
-        Uses tracked item keys first, then category vocabulary and router
-        brief keywords. This is intentionally deterministic and cheap;
-        an LLM category resolver can be added later as a fallback.
+        Router words and tracked-title mentions are language- and phrasing-dependent.
+        They are useful for selecting prompt guidance, but the literal item name
+        passed to ``CategoryIdentityResolver`` must verify tracked/library identity
+        before search. Prompt substring matches are never authoritative.
         """
+        evidence: list[dict[str, object]] = []
         if tracked_items:
             for item in tracked_items:
-                key = getattr(item, "key", "")
+                key = str(getattr(item, "key", "") or "").strip()
                 if key and router_token_matches(text, key):
-                    category = self.get(getattr(item, "item_type", ""))
+                    category = self.get(str(getattr(item, "item_type", "") or ""))
                     if category:
-                        return category
+                        evidence.append({
+                            "category_id": category.category_id,
+                            "score": 50,
+                            "priority": int(getattr(category, "router_priority", 0)),
+                            "source": "tracked_title_mention",
+                            "authoritative": False,
+                            "matched_tokens": [key],
+                        })
 
-        scored: list[tuple[int, int, MediaCategory]] = []
         for category in self._categories.values():
             brief = category.router_brief()
-            # Category vocabulary, not registry-owned media assumptions, drives
-            # routing boosts.  A custom category can add words like chapters,
-            # versions, discs, seasons, or films to its router brief without
-            # modifying this registry.  Matching is boundary-aware so short
-            # terms such as EP/TV do not match unrelated words.
             tokens = [category.category_id, category.display_name, *brief.keywords, *brief.item_types]
-            score = count_router_matches(text, tokens)
-            if score:
-                scored.append((score, int(getattr(category, "router_priority", 0)), category))
-        if not scored:
+            matched = [token for token in tokens if token and router_token_matches(text, token)]
+            if matched:
+                evidence.append({
+                    "category_id": category.category_id,
+                    "score": len(set(str(token).casefold() for token in matched)),
+                    "priority": int(getattr(category, "router_priority", 0)),
+                    "source": "router_vocabulary",
+                    "authoritative": False,
+                    "matched_tokens": matched,
+                })
+        evidence.sort(key=lambda row: (int(row["score"]), int(row["priority"])), reverse=True)
+        return evidence
+
+    def resolve_from_text(self, text: str, tracked_items: object | None = None) -> Optional[MediaCategory]:
+        """Return one unique prompt-scoping category hint.
+
+        This synchronous method never performs provider I/O and never returns
+        authoritative identity. Callers that may mutate/search must pass the
+        literal item title through ``CategoryIdentityResolver`` before acting.
+        """
+        evidence = self.routing_evidence(text, tracked_items=tracked_items)
+        if not evidence:
             return None
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return scored[0][2]
+        top_score = int(evidence[0]["score"])
+        top = [row for row in evidence if int(row["score"]) == top_score]
+        if len({str(row["category_id"]) for row in top}) != 1:
+            return None
+        return self.get(str(top[0]["category_id"]))
 
     def __contains__(self, category_id: str) -> bool:
         return category_id in self._categories

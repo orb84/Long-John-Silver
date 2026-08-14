@@ -33,7 +33,7 @@ def test_category_scaffold_preview_renders_expected_files() -> None:
     assert preview.category_id == "audiobook"
     assert "src/core/categories/custom/audiobook.py" in preview.files
     assert "src/core/categories/prompts/audiobook.md" in preview.files
-    assert "config/category-templates/audiobook.yaml" in preview.files
+    assert "config/category-config-templates/audiobook.yaml" in preview.files
     assert "tests/test_category_audiobook.py" in preview.files
     assert "class AudiobookCategory" in preview.files["src/core/categories/custom/audiobook.py"]
     assert any("library_path" in content for content in preview.files.values())
@@ -68,7 +68,7 @@ def test_category_scaffold_apply_requires_approval_and_protects_existing_files(t
     installed = service.apply(spec, approved=True, root=tmp_path)
     assert installed.status == "success"
     assert (tmp_path / "src/core/categories/custom/games.py").exists()
-    assert (tmp_path / "config/category-templates/games.yaml").exists()
+    assert (tmp_path / "config/category-config-templates/games.yaml").exists()
 
     second = service.apply(spec, approved=True, root=tmp_path)
     assert second.status == "needs_confirmation"
@@ -119,13 +119,13 @@ def test_category_scaffold_preserves_provider_research_and_discovery_sources() -
 
     preview = CategoryScaffoldService().preview(spec)
     prompt = preview.files["src/core/categories/prompts/video_games.md"]
-    config = preview.files["config/category-templates/video_games.yaml"]
+    definition = preview.files["config/category-definitions/video_games.yaml"]
 
     assert "Provider research leads" in prompt
     assert "Download-profile research leads" in prompt
     assert "rawg.io" in prompt
     assert "Game downloads commonly identify platform" in prompt
-    assert "discovery_sources:" in config
-    assert "download_profile:" in config
-    assert "rawg_api_key" in config
-    assert preview.warnings == ["No library_path property was provided; the scaffold will add one."]
+    assert "discovery_sources:" in definition
+    assert "download_profile:" in definition
+    assert "rawg_api_key" in definition
+    assert "No library_path property was provided; the scaffold will add one." in preview.warnings

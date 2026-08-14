@@ -66,7 +66,7 @@ def test_expected_episode_count_and_full_coverage_annotation() -> None:
         payload, object(), item=tv.create_item("A Knight"), season=1, response_facts=facts
     )
     assert annotated["requested_season_coverage"] == "full_requested_season"
-    assert "expected season length is 6" in annotated["coverage_note"]
+    assert "current released/searchable frontier is E06" in annotated["coverage_note"]
 
 
 def test_candidate_picker_and_compactor_preserve_full_season_coverage_and_queue_instruction() -> None:
@@ -83,7 +83,7 @@ def test_candidate_picker_and_compactor_preserve_full_season_coverage_and_queue_
         "bundle_unit_count": 6,
         "expected_episode_count": 6,
         "requested_season_coverage": "full_requested_season",
-        "coverage_note": "covers S01E01-E06; category expected season length is 6",
+        "coverage_note": "covers S01E01-E06; current released/searchable frontier is E06",
         "llm_recommended": True,
     }
     picker = SearchWorkspaceFormatter.candidate_picker_rows([candidate])
@@ -114,7 +114,7 @@ def test_candidate_picker_and_compactor_preserve_full_season_coverage_and_queue_
     compact = ToolResultCompactor().compact("search_media_torrents", result)
     assert compact["expected_episode_count"] == 6
     assert compact["candidate_picker"][0]["requested_season_coverage"] == "full_requested_season"
-    assert compact["candidates"][0]["coverage_note"].endswith("season length is 6")
+    assert compact["candidates"][0]["coverage_note"].endswith("frontier is E06")
     assert "queue_download" in compact["llm_next_action"]
     assert "batch_recommendation" not in compact
 

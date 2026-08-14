@@ -96,13 +96,13 @@ class TestLLMConfigTierResolution:
         config = LLMConfig(model="gpt-4")
         assert config.get_model_for_task("unknown_task") == "gpt-4"
 
-    def test_download_is_lightweight(self):
-        """download task should map to lightweight tier (short JSON output)."""
+    def test_download_is_heavy(self):
+        """Download adjudication uses the heavy tier because mistakes mutate state."""
         config = LLMConfig(
             model="gpt-4",
-            lightweight=TaskModelConfig(model="tiny-model"),
+            heavy=TaskModelConfig(model="strong-model"),
         )
-        assert config.get_model_for_task("download") == "tiny-model"
+        assert config.get_model_for_task("download") == "strong-model"
 
     def test_chat_is_standard(self):
         config = LLMConfig(

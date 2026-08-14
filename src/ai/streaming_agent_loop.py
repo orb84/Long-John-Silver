@@ -23,6 +23,7 @@ from src.ai.chat_presenter import AgentChatPresenter
 from src.ai.bare_tool_call import BareToolCallDetector
 from src.ai.download_context_policy import DownloadContextPolicy
 from src.ai.download_tool_recovery import DownloadToolRecovery
+from src.ai.tool_outcome_guard import ToolOutcomeLedger
 
 
 class StreamingAgentLoopExecutor:
@@ -123,8 +124,13 @@ class StreamingAgentLoopExecutor:
                 return
 
         executed_tool_count = 0
+        executed_tool_names: set[str] = set()
         tool_required_reprompted = False
+        metadata_only_reprompted = False
+        required_queue_followthrough_reprompted = False
         forced_download_search_attempted = False
+        forced_download_status_attempted = False
+        outcome_ledger = ToolOutcomeLedger()
 
         for i in range(max_iterations):
             try:
@@ -214,6 +220,8 @@ class StreamingAgentLoopExecutor:
                     )
                     messages.append(result_message)
                     executed_tool_count += 1
+                    executed_tool_names.add(recovered.name)
+                    outcome_ledger.record(recovered.name, result_message)
                     self.last_content = ""
                     continue
 
@@ -251,6 +259,8 @@ class StreamingAgentLoopExecutor:
                                 )
                                 messages.append(result_message)
                                 executed_tool_count += 1
+                                executed_tool_names.add("search_media_torrents")
+                                outcome_ledger.record("search_media_torrents", result_message)
                                 self.last_content = ""
                                 continue
                         logger.warning(
@@ -297,6 +307,8 @@ class StreamingAgentLoopExecutor:
                                 )
                                 messages.append(result_message)
                                 executed_tool_count += 1
+                                executed_tool_names.add("search_media_torrents")
+                                outcome_ledger.record("search_media_torrents", result_message)
                                 continue
                         fallback = (
                             "I could not get the tool backend to run a search for that download request. "
@@ -305,6 +317,96 @@ class StreamingAgentLoopExecutor:
                         self.last_content = fallback
                         yield fallback
                         return
+                    if (
+                        DownloadContextPolicy.download_turn_requires_tool(task, allowed_tool_names)
+                        and executed_tool_count > 0
+                        and not DownloadContextPolicy.has_operational_download_evidence(executed_tool_names)
+                    ):
+                        if not forced_download_status_attempted and "list_downloads" in set(allowed_tool_names or set()):
+                            forced_download_status_attempted = True
+                            tool_call_id = f"forced_list_downloads_{uuid.uuid4().hex[:12]}"
+                            logger.warning(
+                                "DOWNLOAD turn tried to finalize from metadata/context only; suppressing prose and verifying current downloads"
+                            )
+                            messages.append({
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {"name": "list_downloads", "arguments": "{}"},
+                                }],
+                            })
+                            result_message, _ = await self._tool_executor.execute_tool_call(
+                                name="list_downloads",
+                                arguments_raw="{}",
+                                tool_call_id=tool_call_id,
+                                allowed_tool_names=allowed_tool_names,
+                                tool_context=self._tool_context(
+                                    session_id,
+                                    active_category_id=active_category_id,
+                                    user_prompt=user_prompt,
+                                ),
+                            )
+                            messages.append(result_message)
+                            executed_tool_count += 1
+                            executed_tool_names.add("list_downloads")
+                            outcome_ledger.record("list_downloads", result_message)
+                            self.last_content = ""
+                            continue
+                        if not metadata_only_reprompted:
+                            metadata_only_reprompted = True
+                            messages.append({
+                                "role": "system",
+                                "content": DownloadContextPolicy.reprompt_after_metadata_only_download_answer(user_prompt),
+                            })
+                            self.last_content = ""
+                            continue
+                        fallback = self._error_presenter.queue_failure(
+                            "No current queue or candidate evidence was obtained for this download request.",
+                            user_prompt=user_prompt,
+                        )
+                        self.last_content = fallback
+                        yield fallback
+                        return
+
+                    required_followthrough = outcome_ledger.required_queue_followthrough()
+                    if required_followthrough and not required_queue_followthrough_reprompted:
+                        required_queue_followthrough_reprompted = True
+                        messages.append({"role": "system", "content": required_followthrough})
+                        self.last_content = ""
+                        continue
+
+                    partial_queue_failure = outcome_ledger.partial_queue_failure()
+                    if partial_queue_failure:
+                        success_count, detail = partial_queue_failure
+                        truthful_partial = self._error_presenter.queue_partial_failure(
+                            success_count,
+                            detail,
+                            user_prompt=user_prompt,
+                        )
+                        logger.warning(
+                            "Suppressing LLM final prose because queue_download returned a partial receipt: {} succeeded; {}",
+                            success_count,
+                            detail,
+                        )
+                        self.last_content = truthful_partial
+                        yield truthful_partial
+                        return
+
+                    queue_failure = outcome_ledger.unresolved_queue_failure()
+                    if queue_failure:
+                        truthful_failure = self._error_presenter.queue_failure(
+                            queue_failure,
+                            user_prompt=user_prompt,
+                        )
+                        logger.warning(
+                            "Suppressing LLM final prose because the latest queue_download receipt is a failure: {}",
+                            queue_failure,
+                        )
+                        self.last_content = truthful_failure
+                        yield truthful_failure
+                        return
+
                     # Pure text response — emit the buffered final text now.
                     self.last_content = collected_content
                     if collected_content:
@@ -347,6 +449,17 @@ class StreamingAgentLoopExecutor:
                     )
                     messages.append(result_message)
                     executed_tool_count += 1
+                    executed_tool_names.add(tc.name)
+                    outcome_ledger.record(tc.name, result_message)
+                    clarification = self._terminal_clarification(result_message)
+                    if clarification:
+                        logger.info(
+                            "Ending agent turn after tool {} requested explicit user clarification",
+                            tc.name,
+                        )
+                        self.last_content = clarification
+                        yield clarification
+                        return
 
                 # Next iteration will stream the final answer
 
@@ -401,6 +514,32 @@ class StreamingAgentLoopExecutor:
         elif session_id and "_" in session_id:
             source = session_id.split("_", 1)[0] or "web"
         return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id, user_prompt=user_prompt)
+
+    @staticmethod
+    def _terminal_clarification(result_message: dict[str, Any]) -> str | None:
+        """Return a typed clarification that should end the current model loop.
+
+        Once category-owned metadata and bounded web fallback either find a
+        genuine ambiguity or cannot verify the title at all, repeatedly asking
+        the LLM to call the same search tool cannot create new evidence. Surface
+        the tool's question immediately instead of paying another provider
+        completion and retry window.
+        """
+        try:
+            payload = json.loads(str(result_message.get("content") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or not payload.get("clarification_required"):
+            return None
+        error_code = str(payload.get("error_code") or "").casefold()
+        if error_code not in {"category_ambiguous", "category_resolution_required"}:
+            return None
+        question = str(payload.get("clarification_question") or payload.get("error") or "").strip()
+        if question:
+            return question
+        if error_code == "category_ambiguous":
+            return "I found this title in more than one media category. Which kind of content did you mean?"
+        return "I could not verify what kind of content this title is. Which category did you mean?"
 
     async def _execute_plan_steps(
         self=None,

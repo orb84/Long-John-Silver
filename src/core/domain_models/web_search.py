@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import re
 from typing import Any, Literal, Optional
@@ -433,7 +433,7 @@ class StorageReport(BaseModel):
     """Full category-aware storage report for UI, tools, and prompts."""
 
     ok: bool = True
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     volumes: list[StorageVolumeUsage] = Field(default_factory=list)
     paths: list[StoragePathUsage] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

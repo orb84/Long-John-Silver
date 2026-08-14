@@ -14,11 +14,12 @@ class AssistantChat extends Component {
      * and preserve event names/data attributes so other components can extend
      * this behavior without reaching into private state.
      */
-    constructor() {
+    constructor(eventBus = null) {
         // Option 1 chat feed elements
         super('chat-feed');
         if (!this.container) return;
 
+        this._eventBus = eventBus;
         this.input = document.getElementById('chat-input');
         this.sendBtn = document.getElementById('send-btn');
         this.sessionId = localStorage.getItem('ljs_chat_session') || ('web_' + generateUUID());
@@ -26,9 +27,15 @@ class AssistantChat extends Component {
         
         this.ws = null;
         this.assistantBubble = null;
+        this.assistantRawMarkdown = '';
+        this.isBusy = false;
+        this.activeTurnId = null;
+        this.httpAbortController = null;
 
         this._init();
+        this._subscribeServerState();
         this._loadHistory();
+        this._renderCommandState('idle');
     }
 
     /**
@@ -39,7 +46,7 @@ class AssistantChat extends Component {
         this.connect();
 
         if (this.sendBtn) {
-            this.sendBtn.onclick = () => this.send();
+            this.sendBtn.onclick = () => this.isBusy ? this.cancel() : this.send();
         }
 
         if (this.input) {
@@ -131,7 +138,12 @@ class AssistantChat extends Component {
         this.ws.onmessage = (e) => {
             try {
                 const data = JSON.parse(e.data);
-                if (data.type === 'token') {
+                if (data.turn_id && this.activeTurnId && data.turn_id !== this.activeTurnId) {
+                    return;
+                }
+                if (data.type === 'started') {
+                    this._setBusy(true, data.turn_id || this.activeTurnId, 'working');
+                } else if (data.type === 'token') {
                     this._clearProcessingIndicator();
                     this._appendToken(data.content);
                 } else if (data.type === 'status') {
@@ -144,10 +156,25 @@ class AssistantChat extends Component {
                     }
                     this.assistantBubble = null;
                     this.assistantRawMarkdown = '';
+                    this._setBusy(false, null, 'idle');
                 } else if (data.type === 'error') {
                     this._clearProcessingIndicator();
                     this._appendMsg('system', data.content || 'An assistant error occurred.');
                     this.assistantBubble = null;
+                    this.assistantRawMarkdown = '';
+                    this._setBusy(false, null, 'failed');
+                } else if (data.type === 'cancelled') {
+                    this._clearProcessingIndicator();
+                    if (this.assistantBubble && this.assistantRawMarkdown) {
+                        this._saveMessage('assistant', this.assistantRawMarkdown);
+                    }
+                    this.assistantBubble = null;
+                    this.assistantRawMarkdown = '';
+                    this._appendMsg('status', data.content || 'Request stopped.', false);
+                    this._setBusy(false, null, 'cancelled');
+                } else if (data.type === 'busy') {
+                    this._appendMsg('status', data.content || 'The previous request is still running.', false);
+                    this._setBusy(true, data.turn_id || this.activeTurnId, 'working');
                 }
             } catch (ex) {
                 console.error('[AssistantChat] Message frame error:', ex);
@@ -156,6 +183,11 @@ class AssistantChat extends Component {
 
         this.ws.onclose = () => {
             console.warn('[AssistantChat] Connection closed. Retrying in 4s...');
+            if (this.isBusy) {
+                this._clearProcessingIndicator();
+                this._appendMsg('system', 'The assistant connection closed before the request completed.', false);
+                this._setBusy(false, null, 'failed');
+            }
             setTimeout(() => this.connect(), 4000);
         };
     }
@@ -258,8 +290,12 @@ class AssistantChat extends Component {
      * Send user chat message.
      */
     async send() {
+        if (this.isBusy) return;
         const msg = this.input.value.trim();
         if (!msg) return;
+
+        const turnId = generateUUID();
+        this._setBusy(true, turnId, 'working');
 
         // Render user message bubble
         this._appendMsg('user', msg);
@@ -270,18 +306,166 @@ class AssistantChat extends Component {
         this._showProcessingIndicator();
 
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({ message: msg, session_id: this.sessionId }));
+            this.ws.send(JSON.stringify({
+                type: 'message',
+                message: msg,
+                session_id: this.sessionId,
+                turn_id: turnId,
+                client_asset_version: this._assetVersion()
+            }));
         } else {
             // Degrade to HTTP rest client if WebSocket is disconnected
+            this.httpAbortController = new AbortController();
+            let terminalState = 'idle';
             try {
-                const data = await APIClient.post('/api/chat', { message: msg, session_id: this.sessionId });
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        message: msg,
+                        session_id: this.sessionId,
+                        turn_id: turnId,
+                        client_asset_version: this._assetVersion()
+                    }),
+                    signal: this.httpAbortController.signal
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
                 this._clearProcessingIndicator();
-                this._appendMsg('assistant', data.response);
+                if (data?.cancelled) {
+                    terminalState = 'cancelled';
+                    this._appendMsg('status', data.response || 'Request stopped.', false);
+                } else if (data?.busy) {
+                    terminalState = 'failed';
+                    this._appendMsg('status', data.response || 'Another request is still running.', false);
+                } else {
+                    this._appendMsg('assistant', data.response);
+                }
             } catch (err) {
                 this._clearProcessingIndicator();
-                this._appendMsg('system', 'System interface offline. Could not contact the AI assistant.');
+                if (err && err.name === 'AbortError') {
+                    terminalState = 'cancelled';
+                    this._appendMsg('status', 'Request stopped.', false);
+                } else {
+                    terminalState = 'failed';
+                    this._appendMsg('system', 'System interface offline. Could not contact the AI assistant.');
+                }
+            } finally {
+                this.httpAbortController = null;
+                this._setBusy(false, null, terminalState);
             }
         }
+    }
+
+    /** Stop the active assistant turn and keep the chat session usable. */
+    async cancel() {
+        if (!this.isBusy) return;
+        if (this.httpAbortController) {
+            this.sendBtn?.classList.add('is-stopping');
+            this._renderCommandState('stopping');
+            try {
+                const response = await fetch('/api/chat/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        session_id: this.sessionId,
+                        turn_id: this.activeTurnId,
+                        client_asset_version: this._assetVersion()
+                    })
+                });
+                const data = response.ok ? await response.json() : null;
+                if (data?.cancellation_requested && data?.settled) {
+                    // The server task is gone, so aborting the original REST
+                    // response is now only local cleanup and cannot create
+                    // hidden background work.
+                    this.httpAbortController.abort();
+                } else if (data?.cancellation_requested) {
+                    // Keep the original REST request alive while the server is
+                    // still unwinding. Its eventual cancelled response (or the
+                    // shared state event) releases the UI truthfully.
+                    this._appendMsg('status', 'Stop requested; cleanup is still finishing.', false);
+                } else {
+                    this._appendMsg('status', 'Could not confirm that the active request was stopped yet.', false);
+                }
+            } catch (_) {
+                // Do not abort the local request when the cancellation endpoint
+                // itself failed: that would make the UI look idle while the
+                // server could still be searching in the background.
+                this._appendMsg('status', 'Could not confirm the stop request; the current request is still being tracked.', false);
+            }
+            return;
+        }
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'cancel',
+                session_id: this.sessionId,
+                turn_id: this.activeTurnId,
+                client_asset_version: this._assetVersion()
+            }));
+            this.sendBtn?.classList.add('is-stopping');
+            this._renderCommandState('stopping');
+            if (this.sendBtn) {
+                this.sendBtn.title = 'Stopping request…';
+                this.sendBtn.setAttribute('aria-label', 'Stopping request');
+            }
+        }
+    }
+
+    _subscribeServerState() {
+        this._eventBus?.subscribe('chat_turn_state', payload => {
+            if (!payload || payload.session_id !== this.sessionId) return;
+            const state = String(payload.state || 'idle');
+            const active = state === 'working' || state === 'stopping';
+            this._setBusy(active, payload.turn_id || this.activeTurnId, state);
+        });
+    }
+
+    _assetVersion() {
+        return document.querySelector('meta[name="ljs-asset-version"]')?.content || '';
+    }
+
+    _renderCommandState(state) {
+        const normalized = ['working', 'stopping', 'failed', 'cancelled', 'idle'].includes(state) ? state : 'idle';
+        const root = document.getElementById('chat-command-state');
+        const area = this.input?.closest('.chat-input-area');
+        if (area) area.dataset.chatState = normalized;
+        if (!root) return;
+        root.className = `chat-command-state is-${normalized}`;
+        const labels = {
+            working: 'LLM working', stopping: 'Stopping', failed: 'Request failed',
+            cancelled: 'Stopped', idle: 'Ready'
+        };
+        const label = root.querySelector('.chat-command-state-label');
+        if (label) label.textContent = labels[normalized] || labels.idle;
+    }
+
+    /** Update the command controls for idle/running/stopping states. */
+    _setBusy(busy, turnId = null, state = null) {
+        this.isBusy = Boolean(busy);
+        this.activeTurnId = this.isBusy ? (turnId || this.activeTurnId) : null;
+        this._renderCommandState(state || (this.isBusy ? 'working' : 'idle'));
+        if (this.input) {
+            this.input.disabled = this.isBusy;
+            this.input.setAttribute('aria-busy', this.isBusy ? 'true' : 'false');
+            this.input.placeholder = this.isBusy ? 'Assistant is working…' : 'Give your orders, Captain...';
+        }
+        if (this.sendBtn) {
+            this.sendBtn.disabled = false;
+            this.sendBtn.classList.toggle('is-working', this.isBusy);
+            this.sendBtn.classList.remove('is-stopping');
+            if (this.isBusy) {
+                this.sendBtn.innerHTML = '<span class="send-working-ring"></span><i class="fa-solid fa-stop"></i>';
+                this.sendBtn.title = 'Stop current request';
+                this.sendBtn.setAttribute('aria-label', 'Stop current request');
+            } else {
+                this.sendBtn.innerHTML = '<i class="fa-solid fa-paper-plane"></i>';
+                this.sendBtn.title = 'Send message';
+                this.sendBtn.setAttribute('aria-label', 'Send message');
+            }
+        }
+        if (!this.isBusy && this.input) this.input.focus({ preventScroll: true });
     }
 }
 

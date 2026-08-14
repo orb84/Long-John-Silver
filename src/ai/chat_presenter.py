@@ -40,21 +40,17 @@ class AgentChatPresenter:
         language = detect_user_language_label(user_prompt)
         if language == "Italian":
             messages = [
-                "Ricevuto, Capitano — controllo le rotte giuste prima di rispondere.",
-                "Sto ancora verificando le fonti utili, Capitano.",
-                "Ancora un momento: meglio una risposta solida che legno marcio.",
-                "Sto chiudendo gli ultimi controlli prima di riferire.",
-                "La ricerca è ancora in corso; tengo il timone saldo.",
-                "Ho quasi finito di separare il bottino buono dai rottami.",
+                "Sto controllando le fonti disponibili…",
+                "La ricerca è ancora in corso…",
+                "Sto verificando i risultati utili…",
+                "Sto completando gli ultimi controlli…",
             ]
         else:
             messages = [
-                "Aye Captain — I’m checking the right charts before I answer.",
-                "Still working through the useful evidence, Captain.",
-                "One more moment; I’d rather be right than toss you driftwood.",
-                "I’m tying off the last checks before I report back.",
-                "The search is still running; I’m keeping the helm steady.",
-                "Nearly done sorting the good cargo from the driftwood.",
+                "Checking the available sources…",
+                "The search is still running…",
+                "Checking the useful results…",
+                "Finishing the last checks…",
             ]
         return messages[tick % len(messages)]
 
@@ -80,31 +76,27 @@ class AgentChatPresenter:
 
         if queued_units:
             lines = [
-                f"Aye Captain — I found the cargo{target} and put it on the download manifest.",
-                "",
-                f"**Queued now:** {', '.join(queued_units)}",
+                f"Queued {len(queued_units)} download{'s' if len(queued_units) != 1 else ''}{target}.",
+                f"**Queued:** {', '.join(queued_units)}",
             ]
             picked_titles = self._picked_titles(queued)
             if picked_titles:
-                lines.extend(["", "**Picked releases:**"])
+                lines.extend(["", "**Release{'s' if len(picked_titles) != 1 else ''}:**"])
                 lines.extend(f"- {title}" for title in picked_titles)
-            lines.extend(["", "The downloader has the wheel now; those files are being pulled down."])
         else:
-            lines = [
-                f"Captain, I found candidates{target}, but none made it safely onto the download manifest.",
-            ]
+            lines = [f"No download was queued{target}."]
 
         if failed_units:
             lines.extend([
                 "",
                 f"**Not queued:** {', '.join(failed_units)}",
-                "I did **not** mark those as queued. The link or candidate failed before the downloader accepted it.",
+                "Those items are not being reported as active because the downloader did not accept them.",
             ])
         if fallback_count:
             noun = "candidate" if fallback_count == 1 else "candidates"
             lines.extend([
                 "",
-                f"I used **{fallback_count} alternate {noun}** after dead or expired links. Rotten planks, avoided.",
+                f"Used **{fallback_count} alternate {noun}** after an operational queue failure.",
             ])
         return "\n".join(lines)
 

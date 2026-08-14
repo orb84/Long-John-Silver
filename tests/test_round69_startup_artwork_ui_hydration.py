@@ -36,7 +36,9 @@ def test_booty_panel_rehydrates_and_resolves_local_posters() -> None:
     booty_source = _read("src/web/static/js/components/bootyPanel.js")
 
     assert "_hydrateInitialPanels" in app_source
-    assert "window.bootyPanel.loadCatalog" in app_source
+    assert "Booty/library catalog performs its own progressive initial load" in app_source
+    assert "window.bootyPanel.loadCatalog" not in app_source
+    assert "this.loadCatalog();" in booty_source
     assert "library_metadata_refresh_completed" in booty_source
     assert "_posterUrlFor" in booty_source
     assert "value.startsWith('/category-data/')" in booty_source

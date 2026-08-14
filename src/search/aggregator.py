@@ -78,87 +78,102 @@ class SearchAggregator:
                      quality_profile: QualityProfile | None = None) -> list[SearchResult]:
         """Search all providers in parallel and merge results.
 
-        Deduplicates by magnet link, filters blacklisted items,
-        pre-filters against quality constraints, applies release
-        group reputation boosts, and ranks by quality score.
-
-        Args:
-            query: The search query string.
-            category: Registry category ID. Providers may use it for filtering.
-            preferred_language: Optional language preference for quality scoring.
-            quality_profile: Optional per-query quality profile. If omitted,
-                uses the aggregator's default profile.
+        Every execution gets a lifecycle record before provider work starts. A
+        cancelled user turn therefore produces an explicit cancelled search
+        record instead of vanishing from the logs.
         """
         active_providers = [
             provider for provider in self._providers
             if self._provider_supports_category(provider, category)
         ]
-        
-        all_results, diagnostics = await self._search_providers_with_diagnostics(
-            query, providers=active_providers, category=category,
+        provider_names = [type(provider).__name__ for provider in active_providers]
+        started = time.monotonic()
+        search_id = await self._begin_search_log(
+            query=query, category=category or "all", active_providers=provider_names,
         )
-        profile = quality_profile or self._quality_profile
-        ranked, quality_filtered, filtered, deduped = await self._prepare_results(
-            all_results, preferred_language=preferred_language, quality_profile=profile,
-        )
+        try:
+            all_results, diagnostics = await self._search_providers_with_diagnostics(
+                query, providers=active_providers, category=category,
+            )
+            profile = quality_profile or self._quality_profile
+            ranked, quality_filtered, filtered, deduped = await self._prepare_results(
+                all_results, preferred_language=preferred_language, quality_profile=profile,
+            )
 
-        fallback_used = False
-        if not ranked and self._fallback_providers and (not active_providers or self._should_use_emergency_fallback(diagnostics)):
-            fallback_providers = [
-                provider for provider in self._fallback_providers
-                if self._provider_supports_category(provider, category)
-            ]
-            if fallback_providers:
-                reason = "no primary provider" if not active_providers else self._fallback_reason(diagnostics)
-                logger.warning(
-                    f"Primary torrent search produced no usable results for '{query}' ({reason}). "
-                    "Trying explicitly configured direct-scraper emergency providers."
-                )
-                fallback_results, fallback_diagnostics = await self._search_providers_with_diagnostics(
-                    query, providers=fallback_providers, category=category,
-                )
-                diagnostics.update({f"fallback:{key}": value for key, value in fallback_diagnostics.items()})
-                ranked, quality_filtered, filtered, deduped = await self._prepare_results(
-                    fallback_results, preferred_language=preferred_language, quality_profile=profile,
-                )
-                fallback_used = True
-        elif not ranked and self._fallback_providers and active_providers:
-            logger.info(f"Primary torrent search returned no usable results for '{query}', and emergency fallback policy did not trigger.")
+            fallback_used = False
+            if not ranked and self._fallback_providers and (not active_providers or self._should_use_emergency_fallback(diagnostics)):
+                fallback_providers = [
+                    provider for provider in self._fallback_providers
+                    if self._provider_supports_category(provider, category)
+                ]
+                if fallback_providers:
+                    reason = "no primary provider" if not active_providers else self._fallback_reason(diagnostics)
+                    logger.warning(
+                        f"Primary torrent search produced no usable results for '{query}' ({reason}). "
+                        "Trying explicitly configured direct-scraper emergency providers."
+                    )
+                    fallback_results, fallback_diagnostics = await self._search_providers_with_diagnostics(
+                        query, providers=fallback_providers, category=category,
+                    )
+                    diagnostics.update({f"fallback:{key}": value for key, value in fallback_diagnostics.items()})
+                    ranked, quality_filtered, filtered, deduped = await self._prepare_results(
+                        fallback_results, preferred_language=preferred_language, quality_profile=profile,
+                    )
+                    fallback_used = True
+            elif not ranked and self._fallback_providers and active_providers:
+                logger.info(f"Primary torrent search returned no usable results for '{query}', and emergency fallback policy did not trigger.")
 
-        self._provider_diagnostics = diagnostics
-        logger.info(
-            f"Aggregated {len(ranked)} results from "
-            f"{len(active_providers)}/{len(self._providers)} primary providers "
-            f"and {len(self._fallback_providers)} fallback providers "
-            f"(fallback_used={fallback_used}) "
-            f"(after quality filter: {len(quality_filtered)}/{len(filtered)}) "
-            f"(query: '{query[:50]}')"
-        )
-        if self._search_logger:
-            try:
-                await self._search_logger.log_search(
-                    query=query,
-                    category=category or "all",
-                    active_providers=[type(p).__name__ for p in active_providers],
-                    total_raw=len(all_results),
-                    unique_deduped=len(deduped),
-                    quality_filtered=len(quality_filtered),
-                    provider_diagnostics=diagnostics,
-                    raw_results=all_results,
-                    deduped_results=deduped,
-                    accepted_results=quality_filtered,
-                    ranked_results=ranked,
-                    fallback_used=fallback_used,
-                )
-            except Exception as le:
-                logger.warning(f"Failed to log search details: {le}")
-        if ranked:
-            self._last_successful_search_at = datetime.now(timezone.utc).isoformat()
-            self._last_error = None
-        elif diagnostics:
-            errors = [diag.error for diag in diagnostics.values() if diag.error]
-            self._last_error = "; ".join(errors) if errors else "No providers returned results."
-        return ranked
+            self._provider_diagnostics = diagnostics
+            logger.info(
+                f"Aggregated {len(ranked)} results from "
+                f"{len(active_providers)}/{len(self._providers)} primary providers "
+                f"and {len(self._fallback_providers)} fallback providers "
+                f"(fallback_used={fallback_used}) "
+                f"(after quality filter: {len(quality_filtered)}/{len(filtered)}) "
+                f"(query: '{query[:50]}')"
+            )
+            if self._search_logger:
+                try:
+                    await self._search_logger.log_search(
+                        query=query,
+                        category=category or "all",
+                        active_providers=provider_names,
+                        total_raw=len(all_results),
+                        unique_deduped=len(deduped),
+                        quality_filtered=len(quality_filtered),
+                        provider_diagnostics=diagnostics,
+                        raw_results=all_results,
+                        deduped_results=deduped,
+                        accepted_results=quality_filtered,
+                        ranked_results=ranked,
+                        fallback_used=fallback_used,
+                        search_id=search_id,
+                        search_elapsed_ms=int((time.monotonic() - started) * 1000),
+                    )
+                except Exception as log_exc:
+                    logger.warning(f"Failed to log search details: {log_exc}")
+            if ranked:
+                self._last_successful_search_at = datetime.now(timezone.utc).isoformat()
+                self._last_error = None
+            elif diagnostics:
+                errors = [diag.error for diag in diagnostics.values() if diag.error]
+                self._last_error = "; ".join(errors) if errors else "No providers returned results."
+            return ranked
+        except asyncio.CancelledError:
+            await self._log_search_event_safely(
+                event="torrent_search_cancelled", search_id=search_id, query=query,
+                category=category or "all", active_providers=provider_names,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                detail="Owning user operation was cancelled.",
+            )
+            raise
+        except BaseException as exc:
+            await self._log_search_event_safely(
+                event="torrent_search_failed", search_id=search_id, query=query,
+                category=category or "all", active_providers=provider_names,
+                elapsed_ms=int((time.monotonic() - started) * 1000), detail=str(exc),
+            )
+            raise
 
     async def search_with_diagnostics(self, query: str, category: str | None = None,
                                       preferred_language: str | None = None,
@@ -203,6 +218,35 @@ class SearchAggregator:
             provider_results=diagnostics,
             elapsed_ms=int((time.monotonic() - started) * 1000),
         )
+
+    async def _begin_search_log(
+        self, *, query: str, category: str, active_providers: list[str],
+    ) -> str | None:
+        """Start a search lifecycle record without making logging a dependency."""
+        if self._search_logger is None:
+            return None
+        try:
+            return await self._search_logger.begin_search(
+                query=query, category=category, active_providers=active_providers,
+            )
+        except Exception as exc:
+            logger.warning("Failed to log search start: {}", exc)
+            return None
+
+    async def _log_search_event_safely(
+        self, *, event: str, search_id: str | None, query: str, category: str,
+        active_providers: list[str], elapsed_ms: int, detail: str | None = None,
+    ) -> None:
+        """Write a non-success terminal event without masking search errors."""
+        if self._search_logger is None or not search_id:
+            return
+        try:
+            await self._search_logger.log_search_event(
+                event=event, search_id=search_id, query=query, category=category,
+                active_providers=active_providers, elapsed_ms=elapsed_ms, detail=detail,
+            )
+        except Exception as exc:
+            logger.warning("Failed to log search lifecycle event {}: {}", event, exc)
 
     async def health_check(self) -> dict:
         """Return actionable torrent provider health for API diagnostics."""
@@ -384,39 +428,61 @@ class SearchAggregator:
 
         async def _query(provider: SearchProvider) -> list[SearchResult]:
             started = time.monotonic()
-            try:
-                async with self._search_semaphore:
-                    results = await asyncio.wait_for(
-                        self._call_provider_search(provider, query, category),
-                        timeout=self._provider_timeout_for(provider),
+            attempts = max(1, int(self._provider_retries or 0) + 1)
+            final_error: Exception | None = None
+            final_outcome = "provider_error"
+            blocked = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    async with self._search_semaphore:
+                        results = await asyncio.wait_for(
+                            self._call_provider_search(provider, query, category),
+                            timeout=self._provider_timeout_for(provider),
+                        )
+                    for result in results:
+                        if str(getattr(result, "source", "") or "").strip().lower() in {"", "unknown"}:
+                            result.source = provider.name
+                    blocked = getattr(provider, "latest_error_category", None)
+                    outcome = self._diagnostic_outcome(ok=True, result_count=len(results), error=None, blocked_reason=blocked)
+                    diagnostics[provider.name] = ProviderSearchDiagnostics(
+                        provider=provider.name,
+                        ok=outcome not in {"timeout", "auth_error", "provider_error"},
+                        result_count=len(results),
+                        magnet_count=sum(1 for result in results if result.magnet),
+                        blocked_reason=blocked,
+                        used_browser=False,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        outcome=outcome,
                     )
-                blocked = getattr(provider, "latest_error_category", None)
-                outcome = self._diagnostic_outcome(ok=True, result_count=len(results), error=None, blocked_reason=blocked)
-                diagnostics[provider.name] = ProviderSearchDiagnostics(
-                    provider=provider.name,
-                    ok=outcome not in {"timeout", "auth_error", "provider_error"},
-                    result_count=len(results),
-                    magnet_count=sum(1 for result in results if result.magnet),
-                    blocked_reason=blocked,
-                    used_browser=False,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    outcome=outcome,
-                )
-                return results
-            except asyncio.TimeoutError:
-                diagnostics[provider.name] = ProviderSearchDiagnostics(
-                    provider=provider.name, ok=False, error=f"provider timeout after {self._provider_timeout_for(provider)}s",
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    outcome="timeout",
-                )
-            except Exception as exc:
-                blocked = getattr(provider, "latest_error_category", None)
-                diagnostics[provider.name] = ProviderSearchDiagnostics(
-                    provider=provider.name, ok=False, error=str(exc),
-                    blocked_reason=blocked,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    outcome=self._diagnostic_outcome(ok=False, result_count=0, error=str(exc), blocked_reason=blocked),
-                )
+                    return results
+                except asyncio.TimeoutError as exc:
+                    final_error = exc
+                    final_outcome = "timeout"
+                except Exception as exc:
+                    final_error = exc
+                    blocked = getattr(provider, "latest_error_category", None)
+                    final_outcome = self._diagnostic_outcome(
+                        ok=False, result_count=0, error=str(exc), blocked_reason=blocked,
+                    )
+                if attempt < attempts:
+                    logger.warning(
+                        "Search provider %s failed on attempt %s/%s; retrying: %s",
+                        provider.name, attempt, attempts, final_error,
+                    )
+                    await asyncio.sleep(0)
+            error_text = (
+                f"provider timeout after {self._provider_timeout_for(provider)}s"
+                if final_outcome == "timeout"
+                else str(final_error or "provider search failed")
+            )
+            diagnostics[provider.name] = ProviderSearchDiagnostics(
+                provider=provider.name,
+                ok=False,
+                error=error_text,
+                blocked_reason=blocked,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                outcome=final_outcome,
+            )
             return []
 
         result_lists = await asyncio.gather(*[_query(provider) for provider in target_providers])

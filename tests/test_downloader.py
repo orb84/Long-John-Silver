@@ -103,6 +103,7 @@ class TestSeedingPolicy:
             item_name="Test Show",
             magnet="magnet:?xt=urn:btih:abc",
             completed_at=datetime.now(timezone.utc) - timedelta(hours=completed_hours_ago),
+            sharing_enabled=True,
         )
 
     def test_no_stop_without_completed_at(self):

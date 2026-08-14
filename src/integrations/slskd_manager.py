@@ -14,7 +14,6 @@ import json
 import os
 import platform
 import secrets
-import shutil
 import subprocess
 import tempfile
 import uuid
@@ -54,6 +53,10 @@ class SlskdManager:
         self._running_credentials_key: tuple[str, str] | None = None
         self._start_lock = asyncio.Lock()
         self._adopted_external = False
+        self._command_policy = CommandPolicy()
+        self._managed_path_policy = SafePathResolver(
+            [SLSKD_DIR], category_id="slskd"
+        )
 
     @property
     def is_installed(self) -> bool:
@@ -510,7 +513,10 @@ class SlskdManager:
         try:
             if log_path.exists() and log_path.stat().st_size > 0:
                 try:
-                    previous_path.unlink(missing_ok=True)
+                    if previous_path.exists():
+                        SafePathResolver([previous_path.parent], category_id="slskd").safe_unlink(
+                            previous_path, purpose="slskd.rotate_previous_log", move_to_trash=False
+                        )
                 except Exception:
                     pass
                 log_path.replace(previous_path)
@@ -751,14 +757,20 @@ class SlskdManager:
                 except Exception:
                     pass
                 try:
-                    probe.unlink(missing_ok=True)
+                    if probe.exists():
+                        SafePathResolver([folder], category_id="slskd").safe_unlink(
+                            probe, purpose="slskd.write_probe_cleanup", move_to_trash=False
+                        )
                 except Exception as unlink_exc:
                     attempts.append({"filename": probe.name, "stage": "unlink", "ok": False, "error": repr(unlink_exc)})
                 return {"ok": True, "filename": probe.name, "bytes": size, "attempts": attempts}
             except Exception as exc:
                 attempts.append({"filename": probe.name, "stage": "open_write", "ok": False, "error": repr(exc)})
                 try:
-                    probe.unlink(missing_ok=True)
+                    if probe.exists():
+                        SafePathResolver([folder], category_id="slskd").safe_unlink(
+                            probe, purpose="slskd.write_probe_error_cleanup", move_to_trash=False
+                        )
                 except Exception as unlink_exc:
                     attempts.append({"filename": probe.name, "stage": "cleanup_after_error", "ok": False, "error": repr(unlink_exc)})
         return {"ok": False, "attempts": attempts}
@@ -827,12 +839,17 @@ class SlskdManager:
                     handle.write(b"ljs slskd storage readiness\n")
                     handle.flush()
                 size = probe.stat().st_size if probe.exists() else 0
-                probe.unlink(missing_ok=True)
+                SafePathResolver([folder], category_id="slskd").safe_unlink(
+                    probe, purpose="slskd.readiness_probe_cleanup", move_to_trash=False
+                )
                 return {"ok": True, "filename": probe.name, "bytes": size, "attempts": attempts}
             except Exception as exc:
                 attempts.append({"filename": probe.name, "stage": "open_write_or_cleanup", "ok": False, "error": repr(exc)})
                 try:
-                    probe.unlink(missing_ok=True)
+                    if probe.exists():
+                        SafePathResolver([folder], category_id="slskd").safe_unlink(
+                            probe, purpose="slskd.write_probe_error_cleanup", move_to_trash=False
+                        )
                 except Exception as unlink_exc:
                     attempts.append({"filename": probe.name, "stage": "cleanup_after_error", "ok": False, "error": repr(unlink_exc)})
         return {"ok": False, "attempts": attempts}
@@ -1190,10 +1207,11 @@ class SlskdManager:
     def _binary_is_runnable(exe: Path) -> bool:
         """Return whether the extracted binary can be executed on this host."""
         try:
-            completed = subprocess.run(
+            completed = CommandPolicy().run_sync(
                 [str(exe), "--version"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                purpose="slskd.binary_smoke_test",
+                capture_output=True,
+                text=True,
                 timeout=8,
                 check=False,
             )
@@ -1209,15 +1227,17 @@ class SlskdManager:
     @staticmethod
     def _clear_bin_dir() -> None:
         """Remove stale extracted binaries before trying another release asset."""
-        if SLSKD_BIN_DIR.exists():
-            for child in SLSKD_BIN_DIR.iterdir():
+        if not SLSKD_BIN_DIR.exists():
+            return
+        resolver = SafePathResolver([SLSKD_BIN_DIR], category_id="slskd")
+        for child in SLSKD_BIN_DIR.iterdir():
+            try:
                 if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
+                    resolver.safe_rmtree(child, purpose="slskd.clear_binary_directory", move_to_trash=False)
                 else:
-                    try:
-                        child.unlink()
-                    except Exception:
-                        pass
+                    resolver.safe_unlink(child, purpose="slskd.clear_binary_file", move_to_trash=False)
+            except Exception:
+                pass
 
     @staticmethod
     def _download_file(url: str, dest: str) -> None:

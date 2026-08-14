@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from loguru import logger
 
@@ -19,6 +21,153 @@ class TvMetadataInfoMixin:
     dispatch so alternative metadata providers can be introduced here without
     destabilizing search or organization behavior.
     """
+
+    async def identify_agent_item(
+        self,
+        name: str,
+        *,
+        settings: "Settings",
+        db: "Database" | None = None,
+        metadata_clients: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return provider evidence that ``name`` identifies a TV series.
+
+        TV owns both TMDB-TV and TVMaze identity semantics.  The generic
+        resolver only ranks the compact evidence returned here and therefore
+        never maps provider media types to category ids itself.
+        """
+        evidence: list[dict[str, Any]] = []
+        clients = metadata_clients or {}
+        tmdb_key = settings.category_service_value(self.category_id, "tmdb", "api_key")
+        if tmdb_key and self.metadata_provider_enabled(settings, "tmdb", True):
+            from src.integrations.tmdb import TMDBClient
+
+            tmdb = clients.get("tmdb") or TMDBClient(tmdb_key)
+            owns_tmdb = "tmdb" not in clients
+            try:
+                for row in await tmdb.search(name, media_type="tv"):
+                    title = str(row.get("title") or "").strip()
+                    if title:
+                        evidence.append(self._identity_evidence(
+                            title, "tmdb_tv", 0.24, row.get("id"), row.get("year")
+                        ))
+            except Exception as exc:
+                logger.debug("TV identity TMDB probe failed for {!r}: {}", name, exc)
+            finally:
+                if owns_tmdb:
+                    await tmdb.close()
+
+        from src.integrations.tvmaze import TVMazeClient
+
+        tvmaze = clients.get("tvmaze") or TVMazeClient()
+        try:
+            for row in await tvmaze.search(name):
+                title = str(row.get("name") or "").strip()
+                if title:
+                    evidence.append(self._identity_evidence(
+                        title, "tvmaze", 0.22, row.get("id"), row.get("year")
+                    ))
+        except Exception as exc:
+            logger.debug("TV identity TVMaze probe failed for {!r}: {}", name, exc)
+        return evidence
+
+    async def identify_agent_item_via_web(
+        self,
+        name: str,
+        *,
+        settings: "Settings",
+        db: "Database" | None = None,
+        metadata_clients: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Corroborate a TV identity through bounded category-owned web evidence.
+
+        This is a fallback for unavailable/empty TMDB and TVMaze results, not a
+        parallel search across every installed category.  Search snippets alone
+        are accepted only when a trusted TV/reference host is present or two
+        independent sources agree; fetched page text can provide the second
+        corroboration signal.
+        """
+        collector = (metadata_clients or {}).get("web_identity_search")
+        if collector is None or not hasattr(collector, "collect"):
+            return []
+        query = f'"{name}" TV series seasons episodes official'
+        try:
+            packet = await collector.collect(query, max_results=6, max_pages=2)
+        except Exception as exc:
+            logger.debug("TV identity web fallback failed for {!r}: {}", name, exc)
+            return []
+        if not isinstance(packet, dict) or not packet.get("ok"):
+            return []
+
+        wanted_tokens = [token for token in re.findall(r"[a-z0-9]+", str(name).casefold()) if token]
+        tv_terms = ("tv series", "television series", "episode", "season", "show", "streaming series", "series")
+        trusted_hosts = (
+            "tvmaze.com", "themoviedb.org", "imdb.com", "tv.apple.com",
+            "netflix.com", "hbo.com", "max.com", "primevideo.com",
+            "paramountplus.com", "peacocktv.com", "disneyplus.com", "wikipedia.org",
+        )
+        corroborating_hosts: set[str] = set()
+        trusted = False
+        evidence: list[str] = []
+
+        def consider(text: str, url: str, *, fetched: bool) -> None:
+            nonlocal trusted
+            folded = str(text or "").casefold()
+            if wanted_tokens and not all(token in folded for token in wanted_tokens):
+                return
+            if not any(term in folded for term in tv_terms):
+                return
+            host = urlparse(str(url or "")).netloc.casefold().removeprefix("www.")
+            if not host:
+                return
+            corroborating_hosts.add(host)
+            is_trusted = any(host == value or host.endswith(f".{value}") for value in trusted_hosts)
+            trusted = trusted or is_trusted
+            kind = "fetched page" if fetched else "search result"
+            evidence.append(f"{kind} on {host} identifies {name} as episodic television")
+
+        for hit in packet.get("hits") or []:
+            if not isinstance(hit, dict):
+                continue
+            consider(f"{hit.get('title', '')} {hit.get('snippet', '')}", str(hit.get("url") or ""), fetched=False)
+        for page in packet.get("pages") or []:
+            if not isinstance(page, dict) or page.get("ok") is False:
+                continue
+            consider(f"{page.get('title', '')} {page.get('content', '')}", str(page.get("url") or ""), fetched=True)
+
+        if not trusted and len(corroborating_hosts) < 2:
+            return []
+        source = "web_tv_identity_fallback"
+        if packet.get("fallback_used"):
+            source += "_degraded_provider"
+        return [{
+            "category_id": self.category_id,
+            "title": str(name).strip(),
+            "source": source,
+            "base_score": 0.20 if trusted else 0.16,
+            "external_id": "",
+            "year": None,
+            "evidence": evidence[:6],
+        }]
+
+    def _identity_evidence(
+        self,
+        title: str,
+        source: str,
+        base_score: float,
+        external_id: Any,
+        year: Any,
+    ) -> dict[str, Any]:
+        """Build one compact TV identity candidate for the generic resolver."""
+        return {
+            "category_id": self.category_id,
+            "title": title,
+            "source": source,
+            "base_score": base_score,
+            "external_id": str(external_id or ""),
+            "year": str(year or "")[:4] or None,
+            "evidence": [],
+        }
 
     async def enrich_taste_metadata(self, item: Any, context: Any) -> dict[str, Any] | None:
         """Return TV-owned metadata for taste profiling.
@@ -157,7 +306,7 @@ class TvMetadataInfoMixin:
                     client = TMDBClient(api_key)
                     tv_details = await client.get_tv_details(cached_meta.tmdb_id)
                     if tv_details:
-                        today = datetime.utcnow().date()
+                        today = datetime.now(timezone.utc).date()
                         seasons = tv_details.get("seasons", [])
                         
                         # Fetch episodes for each season
@@ -228,6 +377,13 @@ class TvMetadataInfoMixin:
                 "missing_aired_episodes_count": len(missing_aired),
                 "missing_aired_episodes": missing_aired,
             })
+            if missing_aired:
+                response["recommended_search_arguments"] = {
+                    "name": name,
+                    "category_id": self.category_id,
+                    "language": configured_language,
+                    "unit_scope": "missing_units",
+                }
         else:
             response["note"] = "TMDB reality details could not be loaded; displaying local library state only."
             

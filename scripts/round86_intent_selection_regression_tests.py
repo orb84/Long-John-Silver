@@ -135,7 +135,7 @@ class _FakeRoutingLLM:
         self.prompt = ""
 
     async def completion(self, **kwargs):
-        self.prompt = kwargs["messages"][0]["content"]
+        self.prompt = "\n".join(str(row.get("content") or "") for row in kwargs["messages"])
         return {"choices": [{"message": {"content": "DOWNLOAD"}}]}
 
 

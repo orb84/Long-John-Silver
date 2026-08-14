@@ -426,7 +426,8 @@ class TvWorkflowMixin:
             router_description="TV Shows: episodic video series with seasons, episodes, air dates, and missing-episode tracking.",
             domain_vocabulary=[
                 "show", "series", "season", "episode", "SxxEyy", "season pack",
-                "aired episode", "missing episode", "finale", "special", "pilot",
+                "latest season", "last season", "available episodes", "aired episode",
+                "missing episode", "finale", "special", "pilot",
             ],
             item_types=["show", "season", "episode", "season_pack"],
             identifiers=["title", "season_number", "episode_number", "tmdb_id", "tvmaze_id", "imdb_id"],
@@ -438,11 +439,13 @@ class TvWorkflowMixin:
             ],
             ambiguity_rules=[
                 "If the user gives only a show name and asks to download, decide whether they mean latest aired episode, all missing episodes, or a specific episode; ask if unclear.",
-                "If a title exists as both a movie and a TV show, prefer this category only when the user mentions show, series, season, episode, or SxxEyy.",
+                "Phrases equivalent to latest/last season, available episodes, or season/episode numbering are strong TV-verifier selection clues in any language. They select the TV identity check; they do not replace title verification.",
+                "If a title exists as both a movie and a TV show, prefer this category only when the request semantically refers to seasons, episodes, air dates, or episodic units and TV identity is verified.",
                 "Do not assume an unaired episode is available; check schedule metadata first.",
             ],
             search_rules=[
                 "Resolve show metadata with TV category-owned metadata providers before torrent selection.",
+                "When TV-owned metadata is unavailable or empty after the request semantically selects TV, use the bounded TV-owned public-web identity fallback before asking the user; do not probe unrelated book/audio categories first.",
                 "Prefer exact SxxEyy matches for specific episodes.",
                 "Use season-pack searches only when the user asked for a season or many missing episodes make a pack useful.",
             ],
@@ -1046,7 +1049,7 @@ class TvWorkflowMixin:
             episode = arguments.get("episode")
             label = f"S{int(season):02d}E{int(episode):02d}" if season and episode else None
             item = self.create_item(title, language=getattr(context.settings, "language", "English"))
-            results = await context.pipeline.run_search(item, episode_label=label, mode="llm")
+            results = await context.pipeline.run_search(item, episode_label=label, mode="llm", rank_candidates=False)
             return ActionReceipt(
                 category_id=self.category_id,
                 action_name=workflow_name,

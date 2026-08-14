@@ -93,6 +93,8 @@ class ToolExecutionContext(BaseModel):
     actor: str = "user"
     category_id: str | None = None
     user_prompt: str | None = None
+    operation_id: str | None = None
+    correlation_id: str | None = None
 
 
 class AgentStreamEvent(BaseModel):

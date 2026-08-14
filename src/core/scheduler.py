@@ -53,12 +53,14 @@ from src.core.torrent_racer import TorrentRacer
 from src.core.suggestion_compiler import SuggestionCompiler
 from src.core.category_lifecycle import CategoryLifecycleEngine
 from src.core.download_health import DownloadHealthSupervisor
+from src.core.download_completion_authority import CompletedDownloadAuthority, CompletedDownloadDecision
 
 from src.core.search_pipeline import SearchPipeline
 from src.core.scheduler_services import SchedulerCatalogService, SchedulerServiceContext, SchedulerTorrentSearchService
 
 if TYPE_CHECKING:
     from src.ai.assistant import AIAssistant
+    from src.core.category_item_coordinator import CategoryItemCoordinator
 
 SECONDS_PER_DAY = 86400
 _LIBRARY_SIGNATURE_MAX_DIRS = 5000
@@ -114,6 +116,7 @@ class SchedulerDependencies:
     suggestion_compiler: Optional[SuggestionCompiler] = None
     lifecycle_engine: Optional[CategoryLifecycleEngine] = None
     event_bus: Optional[object] = None
+    web_reader: Optional[object] = None
 
 
 class MediaScheduler:
@@ -155,6 +158,7 @@ class MediaScheduler:
             settings_manager=dependencies.settings_manager,
         )
         self._event_bus = dependencies.event_bus
+        self._web_reader = dependencies.web_reader
         
         # Sub-coordinators
         self._pipeline = SearchPipeline(
@@ -165,6 +169,11 @@ class MediaScheduler:
             settings_manager=dependencies.settings_manager,
         )
         self._pipeline.set_scheduler(self)
+        self._completed_download_authority = CompletedDownloadAuthority(
+            settings_manager=self._settings_manager,
+            category_registry=self._categories,
+            category_context_factory=self._pipeline.category_search_context,
+        )
         self._download_health = DownloadHealthSupervisor(
             settings_manager=dependencies.settings_manager,
             db=dependencies.db,
@@ -245,7 +254,53 @@ class MediaScheduler:
         """
         return self._db
 
-    def category_item_coordinator(self):
+    @property
+    def category_registry(self) -> object | None:
+        """Return the category registry installed at composition time.
+
+        Tool-layer collaborators use this read-only seam for category routing
+        and candidate cleanup instead of reaching into scheduler internals.
+        """
+        return self._categories
+
+    async def resolve_agent_media_identity(
+        self,
+        item_name: str,
+        *,
+        category_hint: str | None = None,
+        request_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an unknown title through library and metadata evidence.
+
+        Router vocabulary is only a hint and may be in any language. Search
+        tools call this boundary before provider/indexer search so an LLM
+        cannot silently demote an unresolved request to abstract ``media`` or
+        force a guessed category.
+        """
+        from src.core.categories.identity_resolution import CategoryIdentityResolver
+
+        metadata_clients = {"tvmaze": self._tvmaze} if self._tvmaze is not None else {}
+        try:
+            from src.search.web.identity import WebIdentitySearch
+
+            metadata_clients["web_identity_search"] = WebIdentitySearch(
+                self._settings_manager.settings.web_search,
+                web_reader=self._web_reader,
+            )
+        except Exception as exc:
+            logger.debug("Web identity fallback is unavailable: {}", exc)
+        return await CategoryIdentityResolver(
+            settings_manager=self._settings_manager,
+            database=self._db,
+            category_registry=self._categories,
+            metadata_clients=metadata_clients,
+        ).resolve(
+            item_name,
+            category_hint=category_hint,
+            request_text=request_text,
+        )
+
+    def category_item_coordinator(self) -> "CategoryItemCoordinator":
         """Return the shared category-item mutation coordinator.
 
         Scheduler/import paths use the same coordinator as UI and assistant
@@ -294,9 +349,9 @@ class MediaScheduler:
             )
 
         self._scheduler.add_job(
-            self.scan_library, interval_seconds=3600, kwargs={"force": True, "refresh_metadata": False},
+            self.scan_library, interval_seconds=SECONDS_PER_DAY, kwargs={"force": True, "refresh_metadata": False},
             id="library_scan",
-            initial_delay_seconds=3600,
+            initial_delay_seconds=SECONDS_PER_DAY,
         )
         self._scheduler.add_job(
             self._repair_stale_media_metadata_job, interval_seconds=6 * 3600,
@@ -1462,11 +1517,18 @@ class MediaScheduler:
             if not item.enabled:
                 continue
             category_id = getattr(item, "category_id", getattr(item, "item_type", "media")) or "media"
-            if await self._db.media.get_category_item_paused(category_id, item.key):
-                continue
-
             category = self._categories.get(item.item_type) if self._categories else None
             if not category:
+                continue
+            try:
+                if not await self._lifecycle.scheduled_work_is_due(item):
+                    dormant_count += 1
+                    continue
+            except Exception as exc:
+                # Ledger read failures must not suppress useful scheduled work;
+                # fall through to the authoritative lifecycle check below.
+                logger.debug("Lifecycle due preflight failed for {}/{}: {}", category_id, item.key, exc)
+            if await self._db.media.get_category_item_paused(category_id, item.key):
                 continue
             await self._reconcile_category_item_runtime_state(category, item, reason="scheduled_check")
             category_config = (settings.category_settings or {}).get(category.category_id, {})
@@ -1755,6 +1817,7 @@ class MediaScheduler:
             try:
                 await self._reconcile_category_item_runtime_state(category, item, reason="watch_policy_sync")
                 plan = await self._build_category_watch_plan(category, item)
+                await self._apply_watch_plan_item_updates(plan, item)
                 if item_name:
                     item_names.append(item_name)
                     item_categories[item_name] = category_id
@@ -1801,6 +1864,44 @@ class MediaScheduler:
             artwork_manager=self._artwork_manager,
         )
         return await category.build_watch_plan(item, context)
+
+    async def _apply_watch_plan_item_updates(self, plan: object, item: object) -> bool:
+        """Persist category-owned item defaults emitted by a watch plan.
+
+        The scheduler treats update keys as opaque item configuration fields;
+        the owning category is solely responsible for deciding values. This is
+        intentionally a narrow mirror update and does not recursively rebuild
+        watch policy.
+        """
+        updates = getattr(plan, "item_updates", None)
+        if not isinstance(updates, dict) or not updates:
+            return False
+        category_id = str(getattr(plan, "category_id", "") or getattr(item, "item_type", "") or "")
+        item_id = str(getattr(plan, "item_id", "") or getattr(item, "key", "") or "")
+        changed = False
+        for key, value in updates.items():
+            if hasattr(item, key):
+                if getattr(item, key, None) != value:
+                    setattr(item, key, value)
+                    changed = True
+            else:
+                properties = getattr(item, "properties", None)
+                if not isinstance(properties, dict):
+                    properties = {}
+                    setattr(item, "properties", properties)
+                if properties.get(key) != value:
+                    properties[key] = value
+                    changed = True
+        if not changed:
+            return False
+        self._settings_manager.save(self._settings_manager.settings)
+        media_repo = getattr(self._db, "media", None)
+        if media_repo is not None and hasattr(media_repo, "upsert_category_item") and category_id and item_id:
+            payload = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(getattr(item, "__dict__", {}) or {})
+            await media_repo.upsert_category_item(category_id, item_id, payload)
+        await self.invalidate_item_lifecycle(category_id, item_id, reason="category_watch_default_applied")
+        logger.info("Applied category watch-plan item defaults for {}/{}: {}", category_id, item_id, sorted(updates))
+        return True
 
     async def _apply_release_watches_from_plan(self, plan: object, item: object) -> None:
         repo = getattr(self._db, "release_watches", None)
@@ -2361,30 +2462,52 @@ class MediaScheduler:
                               torrent_title: str = "",
                               source_seeders: int | None = None,
                               import_context: object | None = None) -> dict:
-        """Manually queue a download from a search result with storage preflight."""
+        """Manually queue a download using canonical library truth for duplicates."""
+        completion = await self._completed_download_authority.evaluate(
+            import_context=import_context,
+            category_id=category_id,
+            item_name=name,
+        )
         item = await self._downloader.add_magnet(
             magnet_link=magnet, item_name=name, season=season, episode=episode,
             reason="manual", priority=priority,
             category_id=category_id, estimated_size_bytes=estimated_size_bytes,
             torrent_title=torrent_title, source_seeders=source_seeders,
             import_context=import_context,
+            retry_completed_if_unsatisfied=completion.retry_completed_row,
         )
-        return self._queue_download_receipt(item)
+        return self._queue_download_receipt(item, completion=completion)
 
-    def _queue_download_receipt(self, item: Any) -> dict[str, Any]:
+    def _queue_download_receipt(
+        self,
+        item: Any,
+        *,
+        completion: CompletedDownloadDecision | None = None,
+    ) -> dict[str, Any]:
         """Return a truthful queue receipt for the assistant/tool layer."""
         status = getattr(item, "status", None)
         status_value = getattr(status, "value", str(status or ""))
         receipt = {"download_id": getattr(item, "id", None), "download_status": status_value}
+        if completion is not None:
+            receipt["canonical_satisfaction"] = completion.as_receipt()
+        selective = self._selective_queue_receipt(item)
+        if selective:
+            receipt["selective_download"] = selective
         if status == DownloadStatus.QUEUED:
             return {"status": "queued", **receipt}
         if status in {DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED, DownloadStatus.STALLED, DownloadStatus.SEEDING}:
             return {"status": "already_active", "already_existing": True, **receipt}
         if status == DownloadStatus.COMPLETE:
+            canonical_present = bool(completion and completion.verified and completion.satisfied is True)
+            error = (
+                "The requested logical unit is already present in the canonical library; no new queue row was created."
+                if canonical_present
+                else "A matching download row is complete, but canonical library presence could not be disproved; no new queue row was created."
+            )
             return {
-                "status": "already_complete",
+                "status": "already_satisfied" if canonical_present else "already_complete",
                 "already_existing": True,
-                "error": "A matching download is already complete; no new queue row was created.",
+                "error": error,
                 **receipt,
             }
         return {
@@ -2392,6 +2515,29 @@ class MediaScheduler:
             "already_existing": True,
             "error": f"A matching download row is {status_value or 'not queueable'}; no new queue row was created.",
             **receipt,
+        }
+
+    @staticmethod
+    def _selective_queue_receipt(item: Any) -> dict[str, Any]:
+        """Describe registered metadata-time file selection without overclaiming it."""
+        context = getattr(item, "import_context", None)
+        snapshot = getattr(context, "candidate_snapshot", {}) if context is not None else {}
+        bundle = snapshot.get("bundle_context") if isinstance(snapshot, dict) else None
+        descriptor = getattr(context, "unit_descriptor", {}) if context is not None else {}
+        if not isinstance(bundle, dict) or not bundle.get("selective_download_required") or not descriptor:
+            return {}
+        policy = bundle.get("selective_queue_policy") if isinstance(bundle.get("selective_queue_policy"), dict) else {}
+        return {
+            key: value
+            for key, value in {
+                "required": True,
+                "status": "registered_pending_metadata",
+                "mode": policy.get("mode") or "metadata_file_priority",
+                "target_label": descriptor.get("label") or descriptor.get("stable_key"),
+                "target_scope": policy.get("target_scope") or bundle.get("selection_scope"),
+                "note": "file priorities will be applied after torrent metadata arrives; this receipt does not claim that metadata selection has completed",
+            }.items()
+            if value not in (None, "", [], {})
         }
 
     def get_last_scan_result(self) -> object:

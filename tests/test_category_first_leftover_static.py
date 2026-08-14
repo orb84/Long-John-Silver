@@ -46,8 +46,9 @@ def test_taste_profiler_does_not_branch_on_built_in_categories() -> None:
 
 
 def test_built_in_categories_own_taste_metadata_hooks() -> None:
-    """Built-in media categories should expose their own taste metadata enrichers."""
-    movie_text = (ROOT / "src/core/categories/movie.py").read_text(errors="ignore")
-    tv_text = (ROOT / "src/core/categories/tv.py").read_text(errors="ignore")
-    assert "async def enrich_taste_metadata" in movie_text
-    assert "async def enrich_taste_metadata" in tv_text
+    """Built-in media category classes expose category-owned taste enrichers."""
+    from src.core.categories.movie import MovieCategory
+    from src.core.categories.tv import TvShowCategory
+
+    assert callable(getattr(MovieCategory, "enrich_taste_metadata", None))
+    assert callable(getattr(TvShowCategory, "enrich_taste_metadata", None))

@@ -594,10 +594,12 @@ def _safe_float(value: Any) -> float | None:
 
 
 def resolution_label_from_dimensions(width: Any, height: Any) -> str | None:
+    """Return a conventional resolution label for pixel dimensions."""
     return MediaProbeResolution.label_from_dimensions(width, height)
 
 
 def resolution_label_from_probe_payload(probe: dict[str, Any] | None) -> str | None:
+    """Derive a resolution label from a normalized media-probe payload."""
     return MediaProbeResolution.label_from_payload(probe)
 
 
@@ -618,14 +620,17 @@ def _stat_signature(path: Path) -> tuple[int, int] | None:
 
 
 async def flush_probe_cache() -> None:
+    """Persist any pending media-probe cache updates."""
     await _DEFAULT_MEDIA_PROBE_SERVICE.flush_cache()
 
 
 async def probe_media_file(path: Path) -> MediaProbeInfo | None:
+    """Probe one media file and return its normalized technical metadata."""
     return await _DEFAULT_MEDIA_PROBE_SERVICE.probe_file(path)
 
 
 async def probe_media_files_serial(paths: Iterable[Path]) -> dict[str, MediaProbeInfo]:
+    """Probe media files serially while preserving input order."""
     results: dict[str, MediaProbeInfo] = {}
     try:
         for path in paths:

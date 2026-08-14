@@ -7,6 +7,11 @@ from src.core.models import ToolExecutionContext
 class FakeSettings:
     tmdb_api_key = "live-key"
 
+    def first_category_service_value(self, category_ids, service_id, key):
+        if service_id == "tmdb" and key == "api_key":
+            return "live-key"
+        return ""
+
 
 class FakeSettingsManager:
     settings = FakeSettings()
@@ -104,6 +109,6 @@ def test_research_tool_provider_logs_and_wires_settings_and_database(caplog):
 
 
 def test_initial_setup_awaits_integration_save_before_advancing():
-    setup_js = open("src/web/static/js/pages/setup.js", encoding="utf-8").read()
-    assert "return APIClient.post('/api/settings/integrations', intelData);" in setup_js
-    assert "APIClient.post('/api/settings/integrations', intelData).catch" not in setup_js
+    saver_js = open("src/web/static/js/components/settingsSavers.js", encoding="utf-8").read()
+    assert "await APIClient.post('/api/settings/integrations', data);" in saver_js
+    assert "APIClient.post('/api/settings/integrations', data).catch" not in saver_js

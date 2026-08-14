@@ -12,8 +12,8 @@ class TestTvSearchQuery:
 
     def test_basic_query_with_progress(self):
         query = self.patterns.build_primary_query("Severance", "English", {"last_season": 1, "last_episode": 4})
-        assert "Severance" in query
-        assert "S01E05" in query
+        assert query == "Severance"
+        assert "S01E05" not in query
 
     def test_query_without_progress(self):
         query = self.patterns.build_primary_query("The Bear", "English", None)

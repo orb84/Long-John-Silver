@@ -185,6 +185,13 @@ When adding a category that should influence recommendations or prompt context:
 Do not add TV/movie/provider branches in `TasteProfiler`, scheduler, assistant,
 repositories, or generic web/UI code. Use category hooks instead.
 
+Post-turn taste interpretation is best-effort background work. In production,
+submit it to the shared `TaskSupervisor` as a coroutine factory so it cannot hold
+the chat WebSocket open or leave Send/Stop locked. Do not run the taste LLM for a
+bare DOWNLOAD command: the behavior recorder already stores that engagement. Run
+model-led extraction only when the message contains explicit preference evidence
+that needs semantic interpretation.
+
 ## 5. Working With Filesystem Operations
 
 ### Use SafePathResolver

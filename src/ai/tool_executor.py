@@ -10,6 +10,7 @@ to ensure consistent tool execution behavior.
 """
 
 import json
+import re
 from typing import Any
 
 from loguru import logger
@@ -56,6 +57,7 @@ _READ_ONLY_RETRYABLE_TOOLS = {
     "search_soulseek",
 }
 _MAX_TOOL_EXECUTION_ATTEMPTS = 2
+_PROVIDER_CHANNEL_SUFFIX_RE = re.compile(r"<\|channel\|>(?:analysis|commentary|final)?$", re.IGNORECASE)
 
 
 class ToolCallExecutor:
@@ -176,8 +178,9 @@ class ToolCallExecutor:
         # Some models occasionally call a historical alias even when the prompt
         # exposes the canonical name.  Resolve the alias only if the canonical
         # tool is allowed; otherwise preserve the safety block.
-        requested_name = name
-        executable_name = _TOOL_NAME_ALIASES.get(name, name)
+        requested_name = str(name or "").strip()
+        normalized_name = _PROVIDER_CHANNEL_SUFFIX_RE.sub("", requested_name).strip()
+        executable_name = _TOOL_NAME_ALIASES.get(normalized_name, normalized_name)
         if executable_name not in allowed_tool_names:
             logger.warning(f"Blocked tool '{requested_name}' for current intent")
             result = {
@@ -189,7 +192,7 @@ class ToolCallExecutor:
             }
         else:
             if executable_name != requested_name:
-                logger.info(f"Resolved tool alias '{requested_name}' -> '{executable_name}'")
+                logger.info(f"Resolved provider/tool alias '{requested_name}' -> '{executable_name}'")
             definition = self._tool_registry.get_tool_definition(executable_name)
             schema = definition.parameters if definition else None
             validation = self._contract_validator.validate(
@@ -206,8 +209,10 @@ class ToolCallExecutor:
                 result = validation.error_payload(executable_name)
             else:
                 # Step 3: Execute via registry using schema-normalized arguments.
+                execution_context = tool_context or ToolExecutionContext()
+                execution_context = execution_context.model_copy(update={"operation_id": tool_call_id})
                 result = await self._execute_with_bounded_retry(
-                    executable_name, validation.arguments, tool_context=tool_context,
+                    executable_name, validation.arguments, tool_context=execution_context,
                 )
 
         if isinstance(result, dict) and (result.get("ok") is False or result.get("error")):

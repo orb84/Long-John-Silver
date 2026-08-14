@@ -13,7 +13,6 @@ sys.path.insert(0, str(ROOT))
 from src.core.categories.tv import TvShowCategory
 from src.core.categories.tv_bundle import TVBundleKnowledge
 from src.core.domain_models.media import CategoryItem
-from src.core.scheduler_services import SchedulerCatalogService
 from src.ai.torrent_selection_prompt import TorrentSelectionPromptBuilder
 
 
@@ -47,8 +46,10 @@ async def check_query_planning() -> None:
 
 
 def check_season_title_extraction() -> None:
-    cleaned, season, episode = SchedulerCatalogService.extract_structured_unit_from_name(
-        "the first season of The Boys", None, None,
+    cleaned, season, episode = TvShowCategory().normalize_agent_search_units_from_name(
+        "the first season of The Boys",
+        season=None,
+        episode=None,
     )
     assert_true(season == 1 and episode is None, f"season extraction failed: {cleaned!r}, {season}, {episode}")
     assert_true(cleaned.casefold() == "the boys", f"title cleanup failed: {cleaned!r}")
@@ -79,7 +80,10 @@ def check_pack_detection_and_validation() -> None:
 def check_prompt_language_rules() -> None:
     parts = "\n".join(TorrentSelectionPromptBuilder.language_and_quality_parts("English", "1080p"))
     assert_false("is ideal" in parts, "dual-audio should not be described as ideal")
-    assert_true("acceptable, not ideal" in parts, "dual-audio demotion language missing")
+    assert_true(
+        "not automatically better than a clean preferred-language match" in parts,
+        "multi-language demotion language missing",
+    )
 
 
 def check_scheduler_status_and_css() -> None:

@@ -14,8 +14,8 @@ def test_web_server_is_bound_before_startup_background_jobs():
     """The UI/API must be reachable before scans or metadata jobs can monopolize startup."""
     source = Path("main.py").read_text(encoding="utf-8")
 
-    web_config = source.index("uvicorn.Config(app, host=web_host, port=port")
-    web_ready = source.index("await _wait_for_web_server_ready(web_host, port, web_task)")
+    web_config = source.index("config = uvicorn.Config(")
+    web_ready = source.index("await readiness_gate.wait(")
     scheduler_initialize = source.index("await scheduler.initialize()")
     deferred_jobs = source.index('"deferred_startup_jobs"')
     comms_bridges = source.index('spawn_one_shot("start_comms_bridges"')

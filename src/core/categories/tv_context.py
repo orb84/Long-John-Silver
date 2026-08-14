@@ -183,11 +183,10 @@ class TvContextMixin:
         payload = await super().build_item_detail_payload(
             item_id=item_id, item=item, settings=settings, db=db, artwork_manager=artwork_manager,
         )
-        if payload.get("auto_download") is None:
-            # TV new-episode automation is safe-by-default. The inspector
-            # presents an explicit opt-in checkbox rather than leaking the
-            # legacy global-inherit null state.
-            payload["auto_download"] = False
+        # Preserve the tri-state value.  ``None`` means the category has not yet
+        # resolved an initial lifecycle-backed default; coercing it to false in
+        # the UI would overwrite the category's pending decision and recreate
+        # the old "new airing shows look untracked" regression.
         canonical = payload.get("canonical_object") or {}
         canonical_seasons = list(canonical.get("seasons") or [])
 

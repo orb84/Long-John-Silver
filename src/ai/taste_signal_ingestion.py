@@ -128,10 +128,13 @@ class TasteSignalIngestionService:
         text = (user_message or "").strip().lower()
         if not text or len(text) < 4:
             return False
-        if intent == Intent.DOWNLOAD:
-            # A download request is weak interest evidence; the LLM still decides
-            # whether there is any explicit taste statement to store.
-            return True
+        # Bare DOWNLOAD commands are already captured by the behavior recorder
+        # as engagement evidence.  Do not launch a second model call merely
+        # because the user asked to fetch something; reserve LLM-led taste
+        # extraction for explicit preference language (for example, "I love
+        # Silo, download the latest season").  This avoids invisible background
+        # contention after routine download turns while preserving nuanced taste
+        # interpretation when the user actually expresses one.
         return any(term in text for term in self._TRIGGER_TERMS)
 
     async def _extract_with_llm(

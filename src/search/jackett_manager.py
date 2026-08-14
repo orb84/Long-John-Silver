@@ -1327,7 +1327,7 @@ class JackettManager:
                     result["post_bootstrap_diagnostics_error"] = str(exc)
         return result
 
-    async def bootstrap_public_indexer_files(self, profile: str = "all_open_public", catalogue_configurer=None) -> dict:
+    async def bootstrap_public_indexer_files(self, profile: str = "all_open_public", catalogue_configurer: object | None = None) -> dict:
         """Directly seed LJS-managed public Jackett indexer files.
 
         This is a compatibility fallback for Jackett builds where the Torznab

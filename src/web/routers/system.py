@@ -18,6 +18,7 @@ from src.core.models import ActionCommand, ActionSource
 from src.integrations.trakt import TraktClient
 from src.integrations.trakt_defaults import resolve_trakt_client_id, trakt_redirect_uri_for_client, is_bundled_trakt_client_id
 from src.web.dependencies import WebDependencies, verify_auth
+from src.web.llm_diagnostics import LLMDiagnosticLogReader
 
 
 class SystemRouter:
@@ -43,6 +44,7 @@ class SystemRouter:
 
     def __init__(self, deps: WebDependencies) -> None:
         self._deps = deps
+        self._llm_log_reader = LLMDiagnosticLogReader()
 
     async def _execute_action(self, name: str, arguments: dict) -> dict:
         """Execute an action through the gateway and return the data dict.
@@ -63,6 +65,9 @@ class SystemRouter:
         """Build and return an APIRouter with system and infrastructure endpoints."""
         router = APIRouter()
         router.add_api_route("/api/system/logs", self._get_logs, methods=["GET"])
+        router.add_api_route("/api/system/llm-activity", self._get_llm_activity, methods=["GET"])
+        router.add_api_route("/api/system/llm-activity/{call_id}", self._get_llm_activity_detail, methods=["GET"])
+        router.add_api_route("/api/system/llm-logs", self._get_llm_logs, methods=["GET"])
         router.add_api_route("/api/races", self._get_race_status, methods=["GET"])
         router.add_api_route("/api/races/{download_id}", self._get_race_detail, methods=["GET"])
         router.add_api_route("/api/browser/health", self._browser_health, methods=["GET"])
@@ -108,6 +113,48 @@ class SystemRouter:
         router.add_api_route("/api/comms/whatsapp/webhook", self._whatsapp_webhook_verify, methods=["GET"])
         router.add_api_route("/api/comms/whatsapp/webhook", self._whatsapp_webhook_receive, methods=["POST"])
         return router
+
+    async def _get_llm_activity(
+        self,
+        limit: int = Query(20, ge=1, le=40),
+        include_context: bool = Query(False),
+        _auth: bool = Depends(verify_auth),
+    ):
+        """Return bounded task-aware LLM call telemetry for the local dashboard."""
+        monitor = self._deps.llm_activity_monitor
+        if monitor is None:
+            return {"ok": True, "active_count": 0, "active": [], "last_call": None, "calls": []}
+        return monitor.snapshot(limit=limit, include_context=include_context)
+
+    async def _get_llm_activity_detail(
+        self,
+        call_id: str,
+        _auth: bool = Depends(verify_auth),
+    ):
+        """Return one call including the exact messages and tool schemas sent."""
+        monitor = self._deps.llm_activity_monitor
+        detail = monitor.detail(call_id) if monitor is not None else None
+        if detail is None:
+            raise HTTPException(status_code=404, detail="LLM activity call not found")
+        return {"ok": True, "call": detail}
+
+    async def _get_llm_logs(
+        self,
+        source: str = Query(
+            "context",
+            pattern="^(context|responses|routing|application)$",
+        ),
+        lines: int = Query(400, ge=1, le=2000),
+        _auth: bool = Depends(verify_auth),
+    ):
+        """Return one bounded, secret-redacted LLM diagnostic log source."""
+        try:
+            return self._llm_log_reader.read(source, lines)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Failed to read LLM diagnostics log")
+            raise HTTPException(status_code=500, detail=f"Failed to read LLM diagnostics: {exc}") from exc
 
     async def _get_logs(
         self,

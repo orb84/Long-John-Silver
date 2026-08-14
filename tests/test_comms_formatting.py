@@ -45,6 +45,7 @@ class TestAssistantPlatformFormatting:
         assistant = AIAssistant(deps)
         assistant._conversation_binding = MagicMock()
         assistant._conversation_binding.build_context_messages = AsyncMock(return_value=[])
+        assistant._conversation_binding.build_intent_routing_context = AsyncMock(return_value="")
         assistant._conversation_binding.record_turn = AsyncMock()
 
         ctx = await assistant._prepare_execution_context(
@@ -82,6 +83,7 @@ class TestAssistantPlatformFormatting:
         assistant = AIAssistant(deps)
         assistant._conversation_binding = MagicMock()
         assistant._conversation_binding.build_context_messages = AsyncMock(return_value=[])
+        assistant._conversation_binding.build_intent_routing_context = AsyncMock(return_value="")
         assistant._conversation_binding.record_turn = AsyncMock()
 
         ctx = await assistant._prepare_execution_context(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import re
 from typing import Any, Literal, Optional
@@ -245,7 +245,7 @@ class SecurityAuditEvent(BaseModel):
     """Append-only audit event for security-relevant operations."""
 
     event_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     actor: str = "system"
     source: str = "system"
     action_name: str

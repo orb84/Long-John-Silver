@@ -35,7 +35,7 @@ from src.core.models import (
 from src.integrations.category_metadata import CategoryMetadataResolver
 
 if TYPE_CHECKING:
-    from src.core.models import Settings
+    from src.core.models import GenericMediaItem, Settings
 
 
 _YEAR_RE = re.compile(r"(?:^|\D)(?P<year>19\d{2}|20\d{2})(?:\D|$)")
@@ -83,6 +83,47 @@ class DefinitionBackedCategory(CategoryMedia):
     def definition(self) -> dict[str, Any]:
         """Return the effective category definition backing this instance."""
         return dict(self._definition)
+
+    async def identify_agent_item(
+        self,
+        name: str,
+        *,
+        settings: "Settings",
+        db: Any | None = None,
+        metadata_clients: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return definition-owned metadata evidence for an unknown title."""
+        if not self.metadata_provider_names:
+            return []
+        resolver = CategoryMetadataResolver(self, settings, db=db)
+        try:
+            payload = await resolver.resolve(name, limit=3)
+        except Exception as exc:
+            logger.debug(
+                "Definition category {} identity probe failed for {!r}: {}",
+                self.category_id,
+                name,
+                exc,
+            )
+            return []
+        evidence: list[dict[str, Any]] = []
+        for row in payload.get("results") or []:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()
+            if not title:
+                continue
+            provider_score = max(0.0, float(row.get("score") or 0.0))
+            evidence.append({
+                "category_id": self.category_id,
+                "title": title,
+                "source": str(row.get("provider") or "category_metadata"),
+                "base_score": min(0.28, max(0.12, provider_score * 0.25)),
+                "external_id": str(row.get("stable_id") or ""),
+                "year": str(row.get("year") or "")[:4] or None,
+                "evidence": [],
+            })
+        return evidence
 
     def _section(self, name: str) -> dict[str, Any]:
         """Return one definition section as a mapping."""
@@ -246,7 +287,7 @@ class DefinitionBackedCategory(CategoryMedia):
         # video-oriented global QualityProfile.  Music/books/audio do not.
         return "preferred_resolution" in profile
 
-    def create_item(self, key: str, **kwargs: Any):
+    def create_item(self, key: str, **kwargs: Any) -> "GenericMediaItem":
         """Create a neutral item for this definition-backed category.
 
         GenericMediaItem historically carries English/1080p video defaults.

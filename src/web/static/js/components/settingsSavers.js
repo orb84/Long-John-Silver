@@ -6,13 +6,14 @@
  */
 
 async function saveLLM() {
-    const data = {
-        provider: document.getElementById('provider-select').value,
-        model: document.getElementById('model').value.trim(),
-        api_base: document.getElementById('api_base').value.trim() || null,
-    };
-    await APIClient.post('/api/settings/llm', data);
-    toast.show('Default LLM saved');
+    const result = await saveLLMRouting({
+        applyBaseToAll: !!((document.getElementById('llm-apply-base-all') || {}).checked),
+    });
+    const cancelled = Number(result.cancelled_old_route_calls || 0);
+    toast.show(cancelled
+        ? `LLM routing saved. ${cancelled} active old-model call(s) stopped; resend the request.`
+        : 'LLM routing saved and verified.');
+    await renderLegacyEffectiveLLMRoutes(result);
 }
 
 /**
@@ -23,6 +24,20 @@ async function saveLLM() {
  * function directly from event handlers.
  */
 async function saveTiers() {
+    const result = await saveLLMRouting({ applyBaseToAll: false });
+    toast.show('Tier routing saved and verified.');
+    await renderLegacyEffectiveLLMRoutes(result);
+}
+
+/**
+ * Persist base and tier routes in one transaction.
+ *
+ * The standalone settings page used to save the base model and tiers through
+ * two separate requests. That allowed an old lightweight route to overwrite a
+ * newly selected base model a second later. Both controls now share the same
+ * authoritative mutation used by the in-app Compass panel.
+ */
+async function saveLLMRouting(options) {
     const tiers = {};
     for (const tier of ['lightweight', 'standard', 'heavy']) {
         var modelEl = document.getElementById('tier-' + tier + '-model');
@@ -32,8 +47,49 @@ async function saveTiers() {
         var provider = providerEl ? providerEl.value : '';
         tiers[tier] = { model: model || null, provider: provider || null };
     }
-    await APIClient.post('/api/settings/tiers', tiers);
-    toast.show('Tiers saved');
+    return APIClient.post('/api/settings/llm', {
+        provider: (document.getElementById('provider-select') || {}).value || '',
+        model: ((document.getElementById('model') || {}).value || '').trim(),
+        api_base: (((document.getElementById('api_base') || {}).value || '').trim() || null),
+        tiers: tiers,
+        apply_base_to_all: !!(options && options.applyBaseToAll),
+    });
+}
+
+/** Render the server-resolved task routes on the legacy settings page. */
+async function renderLegacyEffectiveLLMRoutes(routeSummary) {
+    const root = document.getElementById('legacy-effective-llm-routes');
+    if (!root) return;
+    let summary = routeSummary;
+    if (!summary || !Array.isArray(summary.routes)) {
+        const data = await APIClient.get('/api/settings');
+        summary = data.llm_routing || { config_revision: 0, routes: [] };
+    }
+    const routes = Array.isArray(summary.routes) ? summary.routes.filter(route => route.model) : [];
+    root.replaceChildren();
+    root.appendChild(DOM.el('div', { className: 'llm-route-summary-heading' }, [
+        DOM.el('strong', {}, ['Effective routing']),
+        DOM.el('span', {}, [`revision ${summary.config_revision || 0}`]),
+    ]));
+    routes.forEach(route => {
+        root.appendChild(DOM.el('div', { className: 'llm-route-row' }, [
+            DOM.el('span', { className: 'llm-route-task' }, [String(route.task || 'task').replaceAll('_', ' ')]),
+            DOM.el('span', { className: 'llm-route-model', title: route.model || '' }, [route.model || 'disabled']),
+            DOM.el('span', { className: 'llm-route-source' }, [route.source || 'global']),
+        ]));
+    });
+}
+
+/** Mark a changed base provider/model as the intended route for every task. */
+function markLegacyBaseRouteAuthoritative() {
+    const checkbox = document.getElementById('llm-apply-base-all');
+    if (checkbox) checkbox.checked = true;
+}
+
+/** Mark explicit tier editing so the next save preserves tier ownership. */
+function markLegacyTierRoutesActive() {
+    const checkbox = document.getElementById('llm-apply-base-all');
+    if (checkbox) checkbox.checked = false;
 }
 
 /**
@@ -291,3 +347,12 @@ async function configureJackettCustomIndexerLegacy() {
 }
 
 document.addEventListener('DOMContentLoaded', loadJackettIndexersLegacy);
+
+// The standalone /settings page is a separate UI surface from the in-app
+// Compass panel. Hydrate its authoritative route table as soon as this shared
+// script is loaded; on other pages the missing root makes this a no-op.
+if (document.getElementById('legacy-effective-llm-routes')) {
+    renderLegacyEffectiveLLMRoutes().catch(function(error) {
+        console.error('[Settings] Could not load effective LLM routes:', error);
+    });
+}

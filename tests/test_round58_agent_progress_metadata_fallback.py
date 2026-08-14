@@ -8,6 +8,7 @@ from src.ai.plan_executor import PlanExecutor
 from src.ai.tool_executor import ToolCallExecutor
 from src.ai.tools.research import MetadataLookupTool
 from src.core.models import AgentPlan, Intent, PlanStep, ToolExecutionContext
+from src.ai.tool_registry import ToolDefinition
 
 
 class FakeToolRegistry:
@@ -21,7 +22,17 @@ class FakeToolRegistry:
     def get_definitions(self, allowed_tool_names):
         return [{"name": name} for name in allowed_tool_names]
 
-    async def execute(self, name, arguments):
+    def get_tool_definition(self, name):
+        if name not in self._handlers:
+            return None
+        return ToolDefinition(
+            name=name,
+            description="test tool",
+            parameters={"type": "object", "additionalProperties": True},
+            handler=self._handlers[name],
+        )
+
+    async def execute(self, name, arguments, context=None):
         self.calls.append((name, dict(arguments)))
         return await self._handlers[name](arguments)
 
@@ -113,12 +124,13 @@ async def test_metadata_lookup_uses_persisted_library_snapshot_without_external_
 def test_appdeck_owns_voyage_log_refresh_after_dashboard_split():
     app_js = open("src/web/static/js/app.js", encoding="utf-8").read()
     assert "window.refreshLogs = () => this._refreshVoyageLogs();" in app_js
-    assert "/api/system/logs?lines=160" in app_js
+    assert "this._voyageLogLineLimit = 160" in app_js
+    assert "/api/system/logs?lines=${this._voyageLogLineLimit}" in app_js
     assert "voyage-log-line" in app_js
 
 
-def test_websocket_chat_sends_immediate_status_before_wait_loop():
+def test_websocket_chat_forwards_shared_runner_status_events():
     app_py = open("src/web/app.py", encoding="utf-8").read()
-    initial_send = app_py.index('await websocket.send_json({"type": "status", "content": initial_content})')
-    wait_loop = app_py.index('while True:')
-    assert initial_send < wait_loop
+    assert "async for event in runner.run_events(request)" in app_py
+    assert 'await websocket.send_json({"type": event.type, "content": event.content})' in app_py
+    assert "await _stream_chat_with_progress(websocket, deps, message, session_id)" in app_py

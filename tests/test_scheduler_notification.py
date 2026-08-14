@@ -112,7 +112,7 @@ async def test_stalled_download_notification_formatting():
     msg_body = args[0]
     title = kwargs.get("title")
 
-    assert title == "Stalled Download Detected"
+    assert title == "Stalled Download Alternatives"
     
     # The message must contain real newline characters (\n)
     assert "\n" in msg_body
@@ -121,6 +121,8 @@ async def test_stalled_download_notification_formatting():
     assert "\\n" not in msg_body
 
     # Verify formatting structure is intact
-    assert "I found these alternative options. Reply with a number to try adding one of them:" in msg_body
+    assert "I found possible alternatives, but I did not replace anything automatically." in msg_body
+    assert "The parked torrent will be tested again later" in msg_body
+    assert "Alternatives:" in msg_body
     assert "Project.Hail.Mary.S01E01.1080p.WEBDL-CYBER (2.3 GB, 25 seeders)" in msg_body
     assert "Project.Hail.Mary.S01E01.720p.WEBDL-CYBER (1.2 GB, 5 seeders)" in msg_body

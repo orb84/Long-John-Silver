@@ -21,5 +21,5 @@ def test_open_access_password_skip_is_consistent_with_validation() -> None:
     """Skipping the password should warn, not block setup completion."""
     router = Path("src/web/routers/setup.py").read_text()
     assert '"id": "web_password"' in router
-    assert 'warnings.append({' in router
+    assert 'add_warning({' in router
     assert 'missing.append({"id": "web_password"' not in router

@@ -71,8 +71,14 @@ class TestConversationManager:
             await conversation_manager.add_turn(session_id, "user", f"Message {i}")
 
         messages = await conversation_manager.get_context(session_id, max_turns=5)
-        # Should return at most 5 turns (limited by DB query)
-        assert len(messages) <= 5
+        # The raw recent slice is limited to five turns. Older history may
+        # additionally appear as one explicit compressed system packet.
+        raw_messages = [
+            message for message in messages
+            if not str(message.get("content") or "").startswith("COMPRESSED PAST CONVERSATION CONTEXT:")
+        ]
+        assert len(raw_messages) <= 5
+        assert messages[-5:] == raw_messages[-5:]
 
     @pytest.mark.asyncio
     async def test_clear_session_removes_history(

@@ -77,9 +77,15 @@ class _SystemDB:
         return len(self._turns)
 
 
+class _UsersDB:
+    async def ensure_session(self, session_id: str, **kwargs):
+        return {"id": session_id, "user_id": kwargs.get("user_id") or "local"}
+
+
 class _DB:
     def __init__(self, turns: list[dict]) -> None:
         self.system = _SystemDB(turns)
+        self.users = _UsersDB()
 
 
 async def _conversation_context() -> list[dict]:

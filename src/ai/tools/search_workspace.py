@@ -8,6 +8,8 @@ category-provided candidate annotations.
 
 from __future__ import annotations
 
+TOOL_PROVIDER_MODULE = False
+
 import json
 from typing import Any
 
@@ -22,6 +24,7 @@ class SearchWorkspaceNumbers:
 
     @staticmethod
     def safe_int(value: Any) -> int:
+        """Convert a loosely typed value to an integer without raising."""
         try:
             return int(value or 0)
         except (TypeError, ValueError):
@@ -29,6 +32,7 @@ class SearchWorkspaceNumbers:
 
     @staticmethod
     def safe_float(value: Any) -> float:
+        """Convert a loosely typed value to a float without raising."""
         try:
             return float(value or 0.0)
         except (TypeError, ValueError):
@@ -40,6 +44,7 @@ class SearchWorkspaceFormatter:
 
     @staticmethod
     def format_size(size_bytes: int | None) -> str | None:
+        """Format a byte count as a compact human-readable size."""
         if not size_bytes:
             return None
         units = [(1024 ** 3, "GB"), (1024 ** 2, "MB"), (1024, "KB")]
@@ -56,6 +61,7 @@ class SearchWorkspaceFormatter:
         result_set_id: str = "",
         limit: int = 12,
     ) -> list[dict[str, Any]]:
+        """Return a bounded LLM-facing projection of Soulseek candidates."""
         compact: list[dict[str, Any]] = []
         for raw in (candidates or [])[:limit]:
             if not isinstance(raw, dict):
@@ -95,6 +101,7 @@ class SearchWorkspaceFormatter:
 
     @staticmethod
     def best_soulseek_candidate_id(candidates: list[dict[str, Any]]) -> str:
+        """Return the strongest queueable Soulseek candidate identifier."""
         if not candidates:
             return ""
         folders = [c for c in candidates if isinstance(c, dict) and c.get("candidate_type") == "folder"]
@@ -104,6 +111,7 @@ class SearchWorkspaceFormatter:
 
     @classmethod
     def candidate_picker_rows(cls, candidates: list[dict[str, Any]], limit: int = 60) -> list[dict[str, Any]]:
+        """Build compact candidate rows for user or model selection."""
         rows: list[dict[str, Any]] = []
         for c in candidates[: max(0, int(limit))]:
             candidate_id = c.get("candidate_id")
@@ -118,6 +126,9 @@ class SearchWorkspaceFormatter:
             }
             optional_keys = (
                 "languages",
+                "language_preference_status",
+                "language_evidence",
+                "selective_queue",
                 "resolution",
                 "per_episode_size",
                 "estimated_bitrate_kbps",
@@ -159,6 +170,7 @@ class SearchArgumentConstraints:
 
     @staticmethod
     def from_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+        """Parse normalized search constraints from tool arguments."""
         constraints: dict[str, Any] = {}
         for key in ("target_size_gb", "max_size_gb", "min_size_gb", "current_size_gb"):
             value = arguments.get(key)
@@ -184,12 +196,21 @@ class SearchArgumentConstraints:
             value = str(arguments.get(key) or "").strip()
             if value:
                 constraints[key] = value
+        unit_scope = str(arguments.get("unit_scope") or "").strip().lower()
+        if unit_scope in {"available_units", "missing_units", "all_units"}:
+            constraints["unit_scope"] = unit_scope
         for key in ("smaller_than_current", "preserve_resolution"):
             if arguments.get(key) is not None:
                 constraints[key] = bool(arguments.get(key))
         if constraints.get("smaller_than_current") and not constraints.get("size_mode"):
             constraints["size_mode"] = "smaller"
-        if constraints and "preserve_resolution" not in constraints:
+        quality_keys = {
+            "target_size_gb", "max_size_gb", "min_size_gb", "current_size_gb",
+            "target_bitrate_kbps", "preferred_bitrate_kbps", "max_bitrate_kbps",
+            "current_bitrate_kbps", "preferred_resolution", "required_resolution",
+            "smaller_than_current", "size_mode",
+        }
+        if quality_keys.intersection(constraints) and "preserve_resolution" not in constraints:
             constraints["preserve_resolution"] = True
         return constraints
 
@@ -201,15 +222,18 @@ class CandidateBundlePolicy:
 
     @staticmethod
     def requested_bundle_coverage(candidate: dict[str, Any]) -> str:
+        """Return the normalized requested coverage for a bundle candidate."""
         return str(candidate.get("requested_bundle_coverage") or candidate.get("requested_season_coverage") or "")
 
     @classmethod
     def covers_full_requested_bundle(cls, candidate: dict[str, Any]) -> bool:
+        """Return whether a candidate covers every requested logical unit."""
         coverage = cls.requested_bundle_coverage(candidate)
         return not coverage or coverage in {"full_requested_bundle", "full_requested_season"}
 
     @classmethod
     def is_bundle(cls, candidate: dict[str, Any]) -> bool:
+        """Return whether a candidate represents more than one logical unit."""
         granularity = str((candidate.get("unit_descriptor") or {}).get("granularity") or "").lower()
         return bool(
             candidate.get("is_bundle")
@@ -220,6 +244,7 @@ class CandidateBundlePolicy:
 
     @staticmethod
     def logical_unit_key(candidate: dict[str, Any]) -> str:
+        """Return the stable logical-unit identity used for grouping candidates."""
         descriptor = candidate.get("unit_descriptor") if isinstance(candidate.get("unit_descriptor"), dict) else {}
         for key in ("stable_key", "sort_key", "label"):
             value = descriptor.get(key)
@@ -232,6 +257,7 @@ class CandidateBundlePolicy:
 
     @classmethod
     def quality_scope_key(cls, candidate: dict[str, Any]) -> tuple[str, str]:
+        """Return the stable comparison scope used for quality alternatives."""
         if cls.is_bundle(candidate):
             return ("bundle", cls.logical_unit_key(candidate))
         return ("unit", cls.logical_unit_key(candidate))
@@ -248,31 +274,37 @@ class SelectionPolicyAnnotator:
         preferred_language: str | None = None,
         language_is_explicit: bool = False,
     ) -> None:
+        """Attach deterministic eligibility and queue-safety facts to candidates."""
         preferred = LanguageTokenPolicy.canonical_token(preferred_language) if preferred_language else ""
         for candidate in candidates:
             warnings: list[str] = list(candidate.get("selection_warnings") or [])
-            blockers: list[str] = list(candidate.get("selection_blockers") or [])
+            soft_blockers: list[str] = list(candidate.get("manual_confirmation_reasons") or [])
+            hard_blockers: list[str] = list(candidate.get("hard_queue_blockers") or [])
             seeders = SearchWorkspaceNumbers.safe_int(candidate.get("seeders"))
             candidate["availability_seeders"] = seeders
             if seeders <= 0:
-                blockers.append("no seeder count reported")
+                soft_blockers.append("no seeder count reported")
             elif seeders < 5:
-                blockers.append(f"very low seeders ({seeders})")
+                soft_blockers.append(f"very low seeders ({seeders})")
             elif seeders < 10:
                 warnings.append(f"low seeders ({seeders})")
 
             if preferred:
-                cls._annotate_language(candidate, preferred, preferred_language, language_is_explicit, warnings, blockers)
+                cls._annotate_language(
+                    candidate, preferred, preferred_language, language_is_explicit,
+                    warnings, hard_blockers,
+                )
             elif "language_preference_status" not in candidate:
                 candidate["language_preference_status"] = "not_applicable"
 
             bundle_context = candidate.get("bundle_context") or {}
             if isinstance(bundle_context, dict) and bundle_context.get("selective_download_required"):
-                reason = str(bundle_context.get("selective_download_reason") or bundle_context.get("inspection_required_reason") or "contains extra category units; inspect/select only the requested files before queueing")
-                warnings.append(reason)
-                blockers.append("requires selective file inspection before queueing")
+                cls._annotate_selective_queue(candidate, bundle_context, warnings, hard_blockers)
 
+            blockers = [*hard_blockers, *soft_blockers]
             candidate["selection_warnings"] = warnings
+            candidate["manual_confirmation_reasons"] = soft_blockers
+            candidate["hard_queue_blockers"] = hard_blockers
             candidate["selection_blockers"] = blockers
             if blockers:
                 candidate["auto_queue_allowed"] = False
@@ -280,6 +312,57 @@ class SelectionPolicyAnnotator:
             else:
                 candidate["auto_queue_allowed"] = True
                 candidate["auto_queue_blocked_reason"] = ""
+
+    @staticmethod
+    def narrow_to_explicit_language_evidence(
+        candidates: list[dict[str, Any]], *, language_is_explicit: bool
+    ) -> list[dict[str, Any]]:
+        """Hide unknown/mismatched rows once explicit requested-language rows exist.
+
+        Unknown-language releases are useful fallback evidence only while no
+        release explicitly advertises the requested language.  Presenting them
+        beside verified requested-language releases invites the LLM to recommend
+        a candidate that violates the user's clearest constraint.
+        """
+        if not language_is_explicit:
+            return candidates
+        preferred = [
+            candidate for candidate in candidates
+            if str(candidate.get("language_preference_status") or "").startswith("preferred")
+        ]
+        return preferred or candidates
+
+    @staticmethod
+    def _annotate_selective_queue(
+        candidate: dict[str, Any],
+        bundle_context: dict[str, Any],
+        warnings: list[str],
+        blockers: list[str],
+    ) -> None:
+        """Apply a category-published selective queue capability verdict."""
+        policy = bundle_context.get("selective_queue_policy")
+        policy = policy if isinstance(policy, dict) else {}
+        status = str(policy.get("status") or "requires_inspection").strip().lower()
+        reason = str(
+            policy.get("reason")
+            or bundle_context.get("selective_download_reason")
+            or bundle_context.get("inspection_required_reason")
+            or "bundle selection capability was not confirmed by the owning category"
+        )
+        candidate["selective_queue"] = {
+            key: value for key, value in {
+                "required": True,
+                "status": status,
+                "mode": policy.get("mode"),
+                "target_scope": policy.get("target_scope"),
+                "reason": reason,
+            }.items() if value not in (None, "", [], {})
+        }
+        if status == "supported":
+            warnings.append(reason)
+            return
+        warnings.append(reason)
+        blockers.append("owning category requires torrent-file inspection before this bundle can be queued")
 
     @staticmethod
     def _annotate_language(
@@ -290,6 +373,7 @@ class SelectionPolicyAnnotator:
         warnings: list[str],
         blockers: list[str],
     ) -> None:
+        """Annotate advertised language evidence without promoting preference to fact."""
         languages = candidate.get("languages") or []
         if isinstance(languages, str):
             languages = [languages]
@@ -297,29 +381,54 @@ class SelectionPolicyAnnotator:
         title = str(candidate.get("title") or "")
         title_has_preferred = LanguageTokenPolicy.title_has_language_token(title, preferred)
         multi = "multi" in normalized or LanguageTokenPolicy.title_has_multi_language_signal(title)
-        if normalized and preferred not in normalized and not multi and not title_has_preferred:
-            candidate["language_preference_status"] = "mismatch"
-            blockers.append(f"does not advertise preferred media language {preferred_language}")
-        elif preferred == "english" and normalized and preferred in normalized:
+        candidate["language_evidence"] = {
+            "advertised_languages": sorted(normalized),
+            "preferred_language": preferred_language,
+            "preference_is_release_evidence": False,
+            "source": "release_title_or_provider_fields" if normalized or title_has_preferred or multi else "none",
+        }
+        preferred_is_advertised = preferred in normalized or title_has_preferred
+        if preferred_is_advertised:
             extras = {lang for lang in normalized if lang not in {preferred, "multi"}}
-            if extras or multi:
+            if preferred == "english" and (extras or multi):
                 candidate["language_preference_status"] = "preferred_with_extra_audio"
+                candidate["language_evidence"]["status"] = "advertised_preferred_with_extra_audio"
                 warnings.append(
                     "advertises extra non-preferred audio languages; keep as fallback behind preferred-only or unknown-language candidates"
                 )
+            elif title_has_preferred and preferred not in normalized:
+                candidate["language_preference_status"] = "preferred_by_title"
+                candidate["language_evidence"]["status"] = "advertised_preferred"
             else:
                 candidate["language_preference_status"] = "preferred_only"
-        elif not normalized and not title_has_preferred:
-            candidate["language_preference_status"] = "unknown_acceptable"
-            message = f"language not advertised; preferred media language is {preferred_language}"
+                candidate["language_evidence"]["status"] = "advertised_preferred"
+        elif multi:
+            candidate["language_preference_status"] = "multi_language_unverified"
+            candidate["language_evidence"]["status"] = "advertised_multi_language_unverified"
+            message = (
+                f"release advertises multiple languages but does not specifically advertise {preferred_language}; "
+                "MULTI is not proof that the requested audio language is present"
+            )
             if language_is_explicit and preferred != "english":
                 blockers.append(message)
             else:
                 warnings.append(message)
-        elif title_has_preferred:
-            candidate["language_preference_status"] = "preferred_by_title"
-        elif multi:
-            candidate["language_preference_status"] = "multi_language_fallback"
+        elif normalized:
+            candidate["language_preference_status"] = "mismatch"
+            candidate["language_evidence"]["status"] = "advertised_mismatch"
+            blockers.append(f"does not advertise preferred media language {preferred_language}")
+        else:
+            candidate["language_preference_status"] = "unknown"
+            candidate["language_evidence"]["status"] = "not_advertised"
+            message = (
+                f"language is not advertised; {preferred_language} is only the configured preference, "
+                "not evidence about this release"
+            )
+            if language_is_explicit and preferred != "english":
+                blockers.append(message)
+            else:
+                warnings.append(message)
+
 
 
 class SearchQualityChoicePolicy:
@@ -327,6 +436,7 @@ class SearchQualityChoicePolicy:
 
     @classmethod
     def evaluate(cls, candidates: list[dict[str, Any]], constraints: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Evaluate whether quality trade-offs require an explicit user choice."""
         constraints = constraints or {}
         if any(constraints.get(k) for k in ("target_bitrate_kbps", "preferred_bitrate_kbps", "max_bitrate_kbps", "current_bitrate_kbps")):
             return {"requires_user_choice": False, "reason": "bitrate preference already supplied"}
@@ -375,6 +485,7 @@ class SearchQualityChoicePolicy:
         language_relevant: bool = True,
         use_global_quality_profile: bool = True,
     ) -> tuple:
+        """Return a deterministic score for batch recommendation ordering."""
         if language_relevant:
             languages = candidate.get("languages") or []
             normalized_languages = LanguageTokenPolicy.canonical_tokens(languages)
@@ -427,6 +538,7 @@ class SearchQualityChoicePolicy:
         batch_recommendation: dict[str, Any] | None,
         search_scope: str | None,
     ) -> list[str]:
+        """Return candidate IDs included in the aggregate size estimate."""
         if batch_recommendation and batch_recommendation.get("candidate_ids"):
             return [str(cid) for cid in batch_recommendation.get("candidate_ids") or [] if cid]
         if SearchScopePolicy.is_bundle_scope(search_scope):
@@ -439,6 +551,7 @@ class SearchQualityChoicePolicy:
 
     @staticmethod
     def estimated_total_size_bytes(candidates: list[dict[str, Any]], selected_ids: list[str]) -> int:
+        """Estimate the total bytes represented by selected candidates."""
         if not selected_ids:
             return 0
         wanted = {str(cid) for cid in selected_ids}
@@ -607,8 +720,10 @@ class SearchQualityChoicePolicy:
         return {
             "preferred_only": 5,
             "preferred_by_title": 5,
-            "unknown_acceptable": 4,
+            "unknown_acceptable": 4,  # legacy compatibility
+            "unknown": 4,
             "preferred_with_extra_audio": 3,
+            "multi_language_unverified": 2,
             "multi_language_fallback": 2,
             "not_applicable": 1,
             "mismatch": -100,
@@ -642,6 +757,7 @@ class SearchBatchRecommendationBuilder:
         llm_candidate_review: dict[str, Any] | None,
         quality_choice_policy: dict[str, Any] | None,
     ) -> bool:
+        """Return whether a batch recommendation would be unsafe or misleading."""
         if not batch_recommendation:
             return False
         if quality_choice_policy and quality_choice_policy.get("requires_user_choice"):
@@ -669,28 +785,36 @@ class SearchBatchRecommendationBuilder:
         candidates: list[dict[str, Any]],
         category: object | None = None,
         preferred_language: str | None = None,
+        target_unit_labels: list[str] | None = None,
     ) -> dict[str, Any] | None:
+        """Build a deterministic batch recommendation from eligible candidates."""
         if episode is not None:
             return None
         if season is not None and episode is None and not SearchScopePolicy.is_individual_units_only(search_scope):
             for candidate in candidates or []:
-                if CandidateBundlePolicy.is_bundle(candidate):
+                if CandidateBundlePolicy.is_bundle(candidate) and candidate.get("auto_queue_allowed") is not False:
                     return None
         if season is None and SearchScopePolicy.normalize(search_scope) == SearchScopePolicy.DEFAULT:
             return None
-        if SearchScopePolicy.is_bundle_scope(search_scope):
+        if SearchScopePolicy.is_bundle_only(search_scope):
             return None
         if not category or not hasattr(category, "batch_group_for_candidate"):
             return None
 
+        normalized_targets = cls._normalized_unit_labels(target_unit_labels)
         unit_groups: dict[str, dict[str, Any]] = {}
         request_context = {"season": season, "episode": episode, "category_id": category_id, "search_scope": search_scope}
         for c in candidates or []:
+            if c.get("auto_queue_allowed") is False:
+                continue
             group = category.batch_group_for_candidate(c, request_context)
             if not group:
                 continue
             key = str(group.get("key") or "")
             if not key:
+                continue
+            label = str(group.get("label") or key).strip().upper()
+            if normalized_targets and label not in normalized_targets:
                 continue
             unit_groups.setdefault(key, {"group": group, "candidates": []})["candidates"].append(c)
 
@@ -747,6 +871,72 @@ class SearchBatchRecommendationBuilder:
             "queue_download_arguments": queue_args,
         }
 
+    @staticmethod
+    def _normalized_unit_labels(values: list[str] | None) -> set[str]:
+        """Return exact category-published target labels for batch filtering."""
+        return {str(value).strip().upper() for value in (values or []) if str(value).strip()}
+
+
+class SearchWorkspaceCompletionContractBuilder:
+    """Describe whether a clear search result should proceed without a user menu."""
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        response_facts: dict[str, Any],
+        batch_recommendation: dict[str, Any] | None,
+        quality_choice_policy: dict[str, Any] | None,
+        language: str | None,
+    ) -> dict[str, Any]:
+        """Return a category-neutral action contract from structured workspace evidence."""
+        if quality_choice_policy and quality_choice_policy.get("requires_user_choice"):
+            return {
+                "follow_up_required": True,
+                "reason": "quality_choice_required",
+                "action_required": None,
+            }
+        if not batch_recommendation:
+            return {
+                "follow_up_required": True,
+                "reason": "no_complete_multi_unit_recommendation",
+                "action_required": None,
+            }
+        labels = [str(value).strip().upper() for value in (response_facts.get("target_unit_labels") or []) if str(value).strip()]
+        groups = [group for group in (batch_recommendation.get("groups") or []) if isinstance(group, dict)]
+        group_labels = {
+            str(group.get("unit") or "").strip().upper()
+            for group in groups
+            if str(group.get("unit") or "").strip()
+        }
+        group_count = len(groups)
+        target_count = SearchWorkspaceNumbers.safe_int(response_facts.get("target_unit_count"))
+        target_labels = set(labels)
+        complete = bool(
+            target_count > 1
+            and len(target_labels) == target_count
+            and group_count == target_count
+            and group_labels == target_labels
+        )
+        if not complete:
+            return {
+                "follow_up_required": True,
+                "reason": "target_units_not_fully_covered",
+                "action_required": None,
+            }
+        return {
+            "follow_up_required": False,
+            "reason": "all_current_target_units_have_clear_candidates",
+            "action_required": "queue_download",
+            "queue_download_arguments": batch_recommendation.get("queue_download_arguments"),
+            "target_unit_count": target_count or group_count,
+            "target_unit_labels": labels,
+            "language": language,
+            "season_total_episode_count": response_facts.get("season_total_episode_count"),
+            "aired_episode_count": response_facts.get("aired_episode_count"),
+            "season_release_state": response_facts.get("season_release_state"),
+        }
+
 
 class SearchWorkspaceNextActions:
     """Return prompt-safe affordances for a cached torrent result set."""
@@ -760,6 +950,7 @@ class SearchWorkspaceNextActions:
         has_batch: bool,
         quality_choice_policy: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        """Build valid next-action hints for the current candidate workspace."""
         scope = str(search_scope or "").lower()
         actions: list[dict[str, Any]] = []
         if not candidates:
@@ -853,7 +1044,9 @@ class SearchWorkspaceAuditLogger:
         llm_candidate_review: dict[str, Any] | None,
         llm_candidate_review_status: str,
         next_actions_preview: list[dict[str, Any]],
+        response_facts: dict[str, Any] | None = None,
     ) -> None:
+        """Record a sanitized diagnostic summary of a search workspace."""
         recommended_ids = [str(cid) for cid in ((llm_candidate_review or {}).get("recommended_candidate_ids") or []) if cid]
         keep_ids = set(recommended_ids)
         if quality_choice_policy and isinstance(quality_choice_policy.get("candidate_ids"), list):
@@ -870,6 +1063,12 @@ class SearchWorkspaceAuditLogger:
             "language": language,
             "search_scope": search_scope,
             "query_summary": query,
+            "season_total_episode_count": (response_facts or {}).get("season_total_episode_count"),
+            "aired_episode_count": (response_facts or {}).get("aired_episode_count"),
+            "release_frontier_episode": (response_facts or {}).get("release_frontier_episode"),
+            "target_unit_count": (response_facts or {}).get("target_unit_count"),
+            "target_unit_labels": (response_facts or {}).get("target_unit_labels"),
+            "season_release_state": (response_facts or {}).get("season_release_state"),
             "result_set_id": result_set_id,
             "counts": {
                 "raw_candidates_before_tool_cleaning": raw_candidate_count,
@@ -907,6 +1106,9 @@ class SearchWorkspaceAuditLogger:
             "size_bytes": candidate.get("size_bytes"),
             "seeders": candidate.get("seeders"),
             "languages": candidate.get("languages"),
+            "language_preference_status": candidate.get("language_preference_status"),
+            "language_evidence": candidate.get("language_evidence"),
+            "selective_queue": candidate.get("selective_queue"),
             "resolution": candidate.get("resolution"),
             "codec": candidate.get("codec"),
             "per_episode_size": candidate.get("per_episode_size"),

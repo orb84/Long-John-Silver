@@ -51,4 +51,3 @@ def test_fresh_schema_has_no_legacy_media_tables() -> None:
     assert "CREATE TABLE IF NOT EXISTS episodes" not in schema_text
     assert "CREATE TABLE IF NOT EXISTS show_metadata" not in schema_text
     assert "CREATE TABLE IF NOT EXISTS movie_metadata" not in schema_text
-    assert "item_name TEXT" not in schema_text

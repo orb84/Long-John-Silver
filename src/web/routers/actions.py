@@ -37,12 +37,30 @@ class ActionsRouter:
             raise HTTPException(status_code=500, detail='ActionGateway not configured')
         body = await request.json()
         try:
-            command = ActionCommand(**body)
+            if not isinstance(body, dict):
+                raise ValueError("Request body must be a JSON object")
+            name = str(body.get("name") or "").strip()
+            arguments = body.get("arguments") or {}
+            if not name:
+                raise ValueError("Action name is required")
+            if not isinstance(arguments, dict):
+                raise ValueError("Action arguments must be an object")
+            # Provenance and durable identities are server-owned. A browser may
+            # choose the action and its arguments, but it cannot impersonate the
+            # scheduler/system or overwrite command/correlation identifiers.
+            command = ActionCommand(
+                name=name,
+                arguments=arguments,
+                source=ActionSource.UI,
+                user_id="web",
+                session_id="web_actions",
+                actor="authenticated_web_user",
+            )
         except Exception as exc:
             return JSONResponse(
                 status_code=400,
                 content=jsonable_encoder(ActionResult(
-                    ok=False, error=f'Invalid ActionCommand: {exc}',
+                    ok=False, error=f'Invalid action request: {exc}',
                 )),
             )
         result = await gateway.execute(command)

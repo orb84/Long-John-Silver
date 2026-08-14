@@ -23,7 +23,7 @@ def test_setup_exposes_trakt_client_and_account_status_separately() -> None:
     assert 'trakt_client_available' in SETUP_ROUTER
     assert 'trakt_connected' in SETUP_ROUTER
     assert 'trakt_uses_builtin_client' in SETUP_ROUTER
-    assert 'Trakt account linking needs a client ID' in SETUP_ROUTER
+    assert 'missing the bundled public Trakt Client ID' in SETUP_ROUTER
     assert 'linking it enables personalized recommendations' in SETUP_ROUTER
 
 

@@ -17,11 +17,11 @@ from loguru import logger
 class MediaEnquiryService:
     """Resolve a media item to its owning category and run category enquiry.
 
-    The service is intentionally thin: it reads runtime settings, resolves a
-    category through explicit ``category_id``, tracked-item metadata, or the
-    category registry's text resolver, then delegates to the category's
-    ``enquire`` method.  Extensions should add category behavior to the
-    category implementation rather than adding branches to this service.
+    The service is intentionally thin: it reads runtime settings, then asks
+    the evidence-based identity resolver to compare tracked/canonical state and
+    category-owned metadata probes before delegating to the winning category's
+    ``enquire`` method. Vocabulary hints may rank evidence but never authorize
+    discovery. Extensions belong in category hooks, not branches here.
     """
 
     def __init__(self, settings_manager: Any, database: Any, category_registry: Any | None = None) -> None:
@@ -38,14 +38,20 @@ class MediaEnquiryService:
         self._database = database
         self._category_registry = category_registry
 
-    async def enquire(self, item_name: str, category_id: str = "") -> dict[str, Any]:
+    async def enquire(
+        self,
+        item_name: str,
+        category_id: str = "",
+        *,
+        request_text: str | None = None,
+    ) -> dict[str, Any]:
         """Return category-owned status and metadata for one media item.
 
         Args:
             item_name: Human-visible media title or tracked item key.
-            category_id: Optional explicit category id such as ``tv`` or
-                ``movie``.  When absent, tracked settings and category registry
-                text matching are used.
+            category_id: Optional category hint such as ``tv`` or ``movie``.
+                The hint is verified against tracked/canonical state or
+                category-owned metadata before it can authorize enquiry.
 
         Returns:
             A serializable dict produced by the owning category, with stable
@@ -56,11 +62,45 @@ class MediaEnquiryService:
             return validation_error
         normalized_name = str(item_name or "").strip()
         settings = self._settings_manager.settings
-        resolved_category_id = str(category_id or "").strip() or self.infer_category_id(normalized_name, settings)
-        category = self.resolve_category(normalized_name, resolved_category_id, settings)
+        tracked_category_id = self.infer_category_id(normalized_name, settings)
+        from src.core.categories.identity_resolution import CategoryIdentityResolver
+
+        identity = await CategoryIdentityResolver(
+            settings_manager=self._settings_manager,
+            database=self._database,
+            category_registry=self.get_registry(),
+        ).resolve(
+            normalized_name,
+            category_hint=tracked_category_id or str(category_id or "").strip() or None,
+            request_text=request_text,
+        )
+        if not identity.get("resolved"):
+            error_code = "category_ambiguous" if identity.get("status") == "ambiguous" else "category_resolution_required"
+            return {
+                "ok": False,
+                "error": identity.get("reason") or f"Could not resolve a category for '{normalized_name}'.",
+                "error_code": error_code,
+                "item_name": normalized_name,
+                "category_resolution": identity,
+                "clarification_question": identity.get("clarification_question"),
+                "next_actions": [
+                    "Ask the user the clarification_question before searching or queueing.",
+                    "Do not fall back to the abstract media category.",
+                ],
+            }
+        resolved_category_id = str(identity.get("category_id") or "")
+        category = self.get_registry().get(resolved_category_id)
         if not category:
-            return {"error": f"Could not resolve a category for '{normalized_name}'."}
-        return await self._run_category_enquiry(category, normalized_name, resolved_category_id, settings)
+            return {
+                "ok": False,
+                "error": f"Resolved category '{resolved_category_id}' is not installed.",
+                "error_code": "category_resolution_required",
+                "category_resolution": identity,
+            }
+        result = await self._run_category_enquiry(category, normalized_name, resolved_category_id, settings)
+        result.setdefault("ok", "error" not in result)
+        result["category_resolution"] = identity
+        return result
 
     def _validate_dependencies(self, item_name: str) -> dict[str, Any] | None:
         """Return a user-safe error when required enquiry inputs are missing."""
@@ -105,20 +145,21 @@ class MediaEnquiryService:
         return ""
 
     def resolve_category(self, item_name: str, category_id: str, settings: Any) -> Any | None:
-        """Resolve the most appropriate category for an enquiry request.
+        """Resolve only already-authoritative explicit or tracked categories.
 
-        Args:
-            item_name: Media title to resolve.
-            category_id: Optional explicit category id.
-            settings: Runtime settings whose tracked items can guide fallback
-                resolution.
+        This synchronous compatibility seam deliberately does not use router
+        vocabulary. Unknown titles must pass through :meth:`enquire`, whose
+        asynchronous identity resolver can verify category-owned metadata or
+        return a clarification request.
         """
         registry = self.get_registry()
-        if category_id:
-            category = registry.get(category_id)
+        explicit = str(category_id or "").strip()
+        if explicit:
+            category = registry.get(explicit)
             if category:
                 return category
-        return registry.resolve_from_text(item_name, getattr(settings, "tracked_items", []))
+        tracked = self.infer_category_id(str(item_name or "").strip(), settings)
+        return registry.get(tracked) if tracked else None
 
     def get_registry(self) -> Any:
         """Return a category registry, creating the default registry lazily."""

@@ -7,6 +7,7 @@ generic repositories, assistant tools, or scheduler code.
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+import re
 from loguru import logger
 from typing import TYPE_CHECKING
 
@@ -92,7 +93,6 @@ class TMDBMetadataEnricher(MetadataEnricher):
 
     def _truncate_by_year(self, item_name: str) -> str:
         """Truncate item_name at year if present."""
-        import re
         year_match = re.search(r'\b(19\d{2}|20\d{2})\b', item_name)
         if year_match and year_match.start() > 2:
             return item_name[:year_match.start()]

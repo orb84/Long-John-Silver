@@ -35,7 +35,7 @@ class ShipEventBus:
         if self._supervisor:
             self._supervisor.spawn_one_shot(
                 f"broadcast_{event_type}_{hash(str(data)) % 1000000}",
-                self._manager.broadcast(payload),
+                lambda: self._manager.broadcast(payload),
             )
         else:
             asyncio.create_task(self._manager.broadcast(payload))

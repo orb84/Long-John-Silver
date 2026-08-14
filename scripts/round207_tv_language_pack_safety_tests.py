@@ -73,8 +73,9 @@ def test_multi_season_pack_requires_selective_download_and_size_projection() -> 
         "bundle_context": context,
     }]
     SelectionPolicyAnnotator.annotate(candidates, preferred_language="Italian")
-    assert_true(candidates[0]["auto_queue_allowed"] is False, f"selective pack should not be one-click queueable: {candidates[0]!r}")
-    assert_true("requires selective file inspection" in candidates[0]["auto_queue_blocked_reason"], f"missing selective blocker: {candidates[0]!r}")
+    assert_true(candidates[0]["auto_queue_allowed"] is True, f"category-supported selective pack should be queueable: {candidates[0]!r}")
+    assert_true(candidates[0]["selective_queue"]["status"] == "supported", f"missing category selective capability: {candidates[0]!r}")
+    assert_true(not candidates[0]["selection_blockers"], f"supported metadata-time selection should not be a hard blocker: {candidates[0]!r}")
     projected = SearchQualityChoicePolicy.estimated_total_size_bytes(candidates, ["c1"])
     assert_true(projected == 600 * 1024**2 * 10, f"selective size should project requested season only, got {projected}")
 

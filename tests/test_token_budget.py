@@ -132,14 +132,14 @@ class TestToolResultCompaction:
         """Short results should pass through unchanged."""
         result = json.dumps({"title": "Test", "seeders": 5})
         compacted = self.budget.compact_tool_result("search_torrents", result)
-        assert compacted == result
+        assert json.loads(compacted) == json.loads(result)
 
     def test_compact_string_result(self):
         """String results that are too long should be truncated."""
         result = "A" * 10000
         compacted = self.budget.compact_tool_result("some_tool", result, max_chars=100)
         assert len(compacted) < len(result)
-        assert "truncated" in compacted
+        assert "compressed" in compacted.lower()
 
     def test_compact_dict_result(self):
         """Dict results should be JSON-serialized."""
@@ -152,7 +152,7 @@ class TestToolResultCompaction:
         result = "Page content " * 1000
         compacted = self.budget.compact_tool_result("read_web_page", result)
         # Should be truncated to web page max
-        assert "truncated" in compacted
+        assert "compressed" in compacted.lower()
         assert len(compacted) < len(result)
 
     def test_compact_search_torrents_truncates_list(self):

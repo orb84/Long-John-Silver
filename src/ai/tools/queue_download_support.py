@@ -42,6 +42,7 @@ class QueueDownloadRequest:
     selected_source_seeders: int | None
     requested_priority: str
     raw_arguments: dict[str, Any]
+    user_prompt: str = ""
 
     @classmethod
     def from_arguments(cls, arguments: dict[str, Any], context: ToolExecutionContext) -> "QueueDownloadRequest":
@@ -72,6 +73,7 @@ class QueueDownloadRequest:
             selected_source_seeders=arguments.get("source_seeders"),
             requested_priority=str(arguments.get("priority") or "high").lower(),
             raw_arguments=arguments,
+            user_prompt=str(context.user_prompt or "").strip(),
         )
 
     def priority_for_batch_index(self, batch_index: int, total_to_queue: int) -> str:
@@ -256,6 +258,107 @@ class CachedCandidateResolver:
         return None
 
 
+class CachedCandidateQueuePolicy:
+    """Authorize one cached candidate without owning queue side effects.
+
+    Soft confirmation belongs to the exact result-set candidate the user
+    selected. Hard request constraints are never overridable, and operational
+    fallback candidates must satisfy their own policy independently.
+    """
+
+    def authorization_error(
+        self,
+        request: QueueDownloadRequest,
+        candidate: dict[str, Any],
+        cache: dict[str, Any],
+        *,
+        allow_manual_override: bool,
+    ) -> dict[str, Any] | None:
+        """Return a structured policy error, or ``None`` when queueing is allowed."""
+        hard_blockers = [
+            str(value) for value in (candidate.get("hard_queue_blockers") or []) if str(value).strip()
+        ]
+        if hard_blockers:
+            return {
+                "error": "Candidate is blocked by request constraints: " + "; ".join(hard_blockers),
+                "policy_blocked": True,
+                "fallback_eligible": False,
+                "candidate_id": candidate.get("candidate_id"),
+                "title": candidate.get("title"),
+                "languages": candidate.get("languages"),
+            }
+
+        manual_reasons = [
+            str(value) for value in (candidate.get("manual_confirmation_reasons") or []) if str(value).strip()
+        ]
+        explicitly_confirmed = allow_manual_override and bool(request.raw_arguments.get("confirmed"))
+        followup_confirmed = allow_manual_override and self.is_prior_result_set_user_selection(request, cache)
+        if candidate.get("auto_queue_allowed") is not False or not manual_reasons:
+            return None
+        if explicitly_confirmed or followup_confirmed:
+            return None
+        return {
+            "error": "Candidate requires user confirmation before queueing: " + "; ".join(manual_reasons),
+            "confirmation_required": True,
+            "fallback_eligible": False,
+            "candidate_id": candidate.get("candidate_id"),
+            "title": candidate.get("title"),
+            "seeders": candidate.get("seeders"),
+            "languages": candidate.get("languages"),
+            "next_action": (
+                "Present this candidate to the user. If the user selects it in a later turn, "
+                "queue_download may reuse this stable candidate_id; that prior-result-set selection "
+                "is the confirmation of these soft warnings."
+            ),
+        }
+
+    @staticmethod
+    def error_receipt(
+        entry: dict[str, Any],
+        error: str,
+        *,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build a user/report-safe receipt for one failed candidate."""
+        candidate = entry.get("candidate") or {}
+        cache = entry.get("cache_data") or {}
+        result = result or {}
+        return {
+            "candidate_id": str(entry.get("candidate_id") or ""),
+            "season": candidate.get("season", cache.get("season")),
+            "episode": candidate.get("episode", cache.get("episode")),
+            "unit_label": candidate.get("unit_label") or "",
+            "title": candidate.get("title") or "",
+            "source": candidate.get("source") or "",
+            "error": error,
+            "confirmation_required": bool(result.get("confirmation_required")),
+            "policy_blocked": bool(result.get("policy_blocked")),
+            "fallback_eligible": bool(result.get("fallback_eligible")),
+        }
+
+    @staticmethod
+    def queue_result_error(result: object) -> str | None:
+        """Return a tool-safe error if the scheduler did not verify a queueable row."""
+        if not isinstance(result, dict):
+            return "Queue operation returned no structured receipt."
+        if result.get("error"):
+            return str(result.get("error"))
+        if not result.get("download_id"):
+            return "Queue operation returned no verified download_id."
+        if result.get("status") not in {"queued", "already_active"}:
+            return f"Queue operation did not create or expose an active download (status={result.get('status') or 'unknown'})."
+        return None
+
+    @staticmethod
+    def is_prior_result_set_user_selection(request: QueueDownloadRequest, cache: dict[str, Any]) -> bool:
+        """Return whether this queue call follows a displayed user-choice workspace."""
+        if not bool(cache.get("awaiting_user_choice")):
+            return False
+        current = str(request.user_prompt or "").strip()
+        origin = str(cache.get("origin_user_prompt") or "").strip()
+        return bool(current and origin and current != origin)
+
+
 class QueueDownloadService:
     """Coordinate all queue_download side effects through a small public API."""
 
@@ -264,6 +367,7 @@ class QueueDownloadService:
         self._scheduler = scheduler
         self._database = database
         self._priority_parser = DownloadPriorityParser()
+        self._candidate_policy = CachedCandidateQueuePolicy()
         self._categories = getattr(scheduler, "_categories", None)
 
     async def queue(self, arguments: dict[str, Any], context: ToolExecutionContext) -> object:
@@ -324,17 +428,28 @@ class QueueDownloadService:
             seen_ids.add(candidate_id)
             result = await self._queue_one_entry(request, entry, batch_index, total_to_queue)
             if result.get("error"):
-                fallback = await self._queue_fallback_for_failed_entry(
-                    request, entry, seen_ids, batch_index, total_to_queue, result["error"],
+                fallback = None
+                user_selected_exact_candidate = self._candidate_policy.is_prior_result_set_user_selection(
+                    request, entry.get("cache_data") or {}
                 )
+                if result.get("fallback_eligible") is True and not user_selected_exact_candidate:
+                    fallback = await self._queue_fallback_for_failed_entry(
+                        request, entry, seen_ids, batch_index, total_to_queue, result["error"],
+                    )
                 if fallback and not fallback.get("error"):
                     queued.append(fallback)
                 else:
-                    errors.append(self._queue_error_receipt(entry, result["error"]))
+                    errors.append(self._candidate_policy.error_receipt(entry, result["error"], result=result))
             else:
                 queued.append(result)
         if not queued:
-            return {"error": "No candidates were queued.", "errors": errors}
+            response: dict[str, Any] = {"error": "No candidates were queued.", "errors": errors}
+            if errors and all(bool(error.get("confirmation_required")) for error in errors):
+                response["confirmation_required"] = True
+                response["error"] = "The selected candidate still requires user confirmation."
+            if errors and all(bool(error.get("policy_blocked")) for error in errors):
+                response["policy_blocked"] = True
+            return response
         return self._batch_result(queued, errors)
 
     async def _queue_one_entry(
@@ -343,21 +458,36 @@ class QueueDownloadService:
         entry: dict[str, Any],
         batch_index: int,
         total_to_queue: int,
+        *,
+        allow_manual_override: bool = True,
     ) -> dict[str, Any]:
-        """Queue one resolved candidate and return either a receipt or error."""
-        payload = self._candidate_queue_payload(request, entry, batch_index, total_to_queue)
+        """Queue one resolved candidate and return either a receipt or error.
+
+        ``allow_manual_override`` is true only for the candidate(s) the user or
+        deterministic batch contract actually selected.  Operational fallback
+        candidates must satisfy their own automatic policy and must never
+        inherit confirmation of a different low-confidence/low-seeder release.
+        """
+        payload = self._candidate_queue_payload(
+            request, entry, batch_index, total_to_queue,
+            allow_manual_override=allow_manual_override,
+        )
         if payload.get("error"):
-            return {"error": payload["error"]}
+            return dict(payload)
         try:
             result = await self._scheduler.queue_download(**payload["scheduler_kwargs"])
-            validation_error = self._queue_result_error(result)
+            validation_error = self._candidate_policy.queue_result_error(result)
             if validation_error:
-                return {"error": validation_error, "raw_result": result}
+                return {
+                    "error": validation_error,
+                    "raw_result": result,
+                    "fallback_eligible": True,
+                }
             await self._record_candidate_quality_choice(entry, payload)
             return self._queued_entry_receipt(entry, payload["candidate_name"], result, entry["candidate"], payload)
         except Exception as exc:
             logger.error(f"Queue download batch item error for {entry['candidate_id']}: {exc}")
-            return {"error": str(exc)}
+            return {"error": str(exc), "fallback_eligible": True}
 
     async def _record_candidate_quality_choice(self, entry: dict[str, Any], payload: dict[str, Any]) -> None:
         """Persist a per-item bitrate target when the user queues a chosen candidate.
@@ -466,7 +596,10 @@ class QueueDownloadService:
 
             seen_ids.add(alt_id)
             alt_entry = {"candidate_id": alt_id, "candidate": alt, "cache_data": cache}
-            result = await self._queue_one_entry(request, alt_entry, batch_index, total_to_queue)
+            result = await self._queue_one_entry(
+                request, alt_entry, batch_index, total_to_queue,
+                allow_manual_override=False,
+            )
             if not result.get("error"):
                 result["fallback_for_candidate_id"] = original_id
                 result["fallback_reason"] = original_error
@@ -479,33 +612,6 @@ class QueueDownloadService:
                 f"Fallback candidate {alt_id} also failed for failed candidate "
                 f"{original_id}: {result.get('error')}"
             )
-        return None
-
-    def _queue_error_receipt(self, entry: dict[str, Any], error: str) -> dict[str, Any]:
-        """Build a user/report-safe error receipt for one failed candidate."""
-        candidate = entry.get("candidate") or {}
-        cache = entry.get("cache_data") or {}
-        return {
-            "candidate_id": str(entry.get("candidate_id") or ""),
-            "season": candidate.get("season", cache.get("season")),
-            "episode": candidate.get("episode", cache.get("episode")),
-            "unit_descriptor": candidate.get("unit_descriptor") or {},
-            "title": candidate.get("title") or "",
-            "source": candidate.get("source") or "",
-            "error": error,
-        }
-
-
-    def _queue_result_error(self, result: object) -> str | None:
-        """Return a tool-safe error if the scheduler did not verify a queueable row."""
-        if not isinstance(result, dict):
-            return "Queue operation returned no structured receipt."
-        if result.get("error"):
-            return str(result.get("error"))
-        if not result.get("download_id"):
-            return "Queue operation returned no verified download_id."
-        if result.get("status") not in {"queued", "already_active"}:
-            return f"Queue operation did not create or expose an active download (status={result.get('status') or 'unknown'})."
         return None
 
     def _import_context_for_candidate(self, request: QueueDownloadRequest, candidate_name: str, candidate: dict[str, Any], cache: dict[str, Any], season: int | None, episode: int | None, unit_descriptor: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -563,24 +669,29 @@ class QueueDownloadService:
         entry: dict[str, Any],
         batch_index: int,
         total_to_queue: int,
+        *,
+        allow_manual_override: bool = True,
     ) -> dict[str, Any]:
-        """Return scheduler kwargs for a resolved cached candidate."""
+        """Return scheduler kwargs for a resolved cached candidate.
+
+        Manual confirmation is candidate-specific.  It may authorize the
+        explicitly selected cached candidate, but it is never transferred to an
+        alternate candidate attempted after an operational queue failure.
+        """
         candidate = entry["candidate"]
         cache = entry.get("cache_data") or {}
         candidate_name = cache.get("name") or request.name
         if not candidate.get("magnet"):
-            return {"error": "Candidate has no queueable magnet/link"}
-        if candidate.get("auto_queue_allowed") is False and not request.raw_arguments.get("confirmed"):
-            reason = candidate.get("auto_queue_blocked_reason") or "candidate requires user confirmation"
             return {
-                "error": f"Candidate requires user confirmation before queueing: {reason}",
-                "confirmation_required": True,
-                "candidate_id": candidate.get("candidate_id"),
-                "title": candidate.get("title"),
-                "seeders": candidate.get("seeders"),
-                "languages": candidate.get("languages"),
-                "next_action": "Show this candidate and at least one safer alternative, then queue with confirmed=true only if the user explicitly accepts it.",
+                "error": "Candidate has no queueable magnet/link",
+                "fallback_eligible": True,
             }
+
+        policy_error = self._candidate_policy.authorization_error(
+            request, candidate, cache, allow_manual_override=allow_manual_override,
+        )
+        if policy_error:
+            return policy_error
         if not candidate_name:
             return {"error": "Candidate result set has no media item name"}
         unit_descriptor = self._candidate_unit_descriptor(candidate, request, cache)
@@ -626,7 +737,7 @@ class QueueDownloadService:
                 source_seeders=request.selected_source_seeders,
                 import_context=self._import_context_for_direct(request),
             )
-            validation_error = self._queue_result_error(result)
+            validation_error = self._candidate_policy.queue_result_error(result)
             if validation_error:
                 return {"error": validation_error, "raw_result": result}
             return result
@@ -719,6 +830,8 @@ class QueueDownloadService:
             "queue_status": receipt.get("status"),
             "download_status": receipt.get("download_status"),
             "already_existing": bool(receipt.get("already_existing")),
+            "canonical_satisfaction": receipt.get("canonical_satisfaction") or {},
+            "selective_download": receipt.get("selective_download") or candidate.get("selective_queue") or {},
             "name": candidate_name,
             "season": scheduler_kwargs.get("season", candidate.get("season")),
             "episode": scheduler_kwargs.get("episode", candidate.get("episode")),

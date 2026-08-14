@@ -9,6 +9,7 @@ from src.ai.tools.scheduling import SearchMediaTorrentsTool
 from src.core.models import ToolExecutionContext
 from src.core.models import SearchResult
 from src.ai.assistant import AIAssistant
+from src.core.actions.audit import ActionEventStore
 
 class DummySearchAggregator:
     def __init__(self, results):
@@ -77,22 +78,30 @@ async def test_queue_download_resolves_option_index(db):
     scheduler = MagicMock()
     scheduler.queue_download = AsyncMock(return_value={"status": "queued", "download_id": "dl_123"})
     
-    tool = QueueDownloadTool(scheduler=scheduler, database=db)
+    action_store = ActionEventStore(await db.get_connection())
+    tool = QueueDownloadTool(
+        scheduler=scheduler, database=db, action_event_store=action_store
+    )
     context = ToolExecutionContext(session_id="test_session_123")
     
     # Execute the queue tool using option_index
     result = await tool.execute({"option_index": 2, "name": "Interstellar"}, context)
     
     # Verify the scheduler was called with the resolved magnet link
-    assert result == {"status": "queued", "download_id": "dl_123"}
-    scheduler.queue_download.assert_called_once_with(
-        name="Interstellar",
-        magnet="magnet:?xt=urn:btih:interstellar720p",
-        season=None,
-        episode=None,
-        category_id="",
-        estimated_size_bytes=None,
-    )
+    assert result["status"] == "queued"
+    assert result["download_id"] == "dl_123"
+    assert result["command_receipt"]["ok"] is True
+    assert result["command_receipt"]["status"] == "queued"
+    assert result["command_receipt"]["receipt_persisted"] is True
+    scheduler.queue_download.assert_awaited_once()
+    queued = scheduler.queue_download.await_args.kwargs
+    assert queued["name"] == "Interstellar"
+    assert queued["magnet"] == "magnet:?xt=urn:btih:interstellar720p"
+    assert queued["season"] is None
+    assert queued["episode"] is None
+    assert queued["category_id"] == ""
+    assert queued["torrent_title"] == "Interstellar.2014.720p"
+    assert queued["source_seeders"] == 10
 
 
 @pytest.mark.asyncio

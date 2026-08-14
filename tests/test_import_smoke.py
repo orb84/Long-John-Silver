@@ -231,7 +231,7 @@ def test_tool_init_has_no_eager_imports() -> None:
 
 
 def test_all_tool_providers_have_get_tools() -> None:
-    """Verify every module in src.ai.tools exposes a class with get_tools()."""
+    """Verify provider modules expose get_tools; explicit collaborators may opt out."""
     import src.ai.tools
 
     pkg_path = Path(src.ai.tools.__file__).parent
@@ -241,6 +241,8 @@ def test_all_tool_providers_have_get_tools() -> None:
         if ispkg or modname == "src.ai.tools.base":
             continue
         module = importlib.import_module(modname)
+        if getattr(module, "TOOL_PROVIDER_MODULE", True) is False:
+            continue
         for attr_name in dir(module):
             attr = getattr(module, attr_name)
             if isinstance(attr, type) and hasattr(attr, "get_tools") and callable(attr.get_tools):

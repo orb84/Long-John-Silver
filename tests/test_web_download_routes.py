@@ -117,7 +117,7 @@ class TestDownloadQueue:
         settings_mgr = _mock_settings()
         dl = _make_downloader_mock()
         item = _make_download_item(item_id="dl-001", item_name="Test Show", status=DownloadStatus.QUEUED)
-        dl.get_queued_downloads = AsyncMock(return_value=[item])
+        dl.get_active_downloads = AsyncMock(return_value=[item])
         app = _make_app(settings_mgr, auth, downloader=dl)
         client = TestClient(app)
 
@@ -191,7 +191,7 @@ class TestDownloadActions:
         assert resp.status_code == 200
         data = resp.json()
         assert data["id"] == "dl-001"
-        dl.pause_download.assert_awaited_once_with(download_id="dl-001")
+        dl.pause_download.assert_awaited_once_with("dl-001")
 
     def test_pause_missing_download(self, auth_client):
         """Should return 404 when pausing a non-existent download."""
@@ -210,7 +210,7 @@ class TestDownloadActions:
         resp = client.post("/api/downloads/dl-001/resume")
         assert resp.status_code == 200
         assert resp.json()["id"] == "dl-001"
-        dl.resume_download.assert_awaited_once_with(download_id="dl-001")
+        dl.resume_download.assert_awaited_once_with("dl-001")
 
     def test_resume_missing_download(self, auth_client):
         """Should return 404 when resuming a non-existent download."""
@@ -258,7 +258,7 @@ class TestDownloadActions:
         assert resp.status_code == 200
         assert resp.json()["file_index"] == 0
         assert resp.json()["priority"] == 7
-        dl.set_file_priority.assert_awaited_once_with(download_id="dl-001", file_index=0, priority=7)
+        dl.set_file_priority.assert_awaited_once_with("dl-001", 0, 7)
 
     def test_set_file_priority_invalid_index(self, auth_client):
         """Should return 400 when file_index is missing."""
@@ -299,7 +299,7 @@ class TestDownloadActions:
         resp = client.post("/api/downloads/dl-001/restart")
         assert resp.status_code == 200
         assert resp.json()["id"] == "dl-001"
-        dl.restart_download.assert_awaited_once_with(download_id="dl-001")
+        dl.restart_download.assert_awaited_once_with("dl-001")
 
     def test_restart_missing_download(self, auth_client):
         """Should return 404 when restarting a non-existent download."""
@@ -318,7 +318,7 @@ class TestDownloadActions:
         data = resp.json()
         assert data["status"] == "cancelled"
         assert data["download_id"] == "dl-001"
-        dl.cancel_download.assert_awaited_once_with(download_id="dl-001")
+        dl.cancel_download.assert_awaited_once_with("dl-001")
 
     def test_upload_torrent(self, auth_client):
         """POST /api/downloads/upload should add a magnet and return the id."""

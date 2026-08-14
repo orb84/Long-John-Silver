@@ -93,7 +93,7 @@ async def test_get_category_item_details():
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
         mock_get.return_value = mock_response
         
-        details = await client.get_category_item_details("the-bear")
+        details = await client.get_show_details("the-bear")
         
         assert details["title"] == "The Bear"
         assert "shows/the-bear" in mock_get.call_args[0][0]

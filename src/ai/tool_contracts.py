@@ -95,6 +95,12 @@ class ToolContractValidator:
             prop = properties.get(name)
             if not isinstance(prop, dict):
                 continue
+            if value is None and name not in required:
+                # JSON-producing models commonly emit explicit null for an
+                # unset optional field. Optional null means "not supplied",
+                # not a type error that should burn another LLM iteration.
+                args.pop(name, None)
+                continue
             enum_values = prop.get("enum")
             if enum_values and value not in enum_values:
                 return ToolValidationResult(

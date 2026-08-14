@@ -76,6 +76,8 @@ class TestPromptScheduler:
             prompt="test prompt", interval_minutes=10080
         )
         task.last_run_at = datetime.now(timezone.utc)
+        task.next_run_at = None
+        task.due_at = None
         assert PromptScheduler._is_due(task) is False
 
     @pytest.mark.asyncio
@@ -86,6 +88,8 @@ class TestPromptScheduler:
         )
         # Set last run 2 hours ago
         task.last_run_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        task.next_run_at = None
+        task.due_at = None
         assert PromptScheduler._is_due(task) is True
 
     @pytest.mark.asyncio

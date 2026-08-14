@@ -163,7 +163,14 @@ async def scenario_movie_inside_collection() -> dict[str, Any]:
     movie = MovieCategory()
     handler = BundleDownloadHandler()
     item = SimpleNamespace(key="The Matrix", display_name="The Matrix", year=1999)
-    result = SearchResult(title="The.Matrix.Collection.1999.2003.1080p.BluRay", magnet="magnet:?xt=urn:btih:movie-collection")
+    result = SimpleNamespace(
+        title="The.Matrix.Collection.1999.2003.1080p.BluRay",
+        magnet="magnet:?xt=urn:btih:movie-collection",
+        files=[
+            {"path": "The Matrix Collection/The.Matrix.1999.1080p.BluRay.mkv"},
+            {"path": "The Matrix Collection/The.Matrix.Reloaded.2003.1080p.BluRay.mkv"},
+        ],
+    )
     descriptor = movie.unit_descriptor_from_search_result(result, item, None)
     assert_true(movie.torrent_bundle_candidate_context(result, item=item) is not None, "movie collection should expose bundle context")
 

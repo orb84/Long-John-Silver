@@ -10,6 +10,10 @@ needed for the next tool call.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime, time
+from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -35,8 +39,8 @@ class ToolResultCompactor:
         if isinstance(compacted, str):
             return compacted
         try:
-            return json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError):
+            return self._json_dumps(compacted)
+        except (TypeError, ValueError, RecursionError):
             return self._truncate_middle(str(compacted), self._DEFAULT_MAX_CHARS, "tool result compressed")
 
     def compact(self, tool_name: str, result: Any) -> Any:
@@ -77,6 +81,10 @@ class ToolResultCompactor:
                 "error_code": result.get("error_code"),
                 "recoverable": result.get("recoverable", True),
                 "error": result.get("error"),
+                "clarification_required": result.get("clarification_required"),
+                "clarification_question": result.get("clarification_question"),
+                "identity_candidates": list(result.get("identity_candidates") or [])[:6],
+                "web_search_recommended": result.get("web_search_recommended"),
                 "next_actions": result.get("next_actions"),
                 "agent_instruction": result.get("agent_instruction"),
             }
@@ -90,6 +98,15 @@ class ToolResultCompactor:
             "query": result.get("query"),
             "language": result.get("language"),
             "expected_episode_count": result.get("expected_episode_count"),
+            "season_total_episode_count": result.get("season_total_episode_count"),
+            "aired_episode_count": result.get("aired_episode_count"),
+            "aired_unit_labels": result.get("aired_unit_labels"),
+            "release_frontier_episode": result.get("release_frontier_episode"),
+            "target_unit_count": result.get("target_unit_count"),
+            "target_unit_labels": result.get("target_unit_labels"),
+            "requested_unit_scope": result.get("requested_unit_scope"),
+            "season_release_state": result.get("season_release_state"),
+            "completion_contract": result.get("completion_contract"),
             "category_id": result.get("category_id"),
             "name": result.get("name"),
             "item_id": result.get("item_id"),
@@ -360,8 +377,9 @@ class ToolResultCompactor:
         compact_rows: list[dict[str, Any]] = []
         keys = (
             "id", "candidate_id", "index", "title", "size", "size_bytes", "seeders",
-            "languages", "resolution", "source", "unit", "selection_warnings", "selection_blockers",
-            "auto_queue_allowed", "blocked_reason", "is_bundle", "bundle_scope", "pack_type",
+            "languages", "language_preference_status", "language_evidence", "resolution", "source", "unit",
+            "selection_warnings", "selection_blockers", "auto_queue_allowed", "blocked_reason",
+            "is_bundle", "bundle_scope", "pack_type", "selective_queue",
             "per_episode_size", "per_episode_size_mb", "estimated_bitrate_kbps", "codec",
             "bundle_unit_count", "expected_episode_count", "requested_season_coverage", "coverage_note", "llm_recommended",
         )
@@ -375,8 +393,11 @@ class ToolResultCompactor:
         keys = (
             "index", "option_index", "candidate_id", "title", "size", "size_bytes",
             "seeders", "source", "quality_score", "season", "episode", "languages",
-            "resolution", "codec", "per_episode_size", "per_episode_size_bytes",
-            "estimated_bitrate_kbps", "selection_warnings", "selection_blockers", "auto_queue_allowed", "auto_queue_blocked_reason", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count", "expected_episode_count", "requested_season_coverage", "coverage_note", "llm_recommended",
+            "language_preference_status", "language_evidence", "resolution", "codec",
+            "per_episode_size", "per_episode_size_bytes", "estimated_bitrate_kbps",
+            "selection_warnings", "selection_blockers", "auto_queue_allowed", "auto_queue_blocked_reason",
+            "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count", "selective_queue",
+            "expected_episode_count", "requested_season_coverage", "coverage_note", "llm_recommended",
         )
         compact = {key: candidate.get(key) for key in keys if candidate.get(key) not in (None, "", [])}
         compact["result_set_id"] = candidate.get("result_set_id") or fallback_result_set_id
@@ -403,11 +424,14 @@ class ToolResultCompactor:
 
     def _compact_jsonish(self, result: Any, max_chars: int) -> Any:
         try:
-            text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError):
+            text = self._json_dumps(result)
+        except (TypeError, ValueError, RecursionError):
             text = str(result)
         if len(text) <= max_chars:
-            return result
+            try:
+                return json.loads(text)
+            except (TypeError, ValueError):
+                return text
         return self._truncate_middle(text, max_chars, "tool result compressed")
 
     def _compact_textual(self, result: Any, max_chars: int, label: str) -> str:
@@ -415,17 +439,59 @@ class ToolResultCompactor:
             text = result
         else:
             try:
-                text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-            except (TypeError, ValueError):
+                text = self._json_dumps(result)
+            except (TypeError, ValueError, RecursionError):
                 text = str(result)
         return self._truncate_middle(text, max_chars, label) if len(text) > max_chars else text
+
+    @classmethod
+    def _json_dumps(cls, value: Any) -> str:
+        """Serialize tool output as stable JSON without leaking Python ``repr``.
+
+        Tool handlers may legitimately return datetimes, enums, paths,
+        dataclasses, or Pydantic models.  Chat tool messages must remain valid
+        JSON so the model cannot mistake implementation-specific repr text for
+        an authoritative structured receipt.
+        """
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=cls._json_default,
+        )
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, (datetime, date, time)):
+            return value.isoformat()
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, Path):
+            return str(value)
+        if is_dataclass(value) and not isinstance(value, type):
+            return asdict(value)
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                return model_dump(mode="json")
+            except TypeError:
+                return model_dump()
+        if isinstance(value, (set, frozenset, tuple)):
+            return list(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
     @staticmethod
     def _truncate_middle(text: str, max_chars: int, label: str) -> str:
         if len(text) <= max_chars:
             return text
         if max_chars < 240:
-            return text[:max_chars]
+            marker = f"...[{label}]..."
+            if max_chars <= len(marker):
+                return marker[:max_chars]
+            remaining = max_chars - len(marker)
+            head = max(1, remaining // 2)
+            tail = max(0, remaining - head)
+            return text[:head] + marker + (text[-tail:] if tail else "")
         head = int(max_chars * 0.66)
         tail = max(100, max_chars - head - 90)
         omitted = len(text) - head - tail

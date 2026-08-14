@@ -33,8 +33,9 @@ def test_suggestion_metadata_is_exposed_for_ui_and_agent() -> None:
 
 def test_tv_suggestion_workflow_has_alias_and_progress_diagnostics() -> None:
     source = Path("src/core/categories/workflows/tv_suggestions.py").read_text()
-    assert "canonical_item_key" in source
-    assert "progress_backfill" in source
+    assert "canonical_item_key" in Path("src/core/categories/base_context.py").read_text()
+    assert "must not perform alias/progress-table detective work" in source
+    assert "progress_backfill" not in source
     assert "TV suggestion audit" in source
     assert "all aired episodes appear missing" in source
 

@@ -132,7 +132,7 @@ async def test_category_creation_tools_preview_and_approval_gate(test_registry) 
 
     preview = await preview_tool.execute({"spec": spec}, context)
     assert "src/core/categories/custom/video_games.py" in preview["files"]
-    assert "config/category-templates/video_games.yaml" in preview["files"]
+    assert "config/category-config-templates/video_games.yaml" in preview["files"]
     assert preview["validation_issues"] == []
     assert "taste_dimension_weights" in preview["files"]["src/core/categories/custom/video_games.py"]
 

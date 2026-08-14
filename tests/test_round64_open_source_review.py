@@ -73,7 +73,6 @@ async def test_successful_lifecycle_processing_consumes_pending_invalidations() 
             purpose="suggestions",
             status="success",
             reason="library_changed",
-            fingerprints=LifecycleFingerprints(),
             next_check_at=future,
             valid_until=future,
             invalidated_by=["library_changed"],

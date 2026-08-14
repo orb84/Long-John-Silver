@@ -40,6 +40,11 @@ class HelmPanel extends Component {
             ]),
             DOM.el('div', { className: 'header-tools', style: { display: 'flex', gap: '10px', alignItems: 'center' } }, [
                 DOM.el('span', { className: 'badge', id: 'ai-model-badge' }, [`Model: ${this._model}`]),
+                DOM.btn('', 'llm-activity-toggle is-idle', () => {}, {
+                    id: 'llm-activity-toggle',
+                    title: 'Inspect LLM activity',
+                    content: '<i class="fa-solid fa-microchip"></i><span>LLM idle</span>'
+                }),
                 DOM.btn('', 'btn-clear-chat', () => {
                     if (window.chatController) {
                         window.chatController.clearChat();
@@ -57,9 +62,13 @@ class HelmPanel extends Component {
             ])
         ]);
 
-        const chatInputArea = DOM.el('div', { className: 'chat-input-area' }, [
+        const chatInputArea = DOM.el('div', { className: 'chat-input-area', dataset: { chatState: 'idle' } }, [
+            DOM.el('div', { id: 'chat-command-state', className: 'chat-command-state is-idle', role: 'status', 'aria-live': 'polite' }, [
+                DOM.el('span', { className: 'chat-command-state-dot' }),
+                DOM.el('span', { className: 'chat-command-state-label' }, ['Ready'])
+            ]),
             DOM.el('textarea', { placeholder: 'Give your orders, Captain...', id: 'chat-input', name: 'ljs-command-chat', rows: '1', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', role: 'searchbox', 'aria-label': 'Assistant command input', 'data-ljs-command-input': 'true', 'data-ljs-noncredential': 'true', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true' }),
-            DOM.btn('', 'send-btn', () => {}, { id: 'send-btn', content: '<i class="fa-solid fa-paper-plane"></i>' })
+            DOM.btn('', 'send-btn', () => {}, { id: 'send-btn', title: 'Send message', 'aria-label': 'Send message', content: '<i class="fa-solid fa-paper-plane"></i>' })
         ]);
 
         chatContainer.appendChild(chatHeader);
@@ -159,6 +168,7 @@ class HelmPanel extends Component {
             }
         });
         
+        this._eventBus?.subscribe('settings:llm_saved', () => this.updateModelBadge());
         this.updateStats();
         this.updateModelBadge();
         this.updateStorageStatus();
@@ -233,17 +243,16 @@ class HelmPanel extends Component {
         try {
             const data = await APIClient.get('/api/settings');
             if (data && data.settings && data.settings.llm) {
-                const llm = data.settings.llm;
-                let activeModel = llm.chat?.model || llm.model || 'GPT-4o';
-                
-                // Clean up name for a premium, compact display (e.g. removing provider prefixes)
-                if (activeModel.includes('/')) {
-                    activeModel = activeModel.split('/').pop();
-                }
-                
+                const routes = Array.isArray(data.llm_routing?.routes) ? data.llm_routing.routes : [];
+                const chatRoute = routes.find(route => route.task === 'chat');
+                let activeModel = chatRoute?.model || data.settings.llm.model || 'unconfigured';
+                if (activeModel.includes('/')) activeModel = activeModel.split('/').pop();
                 const badgeEl = document.getElementById('ai-model-badge');
                 if (badgeEl) {
-                    badgeEl.textContent = `Model: ${activeModel}`;
+                    badgeEl.textContent = `Chat: ${activeModel}`;
+                    badgeEl.title = chatRoute
+                        ? `Effective chat route: ${chatRoute.provider || 'provider'} / ${chatRoute.model} (${chatRoute.source || 'global'})`
+                        : 'Effective chat route unavailable.';
                 }
             }
         } catch (err) {

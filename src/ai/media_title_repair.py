@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class _Token:
+    """One normalized token and its original prompt span."""
+
     text: str
     norm: str
     start: int

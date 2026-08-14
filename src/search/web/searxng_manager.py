@@ -27,6 +27,7 @@ from typing import Any, IO
 from loguru import logger
 
 from src.core.models import Settings, WebSearchConfig
+from src.core.security.command_policy import CommandPolicy
 from src.core.security.path_policy import SafePathResolver
 from src.utils.archive_safety import safe_extract_tar
 
@@ -59,6 +60,10 @@ class SearXNGManager:
         self._installed = False
         self._last_error: str | None = None
         self._port = SEARXNG_DEFAULT_PORT
+        self._command_policy = CommandPolicy()
+        self._path_policy = SafePathResolver(
+            [self._service_dir, self._state_dir], category_id="searxng"
+        )
         self._trace_event("manager_initialized", service_dir=str(self._service_dir), state_dir=str(self._state_dir), platform=self.platform_label())
 
     @property
@@ -177,8 +182,10 @@ class SearXNGManager:
             self.logs_dir().mkdir(parents=True, exist_ok=True)
             self._close_log_handle()
             self._log_handle = open(self.logs_dir() / "searxng.log", "ab", buffering=0)
-            self._process = await asyncio.create_subprocess_exec(
-                *command,
+            self._process = await self._command_policy.create_subprocess_exec(
+                command,
+                purpose="searxng.start",
+                approved=True,
                 cwd=str(self._source_dir()),
                 env=self._process_environment(),
                 stdout=self._log_handle,
@@ -382,7 +389,9 @@ class SearXNGManager:
     def _clear_runtime_paths(self) -> None:
         for path in (self._source_dir(), self._venv_dir()):
             if path.exists():
-                shutil.rmtree(path)
+                self._path_policy.safe_rmtree(
+                    path, purpose="searxng.clear_runtime", move_to_trash=False
+                )
 
     async def _ensure_source(self, *, source_ref: str | None = None) -> bool:
         if self._source_dir().exists():
@@ -400,8 +409,12 @@ class SearXNGManager:
             if not unpacked:
                 raise RuntimeError("SearXNG source archive extracted but no searx package was found")
             if self._source_dir().exists():
-                shutil.rmtree(self._source_dir())
-            unpacked.rename(self._source_dir())
+                self._path_policy.safe_rmtree(
+                    self._source_dir(), purpose="searxng.replace_source", move_to_trash=False
+                )
+            self._path_policy.safe_rename(
+                unpacked, self._source_dir(), purpose="searxng.activate_source"
+            )
             self._write_state({"source_ref": ref, "source_downloaded_at": self._utc_now()})
             self._trace_event("source.download_finished", ref=ref, source_dir=str(self._source_dir()))
             return True
@@ -423,7 +436,12 @@ class SearXNGManager:
             return True
         if self._venv_dir().exists():
             self._trace_event("venv.partial_runtime_removed", python=str(python), marker=str(self._venv_ready_marker()))
-            await asyncio.to_thread(shutil.rmtree, self._venv_dir())
+            await asyncio.to_thread(
+                self._path_policy.safe_rmtree,
+                self._venv_dir(),
+                "searxng.remove_partial_venv",
+                False,
+            )
         self._trace_event("venv.create_started", python=str(python))
         try:
             await self._create_virtualenv()
@@ -465,7 +483,12 @@ class SearXNGManager:
         except Exception as exc:
             self._trace_event("venv.uv_failed", uv=uv, seed=seed, error=str(exc))
             if self._venv_dir().exists():
-                await asyncio.to_thread(shutil.rmtree, self._venv_dir())
+                await asyncio.to_thread(
+                self._path_policy.safe_rmtree,
+                self._venv_dir(),
+                "searxng.remove_partial_venv",
+                False,
+            )
             return False
 
     async def _ensure_packaging_tools(self) -> None:
@@ -602,10 +625,9 @@ class SearXNGManager:
         python = self._venv_python()
         if not python.exists():
             return False
-        proc = await asyncio.create_subprocess_exec(
-            str(python),
-            "-c",
-            f"import {module_name}",
+        proc = await self._command_policy.create_subprocess_exec(
+            [str(python), "-c", f"import {module_name}"],
+            purpose="searxng.verify_python_module",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -627,8 +649,10 @@ class SearXNGManager:
         log_path = self.logs_dir() / "install.log"
         self._trace_event("command.started", command=self._redacted_command(command), timeout=timeout, env_overrides=[key for key in ("SEARXNG_SETTINGS_PATH", "PYTHONUNBUFFERED", "LANG", "LC_ALL") if env and key in env])
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        proc = await asyncio.create_subprocess_exec(
-            *command,
+        proc = await self._command_policy.create_subprocess_exec(
+            command,
+            purpose="searxng.install_command",
+            approved=True,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
@@ -826,13 +850,15 @@ outgoing:
                 continue
             target = backup_dir / name
             if path.is_dir():
-                shutil.copytree(path, target)
+                self._path_policy.safe_copytree(path, target, purpose="searxng.backup_tree")
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target)
+                self._path_policy.safe_copy(path, target, purpose="searxng.backup_file")
         state = self._state_dir / "installed-version.json"
         if state.exists():
-            shutil.copy2(state, backup_dir / "installed-version.json")
+            self._path_policy.safe_copy(
+                state, backup_dir / "installed-version.json", purpose="searxng.backup_state"
+            )
         self._write_state({"rollback_available": True, "last_backup_dir": str(backup_dir), "last_backup_reason": reason})
         self._trace_event("backup.finished", reason=reason, backup_dir=str(backup_dir))
         return backup_dir
@@ -848,15 +874,25 @@ outgoing:
         state_backup = backup_dir / "installed-version.json"
         if src_backup.exists():
             self._source_dir().parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(src_backup, self._source_dir())
+            self._path_policy.safe_copytree(
+                src_backup, self._source_dir(), purpose="searxng.restore_source"
+            )
         if venv_backup.exists():
-            shutil.copytree(venv_backup, self._venv_dir())
+            self._path_policy.safe_copytree(
+                venv_backup, self._venv_dir(), purpose="searxng.restore_venv"
+            )
         if settings_backup.exists():
             self.config_path().parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(settings_backup, self.config_path())
+            self._path_policy.safe_copy(
+                settings_backup, self.config_path(), purpose="searxng.restore_settings"
+            )
         if state_backup.exists():
             self._state_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(state_backup, self._state_dir / "installed-version.json")
+            self._path_policy.safe_copy(
+                state_backup,
+                self._state_dir / "installed-version.json",
+                purpose="searxng.restore_state",
+            )
         self._installed = self.is_installed
         self._write_state({"last_rollback_at": self._utc_now(), "restored_backup_dir": str(backup_dir)})
         self._trace_event("rollback.restore_finished", backup_dir=str(backup_dir), installed=self._installed)

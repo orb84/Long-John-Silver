@@ -8,6 +8,8 @@ result scoring live here so the tool does not become a catch-all patch point.
 
 from __future__ import annotations
 
+TOOL_PROVIDER_MODULE = False
+
 import re
 from dataclasses import dataclass
 from typing import Any, Optional, TYPE_CHECKING

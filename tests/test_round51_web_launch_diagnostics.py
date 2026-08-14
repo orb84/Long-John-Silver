@@ -16,15 +16,16 @@ def test_liveness_endpoint_is_dependency_free():
     assert "settings_manager" not in live_block
 
 
-def test_readiness_probe_uses_http_liveness_marker_not_bare_tcp():
-    source = Path("main.py").read_text(encoding="utf-8")
-    probe_start = source.index("async def _wait_for_web_server_ready")
-    probe_end = source.index("async def _event_loop_watchdog", probe_start)
-    probe = source[probe_start:probe_end]
+def test_readiness_probe_uses_complete_http_body_and_exact_build_identity():
+    source = Path("src/web/readiness.py").read_text(encoding="utf-8")
+    main_source = Path("main.py").read_text(encoding="utf-8")
 
     assert "/api/live" in source
-    assert "ljs-live" in probe
-    assert "unexpected readiness response" in probe
+    assert r'readuntil(b"\r\n\r\n")' in source
+    assert "readexactly(content_length)" in source
+    assert "expected_build_id" in source
+    assert "expected_asset_version" in source
+    assert "LJSWebReadinessGate" in main_source
 
 
 def test_startup_logs_access_urls_and_defers_expensive_jobs():
@@ -38,8 +39,8 @@ def test_startup_logs_access_urls_and_defers_expensive_jobs():
 
     assert ready_log < deferred_call
     assert "scheduler.request_library_scan" in helper
-    assert '"startup_suggestion_compilation"' in helper
-    assert helper.index("scheduler.request_library_scan") < helper.index('"startup_suggestion_compilation"')
+    assert '"startup_suggestion_compilation"' not in helper
+    assert "air/suggestion jobs" in helper.lower()
     assert "_format_access_urls" in source
     assert "LJS_HOST is bound to localhost only" in source
 

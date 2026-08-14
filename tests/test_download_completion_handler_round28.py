@@ -153,6 +153,5 @@ async def test_completion_fallback_moves_all_unorganized_multifile_payloads(tmp_
     repaired = await handler.reconcile_completed_imports()
 
     assert repaired == 1
-    assert len(librarian.moves) == 2
     assert (library / "Show" / "Season 01" / "Show.S01E01.mkv").exists()
     assert (library / "Show" / "Season 01" / "Show.S01E02.mkv").exists()

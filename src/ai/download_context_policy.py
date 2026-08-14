@@ -52,9 +52,16 @@ class DownloadContextPolicy:
 
     @classmethod
     def should_start_fresh_goal(cls, user_prompt: str | None, intent: Intent | str | None = None) -> bool:
-        """Return true when active goal result sets should not be inherited."""
+        """Return true when active acquisition result sets should not be inherited.
+
+        SEARCH and DOWNLOAD share the same existing freshness boundary.  A
+        concrete new acquisition request must not inherit the previous goal just
+        because the router chose SEARCH rather than DOWNLOAD; terse refinements
+        and stable candidate/result handles still return false through
+        ``should_suppress_pending_candidates``.
+        """
         intent_value = intent.value if isinstance(intent, Intent) else str(intent or "").upper()
-        if intent_value != "DOWNLOAD":
+        if intent_value not in {"DOWNLOAD", "SEARCH"}:
             return False
         return cls.should_suppress_pending_candidates(user_prompt, intent)
 
@@ -71,6 +78,30 @@ class DownloadContextPolicy:
             "manage_downloads",
             "inspect_torrent_candidate",
         }))
+
+    @classmethod
+    def has_operational_download_evidence(cls, executed_tool_names: set[str] | None) -> bool:
+        """Return whether this turn consulted current queue/search state."""
+        tools = set(executed_tool_names or set())
+        return bool(tools.intersection({
+            "search_media_torrents",
+            "queue_download",
+            "list_downloads",
+            "manage_downloads",
+            "inspect_torrent_candidate",
+        }))
+
+    @classmethod
+    def reprompt_after_metadata_only_download_answer(cls, user_prompt: str | None) -> str:
+        """Explain that metadata alone cannot establish queue or candidate state."""
+        return (
+            "The previous assistant text was not sent because metadata/context lookup does not prove current "
+            "download state and does not provide queueable candidate evidence. Use list_downloads to verify "
+            "active/queued/completed transfer claims, or search_media_torrents to discover current candidates. "
+            "Never infer that a download is active, queued, complete, or language-matched from conversation history, "
+            "tracked preferences, or metadata alone. "
+            f"Current user request: {str(user_prompt or '').strip()}"
+        )
 
     @classmethod
     def reprompt_after_toolless_download_answer(cls, user_prompt: str | None) -> str:

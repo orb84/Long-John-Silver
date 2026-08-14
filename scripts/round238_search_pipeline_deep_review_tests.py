@@ -14,8 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.ai.download_candidate_adjudicator import DownloadCandidateAdjudicator
-from src.core.categories.tv_agent import TvAgentSearchMixin
-from src.core.scheduler_services import SchedulerCatalogService
+from src.core.categories.tv import TvShowCategory
 
 
 @dataclass
@@ -26,18 +25,6 @@ class _Result:
 
 class _Item:
     key = "A Knight the Seven Kingdoms"
-
-
-class _TvHarness(TvAgentSearchMixin):
-    category_id = "tv"
-
-    @staticmethod
-    def _safe_positive_int(value):
-        try:
-            number = int(value)
-        except (TypeError, ValueError):
-            return None
-        return number if number > 0 else None
 
 
 class _TinyContextLLM:
@@ -103,6 +90,7 @@ async def _test_recursive_candidate_tournament() -> None:
 
 
 def _test_title_extraction_preserves_inner_of() -> None:
+    tv = TvShowCategory()
     cases = {
         "A Knight of the Seven Kingdoms": ("A Knight of the Seven Kingdoms", None, None),
         "A Knight of the Seven Kingdoms Season 1": ("A Knight of the Seven Kingdoms", 1, None),
@@ -112,11 +100,11 @@ def _test_title_extraction_preserves_inner_of() -> None:
         "Star City S01E03": ("Star City", 1, 3),
     }
     for raw, expected in cases.items():
-        assert SchedulerCatalogService.extract_structured_unit_from_name(raw, None, None) == expected
+        assert tv.normalize_agent_search_units_from_name(raw, season=None, episode=None) == expected
 
 
 def _test_tv_llm_review_candidate_gate_does_not_crash_on_token_helpers() -> None:
-    harness = _TvHarness()
+    harness = TvShowCategory()
     result = _Result("A Knight of the Seven Kingdoms S01e01-06 [1080p Ita Eng Spa h265 10bit SubS] byMe7alh")
     assert harness._is_llm_review_season_pack_candidate(result, 1, item=_Item(), language="Italian")
 

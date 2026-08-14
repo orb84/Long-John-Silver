@@ -1,13 +1,13 @@
-"""Regression test for library scan bitrate enrichment helper."""
+"""Regression test for category-owned TV scan bitrate enrichment."""
 
-from src.core.scheduler import MediaScheduler
+from src.core.categories.tv import TvShowCategory
 
 
-def test_scheduler_exposes_scan_bitrate_estimator() -> None:
+def test_tv_category_exposes_scan_bitrate_estimator() -> None:
     one_gib = 1024 ** 3
-    estimated = MediaScheduler._estimate_bitrate_kbps(one_gib, runtime_minutes=55)
+    estimated = TvShowCategory._estimate_episode_bitrate_kbps(one_gib, runtime_minutes=55)
 
     assert estimated is not None
     assert 2500 <= estimated <= 2700
-    assert MediaScheduler._estimate_bitrate_kbps(None) is None
-    assert MediaScheduler._estimate_bitrate_kbps(0) is None
+    assert TvShowCategory._estimate_episode_bitrate_kbps(None) is None
+    assert TvShowCategory._estimate_episode_bitrate_kbps(0) is None

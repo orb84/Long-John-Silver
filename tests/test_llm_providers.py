@@ -7,6 +7,7 @@ from src.llm_providers import LLMProviderManager
 from src.llm_providers.key_store import KeyStore
 from src.llm_providers.registry import ProviderRegistry
 from src.llm_providers.catalog import ModelCatalog, _safe_float
+from src.llm_providers.presets import get_builtin_presets
 from src.llm_providers.models import (
     ProviderType, ModelInfo, PricingInfo, ContextInfo, APIKeyEntry,
 )
@@ -176,7 +177,10 @@ class TestLLMProviderManager:
         assert mgr.registry is not None
         assert mgr.catalog is not None
         assert mgr.client is not None
-        assert len(mgr.list_providers()) == 5
+        providers = mgr.list_providers()
+        provider_ids = [provider.id for provider in providers]
+        assert len(provider_ids) == len(set(provider_ids))
+        assert set(provider_ids) == set(get_builtin_presets())
         Path(path).unlink()
 
     def test_list_ready_providers(self):

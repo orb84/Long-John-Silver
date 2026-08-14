@@ -7,6 +7,7 @@ and removing scheduled tasks, as well as immediate show checking.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Optional, TYPE_CHECKING
 
 from loguru import logger
@@ -19,6 +20,7 @@ from src.ai.tools.search_workspace import (
     CandidateBundlePolicy,
     SearchArgumentConstraints,
     SearchBatchRecommendationBuilder,
+    SearchWorkspaceCompletionContractBuilder,
     SearchQualityChoicePolicy,
     SearchWorkspaceAuditLogger,
     SearchWorkspaceFormatter,
@@ -27,6 +29,7 @@ from src.ai.tools.search_workspace import (
 )
 from src.core.models import ToolExecutionContext
 from src.core.models import Intent
+from src.core.categories.language import LanguageTokenPolicy
 
 if TYPE_CHECKING:
     from src.core.prompt_scheduler import PromptScheduler
@@ -363,6 +366,12 @@ class ListMediaItemsTool:
 class SearchMediaTorrentsTool:
     """Search torrents for a media item."""
 
+    # Candidate review is advisory. Provider search has already completed and
+    # deterministic category/safety annotations remain usable if the task model
+    # is slow or unavailable. Never let two internal model retry windows hold an
+    # interactive search turn for ten or twenty minutes.
+    _CANDIDATE_REVIEW_TIMEOUT_SECONDS = 120.0
+
     name = "search_media_torrents"
     description = (
         "Search torrents for any media item (tracked or untracked). Returns candidates with title, size, "
@@ -386,6 +395,45 @@ class SearchMediaTorrentsTool:
         self._scheduler = scheduler
         self._candidate_adjudicator = DownloadCandidateAdjudicator(llm_client)
         self._retry_scheduler = UnmatchedSearchRetryScheduler()
+
+    @staticmethod
+    def _scheduler_category_registry(scheduler: object | None) -> object | None:
+        """Return an explicitly installed public category registry.
+
+        Real ``MediaScheduler`` instances expose a property. Lightweight test
+        collaborators may provide a concrete instance attribute. Missing
+        attributes synthesized by mocks are deliberately ignored.
+        """
+        if scheduler is None:
+            return None
+        explicit = vars(scheduler).get("category_registry")
+        if explicit is not None:
+            return explicit
+        descriptor = getattr(type(scheduler), "category_registry", None)
+        if descriptor is not None:
+            return getattr(scheduler, "category_registry", None)
+        return None
+
+    @staticmethod
+    def _scheduler_identity_resolver(scheduler: object | None) -> object | None:
+        """Return only a real scheduler identity-resolution boundary.
+
+        ``MagicMock`` and similar collaborators synthesize arbitrary callable
+        attributes. Treating those as a metadata resolver can silently bypass
+        or distort tests and lightweight integrations, so only an explicitly
+        assigned instance attribute or a method/property declared by the class
+        is accepted.
+        """
+        if scheduler is None:
+            return None
+        explicit = vars(scheduler).get("resolve_agent_media_identity")
+        if callable(explicit):
+            return explicit
+        descriptor = getattr(type(scheduler), "resolve_agent_media_identity", None)
+        if descriptor is not None:
+            resolved = getattr(scheduler, "resolve_agent_media_identity", None)
+            return resolved if callable(resolved) else None
+        return None
 
     async def _maybe_schedule_unmatched_retry(
         self,
@@ -447,6 +495,11 @@ class SearchMediaTorrentsTool:
                     "type": "string",
                     "enum": ["default", "bundle_preferred", "bundle_only", "individual_units_only"],
                     "description": "Category-neutral search phase preference. Use bundle_preferred when the user asks for a whole category-owned unit such as a season, volume, album, collection, or other bundle/pack and can fall back to individual units; use bundle_only only when the user explicitly wants bundle-only.",
+                },
+                "unit_scope": {
+                    "type": "string",
+                    "enum": ["available_units", "missing_units", "all_units"],
+                    "description": "Category-neutral semantic scope. Set available_units when the user asks in any language for currently released/available units, missing_units when they ask for units absent from the local library, and all_units only when they explicitly request every known unit. Omit for a specific season/episode or when the request is ambiguous; ask the user rather than guessing.",
                 },
                 "category_id": {
                     "type": "string",
@@ -510,14 +563,55 @@ class SearchMediaTorrentsTool:
         season = arguments.get("season")
         episode = arguments.get("episode")
         search_scope = arguments.get("search_scope") or "default"
-        category_id = str(arguments.get("category_id") or "").strip() or None
+        identity: dict[str, Any] | None = None
+        category_hint = str(
+            arguments.get("category_id")
+            or getattr(context, "category_id", None)
+            or ""
+        ).strip() or None
+        category_id = category_hint
         category = None
-        registry = getattr(self._scheduler, "_categories", None) if self._scheduler else None
+        registry = self._scheduler_category_registry(self._scheduler)
+        identity_resolver = self._scheduler_identity_resolver(self._scheduler)
+        if callable(identity_resolver):
+            identity = await identity_resolver(
+                name,
+                category_hint=category_hint,
+                request_text=getattr(context, "user_prompt", None),
+            )
+            if not identity.get("resolved"):
+                return {
+                    "ok": False,
+                    "error": identity.get("reason") or f"Could not resolve a concrete media category for '{name}'.",
+                    "error_code": (
+                        "category_ambiguous" if identity.get("status") == "ambiguous"
+                        else "category_resolution_required"
+                    ),
+                    "item_name": name,
+                    "category_resolution": identity,
+                    "clarification_question": identity.get("clarification_question"),
+                    "next_actions": [
+                        "Ask the user the clarification_question before searching or queueing.",
+                        "Do not fall back to abstract media or a guessed category.",
+                    ],
+                }
+            category_id = str(identity.get("category_id") or "").strip() or None
         if registry and category_id:
             try:
                 category = registry.get(category_id)
             except Exception:
                 category = None
+        if registry and (not category_id or category is None):
+            return {
+                "ok": False,
+                "error": (
+                    f"Could not verify a concrete media category for '{name}'. "
+                    "Ask the user what kind of content it is before searching."
+                ),
+                "error_code": "category_resolution_required",
+                "item_name": name,
+                "clarification_question": f"What kind of content is '{name}'?",
+            }
         normalizer = getattr(category, "normalize_agent_search_name_argument", None) if category else None
         if callable(normalizer):
             normalized_name = normalizer(
@@ -545,6 +639,13 @@ class SearchMediaTorrentsTool:
         language = arguments.get("language")
         language_is_explicit = bool(arguments.get("language_is_explicit") or arguments.get("explicit_language"))
         if language and not language_is_explicit:
+            current_prompt = str(getattr(context, "user_prompt", None) or "")
+            if LanguageTokenPolicy.title_has_language_token(current_prompt, language):
+                # The model supplied a media language that is literally present
+                # in the current user request. Preserve that user evidence even
+                # if a small model forgot the companion provenance flag.
+                language_is_explicit = True
+        if language and not language_is_explicit:
             logger.warning(
                 "Ignoring non-explicit search_media_torrents language argument {!r} for {!r}; "
                 "tool language is media audio/subtitle language, not chat/reply language; scheduler will apply configured defaults.",
@@ -557,6 +658,11 @@ class SearchMediaTorrentsTool:
             return {"error": "Scheduler not available"}
         
         search_constraints = SearchArgumentConstraints.from_arguments(arguments)
+        request_text = str(getattr(context, "user_prompt", None) or "").strip()
+        if request_text:
+            # Transport literal request evidence into the owning category. The
+            # generic tool does not interpret episode/album/book semantics.
+            search_constraints["request_text"] = request_text[:2000]
         res = await self._scheduler.search_media_torrents(
             name=name,
             season=season,
@@ -568,6 +674,8 @@ class SearchMediaTorrentsTool:
             search_constraints=search_constraints,
         )
         
+        if isinstance(res, dict) and identity:
+            res.setdefault("category_resolution", identity)
         if not isinstance(res, dict) or "candidates" not in res:
             return res
 
@@ -603,10 +711,11 @@ class SearchMediaTorrentsTool:
                 "selection_blockers": c.get("selection_blockers") or [],
                 "auto_queue_allowed": c.get("auto_queue_allowed"),
                 "auto_queue_blocked_reason": c.get("auto_queue_blocked_reason"),
+                "title_identity": c.get("title_identity") or {},
             })
 
         category = None
-        registry = getattr(self._scheduler, "_categories", None)
+        registry = self._scheduler_category_registry(self._scheduler)
         if registry and res.get("category_id"):
             try:
                 category = registry.get(res.get("category_id"))
@@ -647,17 +756,7 @@ class SearchMediaTorrentsTool:
             except Exception:
                 category_language_relevant = True
         effective_preferred_language = (res.get("language") or language) if category_language_relevant else None
-        batch_recommendation = SearchBatchRecommendationBuilder.build(
-            name=res.get("name") or name,
-            category_id=res.get("category_id"),
-            season=res.get("season", season),
-            episode=res.get("episode", episode),
-            search_scope=res.get("search_scope") or search_scope,
-            result_set_id=result_set_id,
-            candidates=cache_candidates,
-            category=category,
-            preferred_language=effective_preferred_language,
-        )
+        batch_recommendation = None
 
         # Format clean candidates for LLM (with stable IDs, without magnets)
         clean_candidates = []
@@ -691,6 +790,7 @@ class SearchMediaTorrentsTool:
                 "selection_blockers": c.get("selection_blockers") or [],
                 "auto_queue_allowed": c.get("auto_queue_allowed"),
                 "auto_queue_blocked_reason": c.get("auto_queue_blocked_reason"),
+                "title_identity": c.get("title_identity") or {},
             })
 
         SelectionPolicyAnnotator.annotate(clean_candidates, preferred_language=effective_preferred_language, language_is_explicit=language_is_explicit)
@@ -699,8 +799,35 @@ class SearchMediaTorrentsTool:
             if clean_match:
                 cache_candidate["selection_warnings"] = clean_match.get("selection_warnings") or []
                 cache_candidate["selection_blockers"] = clean_match.get("selection_blockers") or []
+                cache_candidate["manual_confirmation_reasons"] = clean_match.get("manual_confirmation_reasons") or []
+                cache_candidate["hard_queue_blockers"] = clean_match.get("hard_queue_blockers") or []
+                cache_candidate["language_preference_status"] = clean_match.get("language_preference_status")
+                cache_candidate["language_evidence"] = clean_match.get("language_evidence") or {}
                 cache_candidate["auto_queue_allowed"] = clean_match.get("auto_queue_allowed")
                 cache_candidate["auto_queue_blocked_reason"] = clean_match.get("auto_queue_blocked_reason")
+
+        if effective_preferred_language and language_is_explicit:
+            narrowed_clean = SelectionPolicyAnnotator.narrow_to_explicit_language_evidence(
+                clean_candidates, language_is_explicit=True,
+            )
+            if len(narrowed_clean) < len(clean_candidates):
+                keep_ids = {str(c.get("candidate_id") or "") for c in narrowed_clean}
+                logger.info(
+                    "search_media_torrents: suppressing %d unknown/mismatched language candidate(s) "
+                    "because explicit %r release evidence exists for %r",
+                    len(clean_candidates) - len(narrowed_clean),
+                    effective_preferred_language,
+                    res.get("name") or name,
+                )
+                clean_candidates = narrowed_clean
+                cache_candidates = [
+                    candidate for candidate in cache_candidates
+                    if str(candidate.get("candidate_id") or "") in keep_ids
+                ]
+                for i, candidate in enumerate(clean_candidates, 1):
+                    candidate["index"] = i
+                for i, candidate in enumerate(cache_candidates, 1):
+                    candidate["index"] = i
 
         category_quality_choice_relevant = True
         if category and hasattr(category, "uses_global_quality_profile"):
@@ -724,9 +851,35 @@ class SearchMediaTorrentsTool:
                 candidate["selection_warnings"] = warnings
                 candidate["auto_queue_allowed"] = False
                 candidate["auto_queue_blocked_reason"] = "quality/bitrate preference must be chosen first"
+            for candidate in clean_candidates:
+                reasons = list(candidate.get("manual_confirmation_reasons") or [])
+                if "quality/bitrate preference must be chosen first" not in reasons:
+                    reasons.append("quality/bitrate preference must be chosen first")
+                candidate["manual_confirmation_reasons"] = reasons
             for cache_candidate in cache_candidates:
                 cache_candidate["auto_queue_allowed"] = False
                 cache_candidate["auto_queue_blocked_reason"] = "quality/bitrate preference must be chosen first"
+                reasons = list(cache_candidate.get("manual_confirmation_reasons") or [])
+                if "quality/bitrate preference must be chosen first" not in reasons:
+                    reasons.append("quality/bitrate preference must be chosen first")
+                cache_candidate["manual_confirmation_reasons"] = reasons
+
+        batch_recommendation = SearchBatchRecommendationBuilder.build(
+            name=res.get("name") or name,
+            category_id=res.get("category_id"),
+            season=res.get("season", season),
+            episode=res.get("episode", episode),
+            search_scope=res.get("search_scope") or search_scope,
+            result_set_id=result_set_id,
+            candidates=clean_candidates,
+            category=category,
+            preferred_language=effective_preferred_language,
+            target_unit_labels=[
+                str(value)
+                for value in (res.get("target_unit_labels") or [])
+                if str(value).strip()
+            ],
+        )
 
         category_guidance = ""
         if category and hasattr(category, "build_torrent_selection_guidance"):
@@ -737,13 +890,46 @@ class SearchMediaTorrentsTool:
         adjudication_search_result = dict(res)
         if quality_choice_policy:
             adjudication_search_result["quality_choice_policy"] = quality_choice_policy
-        llm_candidate_review = await self._candidate_adjudicator.review(
-            user_prompt=getattr(context, "user_prompt", None),
-            tool_arguments={**arguments, "name": name, "search_scope": search_scope, "category_id": category_id},
-            search_result=adjudication_search_result,
-            candidates=clean_candidates,
-            category_guidance=category_guidance,
+        preliminary_completion_contract = SearchWorkspaceCompletionContractBuilder.build(
+            response_facts=res,
+            batch_recommendation=batch_recommendation,
+            quality_choice_policy=quality_choice_policy,
+            language=res.get("language") or language,
         )
+        explicit_language_workspace_is_self_describing = bool(
+            language_is_explicit
+            and clean_candidates
+            and all(
+                str(candidate.get("language_preference_status") or "").startswith("preferred")
+                for candidate in clean_candidates
+            )
+        )
+        skip_candidate_review = bool(
+            preliminary_completion_contract.get("action_required") == "queue_download"
+            or explicit_language_workspace_is_self_describing
+        )
+        llm_candidate_review_timed_out = False
+        llm_candidate_review = None
+        if not skip_candidate_review:
+            try:
+                llm_candidate_review = await asyncio.wait_for(
+                    self._candidate_adjudicator.review(
+                        user_prompt=getattr(context, "user_prompt", None),
+                        tool_arguments={**arguments, "name": name, "search_scope": search_scope, "category_id": category_id},
+                        search_result=adjudication_search_result,
+                        candidates=clean_candidates,
+                        category_guidance=category_guidance,
+                    ),
+                    timeout=self._CANDIDATE_REVIEW_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                llm_candidate_review_timed_out = True
+                logger.warning(
+                    "search_media_torrents candidate review timed out after %.1fs for %r; "
+                    "returning category-filtered deterministic candidates instead of blocking the chat turn",
+                    self._CANDIDATE_REVIEW_TIMEOUT_SECONDS,
+                    res.get("name") or name,
+                )
         if llm_candidate_review and quality_choice_policy.get("requires_user_choice"):
             policy_ids = [str(cid) for cid in (quality_choice_policy.get("candidate_ids") or []) if cid]
             recommended = [str(cid) for cid in (llm_candidate_review.get("recommended_candidate_ids") or []) if cid]
@@ -762,8 +948,16 @@ class SearchMediaTorrentsTool:
             )
         llm_candidate_review_status = (
             "reviewed" if llm_candidate_review else (
-                "skipped_no_task_llm" if not self._candidate_adjudicator.available else (
-                    "skipped_no_candidates" if not clean_candidates else "review_unavailable_or_failed"
+                (
+                    "skipped_explicit_language_workspace"
+                    if explicit_language_workspace_is_self_describing
+                    else "skipped_complete_deterministic_batch"
+                ) if skip_candidate_review else (
+                    "timed_out_deterministic_fallback" if llm_candidate_review_timed_out else (
+                        "skipped_no_task_llm" if not self._candidate_adjudicator.available else (
+                            "skipped_no_candidates" if not clean_candidates else "review_unavailable_or_failed"
+                        )
+                    )
                 )
             )
         )
@@ -823,6 +1017,7 @@ class SearchMediaTorrentsTool:
                 has_batch=bool(batch_recommendation),
                 quality_choice_policy=quality_choice_policy,
             ),
+            response_facts=res,
         )
 
         cache_data = {
@@ -842,6 +1037,11 @@ class SearchMediaTorrentsTool:
             "companion_soulseek": res.get("companion_soulseek") if isinstance(res.get("companion_soulseek"), dict) else {},
             "llm_candidate_review": llm_candidate_review,
             "llm_candidate_review_status": llm_candidate_review_status,
+            "origin_user_prompt": request_text,
+            "awaiting_user_choice": bool(
+                clean_candidates
+                and preliminary_completion_contract.get("action_required") != "queue_download"
+            ),
         }
 
         db = getattr(self._scheduler, "_db", None)
@@ -938,6 +1138,14 @@ class SearchMediaTorrentsTool:
         res["torrent_candidate_count"] = torrent_candidate_count
         res["soulseek_candidate_count"] = soulseek_candidate_count
         res["downloadable_candidate_count"] = torrent_candidate_count + soulseek_candidate_count
+        if torrent_candidate_count and explicit_language_workspace_is_self_describing:
+            requested_language_label = str(res.get("language") or language or effective_preferred_language or "requested language").strip()
+            res["agent_instruction"] = (
+                f"The torrent search succeeded and the visible candidate workspace contains verified {requested_language_label} evidence. "
+                "Do not tell the user that nothing was found. Present the verified matching candidate(s) plainly. "
+                "If a candidate has low seeders, describe that as a caveat, not as a failed search. "
+                "Do not add unknown-language alternatives merely because they have more seeders."
+            )
         if soulseek_candidate_count and not torrent_candidate_count:
             res["source_result_status"] = "soulseek_only_candidates_found"
             res["agent_instruction"] = (
@@ -986,6 +1194,12 @@ class SearchMediaTorrentsTool:
             "results_total_size_gb": res["results_total_size_gb"],
             "candidate_picker_note": "Use candidate_picker ids for selection; full records remain cached under result_set_id.",
             "next_action_note": "Use next_actions as affordances; do not invent JSON paths into this result.",
+            "season_total_episode_count": res.get("season_total_episode_count"),
+            "aired_episode_count": res.get("aired_episode_count"),
+            "release_frontier_episode": res.get("release_frontier_episode"),
+            "target_unit_count": res.get("target_unit_count"),
+            "target_unit_labels": res.get("target_unit_labels"),
+            "season_release_state": res.get("season_release_state"),
         }
         res["candidates"] = clean_candidates
         if batch_recommendation:
@@ -1019,9 +1233,17 @@ class SearchMediaTorrentsTool:
             }
             if not (llm_candidate_review and llm_candidate_review.get("recommended_candidate_ids")):
                 res["llm_next_action"] = (
-                    "The user asked for a multi-unit download. Queue every recommended candidate by calling "
-                    "queue_download with batch_recommendation.queue_download_arguments. Do not queue only the first unit."
+                    "The search fully covers the current requested unit set. Call queue_download with "
+                    "batch_recommendation.queue_download_arguments now. The user already asked to download, so do not "
+                    "ask for confirmation or present a menu. Do not describe the season's total catalogue order as aired."
                 )
+        completion_contract = SearchWorkspaceCompletionContractBuilder.build(
+            response_facts=res,
+            batch_recommendation=res.get("batch_recommendation"),
+            quality_choice_policy=quality_choice_policy,
+            language=res.get("language") or language,
+        )
+        res["completion_contract"] = completion_contract
         return res
 
 

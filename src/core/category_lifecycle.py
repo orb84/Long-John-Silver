@@ -92,10 +92,10 @@ class CategoryLifecycleEngine:
         category_id, item_id = self._item_identity(item)
         if not category_id or not item_id:
             return
-        current = await self._fingerprints_for_item(item)
         previous = await self.get_processing_state(category_id, item_id)
         if previous:
             return
+        current = await self._fingerprints_for_item(item)
         decision = await self._category_next_decision(
             item,
             purpose=reason,
@@ -165,6 +165,31 @@ class CategoryLifecycleEngine:
             previous_state=previous,
         )
 
+    async def scheduled_work_is_due(self, item: CategoryItem) -> bool:
+        """Return whether scheduled work can be worth a full lifecycle check.
+
+        This is the scheduler's cheap first gate.  It intentionally reads only
+        the persisted lifecycle ledger: no canonical library object, metadata
+        fingerprint, taste snapshot, suggestion rows, provider, or LLM work is
+        performed here.  Repository/event mutations already call
+        :meth:`invalidate_item`, which moves ``next_check_at`` to now and stores
+        an explicit invalidation reason.  Therefore a future-dated clean ledger
+        row is sufficient evidence to leave the item completely dormant until
+        its category-owned due time.
+
+        Once this returns ``True`` the normal ``should_process_item`` path still
+        performs the authoritative fingerprint/category-policy evaluation.
+        """
+        category_id, item_id = self._item_identity(item)
+        if not category_id or not item_id:
+            return True
+        previous = await self.get_processing_state(category_id, item_id)
+        if not previous:
+            return True
+        if self._load_json(previous.get("invalidated_by"), []):
+            return True
+        return bool(self._due_reason(previous))
+
     async def run_scheduled_workflow(
         self,
         item: CategoryItem,
@@ -227,6 +252,9 @@ class CategoryLifecycleEngine:
         force: bool = False,
     ) -> int:
         """Compile suggestions only when item state is new, changed, or due."""
+        if not force and not await self.scheduled_work_is_due(item):
+            category_id, item_id = self._item_identity(item)
+            return await self._active_suggestion_count(category_id, item_id)
         decision = await self.should_process_item(item, purpose="suggestions", force=force)
         if not decision.should_process:
             return await self._active_suggestion_count(decision.category_id, decision.item_id)

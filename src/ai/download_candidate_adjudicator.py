@@ -439,7 +439,9 @@ class DownloadCandidateAdjudicator:
             "- Preserve the user's exact requested title, unit scope, and media language.\n"
             "- Use the owning category guidance below to interpret category-specific release names, bundle/range notation, language tags, unit coverage, and fallback strategy.\n"
             "- Treat title stopwords/articles as semantically important in the answer, but do not reject a candidate merely because another layer dropped one in a search query.\n"
-            "- Respect category-owned annotations such as unit_descriptor, bundle_context, language_preference_status, request-fit fields, coverage notes, and selection warnings.\n"
+            "- Respect category-owned annotations such as unit_descriptor, bundle_context, selective_queue, language_preference_status, language_evidence, request-fit fields, coverage notes, and selection warnings.\n"
+            "- A configured/requested language is a preference, not proof about a release. Claim a release advertises that language only when language_evidence shows title/provider evidence.\n"
+            "- selective_queue.status=supported means the category can register metadata-time file selection; it does not mean selection has already completed.\n"
             "- Reject obvious title collisions, wrong requested units, unrelated title collisions, and rows the candidate annotations mark as hard blockers.\n"
             "- If a candidate declares complete requested-unit coverage through category-owned fields, treat that coverage as authoritative unless another row contradicts it.\n"
             "- If the request/effective_search includes quality_choice_policy.requires_user_choice=true, recommend the best few option candidate_ids, set should_queue_now=false, needs_user_choice=true, and tell the assistant to present quality/size options.\n"
@@ -460,7 +462,7 @@ class DownloadCandidateAdjudicator:
             "season", "episode", "languages", "resolution", "codec", "unit_descriptor",
             "bundle_context", "is_bundle", "bundle_scope", "pack_type", "bundle_unit_count",
             "selection_warnings", "selection_blockers", "auto_queue_allowed", "auto_queue_blocked_reason",
-            "language_preference_status", "tv_request_fit", "availability_seeders",
+            "language_preference_status", "language_evidence", "selective_queue", "tv_request_fit", "availability_seeders",
             "per_episode_size_mb", "estimated_bitrate_kbps", "expected_episode_count", "requested_season_coverage", "coverage_note",
         ]
         return {k: candidate.get(k) for k in fields if candidate.get(k) not in (None, "", [], {})}
@@ -513,12 +515,15 @@ class DownloadCandidateAdjudicator:
 
     @staticmethod
     def language_status_sort_rank(row: dict[str, Any]) -> int:
+        """Return the deterministic ordering rank for a candidate language verdict."""
         status = str(row.get("language_preference_status") or "").lower()
         return {
             "preferred_only": 5,
             "preferred_by_title": 5,
-            "unknown_acceptable": 4,
+            "unknown_acceptable": 4,  # legacy compatibility
+            "unknown": 4,
             "preferred_with_extra_audio": 3,
+            "multi_language_unverified": 2,
             "multi_language_fallback": 2,
             "not_applicable": 1,
             "mismatch": -100,

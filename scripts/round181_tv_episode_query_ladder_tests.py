@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 181 regressions for TV exact-episode search query fallback."""
+"""Round 181 regressions for TV language-first exact-episode search fallback."""
 from __future__ import annotations
 
 import asyncio
@@ -68,16 +68,16 @@ class FakeDb: ...
 class FakeLibrarian: ...
 
 
-def test_tv_builds_bare_episode_before_language_tagged_variants() -> None:
+def test_tv_builds_language_specific_primary_with_bare_episode_fallback() -> None:
     category = TvShowCategory()
     item = category.create_item("For All Mankind", language="Italian")
     primary = category.build_search_query(item, "S05E10", "Italian")
     alternatives = category.build_alternative_search_queries(item, "S05E10", "Italian")
-    require(primary == "For All Mankind S05E10", "TV primary episode query should be bare exact SxxEyy, not ITA-suffixed")
-    require("For All Mankind S05E10" in alternatives, "TV alternatives should retain the bare exact episode query")
+    require(primary == "For All Mankind S05E10 ITA", "TV primary episode query should try the requested language first")
+    require("For All Mankind S05E10" in alternatives, "TV alternatives should retain the bare exact episode query for recall")
     require("For.All.Mankind.S05E10" in alternatives, "TV alternatives should include dotted release-name form")
-    require(any(q.endswith("ITA") for q in alternatives), "TV alternatives may still include language-tagged variants later in the ladder")
-    require(alternatives.index("For All Mankind S05E10") < next(i for i, q in enumerate(alternatives) if q.endswith("ITA")), "bare exact query must be tried before ITA-tagged variants")
+    require(any(q.endswith("ITA") for q in alternatives), "TV alternatives should include additional language-tagged release forms")
+    require(alternatives.index("For All Mankind S05E10") < next(i for i, q in enumerate(alternatives) if q.endswith("ITA")), "within the fallback ladder, bare exact should precede additional tagged variants")
 
 
 def test_search_pipeline_tries_category_alternatives_after_empty_primary() -> None:
@@ -147,7 +147,7 @@ def test_search_pipeline_falls_back_to_tv_season_pack_when_episode_missing() -> 
 
 
 if __name__ == "__main__":
-    test_tv_builds_bare_episode_before_language_tagged_variants()
+    test_tv_builds_language_specific_primary_with_bare_episode_fallback()
     test_search_pipeline_tries_category_alternatives_after_empty_primary()
     test_tv_exact_episode_validator_rejects_wrong_episode()
     test_tv_episode_can_be_satisfied_by_season_pack_candidate()

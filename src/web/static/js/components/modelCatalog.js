@@ -115,6 +115,9 @@ function updateModelInfo(modelId, models) {
  * function directly from event handlers.
  */
 async function onProviderChange(selectEl) {
+    if (typeof markLegacyBaseRouteAuthoritative === 'function') {
+        markLegacyBaseRouteAuthoritative();
+    }
     const providerId = selectEl.value;
     window.currentProvider = providerId;
     const modelsSection = document.getElementById('provider-models-section');
@@ -158,6 +161,9 @@ function onModelSelect(selectEl) {
     const modelId = selectEl.value;
     if (!modelId) return;
     document.getElementById('model').value = modelId;
+    if (typeof markLegacyBaseRouteAuthoritative === 'function') {
+        markLegacyBaseRouteAuthoritative();
+    }
     updateModelInfo(modelId, window.modelCache[window.currentProvider] || []);
 }
 
@@ -181,6 +187,9 @@ function filterModels(query) {
  * function directly from event handlers.
  */
 function onTierProviderChange(tier, selectEl) {
+    if (typeof markLegacyTierRoutesActive === 'function') {
+        markLegacyTierRoutesActive();
+    }
     const providerId = selectEl.value;
     if (!providerId) {
         var modelSelect = document.getElementById('tier-' + tier + '-select');
@@ -212,6 +221,9 @@ function onTierModelSelect(tier, selectEl) {
     const modelId = selectEl.value;
     if (!modelId) return;
     document.getElementById('tier-' + tier + '-model').value = modelId;
+    if (typeof markLegacyTierRoutesActive === 'function') {
+        markLegacyTierRoutesActive();
+    }
 }
 
 /**

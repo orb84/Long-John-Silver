@@ -7,7 +7,12 @@ def test_dom_hardens_dynamic_and_template_form_controls() -> None:
     dom_js = Path('src/web/static/js/components/dom.js').read_text()
 
     assert 'hardenFormControl' in dom_js
-    assert "new-password" in dom_js
+    # App API tokens are deliberately converted away from real password
+    # controls and marked for common password-manager integrations.
+    assert "data-lpignore" in dom_js
+    assert "data-1p-ignore" in dom_js
+    assert "data-bwignore" in dom_js
+    assert "el.setAttribute('type', 'text')" in dom_js
     assert "data-ljs-noncredential" in dom_js
     assert 'DOMContentLoaded' in dom_js
     assert 'MutationObserver' in dom_js

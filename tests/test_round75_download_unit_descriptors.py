@@ -29,10 +29,11 @@ def test_tv_category_builds_unit_descriptor_and_legacy_coordinates() -> None:
 
 def test_search_results_and_queue_cache_carry_unit_descriptors() -> None:
     """Search tool caching should preserve category-owned descriptors for queueing."""
-    source = (project_root() / "src/ai/tools/scheduling.py").read_text(encoding="utf-8")
-    assert '"unit_descriptor": c.get("unit_descriptor") or {}' in source
-    assert "category.batch_group_for_candidate" in source
-    assert "label_bits.append" not in source
+    scheduling = (project_root() / "src/ai/tools/scheduling.py").read_text(encoding="utf-8")
+    workspace = (project_root() / "src/ai/tools/search_workspace.py").read_text(encoding="utf-8")
+    assert '"unit_descriptor": c.get("unit_descriptor") or {}' in scheduling
+    assert "category.batch_group_for_candidate" in workspace
+    assert "label_bits.append" not in workspace
 
 
 def test_queue_download_uses_descriptors_for_ordering_fallbacks_and_import_context() -> None:
@@ -40,7 +41,8 @@ def test_queue_download_uses_descriptors_for_ordering_fallbacks_and_import_conte
     source = (project_root() / "src/ai/tools/queue_download_support.py").read_text(encoding="utf-8")
     assert "sort_cached_download_candidates" in source
     assert "candidates_represent_same_unit" in source
-    assert "unit_descriptor=unit_descriptor" in source
+    assert "unit_descriptor" in source
+    assert "DownloadImportContext.from_selection" in source or "build_import_context" in source
     assert "Return candidates sorted by season/episode" not in source
 
 
@@ -57,4 +59,6 @@ def test_import_context_duplicate_overlap_prefers_descriptor_stable_keys() -> No
     source = (project_root() / "src/core/repositories/download.py").read_text(encoding="utf-8")
     assert "wanted_has_descriptor" in source
     assert "other_has_descriptor" in source
-    assert "return wanted.stable_unit_key == other.stable_unit_key" in source
+    assert "wanted_has_descriptor" in source
+    assert "other_has_descriptor" in source
+    assert "_descriptor_overlap(wanted, other)" in source

@@ -17,7 +17,7 @@ def test_jackett_json_parser_extracts_magnet_and_size() -> None:
                 "Details": "https://example.invalid/details",
             }
         ]
-    })
+    }, source_prefix="Jackett")
 
     assert len(results) == 1
     assert results[0].title.startswith("Example.Movie")

@@ -261,12 +261,21 @@ class EnquireAboutMediaTool:
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
         """Execute a category-owned media enquiry and return its payload."""
         item_name = str(arguments.get("item_name") or arguments.get("name") or "").strip()
+        category_id = str(
+            arguments.get("category_id")
+            or getattr(context, "category_id", None)
+            or ""
+        ).strip()
         service = MediaEnquiryService(
             settings_manager=self._settings_manager,
             database=self._database,
             category_registry=self._category_registry,
         )
-        return await service.enquire(item_name, str(arguments.get("category_id") or ""))
+        return await service.enquire(
+            item_name,
+            category_id,
+            request_text=getattr(context, "user_prompt", None),
+        )
 
 
 class SuggestionsListTool:

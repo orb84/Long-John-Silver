@@ -23,6 +23,7 @@ class ReleaseWatchesRouter:
         self._router.add_api_route("/api/release-watches", self._list_release_watches, methods=["GET"])
 
     def get_router(self) -> APIRouter:
+        """Return the configured FastAPI router for release-watch endpoints."""
         return self._router
 
     async def _list_release_watches(

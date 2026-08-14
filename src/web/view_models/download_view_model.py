@@ -118,6 +118,12 @@ class DownloadViewModelBuilder:
             serialisation.
         """
         result = item.model_dump()
+        status = result.get("status")
+        if hasattr(status, "value"):
+            result["status"] = status.value
+        priority = result.get("priority")
+        if hasattr(priority, "value"):
+            result["priority"] = priority.value
         # Non-active rows must not keep the last instantaneous rates.  A pause,
         # queued requeue, or stall means the current transfer rate is zero even
         # if an older WebSocket stat was cached in the browser.

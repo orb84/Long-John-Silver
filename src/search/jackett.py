@@ -84,6 +84,7 @@ class JackettSearch(SearchProvider):
 
     @property
     def name(self) -> str:
+        """Return the stable provider name exposed in search diagnostics."""
         return "Jackett"
 
     @property
@@ -97,13 +98,12 @@ class JackettSearch(SearchProvider):
         return ["*"]
 
     async def search(self, query: str, category: str | None = None) -> list[SearchResult]:
-        """Search Jackett for one LJS query.
+        """Search Jackett for one LJS query with cancellation-safe child tasks.
 
-        The v188 aggregate endpoint is still started first and remains the
-        compatibility baseline.  To match Jackett's manual UI behavior, direct
-        configured-indexer probes run in parallel for interactive recall.  A
-        single slow ``all`` aggregate request must not hold every fallback
-        hostage for 75 seconds and then masquerade as a legitimate empty result.
+        Aggregate and manual-parity probes are children of the caller's search
+        operation.  If the caller is cancelled, every child is cancelled and
+        awaited before this method exits; provider work must never outlive the
+        user turn that owns it.
         """
         normalized_query = self._normalize_query(query)
         self._last_error_detail = None
@@ -125,80 +125,87 @@ class JackettSearch(SearchProvider):
             if self._enable_direct_recovery
             else None
         )
+        child_tasks = [task for task in (aggregate_task, direct_task) if task is not None]
 
         aggregate_error: str | None = None
         aggregate_empty = False
         direct_empty = False
-        pending = {task for task in (aggregate_task, direct_task) if task is not None}
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                if task is aggregate_task:
-                    try:
-                        aggregate_results, aggregate_error = task.result()
-                    except Exception as exc:
-                        aggregate_results, aggregate_error = [], "unknown"
-                        logger.warning("[Jackett] Aggregate task failed for query={!r}: {}", normalized_query, exc)
-                    if aggregate_results:
-                        self.record_error_category("")
-                        if direct_task and not direct_task.done():
-                            direct_task.cancel()
-                        logger.info(
-                            "[Jackett] Native aggregate JSON returned {} parsed result(s) for query={!r}.",
-                            len(aggregate_results), normalized_query,
-                        )
-                        return aggregate_results
-                    aggregate_empty = True
-                    if aggregate_error:
+        pending = set(child_tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task is aggregate_task:
+                        try:
+                            aggregate_results, aggregate_error = task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            aggregate_results, aggregate_error = [], "unknown"
+                            logger.warning("[Jackett] Aggregate task failed for query={!r}: {}", normalized_query, exc)
+                        if aggregate_results:
+                            self.record_error_category("")
+                            if direct_task and not direct_task.done():
+                                direct_task.cancel()
+                            logger.info(
+                                "[Jackett] Native aggregate JSON returned {} parsed result(s) for query={!r}.",
+                                len(aggregate_results), normalized_query,
+                            )
+                            return aggregate_results
+                        aggregate_empty = True
+                        if aggregate_error:
+                            logger.warning(
+                                "[Jackett] Aggregate JSON degraded for query={!r}: {}; waiting for direct manual-parity results if still running.",
+                                normalized_query, aggregate_error,
+                            )
+                        else:
+                            logger.warning(
+                                "[Jackett] Aggregate JSON returned 0 result(s) for query={!r}; waiting for direct manual-parity verification if still running.",
+                                normalized_query,
+                            )
+                    elif direct_task is not None and task is direct_task:
+                        try:
+                            recovery_results = task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            recovery_results = []
+                            logger.warning("[Jackett] Direct manual-parity task failed for query={!r}: {}", normalized_query, exc)
+                        if recovery_results:
+                            self.record_error_category("")
+                            if not aggregate_task.done():
+                                aggregate_task.cancel()
+                            logger.info(
+                                "[Jackett] Direct configured-indexer manual-parity search returned {} parsed result(s) for query={!r}.",
+                                len(recovery_results), normalized_query,
+                            )
+                            return recovery_results
+                        direct_empty = True
                         logger.warning(
-                            "[Jackett] Aggregate JSON degraded for query={!r}: {}; waiting for direct manual-parity results if still running.",
-                            normalized_query, aggregate_error,
-                        )
-                    else:
-                        logger.warning(
-                            "[Jackett] Aggregate JSON returned 0 result(s) for query={!r}; waiting for direct manual-parity verification if still running.",
+                            "[Jackett] Direct configured-indexer manual-parity search returned 0 result(s) for query={!r}.",
                             normalized_query,
                         )
-                elif direct_task is not None and task is direct_task:
-                    try:
-                        recovery_results = task.result()
-                    except Exception as exc:
-                        recovery_results = []
-                        logger.warning("[Jackett] Direct manual-parity task failed for query={!r}: {}", normalized_query, exc)
-                    if recovery_results:
-                        self.record_error_category("")
-                        if not aggregate_task.done():
+                        if not aggregate_empty and not aggregate_task.done():
+                            aggregate_error = "aggregate_cancelled_after_direct_probe_empty"
                             aggregate_task.cancel()
-                        logger.info(
-                            "[Jackett] Direct configured-indexer manual-parity search returned {} parsed result(s) for query={!r}.",
-                            len(recovery_results), normalized_query,
-                        )
-                        return recovery_results
-                    direct_empty = True
-                    logger.warning(
-                        "[Jackett] Direct configured-indexer manual-parity search returned 0 result(s) for query={!r}.",
-                        normalized_query,
-                    )
-                    if not aggregate_empty and not aggregate_task.done():
-                        # The direct probe has already exercised the manual-UI
-                        # equivalent path.  Do not keep the user waiting for a
-                        # stuck all-indexer aggregate; escalate to emergency
-                        # providers/Soulseek at the orchestration layer.
-                        aggregate_error = "aggregate_cancelled_after_direct_probe_empty"
-                        aggregate_task.cancel()
-                        pending.discard(aggregate_task)
+                            pending.discard(aggregate_task)
 
-        # Preserve degraded markers so SearchAggregator can run emergency
-        # providers.  If aggregate was merely empty and direct verified empty,
-        # this is a credible empty result; if aggregate timed out/errored, it is
-        # provider degradation, not a real zero.
-        marker = aggregate_error or "empty_verified"
-        self.record_error_category(marker)
-        logger.warning(
-            "[Jackett] Query {!r} produced 0 result(s) after aggregate_empty={} direct_empty={} aggregate_error={!r}.",
-            normalized_query, aggregate_empty, direct_empty, aggregate_error,
-        )
-        return []
+            marker = aggregate_error or "empty_verified"
+            self.record_error_category(marker)
+            logger.warning(
+                "[Jackett] Query {!r} produced 0 result(s) after aggregate_empty={} direct_empty={} aggregate_error={!r}.",
+                normalized_query, aggregate_empty, direct_empty, aggregate_error,
+            )
+            return []
+        except asyncio.CancelledError:
+            logger.info("[Jackett] Search cancelled by owning operation for query={!r}; cancelling provider child tasks.", normalized_query)
+            raise
+        finally:
+            for task in child_tasks:
+                if not task.done():
+                    task.cancel()
+            if child_tasks:
+                await asyncio.gather(*child_tasks, return_exceptions=True)
 
     async def health_check(self) -> bool:
         """Check that Jackett accepts the configured API key on a search endpoint."""
@@ -328,6 +335,8 @@ class JackettSearch(SearchProvider):
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
         return self._dedupe(rows)
 
     async def _configured_selectors(self) -> tuple[str, ...]:

@@ -77,7 +77,10 @@ async def test_agent_loop_executes_bare_json_search_instead_of_returning_it() ->
     )
 
     assert result.response == "Here are a few strong recent war-film picks."
+    assert len(calls) == 1
+    context = calls[0].pop("__tool_context")
     assert calls == [{"query": "All Quiet on the Western Front 2022 war film", "max_results": 5}]
+    assert context.operation_id == "bare_json_recovered_call"
     assert not any(msg.get("content", "").startswith('{"query"') for msg in messages if isinstance(msg, dict))
     assert any(msg.get("tool_calls") for msg in messages if isinstance(msg, dict))
 
@@ -118,7 +121,10 @@ async def test_streaming_loop_buffers_and_recovers_bare_json_before_display() ->
         chunks.append(chunk)
 
     assert "".join(chunks) == "Here are better picks."
+    assert len(calls) == 1
+    context = calls[0].pop("__tool_context")
     assert calls == [{"query": "All Quiet on the Western Front 2022 war film", "max_results": 5}]
+    assert context.operation_id == "bare_json_recovered_call"
     assert executor.last_content == "Here are better picks."
 
 

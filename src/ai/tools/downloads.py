@@ -7,7 +7,9 @@ queuing, prioritizing, and pausing/resuming downloads.
 
 from __future__ import annotations
 
-from typing import Optional, TYPE_CHECKING
+import hashlib
+import json
+from typing import Any, Optional, TYPE_CHECKING
 
 from loguru import logger
 
@@ -17,8 +19,9 @@ from src.ai.tools.queue_download_support import QueueDownloadService
 from src.ai.tools.torrent_search_support import TorrentSearchToolService
 from src.ai.tools.soulseek import SoulseekToolProvider
 from src.core.library_sharing import LibrarySharingService
-from src.core.models import ToolExecutionContext
+from src.core.models import ActionCommand, ActionSource, ToolExecutionContext
 from src.core.models import Intent
+from src.core.actions.gateway import ActionGateway
 
 if TYPE_CHECKING:
     from src.core.downloader import DownloadManager
@@ -26,6 +29,7 @@ if TYPE_CHECKING:
     from src.core.database import Database
     from src.core.config import SettingsManager
     from src.search.aggregator import SearchAggregator
+    from src.core.actions.audit import ActionEventStore
 
 
 class ListDownloadsTool:
@@ -136,15 +140,16 @@ class QueueDownloadTool:
     destructive = False
     required_dependencies = ["scheduler"]
 
-    def __init__(self, scheduler: Optional[MediaScheduler] = None, database: Optional[Database] = None) -> None:
-        """Initialize the tool with a media scheduler and database.
-
-        Args:
-            scheduler: MediaScheduler instance for queueing downloads.
-            database: Database instance.
-        """
+    def __init__(
+        self,
+        scheduler: Optional[MediaScheduler] = None,
+        database: Optional[Database] = None,
+        action_event_store: Optional[ActionEventStore] = None,
+    ) -> None:
+        """Initialize queue execution with the shared durable command ledger."""
         self._scheduler = scheduler
         self._database = database
+        self._action_event_store = action_event_store
 
     def parameters(self) -> dict:
         """Return the public tool parameter schema.
@@ -174,7 +179,7 @@ class QueueDownloadTool:
                     "description": "Legacy 1-based index from the latest visible search results. Prefer candidate_id when available."
                 },
                 "magnet": {"type": "string", "description": "Magnet URI (only if queueing a direct magnet link not in search results)."},
-                "name": {"type": "string", "description": "Exact name from list_media or search results."},
+                "name": {"type": "string", "description": "Exact name from list_downloads or search results."},
                 "season": {"type": "integer", "description": "Legacy first unit coordinate for categories that accept it. Prefer candidate_id/result_set_id."},
                 "episode": {"type": "integer", "description": "Legacy second unit coordinate for categories that accept it. Prefer candidate_id/result_set_id."},
                 "unit_descriptor": {"type": "object", "description": "Category-owned unit descriptor from search results; normally supplied automatically via candidate_id."},
@@ -211,7 +216,75 @@ class QueueDownloadTool:
         logger.info(f"Tool: queueing download for '{arguments.get('name')}'")
         if not self._scheduler:
             return {"error": "Scheduler not available"}
-        return await QueueDownloadService(self._scheduler, self._database).queue(arguments, context)
+        service = QueueDownloadService(self._scheduler, self._database)
+        gateway = ActionGateway(audit_store=self._action_event_store)
+
+        async def execute_queue(**command_arguments: Any) -> object:
+            return await service.queue(command_arguments, context)
+
+        gateway.register("queue_download", execute_queue)
+        command_fields: dict[str, Any] = {
+            "name": "queue_download",
+            "arguments": arguments,
+            "source": self._action_source(context.source),
+            "user_id": context.user_id,
+            "session_id": context.session_id,
+            "actor": context.actor,
+            "idempotency_key": self._queue_idempotency_key(arguments, context),
+        }
+        if context.correlation_id:
+            command_fields["correlation_id"] = context.correlation_id
+        command = ActionCommand(**command_fields)
+        receipt = await gateway.execute(command)
+        payload = dict(receipt.data)
+        if not receipt.ok:
+            payload.setdefault("error", receipt.error or "Queue command failed")
+        payload["command_receipt"] = {
+            "command_id": receipt.command_id,
+            "correlation_id": receipt.correlation_id,
+            "idempotency_key": receipt.idempotency_key,
+            "status": receipt.status,
+            "ok": receipt.ok,
+            "replayed": receipt.replayed,
+            "receipt_persisted": receipt.receipt_persisted,
+            "persistence_error": receipt.persistence_error,
+        }
+        if receipt.receipt_persisted is not True:
+            payload["receipt_warning"] = (
+                "The queue outcome is not durably recorded. Verify current downloads "
+                "before retrying or reporting success."
+            )
+        return payload
+
+    @staticmethod
+    def _action_source(source: str) -> ActionSource:
+        normalized = str(source or "chat").lower()
+        if normalized in {"ui", "web", "rest"}:
+            return ActionSource.UI
+        if normalized in {"scheduler", "automation", "watch"}:
+            return ActionSource.SCHEDULER
+        if normalized in {"system", "repair"}:
+            return ActionSource.SYSTEM
+        return ActionSource.CHAT
+
+    @classmethod
+    def _queue_idempotency_key(cls, arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+        # Tool-call IDs are stable across transport retries but change for a new
+        # intentional model invocation. The full argument fingerprint prevents
+        # collisions between different candidates, priorities, units, or options.
+        stable = {
+            "operation_id": context.operation_id,
+            "arguments": arguments,
+            "user_id": context.user_id,
+            "session_id": context.session_id,
+            "source": context.source,
+        }
+        return "queue:" + cls._queue_fingerprint(stable)
+
+    @staticmethod
+    def _queue_fingerprint(value: dict[str, Any]) -> str:
+        encoded = json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:32]
 
 
 
@@ -339,6 +412,7 @@ class DownloadToolProvider:
         search_aggregator: Optional[SearchAggregator] = None,
         settings_manager: Optional[SettingsManager] = None,
         category_registry: object | None = None,
+        action_event_store: object | None = None,
     ) -> None:
         """Initialize with optional dependencies.
 
@@ -355,6 +429,7 @@ class DownloadToolProvider:
         self._search_aggregator = search_aggregator
         self._settings_manager = settings_manager
         self._category_registry = category_registry
+        self._action_event_store = action_event_store
 
     def get_tools(self) -> list:
         """Return instantiated download tool instances.
@@ -365,7 +440,7 @@ class DownloadToolProvider:
         return [
             ListDownloadsTool(downloader=self._downloader, settings_manager=self._settings_manager, database=self._database),
             ListLibrarySharesTool(downloader=self._downloader, settings_manager=self._settings_manager),
-            QueueDownloadTool(scheduler=self._scheduler, database=self._database),
+            QueueDownloadTool(scheduler=self._scheduler, database=self._database, action_event_store=self._action_event_store),
             InspectTorrentCandidateTool(database=self._database),
             SetDownloadPriorityTool(scheduler=self._scheduler),
             ManageDownloadsTool(downloader=self._downloader),
@@ -383,7 +458,7 @@ class SetDownloadPriorityTool:
         "Unified priority control for queued/paused downloads. Works for any media type. "
         "Target all downloads, a season (TV), or a specific episode. "
         "Priority: high, normal, low. "
-        "Chain: list_media \u2192 set_download_priority(name='...', priority='high', season=5)."
+        "Chain: list_downloads \u2192 set_download_priority(name='...', priority='high', season=5)."
     )
     intents = {Intent.DOWNLOAD}
     allow_direct = True
@@ -409,7 +484,7 @@ class SetDownloadPriorityTool:
         return {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Exact name from list_media."},
+                "name": {"type": "string", "description": "Exact name from list_downloads."},
                 "priority": {"type": "string", "description": "high, normal, or low."},
                 "season": {"type": "integer", "description": "Optional \u2014 target a TV season."},
                 "episode": {"type": "integer", "description": "Optional \u2014 target a specific TV episode."},

@@ -131,12 +131,20 @@ class SetupActionHandler:
             settings.llm.api_key = kwargs["api_key"]
             provider = settings.llm.active_provider
             self._llm.keys.add_key(provider, kwargs["api_key"], label="setup", set_active=True)
+        # First-run setup presents one provider/model as the app's AI brain.
+        # It must not leave shipped/stale tier or per-task route identities able
+        # to override that visible selection before the first chat request.
+        clear_routes = getattr(settings.llm, "clear_route_overrides", None)
+        if callable(clear_routes):
+            clear_routes()
         web_payload = kwargs.get("web_search")
         if isinstance(web_payload, dict):
             settings.web_search = WebSearchConfig(**{**settings.web_search.model_dump(), **web_payload})
         self._sm.save(settings)
         self._assistant.update_settings(settings)
-        return {"status": "ok"}
+        summary_method = getattr(self._assistant, "llm_route_summary", None)
+        route_summary = summary_method() if callable(summary_method) else {}
+        return {"status": "ok", **route_summary}
 
 
     async def setup_embeddings(self, **kwargs: Any) -> dict:

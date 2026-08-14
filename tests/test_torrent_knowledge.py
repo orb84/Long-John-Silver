@@ -230,7 +230,8 @@ class TestBundleDownloadHandler:
             category_id="tv",
         )
         assert result is not None
-        assert result["bundle_type"] == "tv_bundle"
+        assert result["bundle_type"] == "complete"
+        assert result["bundle_kind"] == "tv_season_pack"
         assert result["season"] == 1
 
     def test_does_not_describe_single_episode_as_bundle(self):

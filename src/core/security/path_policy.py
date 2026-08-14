@@ -191,6 +191,18 @@ class SafePathResolver:
         self._audit.record(purpose, "copy", "success", "write", self._category_id, [str(safe_source), str(safe_target)])
         return operation
 
+    def safe_copytree(self, source: Path | str, target: Path | str, purpose: str = "copytree") -> SafeFileOperation:
+        """Copy a directory tree only when source and destination are scoped."""
+        safe_source = self.require(source, purpose=f"{purpose}:source", must_exist=True)
+        if not safe_source.is_dir():
+            raise SecurityPolicyError(f"Refusing to copy a non-directory tree: {safe_source}")
+        safe_target = self.ensure_destination(target, purpose=f"{purpose}:target")
+        safe_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(safe_source), str(safe_target))
+        operation = self._operation("copytree", safe_source, safe_target, destructive=False, allowed=True)
+        self._audit.record(purpose, "copytree", "success", "write", self._category_id, [str(safe_source), str(safe_target)])
+        return operation
+
     def safe_hardlink(self, source: Path | str, target: Path | str, purpose: str = "hardlink") -> SafeFileOperation:
         """Create a hardlink only when both source and destination are scoped."""
         safe_source = self.require(source, purpose=f"{purpose}:source", must_exist=True)

@@ -41,7 +41,7 @@
         <div class="form-row">
             <div class="form-group flex-2">
                 <label>Model ID</label>
-                <input type="text" id="model" name="model" value="{{ settings.llm.model or '' }}" placeholder="e.g. openrouter/openai/gpt-4o-mini">
+                <input type="text" id="model" name="model" value="{{ settings.llm.model or '' }}" placeholder="e.g. openrouter/openai/gpt-4o-mini" oninput="markLegacyBaseRouteAuthoritative()">
             </div>
         </div>
         <div class="form-row">
@@ -64,7 +64,18 @@
             </div>
         </div>
 
-        <button type="submit" class="btn btn-gold" style="margin-top:1rem">Save Default LLM</button>
+        {% set has_llm_route_override = settings.llm.lightweight.model or settings.llm.lightweight.provider or settings.llm.standard.model or settings.llm.standard.provider or settings.llm.heavy.model or settings.llm.heavy.provider %}
+        <label class="llm-base-authority-control">
+            <input type="checkbox" id="llm-apply-base-all" {{ '' if has_llm_route_override else 'checked' }}>
+            <span>
+                <strong>Use this base provider/model for every LLM task</strong>
+                <small>Changing the base provider or model checks this automatically. Uncheck it only when the tier routes below are intentional.</small>
+            </span>
+        </label>
+        <div id="legacy-effective-llm-routes" class="llm-effective-routes">
+            <p class="empty-msg">Loading the effective task routes…</p>
+        </div>
+        <button type="submit" class="btn btn-gold" style="margin-top:1rem">Save Model Routing</button>
     </form>
 </section>
 
@@ -87,11 +98,11 @@
                 <label>Provider</label>
                 <select id="tier-lightweight-provider" onchange="onTierProviderChange('lightweight', this)" class="tier-provider-select">
                     <option value="">— Same as default —</option>
-                    <option value="openrouter">OpenRouter</option>
-                    <option value="nvidia_nim">NVIDIA NIM</option>
-                    <option value="ollama_cloud">Ollama Cloud</option>
-                    <option value="ollama_local">Ollama (Local)</option>
-                    <option value="lm_studio">LM Studio</option>
+                    <option value="openrouter" {{ 'selected' if settings.llm.lightweight.provider == 'openrouter' }}>OpenRouter</option>
+                    <option value="nvidia_nim" {{ 'selected' if settings.llm.lightweight.provider == 'nvidia_nim' }}>NVIDIA NIM</option>
+                    <option value="ollama_cloud" {{ 'selected' if settings.llm.lightweight.provider == 'ollama_cloud' }}>Ollama Cloud</option>
+                    <option value="ollama_local" {{ 'selected' if settings.llm.lightweight.provider == 'ollama_local' }}>Ollama (Local)</option>
+                    <option value="lm_studio" {{ 'selected' if settings.llm.lightweight.provider == 'lm_studio' }}>LM Studio</option>
                 </select>
             </div>
             <div class="form-group">
@@ -105,7 +116,7 @@
             </div>
             <div class="form-group flex-2">
                 <label>Model ID (or type custom)</label>
-                <input type="text" name="lightweight_model" id="tier-lightweight-model" value="{{ settings.llm.lightweight.model or '' }}" placeholder="e.g. openrouter/openai/gpt-3.5-turbo">
+                <input type="text" name="lightweight_model" id="tier-lightweight-model" value="{{ settings.llm.lightweight.model or '' }}" placeholder="e.g. openrouter/openai/gpt-3.5-turbo" oninput="markLegacyTierRoutesActive()">
             </div>
         </div>
     </div>
@@ -119,11 +130,11 @@
                 <label>Provider</label>
                 <select id="tier-standard-provider" onchange="onTierProviderChange('standard', this)" class="tier-provider-select">
                     <option value="">— Same as default —</option>
-                    <option value="openrouter">OpenRouter</option>
-                    <option value="nvidia_nim">NVIDIA NIM</option>
-                    <option value="ollama_cloud">Ollama Cloud</option>
-                    <option value="ollama_local">Ollama (Local)</option>
-                    <option value="lm_studio">LM Studio</option>
+                    <option value="openrouter" {{ 'selected' if settings.llm.standard.provider == 'openrouter' }}>OpenRouter</option>
+                    <option value="nvidia_nim" {{ 'selected' if settings.llm.standard.provider == 'nvidia_nim' }}>NVIDIA NIM</option>
+                    <option value="ollama_cloud" {{ 'selected' if settings.llm.standard.provider == 'ollama_cloud' }}>Ollama Cloud</option>
+                    <option value="ollama_local" {{ 'selected' if settings.llm.standard.provider == 'ollama_local' }}>Ollama (Local)</option>
+                    <option value="lm_studio" {{ 'selected' if settings.llm.standard.provider == 'lm_studio' }}>LM Studio</option>
                 </select>
             </div>
             <div class="form-group">
@@ -137,7 +148,7 @@
             </div>
             <div class="form-group flex-2">
                 <label>Model ID (or type custom)</label>
-                <input type="text" name="standard_model" id="tier-standard-model" value="{{ settings.llm.standard.model or '' }}" placeholder="Same as default if blank">
+                <input type="text" name="standard_model" id="tier-standard-model" value="{{ settings.llm.standard.model or '' }}" placeholder="Same as default if blank" oninput="markLegacyTierRoutesActive()">
             </div>
         </div>
     </div>
@@ -151,11 +162,11 @@
                 <label>Provider</label>
                 <select id="tier-heavy-provider" onchange="onTierProviderChange('heavy', this)" class="tier-provider-select">
                     <option value="">— Same as default —</option>
-                    <option value="openrouter">OpenRouter</option>
-                    <option value="nvidia_nim">NVIDIA NIM</option>
-                    <option value="ollama_cloud">Ollama Cloud</option>
-                    <option value="ollama_local">Ollama (Local)</option>
-                    <option value="lm_studio">LM Studio</option>
+                    <option value="openrouter" {{ 'selected' if settings.llm.heavy.provider == 'openrouter' }}>OpenRouter</option>
+                    <option value="nvidia_nim" {{ 'selected' if settings.llm.heavy.provider == 'nvidia_nim' }}>NVIDIA NIM</option>
+                    <option value="ollama_cloud" {{ 'selected' if settings.llm.heavy.provider == 'ollama_cloud' }}>Ollama Cloud</option>
+                    <option value="ollama_local" {{ 'selected' if settings.llm.heavy.provider == 'ollama_local' }}>Ollama (Local)</option>
+                    <option value="lm_studio" {{ 'selected' if settings.llm.heavy.provider == 'lm_studio' }}>LM Studio</option>
                 </select>
             </div>
             <div class="form-group">
@@ -169,11 +180,11 @@
             </div>
             <div class="form-group flex-2">
                 <label>Model ID (or type custom)</label>
-                <input type="text" name="heavy_model" id="tier-heavy-model" value="{{ settings.llm.heavy.model or '' }}" placeholder="e.g. openrouter/anthropic/claude-sonnet-4">
+                <input type="text" name="heavy_model" id="tier-heavy-model" value="{{ settings.llm.heavy.model or '' }}" placeholder="e.g. openrouter/anthropic/claude-sonnet-4" oninput="markLegacyTierRoutesActive()">
             </div>
         </div>
     </div>
-    <button class="btn btn-gold" onclick="saveTiers()">Save Tiers</button>
+    <button class="btn btn-gold" onclick="saveTiers()">Save Tier Routing</button>
 </section>
 
 {# ─── Library Paths ─────────────────────────────────────────────── #}
@@ -667,10 +678,9 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/js/components/traktAuth.js"></script>
-<script src="/static/js/components/modelCatalog.js"></script>
-<script src="/static/js/components/apiKeyManager.js"></script>
-<script src="/static/js/components/settingsSavers.js"></script>
-<script src="/static/js/components/libraryConsolidation.js"></script>
-<script src="/static/js/components/bandwidthScheduler.js"></script>
+<script src="{{ static_asset('/static/js/components/traktAuth.js') }}"></script>
+<script src="{{ static_asset('/static/js/components/modelCatalog.js') }}"></script>
+<script src="{{ static_asset('/static/js/components/apiKeyManager.js') }}"></script>
+<script src="{{ static_asset('/static/js/components/libraryConsolidation.js') }}"></script>
+<script src="{{ static_asset('/static/js/components/bandwidthScheduler.js') }}"></script>
 {% endblock %}

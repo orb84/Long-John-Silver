@@ -26,8 +26,8 @@ def test_builtin_categories_expose_educational_setup_requirements() -> None:
     assert tv_requirements["library_path"].configured is True
     assert tv_requirements["library_path"].setting_key == "category_config.tv.paths.library_path"
     assert tv_requirements["jackett"].configured is True
-    assert tv_requirements["tmdb_api_key"].configured is True
-    assert tv_requirements["tvmaze_metadata"].configured is True
+    assert "tmdb_api_key" not in tv_requirements
+    assert tv_requirements["tvmaze_provider"].configured is True
     assert movie_requirements["web_search"].configured is True
 
 
@@ -38,7 +38,7 @@ def test_missing_required_category_setup_is_visible() -> None:
 
     requirements = {req.id: req for req in movie.setup_requirements(Settings())}
 
-    assert requirements["library_path"].required is True
-    assert requirements["library_path"].configured is False
+    assert requirements["library_path"].required is False
+    assert requirements["library_path"].configured is True
     assert requirements["jackett"].required is True
     assert requirements["jackett"].configured is False

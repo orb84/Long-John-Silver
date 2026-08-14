@@ -159,6 +159,38 @@ queued download.  `queue_download` receipts must distinguish `queued`,
 success only for verified active queue receipts and must surface partial failures
 instead of turning them into a successful batch.
 
+### Round 282 — Canonical Completion, Selective Bundles, and Action Truth
+
+A terminal download row is transfer history, not proof that the requested
+logical unit still exists in the library.  Before a manual request is blocked by
+a matching `complete` row, generic queue orchestration must ask the owning
+category to compare the category-owned unit descriptor with the current
+canonical library object.  Only a positive category verdict may report
+`already_complete`.  A verified canonical absence may revive or replace the
+terminal transfer row; an unknown verdict remains conservative and does not
+discard duplicate protection for queued or active rows.
+
+Bundle selection capability is also category-owned.  A category may publish
+that a bundle proves coverage of the requested unit and supports metadata-time
+file priority selection.  Generic search policy consumes that declaration but
+must not invent pack parsing or categorically ban selective queueing.  The queue
+receipt for such a request says only that the torrent was registered and file
+selection is pending metadata; it must not claim that the target file has
+already been extracted, selected, downloaded, or imported.
+
+Configured language preference is request context, never release evidence.
+Candidate language facts must come from the concrete release title, provider
+fields, or later file inspection.  `MULTI` without the requested language named
+is unverified, and an explicit non-English request must not be queued from that
+signal alone.
+
+State-changing tool receipts outrank LLM prose.  If `queue_download` returns no
+verified queue/active identifier, the agent loop replaces any contradictory
+success prose with the structured failure.  Partial batch receipts must report
+the verified success count and the failed units separately.  Metadata, search
+history, preferences, and old conversation summaries cannot establish that a
+download is currently active; a current queue/status tool is required.
+
 When a generic/tag search result has no provider-backed media identity and no
 category-owned structured unit descriptor, the concrete release title is the
 best available identity for duplicate checks.  The result-set query text, such
@@ -321,10 +353,21 @@ validation.
 If provider metadata is unavailable, the category may use conservative fuzzy
 matching as a degraded recall path. That fallback must remain bounded and must
 not collapse unrelated titles such as one title being a suffix or partial token
-window of another. Public web research can be used for title-ambiguity
-resolution when metadata providers cannot identify a title, but fetched public
-evidence should establish aliases/context rather than becoming a torrent
-queueing shortcut.
+window of another. Single-token aliases are especially risky: a request for
+``Title`` may match the isolated series/movie title, or the title followed only
+by release disambiguators such as a year, quality/source tag, language tag, or
+season/episode marker, but it must not match a longer semantic title such as
+``Title Fighter`` or ``Atomic Title`` merely because the token appears in the
+release name. Public web research can be used for title-ambiguity resolution
+when metadata providers cannot identify a title, but fetched public evidence
+should establish aliases/context rather than becoming a torrent queueing
+shortcut.
+
+Category search hooks should publish their title-identity verdicts on candidate
+payloads when they already have item metadata or requested-title scope. Generic
+search workspaces may consume that boolean verdict, stable descriptor keys, and
+category warnings, but they must not re-parse TV/movie titles or infer that a
+matching episode coordinate makes a different title safe.
 
 Movie search follows the same authority-first rule as TV. Before an interactive
 movie download/search reaches the generic LLM candidate reviewer, the Movie
@@ -2216,3 +2259,824 @@ uses bundle/range terminology rather than TV-specific season-pack wording.
 Verify with `scripts/round280_metadata_prompt_drift_tests.py` after changing
 metadata research tools, media probing, TV category definition prompt examples,
 or the generic intent-router download follow-up wording.
+
+## Round 283 — Durable Commands, Operational Ledger, and State Authority
+
+All state-changing flows are converging on one durable command contract. A
+command carries `command_id`, `correlation_id`, optional `idempotency_key`,
+actor/source identity, arguments, and creation time. Execution returns an
+authoritative receipt with status, timestamps, result data, and error details.
+The receipt—not model prose, search metadata, or historical state—is the source
+of truth for what the application actually did.
+
+`ActionGateway` persists three complementary command records:
+
+- `action_command_claims`: one atomic idempotency ownership record per scoped operation;
+- `action_command_receipts`: one immutable durable final receipt per command;
+- `operational_events`: an append-only command lifecycle timeline.
+
+The existing `action_events` table remains as a compatibility/read-model
+projection for memory and older consumers. New operational debugging and
+reconciliation must use command receipts and the ledger. Completed claims are
+not silently recycled: transport retries replay the immutable original receipt,
+while a later intentional operation must receive a new semantic idempotency key.
+
+The first production vertical slice is `queue_download` from the assistant tool
+surface. It executes through the same command contract and returns command
+receipt metadata alongside the existing queue receipt. Other mutations should
+be migrated incrementally without introducing parallel command frameworks.
+
+State questions must use the authority declared by `StateAuthorityRegistry`:
+
+| Fact | Authority |
+|---|---|
+| Logical unit present locally | Canonical library object |
+| Transfer active now | Live downloader projection, with durable active queue fallback |
+| Transfer attempted previously | Download history |
+| Unattended action permitted | Reconciled item policy/category watch plan |
+| Candidate selected by user/model | Pending result set |
+| Mutation actually happened | Command receipt/operational ledger |
+| Provider says a unit exists | Timestamped provider snapshot |
+
+Typed `FactVerdict` values distinguish verified, unknown, and stale evidence.
+Consumers must not substitute a non-authoritative source merely because the
+proper authority is unavailable. The registry is currently a declared contract
+and is enforced in selected flows; it is not yet a universal runtime gate over
+every historical reader. New code must consult it, and existing flows should be
+migrated incrementally rather than claiming global enforcement prematurely.
+
+`DownloadStateReconciler` is the first read-only recovery diagnostic. It finds
+terminal completed rows whose category-owned canonical target is verified
+absent. It reports a previewable repair action but does not mutate history yet.
+Repair execution will be added through the same command/receipt contract.
+
+
+## Round 284 — Command integrity, truthful uncertainty, and security capabilities
+
+The durable command foundation must reserve idempotency **before** invoking a
+mutation. Claims are scoped by action name, source, user, session, and semantic
+idempotency key. The complete normalized argument set is hashed into a request
+fingerprint; reusing the same key with different arguments is a conflict, not a
+replay. A concurrent duplicate either waits briefly for the owner's immutable
+receipt or returns an in-progress result. An expired running lease without a
+receipt becomes `uncertain` and blocks automatic re-execution.
+
+A receipt insert and claim finalization happen in one database transaction.
+Receipts are append-only and must never use replacement semantics. If the
+underlying mutation returns but the receipt cannot be persisted, the outward
+result is `ok=false`, `status=uncertain`, with wording that the mutation may have
+executed and current state must be verified before retrying. Agent final-response
+guards must reject queue success prose unless the queue identifiers are present
+**and** `command_receipt.receipt_persisted` is true.
+
+Operational arguments, results, and free-text errors are sanitized and bounded
+before durable persistence. Magnet tracker URLs, passkeys, tokens, credentials,
+and URL query strings must not enter command receipts, operational events,
+legacy action projections, or support bundles. Browser action endpoints own
+actor/source/user/session and durable IDs server-side; client payloads cannot
+impersonate scheduler or system activity.
+
+The first queue slice also has an execution-level start reservation. Database
+deduplication alone is insufficient because two callers could start the same
+magnet before either row becomes visible. `TorrentStartCoordinator` reserves one
+engine-start attempt per download identity and releases it on failure or terminal
+cleanup.
+
+Privileged process and filesystem operations are capability-owned. Autostart,
+managed slskd, and managed SearXNG code must execute commands through
+`CommandPolicy` and perform deletion/copy/rollback through `SafePathResolver`
+with explicit managed roots. Direct subprocess calls or destructive path
+operations in those managers are architecture violations, not convenience
+shortcuts.
+
+
+Background asynchronous work follows an ownership-before-construction rule.
+`TaskSupervisor` accepts coroutine factories for restartable and one-shot work and
+creates the coroutine only inside the task it owns. Event broadcasts and download
+statistics broadcasts must pass factories rather than pre-created coroutine
+objects. This prevents immediate shutdown, rejected scheduling, or mocked
+supervisors from leaking unawaited coroutines and makes cancellation ownership
+explicit.
+
+Current limitation: command leases do not yet have heartbeat renewal. Do not
+migrate long-running mutations whose normal execution can exceed the lease until
+lease ownership can be renewed safely. The queue command is the mature semantic
+idempotency slice; scheduler, import, repair, configuration, and suggestion
+mutations must move through the same gateway incrementally.
+
+## Round 285 — Evidence-based category identity and localized TV recall
+
+Unknown media titles must resolve to a concrete owning category before provider
+discovery, but natural-language vocabulary is never category truth. Users may
+speak any language, titles can exist as several media forms, and the model may
+supply an incorrect or omitted category argument. The resolution order is:
+
+1. exact tracked-item or canonical-library identity;
+2. weak model/router semantic evidence selects one category-owned verifier to run first;
+3. a strong exact result from that verifier resolves immediately;
+4. when the selected verifier is weak or empty, its bounded category-owned web fallback runs;
+5. only then are remaining installed categories compared for ambiguity;
+6. a unique strong category match proceeds, otherwise a structured clarification ends the turn.
+
+The generic ``CategoryIdentityResolver`` must not know that a TMDB result is TV,
+a movie, a book, music, or any future domain. ``MediaCategory.identify_agent_item``
+is the extension point: TV owns TMDB-TV/TVMaze probing, Movies own TMDB-movie
+probing, and definition-backed categories own their declared metadata resolvers.
+Evidence returned for another category is discarded. Hints select a verifier but
+never authorize search. Strong exact evidence from the selected verifier prevents
+unrelated category probes; only weak/absent evidence fans out to a bounded
+cross-category comparison. Absence, weak evidence, or plausible cross-category matches produce
+``category_resolution_required``/``category_ambiguous`` with a clarification
+question. A model argument, ``ToolExecutionContext.category_id``, singular/plural
+router term, or chat language can never authorize search by itself. When metadata
+is unavailable the response may recommend web research, but LJS asks rather than
+silently falling back to abstract ``media``.
+
+Ordinary DOWNLOAD turns expose the category-owned ``search_media_torrents``
+workspace and not raw torrent or raw Soulseek discovery tools. Raw provider
+search may remain registered for explicit internal/direct diagnostics, but it
+is not an LLM escape hatch around category metadata, unit discovery, language
+evidence, pack interpretation, result caching, and queue validation.
+
+Multilingual unit intent is model-owned and structured. ``search_media_torrents``
+accepts the category-neutral ``unit_scope`` values ``available_units``,
+``missing_units``, and ``all_units``. Categories interpret those values in their
+own domain; generic code and TV do not use English/Italian phrase lists as an
+authority. Structured constraints and the literal request text must survive the
+whole tool → scheduler → category handoff; an intermediate normalizer may not
+drop them and reconstruct intent from English words. TV enquiry returns
+recommended search arguments when provider-backed missing aired episodes are
+known. A broad TV title with no season, episode, bundle scope, or structured
+unit scope fails closed and asks which units are wanted instead of running a
+broad title query that can select an unrelated or future episode.
+
+For non-English TV requests, an untagged or wrong-language season pack is not
+evidence that localized releases do not exist. The TV-owned query ladder must
+continue through exact aired episode/unit queries, including configured language
+aliases such as ``ITA`` and ``Italian``, until useful candidates are found or the
+known aired frontier is exhausted. Provider catalogue totals and future
+announced seasons are not download frontiers: dated future seasons are excluded,
+and undated episode counts alone do not invent searchable units.
+
+Pack evidence remains structurally subordinate to direct unit evidence. A
+single episode returned by a season/range query is not a season pack and cannot
+stop a multi-unit fallback. During an exact episode ladder, direct requested-
+language releases and bundles containing the episode are tracked separately.
+When a direct requested-language release exists, an untagged or wrong-language
+bundle is suppressed rather than presented as equivalent; a requested-language
+bundle may remain, and bundle fallback remains available when no direct release
+exists.
+
+Both LLM ranking stages are advisory after provider/category filtering and are
+hard-bounded. Interactive TV search disables the legacy pipeline ranker and uses
+one final candidate review; compatibility paths time out to deterministic
+category-filtered candidates. A slow task model must not hold an interactive
+search turn for repeated multi-minute retry windows.
+
+Verify with ``scripts/round285_silo_tv_category_recall_tests.py`` after changing
+category identity hooks, enquiry/search resolution, abstract-media fallbacks,
+structured unit scope, TV localized pack/episode ladders, aired-season selection,
+DOWNLOAD tool policy, or candidate-adjudication timeout behavior.
+
+
+## Round 286 — Observable and cancellable LLM activity
+
+Every task-aware model call crosses `TaskLLMClient` and is registered with the
+bounded `LLMActivityMonitor`. The monitor links calls to the originating chat
+session/turn and records task, provider, model, streaming state, start/end time,
+duration, retry attempts, error/cancellation state, generation controls, exact
+messages, exact function schemas, payload character counts, conservative token
+estimates, and provider-reported prompt/completion usage when available. The web
+API exposes a cheap summary endpoint for polling and a per-call detail endpoint
+for exact context inspection. Exact context remains local, authenticated, and
+bounded in memory.
+
+Context budgeting includes serialized tool schemas. Task-specific values are
+**soft assembly targets**, not replacements for the endpoint/user-selected
+context window: routing/progress calls target 8k, ordinary
+chat/search/download/tool calls target 32k, planning/ranking/final calls target
+24k, and web research targets 48k. The endpoint or explicit user cap remains the
+hard authority, with the configured safety percentage applied once. History and
+optional packets are compacted toward the soft target; an irreducible prompt may
+exceed it and continue while still below the hard ceiling. The runtime logs an
+`LLM_PAYLOAD_BUDGET` line for the payload actually sent, distinguishing selected
+window, usable hard ceiling, soft target, estimated messages, schemas, output
+reserve, and total. Only a payload exceeding the usable hard ceiling fails before
+provider I/O. `llm_context.log` stores exact message and schema JSON with measured
+character counts and labelled estimates.
+
+The browser chat transport permits one active turn per WebSocket. The input is
+locked while a turn runs; the Send control becomes a visible Stop control. A
+second message receives a typed `busy` response. Stop cancels the server-side
+assistant task, propagates cancellation through provider HTTP/stream awaits, and
+returns a typed `cancelled` event. Disconnect also cancels the owned turn. Bridge
+code must not fake cancellation by merely hiding UI state.
+
+The Helm exposes LLM state at a glance (idle/running/failed, duration, and context
+size) and a detail drawer with recent calls, attempts/retries, latency, provider
+usage, exact messages, and exact tool schemas. Header status text is a single
+bounded flex row with ellipsis; intermediate widths reduce avatar/navigation
+footprint before the existing compact breakpoint so status labels cannot stack
+outside the header.
+
+Category identity now treats season/episode/latest-season semantics as verifier
+selection evidence in any language. Once TV metadata strongly confirms a literal
+title, unrelated ebook/audiobook probes do not manufacture ambiguity. If TV
+metadata is unavailable or empty, only TV runs a bounded public-web identity
+fallback; it requires a trusted TV/reference host or independent corroboration.
+Unresolved and ambiguous identity packets both terminate the current agent loop
+with their clarification question rather than triggering repeated model calls.
+Definition-backed book metadata adapters also fail soft under legacy private
+config drift: Internet Archive recovers a category-owned media type when provider
+kwargs are missing, and LibriVox uses its canonical trailing-slash feed endpoint.
+
+Verify with `tests/test_round286_llm_observability_cancel_and_tv_identity.py`
+after changing LLM provider boundaries, context budgeting, chat WebSockets,
+activity UI/API, responsive header rules, or category identity fallback.
+
+
+## Round 287 — Context authority, soft-target resilience, and post-turn latency
+
+Round 286 incorrectly implemented the task-specific context target as a hard
+replacement for the configured/provider context window and then applied the
+context safety percentage to that replacement. On a provider-confirmed 128k
+model, DOWNLOAD became a 32,768-token hard cap and then a 27,852-token usable
+cap. The incident payload was estimated at 28,700 tokens, so a basic request was
+rejected before provider I/O even though the real configured window had ample
+space.
+
+The corrected authority chain is:
+
+1. provider-reported/model metadata establishes the model maximum;
+2. an explicit user cap may narrow it, while a null cap means endpoint maximum;
+3. `context_budget_percent` applies once to produce the usable hard ceiling;
+4. task-specific values are soft assembly targets beneath that hard ceiling;
+5. output reserve and serialized tool schemas are measured explicitly;
+6. optional history/tool results are compressed toward the target;
+7. an irreducible payload may spill above the target but must remain below the
+   usable hard ceiling;
+8. only the usable hard ceiling can block provider I/O.
+
+For the logged NVIDIA NIM configuration this means: selected/model window
+128,000; usable hard ceiling 108,800 at 85%; ordinary DOWNLOAD target 32,768;
+target prompt space 31,744 after a 1,024 output reserve. The target is not
+multiplied by 85% a second time.
+
+Ordinary DOWNLOAD tool exposure is also bounded at the policy source. It keeps
+one generic control surface and one category-owned discovery chain:
+`list_downloads`, `manage_downloads`, `set_download_priority`,
+`get_storage_status`, `inspect_torrent_candidate`, `enquire_about_media`,
+`metadata_lookup`, `search_media_torrents`, `queue_download`, and
+`enqueue_soulseek_download`. Alias controls, broad library/configuration helpers,
+tracking/watch schemas, and unrelated Soulseek administration are not serialized
+into every basic DOWNLOAD call. The full public-web handbook is injected only
+for SEARCH, because ordinary DOWNLOAD does not expose that execution surface.
+
+The activity inspector displays selected/model window, usable hard ceiling,
+interactive target, measured prompt/total, cap source, and whether a call stayed
+within target, spilled safely above target, or was rejected at the hard ceiling.
+Pre-provider hard-budget failures are recorded as normal failed activity entries
+with exact local messages/tool schemas.
+
+Routing provider calls use two observable attempts with a 90-second timeout
+per attempt. The chat publishes an early routing-progress state after five seconds,
+so tolerating a slower reasoning-capable provider does not make the UI silent. NVIDIA NIM and the generic provider path retry only concrete timeouts, transport
+failures, rate limits, or explicit transient HTTP status codes; generic words such
+as `API` or `HTTP` do not make an invalid request retryable. Post-turn taste
+extraction is dispatched through `TaskSupervisor.spawn_one_shot` in production,
+so it cannot keep the WebSocket turn busy or leave Send/Stop locked after the
+visible response has completed. Routine DOWNLOAD engagement is already recorded
+by the behavior recorder and therefore does not launch a second taste-extraction
+LLM call unless the user explicitly expresses preference evidence.
+
+Verify with `pytest -q tests/test_round287_context_budget_resilience.py` and
+`python scripts/round287_context_budget_resilience_tests.py` after changing
+context-window resolution, tool-schema accounting, DOWNLOAD tool policy,
+activity telemetry, provider retry envelopes, or post-turn taste ingestion.
+
+
+## Round 288 — Reasoning-safe routing and authoritative live diagnostics
+
+The Round 287 live incident proved that the intent router was not failing because
+the user request was ambiguous. Its NVIDIA NIM call was terminated by an
+aggressive 15-second timeout, and the direct provider adapter had discarded the
+router's per-call generation settings. The fallback then mislabeled a provider
+failure as `CLARIFY` with fabricated confidence `1.00`, preventing category
+identity, metadata, search, and download code from running.
+
+Routing remains a small semantic classification stage used to select a compact
+intent-owned tool surface, but its execution contract is now provider-aware:
+
+1. `IntentRouter` requests a narrow label response and does not set artificial
+   `max_tokens` or temperature values. Task/user generation configuration remains
+   authoritative.
+2. `LLMGenerationPolicy` merges task/user and per-call generation settings once.
+3. LiteLLM and direct NVIDIA NIM adapters consume that same effective contract;
+   direct adapters filter only fields the endpoint does not support.
+4. GPT-OSS routing receives its documented low-reasoning instruction rather than
+   an output-token starvation trick.
+5. `LLMCallPolicy` separates retry/timeout transport controls from generation
+   settings. Routing currently permits two 90-second attempts.
+6. `ChatSessionRunner` publishes a visible classification-progress message after
+   five seconds while the provider call continues.
+7. Provider/circuit failure returns confidence zero and an explicit infrastructure
+   failure status. It is never rewritten as semantic certainty or user ambiguity.
+
+`LLMActivityMonitor` is the sole authority for live call state. It records exact
+messages/tool schemas in bounded local history and emits compact safe events for
+each attempt timeout/failure, retry start, terminal failure, context rejection,
+rate limit, authentication error, and cancellation. `LLMActivityBroadcaster`
+forwards those events through `ShipEventBus`; the browser's `LLMProblemCards`
+subscribes to that stream. Bounded activity snapshots reconcile any events missed
+during a temporary WebSocket interruption using stable call/attempt keys, without
+duplicating cards already delivered live. Each attempt remains individually
+visible, and clicking a card opens the related call in `LLMActivityPanel`.
+
+The former side drawer is now a dedicated full-screen LLM Diagnostics workspace
+with five authenticated views:
+
+- Activity: call history, status, latency, attempts, task/provider/model, measured
+  context, hard/soft budget values, generation settings, exact selected-call
+  messages/tool schemas, and provider token usage.
+- Context log: bounded secret-redacted `logs/llm_context.log`.
+- Raw responses: bounded secret-redacted `logs/llm_raw_response.log`.
+- Routing log: bounded secret-redacted `logs/structured_replies.log`, including
+  intent, confidence, operational status, and routing errors.
+- LLM application log: bounded, filtered, secret-redacted LLM/provider/routing
+  rows from `logs/ljs.log`, including nearby traceback continuations.
+
+Large exact payloads remain lazy-loaded only when a call is selected. Raw log
+endpoints are bounded to 2,000 lines and use normal dashboard authentication.
+Provider/attempt errors are also redacted before activity snapshots reach the
+browser, so snapshot-based notification recovery cannot expose credentials.
+Streaming telemetry remains active until iteration completes, fails, or is
+cancelled; creating a stream iterator is not completion.
+
+Verify with `tests/test_round288_reasoning_router_live_diagnostics.py`,
+`scripts/round288_reasoning_router_live_diagnostics_tests.py`, and the standard
+AI intent, AI context, security, public-document, and architecture checks.
+
+
+## Round 289 — Effective model ownership, durable browser diagnostics, and server-authoritative chat state
+
+The Round 288 target-machine logs exposed three integration failures that unit
+coverage had not exercised. The settings interface probed a newly selected
+`openai/gpt-oss-20b` model, but the next `intent_routing` call still resolved to
+`openai/gpt-oss-120b`; the old two-step settings workflow hot-reloaded twice
+while that call was running, and its retry remained bound to the captured old
+route. At the same time, the Python backend contained LLM-card and Send/Stop code
+that the browser did not visibly execute. The release had therefore validated
+individual modules without proving route ownership, browser-bundle coherence,
+or the complete server/UI state path.
+
+### Field-by-field route authority
+
+`LLMConfig` resolves each `TaskModelConfig` field independently through
+per-task → tier → global fallback. A task object that configures only
+`max_tokens`, temperature, or context no longer erases the tier's provider or
+model. `route_source()` reports the exact winning layer for every field, and
+`TaskLLMClient.effective_routes()` exposes a credential-free task map for the
+settings UI and diagnostics.
+
+A base-route save is one atomic mutation. Both the Compass settings panel and
+the standalone `/settings` page send the base route and visible tier routes to
+`/api/settings/llm` in one request. When the user selects “use this base route
+for every task,” `clear_route_overrides()` clears provider/model/api-base/api-key
+identity from chat tiers and task overrides while retaining generation/context
+tuning and the explicit embedding route. The retired two-step
+`/api/settings/tiers` mutation returns a reload instruction instead of allowing
+an obsolete browser to reapply a stale lightweight route.
+
+Every runtime route configuration has a monotonically increasing revision.
+`TaskLLMClient` stamps calls with the revision and winning route sources. A
+settings reload cancels active completion/stream consumers that captured the
+superseded revision, records a `route_configuration_changed` diagnostic event,
+and preserves the truthful cancellation reason. The next call resolves from the
+new settings object; retries cannot continue on an old model after a route save.
+
+### Durable problem events and exact browser recovery
+
+`LLMActivityMonitor` owns a bounded event ledger in addition to call history.
+Events are persisted before live delivery, included in the first authenticated
+activity snapshot, and reconciled by stable call/event/attempt keys. This means
+a timeout that occurred before the page connected—or during a temporary
+`/ws/events` gap—still produces one compact notification card without duplicate
+live/recovered cards. Cards and the full diagnostics workspace are generated
+from the same monitor records and each card opens its exact call id.
+
+The monitor exposes a constant-size `status(call_id)` lookup for provider cleanup.
+Provider teardown must not copy exact messages and serialized tool schemas merely
+to determine whether an activity record is still running.
+
+### Server-authoritative chat state
+
+The browser enters busy state synchronously before sending a turn: input is
+disabled, Send becomes Stop, and the command status becomes `LLM working`.
+`ChatTurnStateBroadcaster` also publishes session/turn-scoped working, stopping,
+failed, cancelled, and idle states through the shared event bus. The controller
+accepts only matching-session state, rejects a concurrent send, and Stop cancels
+the real server task. Local optimistic state gives immediate feedback; server
+state repairs disconnect/reconnect or terminal-path drift.
+
+### Browser/backend bundle coherence
+
+All local CSS/JavaScript URLs carry one content-derived static-bundle fingerprint.
+HTML responses are `no-store` and expose the active fingerprint. Browser chat
+messages and cancellations include their loaded asset version. A browser-origin
+request with a missing or obsolete version is rejected before LLM execution with
+a visible reload instruction; non-browser API clients remain compatible. This
+prevents a new Python backend from silently operating with an older cached chat,
+settings, or diagnostics controller.
+
+Verify with:
+
+```bash
+pytest -q tests/test_round289_effective_routing_live_ui.py
+node scripts/round289_frontend_contract_harness.js .
+python scripts/round289_effective_model_routes_live_ui_tests.py
+```
+
+Also run the standard AI intent/context, security, public-document,
+compatibility, and complete architecture gates after changing these boundaries.
+
+
+## Round 290 — Complete HTTP readiness and exact deployed-build identity
+
+The Round 289 target-machine package did not reach normal runtime. Uvicorn
+returned a valid `200 OK` from `/api/live`, but the startup probe performed one
+unframed `reader.read(512)` and searched that arbitrary TCP fragment for the
+`ljs-live` marker. On the observed machine, headers arrived before the 36-byte
+JSON body. LJS therefore rejected its own healthy server for 15 seconds and
+shut the new process down. The prior runtime/UI was consequently the only build
+the user had actually exercised, which made model routing, cards, and Send/Stop
+appear unchanged even though their Round 289 code had never started.
+
+`LJSWebReadinessGate` (`src/web/readiness.py`) now owns startup verification. It:
+
+1. reads HTTP headers through `\r\n\r\n` rather than assuming one TCP read is a
+   complete response;
+2. parses and bounds `Content-Length`;
+3. reads the exact complete body before decoding JSON;
+4. requires HTTP 200 plus the dependency-free `status=ok` / `service=ljs-live`
+   contract;
+5. verifies both the browser-asset fingerprint and a backend/runtime build ID.
+
+`RuntimeBuildIdentityResolver` hashes shipped backend sources, templates/static
+assets, and category definitions. `/api/live` returns this `build_id` alongside
+`asset_version`, and `main.py` requires both to match the app instance it just
+launched. A stale process on the same port can no longer satisfy readiness merely
+because it exposes an older LJS liveness marker. The exact build ID is logged at
+startup and embedded in rendered HTML/LLM Diagnostics so users and support logs
+can prove which package is active.
+
+The liveness endpoint remains dependency-free: it reads only immutable values
+stored on `app.state`; it does not touch databases, providers, storage, browsers,
+or library services.
+
+Verify with:
+
+```bash
+pytest -q tests/test_round290_startup_build_identity.py
+python scripts/round290_complete_readiness_build_identity_tests.py
+```
+
+The regression test deliberately splits HTTP headers and JSON body across
+multiple writes and also starts a real uvicorn server over TCP. Never replace
+this parser with a single `read()` or remove exact build/asset matching.
+
+## Round 291 — TV release-frontier truth and direct download completion
+
+The July 13 Silo incident exposed a semantic contradiction inside the TV search
+workspace. Provider catalogue metadata said Season 3 had ten ordered episodes,
+while TVMaze/TMDB air-date evidence and exact torrent fallback identified only
+S03E01 and S03E02 as released. The old response published the catalogue total as
+`expected_episode_count=10`, omitted the aired/target frontier, and returned no
+multi-unit recommendation. The final model consequently described ten episodes
+as available and asked the user to choose whether to proceed. A later fully
+successful two-item queue receipt was then falsely rendered as a partial failure
+because the outcome guard treated the success status `queued` as an error detail.
+
+### One category-owned release snapshot
+
+`CategoryWorkflowContext.agent_search_facts` transports opaque category facts
+from category search through scheduler response assembly. Generic scheduler/tool
+code may carry and display those facts, but it must not infer TV air dates,
+episode counts, or release coordinates.
+
+TV builds one season availability snapshot before pack/fallback search:
+
+- `season_total_episode_count` is the provider catalogue/order size;
+- `aired_episode_count` and `aired_unit_labels` are dated release evidence;
+- `release_frontier_episode` is the highest currently aired episode;
+- `target_unit_count` and `target_unit_labels` are the released units still
+  targeted by the download search;
+- `season_release_state` distinguishes currently airing from complete/unknown;
+- compatibility `expected_episode_count` means released/searchable bundle
+  coverage, never a future catalogue order.
+
+If dated release evidence is unavailable, released/searchable coverage remains
+unknown. Compatibility fields must not fall back to the provider's catalogue
+total merely to produce a number.
+
+Pack range queries use the released frontier. A season with ten ordered episodes
+but only E01/E02 aired may query `S03E01-E02`; it must not query or advertise
+`S03E01-E10` as the current downloadable range. Exact fallback remains limited
+to provider-aired/local evidence. This rule is category-owned and does not use
+English or Italian phrase detection.
+
+### Complete deterministic batch, no redundant menu
+
+After category filtering and language/selection annotations,
+`SearchBatchRecommendationBuilder` may build one candidate per concrete unit even
+when the original scope was `bundle_preferred`, provided no acceptable bundle is
+present. `bundle_only` still forbids individual-unit batch fallback. Candidates
+blocked by language, identity, quality, or queue safety cannot enter the batch.
+Category-published `target_unit_labels` also filter the batch, so unrelated or
+future units cannot be included merely because an indexer happened to return
+them.
+
+`SearchWorkspaceCompletionContractBuilder` publishes whether the structured
+workspace fully covers the current target. When it says
+`follow_up_required=false` and `action_required=queue_download`, the user's
+existing download request is already sufficient authority. The main agent must
+call `queue_download` with the supplied stable IDs; it must not ask for another
+confirmation or present a candidate menu. The loop enforces this by suppressing
+premature prose and issuing one structured queue-followthrough reprompt. This is
+not hidden deterministic queueing: the LLM still performs the explicit tool
+call, while generic code validates stable IDs and receipts.
+
+Completion is exact, not count-based: recommended group labels must equal the
+category-published target labels. Two candidate groups do not satisfy a
+two-unit target if they are E01 and E03 while the target is E01 and E02.
+
+A complete deterministic batch skips the separate advisory torrent-ranker LLM
+call. The main agent remains the model decision boundary, and the app avoids an
+extra slow/blank ranking request when category evidence already provides one
+safe candidate for every target unit.
+
+### Human success and truthful failure presentation
+
+Search tool output preserves total-order, aired, and target fields in compact
+LLM context and audit logs. Prompt guidance requires brief human-language queue
+summaries using title, unit labels/count, requested language, and actual queue
+status. Internal result-set IDs, policy names, and receipt jargon are omitted
+unless needed to explain a real problem.
+
+`ToolOutcomeLedger` no longer converts successful statuses such as `queued` or
+`already_active` into failure details. A receipt with two verified successes and
+zero errors is a full success, not a partial failure.
+
+Provider control-token leakage appended to an otherwise valid tool name (for
+example `inspect_torrent_candidate<|channel|>commentary`) is stripped only at the
+known terminal channel-token boundary before allow-list validation. Arbitrary
+unknown tool names remain blocked.
+
+Verify with:
+
+```bash
+pytest -q tests/test_round291_silo_airing_frontier_and_human_flow.py
+python scripts/round291_silo_airing_frontier_direct_queue_tests.py
+```
+
+Also rerun Round 241, 276, 279, 285, and the standard AI/category/security and
+complete architecture gates after changing these contracts.
+
+## Round 292 — Search truth, acquisition continuity, TV tracking defaults, and lifecycle cadence
+
+The August 10 long-session logs exposed a set of regressions that shared one
+architectural cause: category/provider truth was being weakened or reinterpreted
+in later generic layers, while periodic coordinators performed expensive work
+before asking the lifecycle ledger whether an item was due.
+
+### Category-owned movie identity survives the whole search workspace
+
+A provider-confirmed one-word movie title must not be forced through a generic
+release-token whitelist after the category has already established title/year
+identity.  For example, TMDB-backed `Oppenheimer (2023)` is strong enough to
+validate an exact `Oppenheimer 2023 ...` release prefix; normal codec, language,
+IMAX, group, and audio metadata after that prefix is not title ambiguity.
+Without an independently verified year, one-word aliases retain the conservative
+suffix-only rule.
+
+`MovieCategory` therefore owns the title/year verdict and publishes it in the
+candidate payload as opaque `title_identity` evidence.  Generic workspace code
+carries that verdict instead of re-parsing the release name with weaker rules.
+Movie interactive search also stops its query ladder only once a useful pool of
+validated canonical results exists; when the user requested a language, that
+pool must contain explicit preferred-language evidence.  This avoids both
+low-value alias fanout and premature stopping on dozens of title-correct but
+constraint-wrong rows.
+
+### Source strategy belongs to the category
+
+Torrent and Soulseek are independent discovery backends, but they do not need to
+block one another equally for every category.  Categories may publish a
+`soulseek_source_strategy()` hint that controls foreground companion behavior.
+Movies use `fallback_if_primary_empty`: a successful torrent search returns
+immediately and Soulseek is attempted only when the primary torrent result set is
+empty.  Categories that genuinely benefit from concurrent source discovery may
+retain `parallel` behavior.  Generic scheduler code interprets only this source
+strategy contract; it does not encode movie semantics.
+
+### Acquisition continuity uses structured goal state, not generic web search
+
+A terse follow-up such as "search harder" after a media acquisition request must
+reuse the active goal's category and result-set state.  `AgentGoalStateManager`
+exposes the current structured goal, and `AIAssistant` marks SEARCH turns that
+continue an acquisition result set.  Those turns receive a deliberately compact
+media-search tool surface including `search_media_torrents` and inspection
+helpers, but not queue mutation authority.  Public web research may contribute
+identity/evidence; raw URLs or magnets from web search do not become queueable
+media candidates.  Stable category-owned result-set/candidate handles remain the
+only acquisition continuation authority.
+
+### One active assistant turn per chat session, independent of transport
+
+`ChatTurnRegistry` is the process-local authority for at most one live assistant
+task per `session_id`.  Both `/ws/chat` and `/api/chat` acquire the same registry
+before starting work.  A reconnect, second browser tab, or REST fallback cannot
+start a competing turn while the prior WebSocket task is still running.  Stop
+and disconnect cancel/release only the matching owned turn.  This prevents
+crossed result sets and the user-visible failure mode where one turn says
+"nothing found" while an older overlapping turn continues searching or queues a
+download later.
+
+### TV initial episode tracking is lifecycle-owned and tri-state
+
+`TvShowItem.auto_download` is tri-state.  A newly discovered show stays `None`
+until the TV category has enough provider lifecycle evidence.  During watch-plan
+construction, TV may perform one category-owned lifecycle metadata lookup when
+cached lifecycle data is absent.  Active/returning/in-production shows default
+to `True`; ended/cancelled/finished shows default to `False`; unknown state stays
+unset.  Once the user sets a literal boolean, that choice is authoritative and
+is never overwritten by the defaulting path.
+
+`CategoryWatchPlan.item_updates` transports these category-owned initial values
+back through the generic scheduler without teaching core code what TV statuses
+mean.  The scheduler persists the opaque item fields and invalidates lifecycle
+state once so normal reconciliation observes the change.
+
+### Lifecycle due checks happen before expensive reconciliation
+
+The lifecycle ledger is the first gate for periodic work.  A future-dated clean
+row is sufficient to leave an item dormant; explicit invalidation or a due row
+enters the authoritative fingerprint/category-policy path.  The cheap
+`scheduled_work_is_due()` preflight intentionally performs no canonical-library
+build, metadata fingerprint, provider, suggestion, taste, or LLM work.
+
+Tracked-item scheduled updates and suggestion compilation both use this preflight
+before expensive processing.  `reconcile_item()` also checks for an existing
+ledger row before computing first-time fingerprints.  This preserves event-driven
+invalidations while preventing the hourly scheduler from rebuilding unchanged
+library state merely to discover that the category is not due.
+
+Stable, locally present movies use the category's long 180-day lifecycle cadence;
+missing or metadata-incomplete movies retain shorter category-owned repair
+cadences.  The full forced library crawl is a daily safety net rather than an
+hourly invalidation source.  The existing 120-second filesystem watcher and
+targeted managed-import reconciliation remain responsible for prompt reaction to
+real library changes.
+
+Verify the incident contracts with:
+
+```bash
+PYTHONPATH=. python scripts/round292_search_truth_tracking_cadence_tests.py
+pytest -q tests/test_round292_search_truth_tracking_cadence.py
+python scripts/check_category_architecture.py
+python scripts/check_ai_intent_architecture.py
+python scripts/check_ai_context_architecture.py
+python scripts/check_architecture.py
+```
+
+The executable harness is dependency-light so the core incident contracts can be
+checked even on a packaging host without LJS's optional/runtime provider stack.
+The pytest regression file remains the authoritative in-project test when the
+normal declared Python environment is available.
+
+## Round 293 — Search-result truth, exact candidate confirmation, and cancellation ownership
+
+The August 11 Ella Enchanted incident exposed a different failure chain from the
+Round 292 Oppenheimer case. The first request was manually stopped by the user;
+its later timestamps must therefore not be interpreted as a single long-running
+foreground search. Instead, the logs show provider/search work continuing after
+the browser considered the turn stopped. A later fresh request did find an
+explicit Italian candidate, but several generic layers weakened that success
+before queueing.
+
+### Categorized media search does not need a second advisory planner
+
+A SEARCH turn whose category has already been resolved and whose allowed tool
+surface contains `search_media_torrents` runs the ordinary registered tool loop
+directly. DOWNLOAD does the same. The old advisory pre-planner added extra model
+calls before the model could perform an already-obvious media search and could
+fail independently without adding execution authority. Generic SEARCH turns
+without a category-owned media-search tool retain their existing planner path.
+
+Tool argument normalization also treats optional JSON `null` values as omitted
+after required-field checks. An unset optional field such as `target_size_gb`
+must not invalidate an otherwise legal tool call and consume another LLM turn.
+Known terminal provider control tokens accidentally appended to a valid tool
+name are stripped at the executor boundary before normal allow-list validation;
+arbitrary unknown tool names remain forbidden.
+
+A complete new acquisition request also starts a fresh structured goal whether
+the router labels it SEARCH or DOWNLOAD. This reuses the existing generic
+context-freshness decision: terse refinements such as `search harder`, quality
+selectors, and stable candidate/result handles remain continuations, while a
+new concrete title request cannot inherit stale result sets from an older goal.
+
+### Explicit-language evidence ends the useful movie query ladder
+
+Movie query expansion remains category-owned. When a language is explicit,
+`CategoryTitleAuthority` builds search aliases from the canonical/provider title,
+the user's title, and translations specifically associated with the requested
+locale. Arbitrary translations from unrelated locales are excluded from that
+explicit-language ladder.
+
+Search sufficiency is based on constraint satisfaction rather than an arbitrary
+volume target. For an explicit-language movie request, one provider/year-backed,
+title-valid candidate that explicitly advertises the requested language is
+useful evidence and ends further alias fan-out. Low swarm health is a selection
+warning, not proof that search failed. When no requested-language evidence
+exists, the bounded fallback ladder may continue as before.
+
+The candidate workspace keeps unknown-language releases only as fallback
+evidence while no explicit requested-language release exists. Once explicit
+preferred-language candidates are present, the LLM-facing/cached selection
+workspace is narrowed to those candidates so a higher-seeder unknown-language
+release cannot displace the user's hard language constraint.
+
+### Stable result-set selection confirms only that candidate's soft warning
+
+Search result sets persist their origin prompt, stable candidate IDs, and whether
+the UI was awaiting a user choice. A later turn that resolves to one of those
+stable candidates is provenance that the user selected the displayed candidate;
+no English phrase or numeric-string parser is used as confirmation authority.
+
+Soft warnings such as very low/no reported seeders may therefore be confirmed by
+that later exact-candidate selection. Hard blockers such as explicit-language
+mismatch, identity failure, or other request-constraint violations remain
+non-overridable. Confirmation is never inherited by a substitute candidate.
+
+Queue fallback is correspondingly narrow: confirmation/policy failures are
+terminal for that selected candidate and do not launch a spray of alternate
+cached releases. Automated first-turn or deterministic batch queueing may try an
+alternate only after an operational error explicitly marked fallback-eligible,
+and that alternate is evaluated under its own automatic policy without
+inheriting the original candidate's confirmation. A later explicit user choice
+of one stable cached candidate is different: once that exact candidate has been
+selected, an operational failure of that queue attempt is reported for that
+candidate and must not silently substitute another release.
+
+### Stop owns the server task, not merely the browser request
+
+`ChatTurnRegistry` remains the session-scoped owner of one assistant task. Both
+WebSocket and REST Stop paths cancel that same server task. The REST browser does
+not abort its local `/api/chat` fetch until `/api/chat/cancel` confirms the
+server task settled. If cancellation is still unwinding, the UI remains in a
+truthful `stopping` state rather than pretending the turn ended while provider
+work continues in the background.
+
+Search providers are children of that task. `JackettSearch` now cancels and
+awaits aggregate/manual-parity child tasks in `finally`, including direct-indexer
+probe children. This makes cancellation propagation an ownership rule rather
+than a best-effort UI behavior.
+
+The generic operation trace carries session ID, turn ID, and turn-relative
+elapsed time through LLM, search, and structured logs, including the ordinary
+`ljs.log` sink. A dedicated turn audit records
+received/started/cancel-requested/settled/completed/failed transitions. Search
+logging records `torrent_search_started` before provider I/O and an explicit
+cancelled/failed terminal event, while the historical completion record now
+also carries `terminal_state=completed`. Authenticated diagnostics expose
+bounded **Turn lifecycle** and **Searches** views. Future incident analysis can
+therefore distinguish user cancellation, provider latency, post-cancel cleanup,
+and a later independent request without inferring duration from unrelated
+wall-clock gaps.
+
+### Plain-language outcomes
+
+Deterministic queue and error presentation reports what happened directly:
+queued downloads, failed candidates, confirmation requirements, or provider
+errors. The old theatrical cargo/captain/parrot wording is removed from these
+system outcomes because it obscured operational truth during failure recovery.
+
+Verify with:
+
+```bash
+PYTHONPATH=. python scripts/round293_ella_search_selection_cancel_tests.py
+pytest -q tests/test_round293_ella_search_selection_cancel.py
+python scripts/round290_complete_readiness_build_identity_tests.py
+python scripts/round291_silo_airing_frontier_direct_queue_tests.py
+python scripts/round292_search_truth_tracking_cadence_tests.py
+python scripts/check_category_architecture.py
+python scripts/check_ai_intent_architecture.py
+python scripts/check_ai_context_architecture.py
+python scripts/check_security_architecture.py
+python scripts/check_architecture.py
+```
+
+The dependency-light executable harness exists specifically for packaging hosts
+that do not have the complete declared LJS runtime installed. The in-project
+pytest file remains the normal authoritative regression when that environment is
+available.

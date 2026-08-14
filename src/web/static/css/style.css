@@ -3282,3 +3282,561 @@ body {
     animation: none !important;
   }
 }
+
+/* ─── Round 286: bounded header layout and LLM observability ───────── */
+.brand,
+.brand-text {
+  min-width: 0;
+}
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.brand-text h1 {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.brand-status-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.brand-status-row .status {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+}
+.brand-status-row .status > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 1480px) and (min-width: 1121px) {
+  .app-layout {
+    padding-left: 22px;
+    padding-right: 22px;
+  }
+  .app-header {
+    padding: 14px 20px;
+    gap: 14px;
+  }
+  .brand {
+    gap: 14px;
+    flex: 1 1 430px;
+    max-width: 540px;
+  }
+  .persona-avatar {
+    width: 126px;
+    height: 126px;
+    flex-basis: 126px;
+    margin-left: -18px;
+  }
+  .brand-text h1 {
+    font-size: 1.18rem;
+  }
+  .brand-status-row {
+    gap: 9px;
+  }
+  .status {
+    font-size: .72rem;
+  }
+  .nav-dock {
+    gap: 6px;
+    flex: 0 1 auto;
+  }
+  .nav-btn {
+    padding: 9px 11px;
+    gap: 7px;
+  }
+}
+
+@media (max-width: 1290px) and (min-width: 1121px) {
+  .brand {
+    flex-basis: 390px;
+    max-width: 470px;
+  }
+  .nav-label {
+    display: none;
+  }
+  .nav-btn {
+    width: 42px;
+    height: 42px;
+    padding: 0;
+    justify-content: center;
+  }
+  .brand-status-row .bg-status {
+    max-width: 170px;
+  }
+}
+
+/* Chat command lifecycle: input is locked while the same button becomes Stop. */
+.chat-input-area textarea:disabled {
+  opacity: .68;
+  cursor: wait;
+  border-color: rgba(42, 157, 143, .32);
+  background: rgba(0, 0, 0, .3);
+}
+.chat-input-area .send-btn {
+  position: relative;
+  isolation: isolate;
+}
+.chat-input-area .send-btn.is-working {
+  background: rgba(231, 111, 81, .95);
+  color: #fff;
+  box-shadow: 0 0 0 1px rgba(255,255,255,.12), 0 0 22px rgba(231,111,81,.25);
+}
+.chat-input-area .send-btn.is-working:hover {
+  transform: scale(1.04);
+}
+.chat-input-area .send-btn.is-stopping {
+  opacity: .7;
+  cursor: wait;
+}
+.send-working-ring {
+  position: absolute;
+  inset: -4px;
+  border: 2px solid transparent;
+  border-top-color: rgba(255,255,255,.92);
+  border-right-color: rgba(255,255,255,.32);
+  border-radius: 50%;
+  animation: llm-send-spin .9s linear infinite;
+  z-index: -1;
+}
+@keyframes llm-send-spin { to { transform: rotate(360deg); } }
+
+.llm-activity-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 27px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  border: 1px solid rgba(42,157,143,.28);
+  background: rgba(42,157,143,.08);
+  color: var(--text-dim);
+  font-family: var(--font-main);
+  font-size: .72rem;
+  font-weight: 650;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .2s, border-color .2s, color .2s, transform .2s;
+}
+.llm-activity-toggle:hover {
+  transform: translateY(-1px);
+  color: var(--text-main);
+  border-color: rgba(42,157,143,.52);
+}
+.llm-activity-toggle.is-running {
+  color: #7ce0d4;
+  background: rgba(42,157,143,.14);
+  border-color: rgba(42,157,143,.55);
+}
+.llm-activity-toggle.is-running i { animation: llm-activity-pulse 1.2s ease-in-out infinite; }
+.llm-activity-toggle.is-failed,
+.llm-activity-toggle.is-unavailable {
+  color: #ff9a83;
+  background: rgba(231,111,81,.11);
+  border-color: rgba(231,111,81,.42);
+}
+@keyframes llm-activity-pulse { 50% { opacity: .35; transform: scale(.9); } }
+
+.llm-activity-eyebrow {
+  margin: 0 0 3px;
+  color: var(--text-dim);
+  font-size: .66rem;
+  letter-spacing: .14em;
+  font-weight: 750;
+}
+.llm-activity-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--glass-border);
+}
+.llm-metric-card {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 12px;
+  background: rgba(255,255,255,.035);
+}
+.llm-metric-card strong,
+.llm-metric-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.llm-metric-label { color: var(--text-dim); font-size: .68rem; margin-bottom: 4px; }
+.llm-metric-card strong { color: var(--text-main); font-size: .84rem; }
+.llm-activity-history-wrap {
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--glass-border);
+  display: flex;
+  flex-direction: column;
+}
+.llm-activity-section-title {
+  padding: 14px 14px 9px;
+  color: var(--text-dim);
+  font-size: .7rem;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.llm-activity-history,
+.llm-activity-detail-wrap {
+  min-height: 0;
+  overflow-y: auto;
+}
+.llm-activity-history { padding: 0 8px 12px; }
+.llm-call-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  padding: 10px 8px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-main);
+  text-align: left;
+  cursor: pointer;
+}
+.llm-call-row:hover,
+.llm-call-row.is-selected { background: rgba(255,255,255,.055); }
+.llm-call-state { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); }
+.llm-call-state.state-running { background: var(--accent-teal); box-shadow: 0 0 10px var(--accent-teal); }
+.llm-call-state.state-failed { background: var(--accent-red); }
+.llm-call-state.state-cancelled { background: var(--accent-gold); }
+.llm-call-main { min-width: 0; }
+.llm-call-main strong,
+.llm-call-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.llm-call-main strong { font-size: .78rem; }
+.llm-call-main small { color: var(--text-dim); font-size: .65rem; margin-top: 3px; }
+.llm-call-duration { color: var(--text-dim); font-size: .68rem; font-family: monospace; }
+.llm-activity-detail { padding: 18px 20px 28px; }
+.llm-call-detail-head { display: flex; justify-content: space-between; align-items: center; gap: 14px; margin-bottom: 14px; }
+.llm-call-detail-head h3 { font-family: var(--font-display); font-size: 1.05rem; color: var(--text-main); }
+.llm-detail-status { padding: 5px 9px; border-radius: 999px; background: rgba(255,255,255,.05); color: var(--text-dim); font: .7rem monospace; }
+.llm-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 14px; margin-bottom: 16px; }
+.llm-detail-row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 9px; border-radius: 8px; background: rgba(255,255,255,.025); font-size: .72rem; }
+.llm-detail-row span { color: var(--text-dim); }
+.llm-detail-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.llm-call-error { margin: 12px 0; padding: 11px 12px; border: 1px solid rgba(231,111,81,.32); border-radius: 10px; background: rgba(231,111,81,.08); color: #ffae99; font: .72rem/1.45 monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.llm-context-block { margin-top: 10px; border: 1px solid rgba(255,255,255,.07); border-radius: 10px; overflow: hidden; }
+.llm-context-block summary { cursor: pointer; padding: 10px 12px; color: var(--text-main); font-size: .76rem; font-weight: 650; background: rgba(255,255,255,.03); }
+.llm-context-block pre { margin: 0; padding: 12px; max-height: 360px; overflow: auto; background: rgba(0,0,0,.25); color: #b9d8d4; font: .68rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.llm-activity-empty { padding: 18px; color: var(--text-dim); font-size: .78rem; }
+
+@media (max-width: 720px) {
+  .llm-activity-toggle span { display: none; }
+  .llm-activity-toggle { width: 28px; justify-content: center; padding: 4px; }
+  .llm-activity-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px; }
+  .llm-activity-history-wrap { max-height: 190px; border-right: 0; border-bottom: 1px solid var(--glass-border); }
+  .llm-detail-grid { grid-template-columns: 1fr; }
+  .llm-activity-detail { padding: 14px 12px 22px; }
+}
+
+/* Round 288: dedicated full-screen LLM diagnostics and live problem cards. */
+body.llm-diagnostics-open { overflow: hidden; }
+.llm-diagnostics-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9997;
+  background: rgba(2, 7, 12, .72);
+  backdrop-filter: blur(5px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .2s ease;
+}
+.llm-diagnostics-backdrop.is-open { opacity: 1; pointer-events: auto; }
+.llm-diagnostics-dialog {
+  position: fixed;
+  inset: 22px;
+  z-index: 9998;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 20px;
+  background: rgba(7, 16, 24, .985);
+  border: 1px solid rgba(91, 193, 180, .22);
+  box-shadow: 0 30px 100px rgba(0, 0, 0, .62);
+  opacity: 0;
+  transform: scale(.975) translateY(8px);
+  pointer-events: none;
+  transition: opacity .2s ease, transform .22s ease;
+}
+.llm-diagnostics-dialog.is-open {
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  pointer-events: auto;
+}
+.llm-diagnostics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 17px 22px 13px;
+  border-bottom: 1px solid var(--glass-border);
+}
+.llm-diagnostics-title { min-width: 0; }
+.llm-diagnostics-title h2 {
+  margin: 0;
+  color: var(--accent-teal);
+  font-family: var(--font-display);
+  font-size: 1.28rem;
+}
+.llm-diagnostics-subtitle {
+  margin: 3px 0 0;
+  color: var(--text-dim);
+  font-size: .72rem;
+  line-height: 1.35;
+}
+.llm-diagnostics-build-id {
+  display: inline-block;
+  margin-top: 5px;
+  color: rgba(207, 224, 230, .58);
+  font: .61rem ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.llm-diagnostics-header-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.llm-diagnostics-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 22px;
+  border-bottom: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, .018);
+}
+.llm-diagnostics-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-dim);
+  font: 650 .72rem var(--font-main);
+  cursor: pointer;
+}
+.llm-diagnostics-tab:hover { color: var(--text-main); background: rgba(255,255,255,.04); }
+.llm-diagnostics-tab.is-active {
+  color: #8ce2d7;
+  border-color: rgba(42,157,143,.28);
+  background: rgba(42,157,143,.11);
+}
+.llm-diagnostics-main { flex: 1; min-height: 0; overflow: hidden; }
+.llm-diagnostics-pane { display: none; height: 100%; min-height: 0; }
+.llm-diagnostics-pane.is-active { display: grid; }
+#llm-diagnostics-activity { grid-template-columns: 300px minmax(0, 1fr); }
+.llm-log-pane { grid-template-rows: auto minmax(0, 1fr); }
+.llm-log-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 15px 20px 12px;
+  border-bottom: 1px solid var(--glass-border);
+}
+.llm-log-pane-header h3 { margin: 0; color: var(--text-main); font-size: .94rem; }
+.llm-log-pane-header p { margin: 3px 0 0; color: var(--text-dim); font-size: .7rem; }
+.llm-log-line-select {
+  min-width: 116px;
+  padding: 7px 9px;
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  background: rgba(0,0,0,.25);
+  color: var(--text-main);
+  font-size: .7rem;
+}
+.llm-diagnostics-log {
+  min-height: 0;
+  margin: 0;
+  padding: 18px 20px 30px;
+  overflow: auto;
+  background: rgba(0,0,0,.3);
+  color: #b9d8d4;
+  font: .7rem/1.52 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.llm-diagnostics-dialog .llm-activity-summary { padding: 10px 22px; }
+.llm-diagnostics-dialog .llm-activity-history-wrap { border-right: 1px solid var(--glass-border); }
+.llm-diagnostics-dialog .llm-activity-detail-wrap { min-width: 0; }
+.llm-diagnostics-dialog .llm-activity-detail { max-width: 1280px; margin: 0 auto; }
+
+.llm-problem-cards {
+  position: fixed;
+  top: 72px;
+  right: 16px;
+  z-index: 9996;
+  width: min(370px, calc(100vw - 28px));
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  pointer-events: none;
+}
+.llm-problem-card {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 24px;
+  gap: 10px;
+  align-items: start;
+  padding: 11px 10px;
+  border: 1px solid rgba(231,111,81,.34);
+  border-radius: 13px;
+  background: rgba(12, 22, 31, .97);
+  box-shadow: 0 12px 38px rgba(0,0,0,.42);
+  color: var(--text-main);
+  cursor: pointer;
+  pointer-events: auto;
+  opacity: 0;
+  transform: translateX(22px) scale(.98);
+  transition: opacity .2s ease, transform .22s ease, border-color .18s ease;
+}
+.llm-problem-card.is-visible { opacity: 1; transform: translateX(0) scale(1); }
+.llm-problem-card:hover { border-color: rgba(231,111,81,.65); transform: translateY(-1px); }
+.llm-problem-card.severity-warning { border-color: rgba(244,162,97,.42); }
+.llm-problem-card.severity-info { border-color: rgba(42,157,143,.38); }
+.llm-problem-card-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: rgba(231,111,81,.13);
+  color: #ff9f89;
+}
+.llm-problem-card.severity-warning .llm-problem-card-icon { background: rgba(244,162,97,.13); color: #ffc080; }
+.llm-problem-card.severity-info .llm-problem-card-icon { background: rgba(42,157,143,.13); color: #83ddd1; }
+.llm-problem-card-copy { min-width: 0; }
+.llm-problem-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.llm-problem-card-heading strong { min-width: 0; font-size: .78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.llm-problem-card-heading span { color: var(--text-dim); font: .62rem ui-monospace, monospace; }
+.llm-problem-card-copy p {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  margin: 4px 0 3px;
+  overflow: hidden;
+  color: #cad6dc;
+  font-size: .68rem;
+  line-height: 1.35;
+}
+.llm-problem-card-copy small { display: block; overflow: hidden; color: var(--text-dim); font-size: .6rem; text-overflow: ellipsis; white-space: nowrap; }
+.llm-problem-card-close { width: 22px; height: 22px; min-width: 22px; padding: 0; opacity: .62; }
+.llm-problem-card-close:hover { opacity: 1; }
+
+@media (max-width: 760px) {
+  .llm-diagnostics-dialog { inset: 7px; border-radius: 14px; }
+  .llm-diagnostics-header { padding: 13px 14px 10px; }
+  .llm-diagnostics-subtitle { display: none; }
+  .llm-diagnostics-tabs { padding: 7px 10px; overflow-x: auto; }
+  .llm-diagnostics-tab { flex: 0 0 auto; }
+  .llm-diagnostics-dialog .llm-activity-summary { padding: 9px 10px; }
+  #llm-diagnostics-activity { grid-template-columns: 1fr; grid-template-rows: minmax(120px, 27vh) minmax(0, 1fr); }
+  .llm-diagnostics-dialog .llm-activity-history-wrap { border-right: 0; border-bottom: 1px solid var(--glass-border); }
+  .llm-problem-cards { top: 58px; right: 8px; width: calc(100vw - 16px); }
+}
+
+/* Round 289: explicit, readable chat lifecycle state. */
+.chat-input-area {
+  position: relative;
+  padding-top: 27px;
+}
+.chat-command-state {
+  position: absolute;
+  top: 5px;
+  left: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: .66rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+.chat-command-state-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #69d1c5;
+  box-shadow: 0 0 8px rgba(105, 209, 197, .42);
+}
+.chat-command-state.is-working { color: #8ee9df; }
+.chat-command-state.is-working .chat-command-state-dot {
+  animation: llm-activity-pulse 1.1s ease-in-out infinite;
+}
+.chat-command-state.is-stopping { color: #ffc080; }
+.chat-command-state.is-stopping .chat-command-state-dot { background: #f4a261; }
+.chat-command-state.is-failed { color: #ff9f89; }
+.chat-command-state.is-failed .chat-command-state-dot { background: #e76f51; }
+.chat-command-state.is-cancelled { color: #ffc080; }
+.chat-command-state.is-cancelled .chat-command-state-dot { background: #f4a261; }
+.send-working-ring { z-index: 0; pointer-events: none; }
+.chat-input-area .send-btn > i { position: relative; z-index: 1; }
+
+/* Effective route ownership is displayed beside the settings that control it. */
+.llm-effective-routes {
+  margin: 3px 0 12px;
+  padding: 10px;
+  border: 1px solid rgba(42, 157, 143, .22);
+  border-radius: 11px;
+  background: rgba(0, 0, 0, .18);
+  max-height: 300px;
+  overflow: auto;
+}
+.llm-base-authority-control {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  margin: 14px 0 10px;
+  padding: 11px 12px;
+  border: 1px solid rgba(244, 162, 97, .28);
+  border-radius: 11px;
+  background: rgba(244, 162, 97, .07);
+  cursor: pointer;
+}
+.llm-base-authority-control input { margin-top: 3px; }
+.llm-base-authority-control strong,
+.llm-base-authority-control small { display: block; }
+.llm-base-authority-control small {
+  margin-top: 3px;
+  color: var(--text-dim);
+  font-size: .72rem;
+  line-height: 1.4;
+}
+.llm-route-summary-heading,
+.llm-route-row {
+  display: grid;
+  grid-template-columns: minmax(105px, .8fr) minmax(160px, 1.6fr) minmax(90px, .7fr);
+  gap: 10px;
+  align-items: center;
+}
+.llm-route-summary-heading {
+  margin-bottom: 6px;
+  color: var(--text-main);
+  font-size: .72rem;
+}
+.llm-route-summary-heading span { grid-column: 3; color: var(--text-dim); text-align: right; }
+.llm-route-row {
+  padding: 6px 0;
+  border-top: 1px solid rgba(255,255,255,.055);
+  font-size: .67rem;
+}
+.llm-route-task { color: var(--text-dim); text-transform: capitalize; }
+.llm-route-model { overflow: hidden; color: var(--text-main); text-overflow: ellipsis; white-space: nowrap; }
+.llm-route-source { color: #83ddd1; text-align: right; }
+@media (max-width: 760px) {
+  .llm-route-summary-heading,
+  .llm-route-row { grid-template-columns: minmax(90px, .75fr) minmax(0, 1.25fr); }
+  .llm-route-source,
+  .llm-route-summary-heading span { grid-column: 1 / -1; text-align: left; }
+}

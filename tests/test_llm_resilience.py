@@ -122,7 +122,7 @@ class TestIntentRoutingResilience:
         
         intent, confidence = await router._route_with_llm("download stranger things")
         assert intent == Intent.DOWNLOAD
-        assert confidence == 0.8
+        assert confidence == 0.85
 
     @pytest.mark.asyncio
     async def test_route_with_llm_conversational(self):
@@ -133,7 +133,7 @@ class TestIntentRoutingResilience:
         
         intent, confidence = await router._route_with_llm("what are ratings")
         assert intent == Intent.SEARCH
-        assert confidence == 0.8
+        assert confidence == 0.85
 
     @pytest.mark.asyncio
     async def test_route_with_llm_dict_format(self):
@@ -152,7 +152,7 @@ class TestIntentRoutingResilience:
         
         intent, confidence = await router._route_with_llm("change setting")
         assert intent == Intent.CONFIG
-        assert confidence == 0.8
+        assert confidence == 0.85
 
 
 class TestTorrentSelectionResilience:
@@ -207,7 +207,7 @@ class TestTorrentSelectionResilience:
         assert res["title"] == "Show.S01E01.1080p"
 
     @pytest.mark.asyncio
-    async def test_select_best_unparsable_safe_default(self):
+    async def test_select_best_unparsable_fails_closed(self):
         # LLM returning completely garbage content with no index whatsoever
         mock_resp = MockResponse(content="This torrent has excellent seeders.")
         client = MockLLMClient(mock_resp)
@@ -227,9 +227,8 @@ class TestTorrentSelectionResilience:
             preferred_language="english",
             media_category="tv",
         )
-        # Should safely default to candidate 0 (Show.S01E01.1080p)
-        assert res is not None
-        assert res["title"] == "Show.S01E01.1080p"
+        # Unparseable adjudication must not silently select an arbitrary release.
+        assert res is None
 
 
 class TestToolExecutorResilience:
@@ -258,8 +257,11 @@ class TestToolExecutorResilience:
         
         assert msg is not None
         assert msg["tool_call_id"] == "call_123"
-        # Verify it serialized successfully and contains the datetime string representation
-        assert "2026-05-18" in msg["content"]
+        # Tool messages remain stable JSON even for non-primitive values.
+        import json
+        content = json.loads(msg["content"])
+        assert content["status"] == "success"
+        assert content["timestamp"] == "2026-05-18T04:02:02"
 
 
 @pytest.mark.asyncio

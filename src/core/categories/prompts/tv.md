@@ -2,6 +2,12 @@
 
 ## Metadata and local-state workflow
 
+## Category identity clues
+
+- Requests semantically referring to a latest/last season, available episodes, episode numbers, season numbers, air dates, or missing episodic units should select the TV category verifier even when those ideas are expressed in another language. These clues are routing evidence, not identity proof.
+- Verify the literal title with TV-owned metadata first. Once a strong exact TV match exists, proceed with TV ownership rather than probing unrelated ebook/audiobook categories and inventing ambiguity.
+- If TV metadata is unavailable or empty, use the bounded TV-owned public-web identity fallback. Ask a concise clarification only when both TV-owned verification paths are weak, conflicting, or absent. Never search abstract `media`.
+
 - For stable factual questions about a TV show (cast, lead actors, creators, known seasons, known episodes, ratings, IDs, artwork), prefer the generic `metadata_lookup` tool with `media_type="tv"` before general web search.
 - For current public questions — rumours, renewal/cancellation, production status, shooting/filming, creator/showrunner interviews, delays, next-season information, next-episode schedules, or public chatter — metadata alone is not enough. Use `category_web_research` and preserve the user's exact focus in its `query` argument.
 - For next-episode questions, use TV-owned providers/episode lists first, then corroborate with official/platform/reference pages when needed. Never derive a schedule by adding seven days unless a fetched source explicitly states the cadence and dates.

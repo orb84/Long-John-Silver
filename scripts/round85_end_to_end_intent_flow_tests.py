@@ -116,7 +116,7 @@ def assert_download_prompt_guidance_documents_generic_chain() -> None:
     assert "search_media_torrents" in prompt
     assert "queue_download" in prompt
     assert "enquire_about_media" in prompt
-    assert "TOOL PHILOSOPHY" in prompt
+    assert "CRITICAL TOOL OUTPUT RULE" in prompt
     assert "tv.find_missing_episodes" not in prompt
     assert "tv.download_missing_batch" not in prompt
     assert "audio_languages" in prompt or "existing language" in prompt.lower()
@@ -188,7 +188,7 @@ async def assert_prepare_plan_path_uses_generic_tools_only() -> None:
         context="ACTIVE CATEGORY LIBRARY CONTEXT PACKET: For All Mankind language Italian missing S05E03 S05E04",
     )
     assert plan is not None
-    assert executor is not None
+    assert executor is None  # advisory plans are not directly executed
     assert [step.tool_name for step in plan.steps] == ["search_media_torrents"]
     assert plan.steps[0].arguments["language"] == "Italian"
     assert "tv.find_missing_episodes" not in updated

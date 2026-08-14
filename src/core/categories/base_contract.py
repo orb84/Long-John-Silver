@@ -1385,6 +1385,21 @@ class CategoryContractMixin(CategoryContextMixin):
         """
         return ""
 
+    def canonical_download_satisfaction(
+        self,
+        canonical: Any,
+        unit_descriptor: dict[str, Any],
+    ) -> bool | None:
+        """Return whether a canonical object contains the requested download unit.
+
+        ``None`` means the category cannot make a definitive statement from the
+        supplied descriptor.  Generic queue code uses this tri-state hook before
+        deciding whether an old completed transfer row may block a new manual
+        request.
+        """
+        _ = (canonical, unit_descriptor)
+        return None
+
     async def discovery_already_satisfied(self, item: Any, unit_label: str | None, context: Any | None = None) -> bool:
         """Return whether auto-discovery should skip this request.
 
@@ -1818,7 +1833,7 @@ class CategoryContractMixin(CategoryContextMixin):
         merged: list[Any] = []
         seen: set[str] = set()
         for label in labels or [None]:
-            results = await context.pipeline.run_search(item, label, mode="llm", language=language)
+            results = await context.pipeline.run_search(item, label, mode="llm", language=language, rank_candidates=False)
             for result in results or []:
                 magnet = getattr(result, "magnet", None) or ""
                 identity = magnet or f"{getattr(result, 'source', '')}|{getattr(result, 'title', '')}"

@@ -110,7 +110,8 @@ class TorrentSelectionPromptBuilder:
         if preferred_resolution:
             parts.append(
                 f"  6. Have a resolution HIGHER than the preferred resolution of '{preferred_resolution}' "
-                f"(e.g., 4k/2160p when preferred is {preferred_resolution}) — reject unless this is clearly the only sane match."
+                f"(e.g., 4k/2160p when preferred is {preferred_resolution}). "
+                f"DO NOT select resolutions higher than '{preferred_resolution}'."
             )
         if max_file_size_mb:
             parts.append(

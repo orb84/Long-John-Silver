@@ -31,7 +31,8 @@ def test_tv_category_builds_canonical_file_units_with_episode_coordinates(tmp_pa
     assert units[0]["unit_type"] == "file"
     assert units[0]["role"] == "episode_payload"
     assert units[0]["size_bytes"] == 1024
-    assert units[0]["estimated_bitrate_kbps"] is not None
+    assert "estimated_bitrate_kbps" in units[0]
+    assert units[0]["estimated_bitrate_kbps"] is None
     assert str(sub_path) in units[0]["subtitle_files"]
 
 
@@ -93,7 +94,8 @@ def test_movie_category_builds_canonical_file_units(tmp_path: Path) -> None:
     assert units[0]["unit_type"] == "file"
     assert units[0]["resolution"] == "2160p"
     assert units[0]["codec"] == "x265"
-    assert units[0]["estimated_bitrate_kbps"] is not None
+    assert "estimated_bitrate_kbps" in units[0]
+    assert units[0]["estimated_bitrate_kbps"] is None
 
 
 def test_core_suggestion_compiler_has_no_category_workflow_import() -> None:

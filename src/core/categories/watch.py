@@ -57,7 +57,16 @@ class CategoryWatchPlan:
     reason: str = ""
     rss_feeds: list[CategoryRssFeedSpec] = field(default_factory=list)
     release_watches: list[CategoryReleaseWatchSpec] = field(default_factory=list)
+    item_updates: dict[str, Any] = field(default_factory=dict)
+    """Category-owned initial/config reconciliation updates discovered while building the plan.
+
+    The generic scheduler may persist these fields before applying watches, but
+    it must not infer their meaning.  This is primarily useful when provider
+    lifecycle metadata lets a category choose a safe default for a newly
+    discovered item whose setting is still unset.
+    """
 
     @property
     def active(self) -> bool:
+        """Return whether the category watch is currently enabled."""
         return bool(self.rss_feeds or self.release_watches or self.mode not in {"", "none"})

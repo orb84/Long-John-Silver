@@ -86,8 +86,15 @@ class SettingsRouter:
                 manifest = cat.manifest(settings=settings)
                 data = manifest.model_dump()
                 categories.append(data)
+        route_summary = {"config_revision": 0, "routes": []}
+        route_summary_method = getattr(self._deps.assistant, "llm_route_summary", None)
+        if callable(route_summary_method):
+            candidate_summary = route_summary_method()
+            if isinstance(candidate_summary, dict):
+                route_summary = candidate_summary
         return {
             "settings": self._deps.settings_manager.settings.model_dump(),
+            "llm_routing": route_summary,
             "categories": categories,
             "config_files": {
                 "global_live": str(self._deps.settings_manager.settings_path),
@@ -245,11 +252,21 @@ class SettingsRouter:
             "max_recent_conversation_turns",
             "auto_compress_context",
             "conversation_summary_max_tokens",
+            "tiers",
+            "apply_base_to_all",
         ):
             if key in body:
                 args[key] = body[key]
-        await self._execute_action('settings_update_llm', args)
-        return {"status": "ok"}
+        if (
+            "apply_base_to_all" not in body
+            and "tiers" not in body
+            and any(key in body for key in ("model", "provider"))
+        ):
+            # Compatibility for a browser bundle from before atomic routing:
+            # changing the visible base model must not leave hidden tier/task
+            # routes silently owning the next request.
+            args["apply_base_to_all"] = True
+        return await self._execute_action('settings_update_llm', args)
 
     async def _update_quality_form(
         self,
@@ -317,14 +334,14 @@ class SettingsRouter:
         return await self._execute_action('settings_update_auto_download', args)
 
     async def _update_tiers(self, request: Request, _auth: bool = Depends(verify_auth)):
-        deps = self._deps
-        body = await request.json()
-        args = {}
-        for tier_key in ("lightweight", "standard", "heavy"):
-            if tier_key in body:
-                args[tier_key] = body[tier_key]
-        await self._execute_action('settings_update_tiers', args)
-        return {"status": "ok"}
+        await request.json()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This browser is using the retired two-step LLM settings API. "
+                "Reload the page and save model routing again."
+            ),
+        )
 
 
     async def _update_embeddings(self, request: Request, _auth: bool = Depends(verify_auth)):

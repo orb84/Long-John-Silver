@@ -18,6 +18,7 @@ from src.core.behavior_tracker import BehaviorTracker
 from src.ai.prompt_builder import PromptBuilder
 from src.ai.pending_actions import PendingActionContextBuilder
 from src.utils.item_matcher import ItemMatcher
+from src.ai.tracked_language_policy import TrackedLanguagePlanPolicy
 
 
 class AgentRunPreparer:
@@ -164,20 +165,17 @@ class AgentRunPreparer:
                     if is_mentioned:
                         logger.info(
                             f"[Tracked Item Binding] Tracked item '{item.key}' detected in plan. "
-                            "Binding exact item key and filling configured language only when the plan omitted language."
+                            "Binding exact item key and enforcing configured language unless the request explicitly overrides it."
                         )
-                        plan_has_language = bool(agent_plan.constraints.get("language"))
-                        for step in agent_plan.steps:
-                            if isinstance(step.arguments, dict) and step.arguments.get("language"):
-                                plan_has_language = True
-                                break
-                        if not plan_has_language:
-                            agent_plan.constraints["language"] = lang
+                        TrackedLanguagePlanPolicy.apply(
+                            agent_plan,
+                            configured_language=lang,
+                            user_prompt=user_prompt,
+                            intent=intent,
+                        )
                         for step in agent_plan.steps:
                             if not isinstance(step.arguments, dict):
                                 continue
-                            if not plan_has_language and step.tool_name in ("search_torrents", "search_media_torrents"):
-                                step.arguments["language"] = lang
                             for arg_key in ("name", "title", "item_name"):
                                 val = step.arguments.get(arg_key)
                                 if val and isinstance(val, str) and ItemMatcher.fuzzy_match_names(item.key, val):
@@ -258,10 +256,10 @@ class AgentRunPreparer:
             "- **Configure** a setting? (e.g., 'Add Breaking Bad to tracked items')\n"
         )
 
-    async def _route_intent(self, message: str) -> Intent:
-        """Route user intent using IntentRouter or legacy method."""
+    async def _route_intent(self, message: str, context: str = "") -> Intent:
+        """Route user intent with structured pending-action context."""
         if self._intent_router:
-            return await self._intent_router.route(message)
+            return await self._intent_router.route(message, context=context)
 
         # Legacy fallback
         from src.ai.intent_router import route_intent

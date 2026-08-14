@@ -20,7 +20,12 @@ from src.llm_providers.context_limits import (
     MAX_MANUAL_CONTEXT_LIMIT,
     MIN_USER_CONTEXT_LIMIT,
 )
+from src.llm_providers.activity import LLMActivityContext
 from src.utils.circuit_breaker import CircuitBreaker
+
+
+class LLMPayloadBudgetError(RuntimeError):
+    """Raised before provider I/O when the measured payload cannot fit."""
 
 
 class LLMTaskRuntime:
@@ -30,6 +35,24 @@ class LLMTaskRuntime:
     creates async completion callables wrapped in the circuit breaker,
     and resolves tool definitions filtered by intent.
     """
+
+    # Automatic interactive limits are **soft assembly targets**, not provider
+    # or user context-window caps.  They keep routine turns compact while the
+    # provider/user-selected ceiling remains available when irreducible system
+    # instructions and tool schemas legitimately need more room.
+    _AUTO_CONTEXT_TARGETS = {
+        "intent_routing": 8192,
+        "routing_fast": 8192,
+        "progress_message": 8192,
+        "chat": 32768,
+        "search": 32768,
+        "download": 32768,
+        "tool_agent_reliable": 32768,
+        "planning_strict": 24576,
+        "torrent_ranker": 24576,
+        "final_response": 24576,
+        "research_web": 49152,
+    }
 
     def __init__(self, settings: Settings, llm_client: Any,
                  tool_registry: ToolRegistry) -> None:
@@ -112,7 +135,11 @@ class LLMTaskRuntime:
             selected_limit = min(max(min_selectable, int(user_cap)), manual_max)
             context_cap_source = "user_cap_clamped_to_endpoint" if endpoint_reported else "user_cap_unverified_endpoint"
 
-        pct = max(0, min(100, int(getattr(llm, "context_budget_percent", 85) or 85)))
+        # The UI constrains this value to 20..100.  Clamp configuration-file or
+        # legacy values to the same usable range so 0 cannot accidentally mean
+        # "fall back to the full endpoint" or produce a non-functional budget.
+        configured_pct = getattr(llm, "context_budget_percent", None)
+        pct = max(20, min(100, int(85 if configured_pct is None else configured_pct)))
         effective_limit = int(selected_limit * (pct / 100.0)) if selected_limit > 0 else 0
         reserved_output = (
             getattr(llm, "reserved_output_tokens", None)
@@ -124,7 +151,16 @@ class LLMTaskRuntime:
         # reserve.  History is split into raw recent context and compressed older
         # context; the default preserves 30% of the prompt budget as raw recent
         # turns and uses the rest for compressed history/category/tool context.
-        available_prompt_tokens = max(0, effective_limit - int(reserved_output))
+        provider_call_context_tokens = max(0, effective_limit)
+        auto_target = int(self._AUTO_CONTEXT_TARGETS.get(str(task or ""), 32768))
+        target_context_tokens = min(provider_call_context_tokens, auto_target) if provider_call_context_tokens > 0 else 0
+        context_target_source = (
+            "task_auto_target"
+            if target_context_tokens and target_context_tokens < provider_call_context_tokens
+            else "selected_context_limit"
+        )
+        available_prompt_tokens = max(0, target_context_tokens - int(reserved_output))
+        hard_available_prompt_tokens = max(0, provider_call_context_tokens - int(reserved_output))
         raw_recent_percent = max(0, min(100, int(getattr(llm, "raw_recent_context_percent", 30) or 0)))
         conversation_tokens = 0 if available_prompt_tokens <= 0 else max(512, int(available_prompt_tokens * 0.45))
         raw_recent_conversation_tokens = 0 if conversation_tokens <= 0 else int(conversation_tokens * (raw_recent_percent / 100.0))
@@ -138,9 +174,12 @@ class LLMTaskRuntime:
             "model_context_tokens": int(selected_limit),
             "context_cap_source": context_cap_source,
             "effective_context_tokens": effective_limit,
-            "provider_call_context_tokens": effective_limit if effective_limit > 0 else endpoint_limit,
+            "provider_call_context_tokens": provider_call_context_tokens,
+            "target_context_tokens": target_context_tokens,
+            "context_target_source": context_target_source,
             "reserved_output_tokens": int(reserved_output),
             "available_prompt_tokens": available_prompt_tokens,
+            "hard_available_prompt_tokens": hard_available_prompt_tokens,
             "raw_recent_context_percent": raw_recent_percent,
             "conversation_tokens": conversation_tokens,
             "raw_recent_conversation_tokens": raw_recent_conversation_tokens,
@@ -148,14 +187,18 @@ class LLMTaskRuntime:
             "max_recent_turns": max_recent_turns,
         }
         logger.debug(
-            "LLM context budget: task={} model_context={} effective={} prompt={} source={} endpoint_reported={} user_cap={} reserved_output={}",
+            "LLM context budget: task={} model_context={} effective={} target={} target_prompt={} hard_prompt={} "
+            "cap_source={} target_source={} endpoint_reported={} user_cap={} reserved_output={}",
             task,
             budget["model_context_tokens"],
             budget["effective_context_tokens"],
+            budget["target_context_tokens"],
             budget["available_prompt_tokens"],
+            budget["hard_available_prompt_tokens"],
             budget["context_cap_source"],
+            budget["context_target_source"],
             budget["endpoint_context_reported"],
-            user_cap if user_cap is not None else "auto",
+            user_cap if user_cap is not None else "endpoint_default",
             budget["reserved_output_tokens"],
         )
         return budget
@@ -225,14 +268,18 @@ class LLMTaskRuntime:
             budget = self.context_budget_for_task(task)
             trimmed_messages = self._token_budget.trim_messages(
                 messages,
-                context_limit=budget.get("provider_call_context_tokens", budget["effective_context_tokens"]),
+                context_limit=budget.get("target_context_tokens", budget["effective_context_tokens"]),
                 reserved_output_tokens=budget["reserved_output_tokens"],
                 raw_recent_context_percent=budget.get("raw_recent_context_percent", 30),
+                tools=tools,
+                allow_target_overflow=True,
             )
-            return await llm_breaker.call(
-                llm_client.completion,
-                task=task, messages=trimmed_messages, tools=tools, **gen_options,
-            )
+            payload_audit = self._audit_payload_budget(task, trimmed_messages, tools, budget)
+            with LLMActivityContext.bind_budget(self._activity_budget_payload(budget, payload_audit)):
+                return await llm_breaker.call(
+                    llm_client.completion,
+                    task=task, messages=trimmed_messages, tools=tools, **gen_options,
+                )
         return completion_fn
 
     def make_stream_completion_fn(self) -> object:
@@ -254,16 +301,146 @@ class LLMTaskRuntime:
             budget = self.context_budget_for_task(task)
             trimmed_messages = self._token_budget.trim_messages(
                 messages,
-                context_limit=budget.get("provider_call_context_tokens", budget["effective_context_tokens"]),
+                context_limit=budget.get("target_context_tokens", budget["effective_context_tokens"]),
                 reserved_output_tokens=budget["reserved_output_tokens"],
                 raw_recent_context_percent=budget.get("raw_recent_context_percent", 30),
+                tools=tools,
+                allow_target_overflow=True,
             )
-            return await llm_breaker.call(
-                llm_client.completion,
-                task=task, messages=trimmed_messages, tools=tools,
-                stream=True, **gen_options,
-            )
+            payload_audit = self._audit_payload_budget(task, trimmed_messages, tools, budget)
+            with LLMActivityContext.bind_budget(self._activity_budget_payload(budget, payload_audit)):
+                return await llm_breaker.call(
+                    llm_client.completion,
+                    task=task, messages=trimmed_messages, tools=tools,
+                    stream=True, **gen_options,
+                )
         return stream_completion_fn
+
+
+    def _audit_payload_budget(
+        self,
+        task: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        budget: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Log the payload actually handed to the provider, including schemas.
+
+        The old diagnostic reported the selected context allowance as though it
+        described the sent prompt, and ignored function schemas entirely.  This
+        audit distinguishes the configured ceiling from the measured request so
+        a 100k-token runaway is immediately visible and attributable.
+        """
+        message_tokens = self._token_budget.estimate_messages(messages)
+        tool_tokens = self._token_budget.estimate_tools(tools)
+        prompt_tokens = message_tokens + tool_tokens
+        reserve = int(budget.get("reserved_output_tokens") or 0)
+        provider_limit = int(
+            budget.get("provider_call_context_tokens")
+            or budget.get("effective_context_tokens")
+            or budget.get("model_context_tokens")
+            or 0
+        )
+        total_with_output = prompt_tokens + reserve
+        target_limit = int(budget.get("target_context_tokens") or provider_limit or 0)
+        over_target = bool(target_limit and total_with_output > target_limit)
+        over_limit = bool(provider_limit and total_with_output > provider_limit)
+        log = logger.error if over_limit else (logger.warning if over_target else logger.info)
+        log(
+            "LLM_PAYLOAD_BUDGET task={} messages={} tools={} message_tokens_est={} "
+            "tool_tokens_est={} prompt_tokens_est={} output_reserve={} total_est={} "
+            "target_limit={} provider_limit={} cap_source={} target_source={} "
+            "over_target={} over_limit={}",
+            task,
+            len(messages or []),
+            len(tools or []),
+            message_tokens,
+            tool_tokens,
+            prompt_tokens,
+            reserve,
+            total_with_output,
+            target_limit,
+            provider_limit,
+            budget.get("context_cap_source"),
+            budget.get("context_target_source"),
+            over_target,
+            over_limit,
+        )
+        audit = {
+            "message_tokens_estimated": message_tokens,
+            "tool_tokens_estimated": tool_tokens,
+            "prompt_tokens_estimated": prompt_tokens,
+            "output_reserve_tokens": reserve,
+            "total_tokens_estimated": total_with_output,
+            "target_context_tokens": target_limit,
+            "provider_context_tokens": provider_limit,
+            "over_target": over_target,
+            "over_hard_limit": over_limit,
+        }
+        if over_limit:
+            error = LLMPayloadBudgetError(
+                "The measured LLM request cannot fit the selected context window "
+                f"({total_with_output} estimated tokens including output reserve vs "
+                f"{provider_limit}). Tool schemas account for {tool_tokens} tokens. "
+                "The request was stopped before provider I/O."
+            )
+            self._record_budget_rejection(task, messages, tools, budget, audit, error)
+            raise error
+        return audit
+
+    @staticmethod
+    def _activity_budget_payload(budget: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
+        """Return the compact budget contract shown in the activity inspector."""
+        keys = (
+            "endpoint_context_tokens",
+            "endpoint_context_source",
+            "endpoint_context_reported",
+            "model_context_tokens",
+            "context_cap_source",
+            "effective_context_tokens",
+            "provider_call_context_tokens",
+            "target_context_tokens",
+            "context_target_source",
+            "reserved_output_tokens",
+            "available_prompt_tokens",
+            "hard_available_prompt_tokens",
+        )
+        payload = {key: budget.get(key) for key in keys}
+        payload["payload"] = dict(audit)
+        return payload
+
+    def _record_budget_rejection(
+        self,
+        task: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        budget: dict[str, Any],
+        audit: dict[str, Any],
+        error: BaseException,
+    ) -> None:
+        """Expose pre-provider budget failures through the normal activity UI."""
+        monitor = getattr(self._llm_client, "activity_monitor", None)
+        if monitor is None:
+            return
+        provider = "default"
+        model = ""
+        try:
+            resolved = self._llm_client.resolve_task(task)
+            provider = str(getattr(resolved, "provider_id", None) or "default")
+            model = str(getattr(resolved, "model", None) or "")
+        except Exception:
+            pass
+        call_id = monitor.start_call(
+            task=task,
+            provider=provider,
+            model=model,
+            messages=messages,
+            tools=tools,
+            stream=False,
+            generation={"pre_provider_rejection": True},
+            budget=self._activity_budget_payload(budget, audit),
+        )
+        monitor.finish_call(call_id, status="failed", error=error)
 
     def get_tool_definitions_for_intent(self, intent: Intent) -> list[dict] | None:
         """Return only the tool definitions appropriate for an intent.

@@ -5,7 +5,7 @@ selective download configuration, and per-download lock management.
 """
 
 import asyncio
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from loguru import logger
 from src.core.models import DownloadItem, DownloadStatus, TaskCriticality
 from src.core.storage_path_availability import StoragePathUnavailableError
@@ -55,6 +55,7 @@ class DownloadStartCoordinator:
         self._bundle_download_handler = bundle_download_handler
         self._add_locks: dict[str, asyncio.Lock] = {}
         self._selective_downloads: dict[str, dict] = {}
+        self._start_reservations: set[str] = set()
 
         # Stable callbacks (bound methods, set once at construction)
         self._on_file_progress = on_file_progress
@@ -87,6 +88,44 @@ class DownloadStartCoordinator:
         if download_id not in self._add_locks:
             self._add_locks[download_id] = asyncio.Lock()
         return self._add_locks[download_id]
+
+    def reserve_start(self, download_id: str) -> bool:
+        """Atomically reserve one engine-start attempt for a download ID.
+
+        The asyncio event loop runs this synchronous set mutation without an
+        await boundary, so concurrent callers cannot both acquire it. The
+        reservation remains after a successful start; database/live state then
+        becomes authoritative. Failed starts and explicit lifecycle resets must
+        release it before a later attempt is allowed.
+        """
+        if download_id in self._start_reservations:
+            return False
+        self._start_reservations.add(download_id)
+        return True
+
+    def release_start(self, download_id: str) -> None:
+        """Release a start reservation after failure or an explicit reset."""
+        self._start_reservations.discard(download_id)
+
+    async def run_start_once(
+        self,
+        download_id: str,
+        starter: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """Run one engine-start callback for a download ID.
+
+        Returns:
+            ``True`` when this caller owned the start attempt, otherwise
+            ``False`` when another caller already reserved it.
+        """
+        if not self.reserve_start(download_id):
+            return False
+        try:
+            await starter()
+        except Exception:
+            self.release_start(download_id)
+            raise
+        return True
 
     # ── Selective download bookkeeping ──────────────────────────────
 

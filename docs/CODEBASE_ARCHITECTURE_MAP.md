@@ -448,6 +448,12 @@ The storage-aware package injects storage information into the assistant context
 
 `TaskLLMClient.completion()` and `LLMClient.completion()` apply `RuntimePromptContext.ensure_messages()` before prompt logging or provider dispatch.  Main assistant prompts still include runtime date/time guidance through `PromptBuilder`, but the provider boundary protects helper prompts such as intent routing, summaries, candidate adjudication, taste extraction, and legacy direct provider paths that do not use the main prompt builder.
 
+### Context-window authority and post-turn work
+
+`LLMTaskRuntime` treats the endpoint/model maximum or explicit user cap as the hard context authority. Task-specific values are soft assembly targets used to compact optional history and tool results; serialized tool schemas and output reserve are measured, and an irreducible prompt may spill above the soft target while remaining below the usable hard ceiling. The activity monitor records the selected window, usable hard ceiling, soft target, measured payload, and any pre-provider hard rejection.
+
+`AIAssistant` dispatches model-led post-turn taste extraction through the injected `TaskSupervisor`, using a coroutine factory so the visible WebSocket turn can complete first. Routine DOWNLOAD engagement is already captured by the behavior recorder and does not trigger a redundant taste-extraction call unless the user explicitly expresses a preference.
+
 ### Tool registry and policy
 
 Key files:
@@ -788,12 +794,26 @@ AIAssistant.run()
   -> CategoryToolFactory exposes category tools
   -> SearchAggregator queries JackettSearch first, then explicit direct fallback if enabled
   -> TorrentSelectionService normalizes/selects candidates
-  -> DownloadManager checks storage and queues torrent
+  -> ActionGateway reserves the scoped idempotency claim
+  -> DownloadManager checks storage and queues torrent through TorrentStartCoordinator
+  -> ActionGateway persists the immutable receipt and append-only operational events
   -> DownloadCompletionHandler receives ready/complete callbacks
   -> Librarian/CategoryPathPlanner computes target paths
   -> SafePathResolver validates filesystem operations
   -> ActionReceipt / events / notifications / UI updates
 ```
+
+
+### Background work ownership
+
+```text
+caller supplies coroutine factory
+  -> TaskSupervisor creates and owns the coroutine inside the supervised task
+  -> shutdown cancels/awaits owned tasks
+  -> restartable tasks recreate the coroutine only after restart is scheduled
+```
+
+Do not create a coroutine before handing work to `TaskSupervisor`. Passing a factory prevents immediate shutdown, rejected scheduling, or mocked supervisors from leaving an unawaited coroutine. One-shot event and download-stat broadcasts follow this contract.
 
 ### Setup wizard loads requirements
 
@@ -1063,3 +1083,10 @@ provider for one domain.
 - `src/core/categories/media_probe.py` now has class-owned probe collaborators (`MediaProbeValueParser`, `MediaProbeLanguageNormalizer`, `MediaProbeResolution`, `MediaProbeService`). Public module functions are compatibility wrappers only.
 - `config/category-definitions/tv.yaml` active search examples should remain neutral pattern examples, not titles copied from troubleshooting logs or one-off local test scenarios.
 - `src/ai/intent_router.py` should keep generic download follow-up wording in bundle/range terms; TV-specific season-pack teaching belongs to TV-owned category guidance.
+
+### Round 281 TV title-identity boundary
+
+- `src/core/categories/title_authority.py` owns provider/user alias matching. One-word aliases are exact-title scoped: they may match the isolated title or title plus release disambiguators, but not longer semantic titles that merely begin or end with the same token.
+- `src/core/categories/tv_agent.py` owns TV release-title identity checks and publishes `title_identity` on annotated search candidates. TV payload filters must reject a row when that verdict says the candidate names a different series, even if the row has a matching `unit_descriptor` such as `S01E06`.
+- `src/ai/tools/scheduling.py` may preserve and pass through `title_identity`, but it must not regain TV title parsing or decide that an episode coordinate makes a candidate title safe.
+- `scripts/round281_tv_title_identity_guard_tests.py` covers the Rooster/Rooster Fighter class of regression with neutral fixture names so active tests do not encode one-off show titles.

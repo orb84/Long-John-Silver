@@ -162,8 +162,8 @@ class CategoryItemDetailModal extends Component {
                 DOM.el('span', { className: 'detail-toggle-copy' }, [
                     DOM.el('strong', {}, ['Automatically download new episodes']),
                     DOM.el('small', { className: 'muted' }, [
-                        'Off by default for library shows. Enable it to automatically download ',
-                        'new episodes for this show.'
+                        'Newly discovered shows that are still active default to on. ',
+                        'Turn it off here whenever you do not want future episodes downloaded automatically.'
                     ])
                 ])
             ])

@@ -85,7 +85,7 @@ def test_download_metadata_placeholder_chain_is_canonicalized() -> None:
     assert step.depends_on == []
     assert step.arguments["name"] == "Yellowstone"
     assert step.arguments["language"] == "Italian"
-    assert step.arguments["search_scope"] == "season_pack_preferred"
+    assert step.arguments["search_scope"] == "bundle_preferred"
     assert "season" not in step.arguments, "latest season must be resolved by the TV category, not by a planner placeholder"
     assert "${" not in json.dumps(step.arguments)
 

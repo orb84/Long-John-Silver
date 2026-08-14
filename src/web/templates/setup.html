@@ -3,10 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="ljs-asset-version" content="{{ static_asset_version }}">
+    <meta name="ljs-build-id" content="{{ runtime_build_id }}">
     <title>LJS — Set Sail</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="{{ static_asset('/static/css/style.css') }}">
     <link rel="icon" href="data:,">
     <style>
         :root {
@@ -1424,15 +1426,15 @@
     </div>
 
     <!-- Core setup assets scripts -->
-    <script src="/static/js/components/dom.js"></script>
-    <script src="/static/js/core/eventBus.js"></script>
-    <script src="/static/js/core/toastManager.js"></script>
-    <script src="/static/js/components/modalManager.js"></script>
-    <script src="/static/js/api/actionClient.js"></script>
-    <script src="/static/js/components/modelCatalog.js"></script>
-    <script src="/static/js/components/traktAuth.js"></script>
-    <script src="/static/js/components/serverPathBrowser.js"></script>
-    <script src="/static/js/pages/setup.js"></script>
+    <script src="{{ static_asset('/static/js/components/dom.js') }}"></script>
+    <script src="{{ static_asset('/static/js/core/eventBus.js') }}"></script>
+    <script src="{{ static_asset('/static/js/core/toastManager.js') }}"></script>
+    <script src="{{ static_asset('/static/js/components/modalManager.js') }}"></script>
+    <script src="{{ static_asset('/static/js/api/actionClient.js') }}"></script>
+    <script src="{{ static_asset('/static/js/components/modelCatalog.js') }}"></script>
+    <script src="{{ static_asset('/static/js/components/traktAuth.js') }}"></script>
+    <script src="{{ static_asset('/static/js/components/serverPathBrowser.js') }}"></script>
+    <script src="{{ static_asset('/static/js/pages/setup.js') }}"></script>
 
     <!-- Visual micro-animations setup triggers -->
     <script>

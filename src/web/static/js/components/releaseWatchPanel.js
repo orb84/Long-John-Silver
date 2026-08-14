@@ -7,6 +7,7 @@
  * interpreting category-specific unit semantics in the frontend shell.
  */
 class ReleaseWatchPanel extends Component {
+    /** Initialize the release-watch panel for the supplied application shell. */
     constructor(elementId, eventBus) {
         super(elementId);
         this._eventBus = eventBus;
@@ -21,6 +22,7 @@ class ReleaseWatchPanel extends Component {
         }
     }
 
+    /** Render the current release-watch state into the panel container. */
     render() {
         this._clear();
         const header = DOM.el('div', { className: 'release-watch-header' }, [
@@ -95,6 +97,7 @@ class ReleaseWatchPanel extends Component {
         }
     }
 
+    /** Load current release watches and refresh the rendered panel. */
     async load({ quiet = false } = {}) {
         const list = document.getElementById('release-watch-list');
         if (!list || typeof APIClient === 'undefined') return;

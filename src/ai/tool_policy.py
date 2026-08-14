@@ -30,25 +30,17 @@ class AgentToolPolicy:
         """Create a policy evaluator with optional live settings."""
         self._settings = settings
 
-    # Tools that must remain visible independently of the selected category.
-    # These are application-control and inspection primitives, not TV/Movie/etc.
-    # semantics.  Category YAML can narrow category/search tools, but it must not
-    # hide the user's ability to inspect storage/download state or control an
-    # existing queue/download from any conversation context.
+    # Compact application-level inspection/control tools that remain visible
+    # independently of the selected category.  Do not add one alias per queue
+    # operation here: every additional schema is serialized into every agent
+    # call.  ``manage_downloads`` owns pause/resume/cancel/reorder/priority and
+    # keeps the surface coherent.
     _GLOBAL_ALWAYS_TOOLS = {
         "list_downloads",
         "manage_downloads",
         "set_download_priority",
-        "download_set_priority",
-        "pause_downloads",
-        "resume_downloads",
-        "cancel_downloads",
-        "download_upload",
         "get_storage_status",
-        "check_storage_capacity",
         "inspect_torrent_candidate",
-        "suggestions_list",
-        "list_library_shares",
     }
 
     _GENERIC_READ_TOOLS = {
@@ -92,32 +84,22 @@ class AgentToolPolicy:
     _DOWNLOAD_CONTEXT_TOOLS = {
         "enquire_about_media",
         "metadata_lookup",
-        "compare_date_to_now",
-        "get_library_status",
-        "suggestions_list",
-        "list_downloads",
-        "list_library_shares",
+    }
+
+    _ACQUISITION_SEARCH_TOOLS = {
+        "enquire_about_media",
+        "metadata_lookup",
+        "search_media_torrents",
         "inspect_torrent_candidate",
         "get_storage_status",
+        "list_downloads",
+        "category_web_research",
     }
 
     _GENERIC_DOWNLOAD_TOOLS = {
-        "search_torrents",
         "search_media_torrents",
-        "search_soulseek",
         "queue_download",
         "enqueue_soulseek_download",
-        "get_soulseek_share_plan",
-        "inspect_torrent_candidate",
-        "suggestions_list",
-        "list_downloads",
-        "list_library_shares",
-        "set_download_priority",
-        "manage_downloads",
-        "check_storage_capacity",
-        "record_category_taste_signal",
-        "track_category_item",
-        "create_web_information_watch",
     }
 
     _GENERIC_CONFIG_TOOLS = {
@@ -152,6 +134,7 @@ class AgentToolPolicy:
         intent: Intent,
         category: MediaCategory | None = None,
         confirmed: bool = False,
+        acquisition_continuation: bool = False,
     ) -> set[str]:
         """Return LLM tool names allowed for one intent/category pair.
 
@@ -164,29 +147,24 @@ class AgentToolPolicy:
         Returns:
             Set of registered tool names that may be exposed to the model.
         """
-        generic_tools = self._generic_tools_for_intent(intent)
+        generic_tools = (
+            set(self._ACQUISITION_SEARCH_TOOLS)
+            if intent == Intent.SEARCH and acquisition_continuation
+            else self._generic_tools_for_intent(intent)
+        )
         if category is None:
             return generic_tools
 
         tool_policy = category.category_tool_policy(self._settings) if hasattr(category, "category_tool_policy") else {}
 
-        if intent == Intent.SEARCH:
-            # Category search workflows are now part of the category contract.
-            # Expose only the selected category's read-risk SEARCH workflows/actions,
-            # avoiding the old global pile of TV/movie-specific tools while still
-            # letting a category teach the LLM its own domain operations.
-            return self._apply_category_yaml_tool_policy(
-                generic_tools | self._category_tools_for_intent(category, {"read"}, confirmed, intent),
-                tool_policy,
-            )
-        if intent == Intent.DOWNLOAD:
-            # Download turns need the generic candidate workspace plus the selected
-            # category's declared read/write download workflows. Destructive tools
-            # remain gated by confirmation and are not exposed by default.
-            return self._apply_category_yaml_tool_policy(
-                generic_tools | self._category_tools_for_intent(category, {"read", "write"}, confirmed, intent),
-                tool_policy,
-            )
+        if intent in {Intent.SEARCH, Intent.DOWNLOAD, Intent.CHAT}:
+            # Ordinary assistant turns deliberately expose only the generic tool
+            # surface. Category semantics arrive through prompt/context hooks and
+            # category-owned validation inside the generic search/queue pipeline;
+            # exposing category micro-tools here recreates competing execution
+            # paths and overwhelms small local models. Category actions remain
+            # available to explicit UI/internal/configuration flows below.
+            return self._apply_category_yaml_tool_policy(generic_tools, tool_policy)
         if intent == Intent.CONFIG:
             return self._apply_category_yaml_tool_policy(
                 generic_tools | self._category_action_tools(category, {"read", "write", "destructive"}, confirmed),
@@ -202,6 +180,7 @@ class AgentToolPolicy:
         intent: Intent,
         category: MediaCategory | None = None,
         confirmed: bool = False,
+        acquisition_continuation: bool = False,
     ) -> list[dict] | None:
         """Return registered tool definitions allowed for the intent/category.
 
@@ -214,7 +193,12 @@ class AgentToolPolicy:
         Returns:
             Tool definitions, or None if no allowed tools are registered.
         """
-        tool_names = self.allowed_tool_names(intent, category=category, confirmed=confirmed)
+        tool_names = self.allowed_tool_names(
+            intent,
+            category=category,
+            confirmed=confirmed,
+            acquisition_continuation=acquisition_continuation,
+        )
         return registry.get_definitions(tool_names) or None
 
     def _apply_category_yaml_tool_policy(self, allowed: set[str], policy: dict | None) -> set[str]:
@@ -255,12 +239,11 @@ class AgentToolPolicy:
                 "create_web_information_watch",
                 "list_web_information_watches",
                 "track_category_item",
-                # Source companion tools stay globally available for downloadable categories.
-                # Logs from Round 135 showed category YAML narrowing hid search_soulseek
-                # from Music even though the global download policy allowed it.
-                "search_soulseek",
+                # Queueing remains available for category-owned Soulseek
+                # companion candidates returned by search_media_torrents. Raw
+                # direct Soulseek search is intentionally not an ordinary
+                # DOWNLOAD escape hatch around category identity/search rules.
                 "enqueue_soulseek_download",
-                "get_soulseek_share_plan",
             }
             result = (result & requested) | (result & always)
         return result
@@ -269,7 +252,11 @@ class AgentToolPolicy:
         """Return generic tool names for an intent."""
         always = set(self._GLOBAL_ALWAYS_TOOLS)
         if intent == Intent.SEARCH:
-            return set(self._GENERIC_READ_TOOLS) | always
+            # SEARCH can be a continuation of an acquisition goal (for
+            # example "search harder").  Discovery is read-only, but keep it
+            # out of CHAT so ordinary conversation does not pay for or wander
+            # into the torrent-search schema.
+            return set(self._GENERIC_READ_TOOLS) | {"search_media_torrents"} | always
         if intent == Intent.DOWNLOAD:
             # DOWNLOAD used to expose every generic read/research/browser tool.
             # Logs showed this inflated the function schema surface to 30+ tools

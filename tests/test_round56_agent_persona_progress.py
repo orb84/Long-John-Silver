@@ -14,8 +14,8 @@ def test_download_progress_is_persona_based_and_useful() -> None:
     )
 
     assert "Captain" in message
-    assert "manifest" in message.lower() or "release" in message.lower()
-    assert "download" not in message.lower() or "releases" in message.lower()
+    assert "checking" in message.lower() or "charts" in message.lower()
+    assert "queued" not in message.lower() and "started" not in message.lower()
 
 
 def test_batch_queue_result_reports_units_titles_and_fallbacks() -> None:
@@ -48,4 +48,4 @@ def test_frontend_handles_status_frames_without_final_answer_bubble_reuse() -> N
     assert "_appendMsg('status'" in chat
     assert "this.assistantBubble = null" not in chat.split("data.type === 'status'", 1)[1].split("data.type === 'done'", 1)[0]
     assert "_stream_chat_with_progress" in app
-    assert '"type": "status"' in app
+    assert '{"type": event.type, "content": event.content}' in app

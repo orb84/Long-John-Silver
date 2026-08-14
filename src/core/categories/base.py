@@ -77,6 +77,7 @@ class CategoryWorkflowContext:
     session_id: str | None = None
     category_registry: object | None = None
     search_constraints: dict[str, Any] = field(default_factory=dict)
+    agent_search_facts: dict[str, Any] = field(default_factory=dict)
 
 
 class MediaCategory(CategoryContractMixin, ABC):
@@ -209,6 +210,42 @@ class MediaCategory(CategoryContractMixin, ABC):
         item coordinator rather than importing category-specific metadata code.
         """
         return item
+
+    async def identify_agent_item(
+        self,
+        name: str,
+        *,
+        settings: "Settings",
+        db: Optional["Database"] = None,
+        metadata_clients: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return category-owned identity evidence for an unclassified title.
+
+        The generic identity resolver may compare evidence from installed
+        categories, but it must not know which provider identifies TV, movies,
+        books, music, or future domains.  Concrete categories override this
+        hook and return compact candidates with ``title``, ``source``,
+        ``base_score``, and optional external identity fields.  The base
+        category deliberately contributes no evidence.
+        """
+        return []
+
+    async def identify_agent_item_via_web(
+        self,
+        name: str,
+        *,
+        settings: "Settings",
+        db: Optional["Database"] = None,
+        metadata_clients: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return category-owned identity evidence from bounded public web search.
+
+        The generic resolver invokes this only for a category already suggested
+        by request semantics and only after that category's structured metadata
+        could not confirm the title.  Categories author and interpret their own
+        queries; the base implementation opts out.
+        """
+        return []
 
     async def build_watch_plan(self, item: "CategoryItem", context: Any) -> Any:
         """Return a category-owned watch policy for ``item``.

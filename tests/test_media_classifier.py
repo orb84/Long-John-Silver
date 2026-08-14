@@ -14,7 +14,7 @@ class TestMediaClassifier:
     async def test_heuristic_classify_tv(self) -> None:
         """Verify keyword heuristics correctly identify TV shows."""
         settings_manager = MagicMock()
-        settings_manager.settings.tmdb_api_key = None
+        settings_manager.settings.first_category_service_value.return_value = None
         classifier = MediaClassifier(settings_manager)
 
         assert await classifier.classify("Breaking Bad Season 1") == "tv"
@@ -23,19 +23,19 @@ class TestMediaClassifier:
 
     @pytest.mark.asyncio
     async def test_heuristic_classify_movie(self) -> None:
-        """Verify keyword heuristics default to movie for non-tv titles."""
+        """Verify non-episodic titles remain neutral without provider evidence."""
         settings_manager = MagicMock()
-        settings_manager.settings.tmdb_api_key = None
+        settings_manager.settings.first_category_service_value.return_value = None
         classifier = MediaClassifier(settings_manager)
 
-        assert await classifier.classify("Inception 2010") == "movie"
-        assert await classifier.classify("The Matrix") == "movie"
+        assert await classifier.classify("Inception 2010") == "media"
+        assert await classifier.classify("The Matrix") == "media"
 
     @pytest.mark.asyncio
     async def test_tmdb_classify_movie(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Verify TMDB multi-search accurately classifies a movie query."""
         settings_manager = MagicMock()
-        settings_manager.settings.tmdb_api_key = "dummy_key"
+        settings_manager.settings.first_category_service_value.return_value = "dummy_key"
         classifier = MediaClassifier(settings_manager)
 
         mock_tmdb_client_class = MagicMock()

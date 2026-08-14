@@ -187,6 +187,7 @@ class ManagedSearXNGToolStartup:
 
     @staticmethod
     async def ensure_ready(settings_manager: Optional[SettingsManager], searxng_manager: Any) -> dict[str, Any]:
+        """Ensure the managed SearXNG service is available for tool execution."""
         if settings_manager is None or searxng_manager is None:
             return {"attempted": False, "reason": "missing_dependencies"}
         cfg = getattr(settings_manager.settings, "web_search", None)
@@ -663,6 +664,7 @@ class RunWebInformationWatchTool:
         self._llm_client = llm_client
 
     def parameters(self) -> dict:
+        """Return the JSON schema for running a web-information watch."""
         return {
             "type": "object",
             "properties": {
@@ -672,6 +674,7 @@ class RunWebInformationWatchTool:
         }
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
+        """Run one web-information watch through the shared watch service."""
         from src.core.models import WebSearchConfig
         from src.search.web.information_watch import WebInformationWatchService
 
@@ -701,6 +704,7 @@ class ListWebInformationWatchesTool:
         self._database = database
 
     def parameters(self) -> dict:
+        """Return the JSON schema for listing web-information watches."""
         return {
             "type": "object",
             "properties": {
@@ -713,6 +717,7 @@ class ListWebInformationWatchesTool:
         }
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
+        """List web-information watches visible to the current tool context."""
         repository = getattr(self._database, "web_research", None) if self._database else None
         if not repository:
             return {"ok": False, "error": "Web research repository is not configured."}
@@ -740,6 +745,7 @@ class DisableWebInformationWatchTool:
         self._database = database
 
     def parameters(self) -> dict:
+        """Return the JSON schema for disabling a web-information watch."""
         return {
             "type": "object",
             "properties": {
@@ -750,6 +756,7 @@ class DisableWebInformationWatchTool:
         }
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> Any:
+        """Disable a web-information watch through the shared action path."""
         repository = getattr(self._database, "web_research", None) if self._database else None
         if not repository:
             return {"ok": False, "error": "Web research repository is not configured."}

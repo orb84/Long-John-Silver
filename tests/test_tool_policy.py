@@ -24,13 +24,15 @@ class TestAgentToolPolicy:
         assert "tv.resolve_show" not in allowed
         assert "movie.delete_item" not in allowed
 
-    def test_download_includes_generic_download_and_category_workflows(self):
-        """DOWNLOAD should include generic torrent tools and category workflow tools."""
+    def test_download_uses_generic_tools_with_category_owned_context(self):
+        """DOWNLOAD keeps the LLM surface generic; categories own context and validation."""
         tv = self.registry.get("tv")
         download_tools = self.policy.allowed_tool_names(Intent.DOWNLOAD, category=tv)
-        assert "search_torrents" in download_tools
+        assert "search_media_torrents" in download_tools
+        assert "search_torrents" not in download_tools
         assert "queue_download" in download_tools
-        assert "tv.download_next_missing_episode" in download_tools
+        assert "tv.download_next_missing_episode" not in download_tools
+        assert not any(name.startswith("tv.") for name in download_tools)
         assert "category_item_add" not in download_tools
 
     def test_config_includes_category_action_tools_without_unconfirmed_destructive(self):

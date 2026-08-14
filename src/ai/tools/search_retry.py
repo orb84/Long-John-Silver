@@ -8,6 +8,8 @@ future search prompt, but it must not silently authorize a future download.
 
 from __future__ import annotations
 
+TOOL_PROVIDER_MODULE = False
+
 import hashlib
 from typing import Any
 

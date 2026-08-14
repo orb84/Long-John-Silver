@@ -98,8 +98,8 @@ def test_legacy_global_symbols_do_not_reappear_in_source() -> None:
     assert scoped == {}
 
 
-def test_custom_category_manifest_and_tool_policy_need_no_app_special_case() -> None:
-    """A new category can register workflows and be exposed through policy only."""
+def test_custom_category_manifest_needs_no_app_special_case() -> None:
+    """A new category registers declarative workflows without widening normal chat tools."""
     registry = CategoryRegistry()
     music = MusicCategory()
     registry.register(music)
@@ -110,6 +110,7 @@ def test_custom_category_manifest_and_tool_policy_need_no_app_special_case() -> 
     assert registry.get("music") is music
     assert manifest.category_id == "music"
     assert manifest.workflows[0].tool_name == "music.download_album"
-    assert "music.download_album" in policy_tools
+    assert "music.download_album" not in policy_tools
+    assert not any(name.startswith("music.") for name in policy_tools)
     assert "queue_download" in policy_tools
     assert "get_tmdb_details" not in policy_tools

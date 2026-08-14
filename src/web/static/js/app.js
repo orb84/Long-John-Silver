@@ -70,7 +70,14 @@ class AppDeck {
 
         // 3. Instantiate view controllers & modules (Dependency Inversion over generated DOM)
         window.downloads = new DownloadManager();
-        window.chatController = new AssistantChat();
+        window.chatController = new AssistantChat(this._eventBus);
+        if (window.LLMActivityPanel) {
+            window.llmActivityPanel = new LLMActivityPanel(this._eventBus);
+        }
+        if (window.LLMProblemCards) {
+            window.llmProblemCards = new LLMProblemCards(this._eventBus, window.llmActivityPanel);
+        }
+        window.llmActivityPanel?.start();
         window.detailModal = new CategoryItemDetailModal();
         if (window.SuggestionManager) {
             window.suggestionManager = new SuggestionManager();

@@ -162,31 +162,30 @@ class TestBTDiggParser:
 
 @pytest.mark.asyncio
 async def test_scheduler_untracked_search_dynamic_tvshowitem():
-    from unittest.mock import MagicMock, AsyncMock
-    from src.core.scheduler import MediaScheduler
+    """Untracked TV requests should be materialized by the TV category."""
+    from unittest.mock import MagicMock
+
+    from src.core.categories.registry import CategoryRegistry
     from src.core.models import Settings
-    
-    # Mock all dependencies
-    deps = MagicMock()
-    deps.settings_manager = MagicMock()
+    from src.core.scheduler_services import SchedulerServiceContext, SchedulerTorrentSearchService
+
+    settings_manager = MagicMock()
     settings = Settings()
     settings.tracked_items = []
-    settings.language = "English"
-    deps.settings_manager.settings = settings
-    
-    # Mock MediaScheduler and pipeline
-    scheduler = MediaScheduler.__new__(MediaScheduler)
-    scheduler._settings_manager = deps.settings_manager
-    scheduler._pipeline = MagicMock()
-    scheduler._pipeline.run_search = AsyncMock(return_value=[])
-    
-    # Execute search_media_torrents for untracked show
-    result = await scheduler.search_media_torrents("Firefly", season=1, episode=1)
-    
-    # Verify that run_search was called with a dynamically constructed TvShowItem!
-    scheduler._pipeline.run_search.assert_called_once()
-    called_item = scheduler._pipeline.run_search.call_args[0][0]
-    
-    assert called_item.key == "Firefly"
-    assert called_item.language == "English"
-    assert called_item.item_type == "tv"
+    settings_manager.settings = settings
+    context = SchedulerServiceContext(
+        settings_manager=settings_manager,
+        db=MagicMock(),
+        downloader=MagicMock(),
+        pipeline=MagicMock(),
+        aggregator=MagicMock(),
+        categories=CategoryRegistry.with_defaults(),
+    )
+    service = SchedulerTorrentSearchService(context)
+
+    media = await service._media_for_request("Firefly", "Firefly", "tv", "English")
+
+    assert media.key == "Firefly"
+    assert media.language == "English"
+    assert media.item_type == "tv"
+

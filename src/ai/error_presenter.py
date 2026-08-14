@@ -10,6 +10,7 @@ character.
 from __future__ import annotations
 
 from src.ai.persona_context import PersonaContext
+from src.ai.language import detect_user_language_label
 
 
 class AgentErrorPresenter:
@@ -37,19 +38,19 @@ class AgentErrorPresenter:
             operation: Human-readable subsystem or operation name.
         """
         return self.format_error(
-            title="the signal lantern is out",
+            title="AI service temporarily unavailable",
             operation=operation,
             detail="The AI service circuit breaker is open. Please try again in a minute.",
-            hint="No data was changed; the ship just needs the fog to clear.",
+            hint="No data was changed.",
         )
 
     def iteration_limit(self) -> str:
         """Return a fallback when the agent loop exhausts its iterations."""
         return self.format_error(
-            title="I lost the thread in the rigging",
+            title="request did not complete",
             operation="agent reasoning loop",
             detail="The assistant hit its iteration limit before reaching a final answer.",
-            hint="Ask again with one concrete target or action and I will take another clean pass.",
+            hint="Try the request again; the previous attempt made no verified changes beyond completed tool actions.",
         )
 
     def exception(self, operation: str, exc: BaseException | str) -> str:
@@ -60,7 +61,7 @@ class AgentErrorPresenter:
             exc: The exception object or already formatted detail.
         """
         return self.format_error(
-            title="a plank creaked where it should not",
+            title="unexpected error",
             operation=operation,
             detail=str(exc) or type(exc).__name__,
         )
@@ -78,17 +79,44 @@ class AgentErrorPresenter:
             detail=detail,
         )
 
-    def queue_failure(self, detail: str) -> str:
-        """Return an error for queue/download failures.
-
-        Args:
-            detail: Exact queue failure detail.
-        """
+    def queue_failure(self, detail: str, user_prompt: str | None = None) -> str:
+        """Return a language-aware error for an unverified queue operation."""
+        if detect_user_language_label(str(user_prompt or "")) == "Italian":
+            safe_detail = detail.strip() if detail else "Errore sconosciuto"
+            return "\n".join([
+                "⚠️ **Download non messo in coda**",
+                "Il downloader non ha confermato un nuovo download attivo.",
+                f"**Dettagli:** `{safe_detail}`",
+                "Non lo segnalo come attivo finché il downloader non restituisce una ricevuta verificata.",
+            ])
         return self.format_error(
-            title="the cargo did not make the manifest",
+            title="download was not queued",
             operation="queue download",
             detail=detail,
+            hint="No download is reported as active unless the downloader returned a verified queue receipt.",
         )
+
+    def queue_partial_failure(self, success_count: int, detail: str, user_prompt: str | None = None) -> str:
+        """Return a truthful receipt when only part of a queue request succeeded."""
+        count = max(0, int(success_count or 0))
+        safe_detail = detail.strip() if detail else "Unknown queue error"
+        if detect_user_language_label(str(user_prompt or "")) == "Italian":
+            noun = "download" if count == 1 else "download"
+            return "\n".join([
+                "⚠️ **Coda completata solo in parte**",
+                f"Il downloader ha confermato {count} {noun}, ma almeno un altro elemento non è stato messo in coda.",
+                "**Operazione:** coda download",
+                f"**Dettagli del fallimento:** `{safe_detail}`",
+                "Considero attivi solo gli elementi con una ricevuta verificata dal downloader.",
+            ])
+        noun = "download" if count == 1 else "downloads"
+        return "\n".join([
+            "⚠️ **The queue request completed only in part**",
+            f"The downloader verified {count} {noun}, but at least one other item was not queued.",
+            "**Operation:** queue download",
+            f"**Failure details:** `{safe_detail}`",
+            "Only items with a verified downloader receipt are being reported as active.",
+        ])
 
     def batch_queue_failure(self, detail: str) -> str:
         """Return an error for automatic batch queueing failures.
@@ -97,7 +125,7 @@ class AgentErrorPresenter:
             detail: Exact batch queue failure detail.
         """
         return self.format_error(
-            title="the batch queue snagged",
+            title="batch download was not fully queued",
             operation="recommended batch queue",
             detail=detail,
         )
@@ -123,7 +151,6 @@ class AgentErrorPresenter:
         safe_detail = detail.strip() if detail else "Unknown error"
         lines = [
             f"⚠️ **Error — {title}**",
-            "Captain, I hit a snag. No need to shoot the parrot yet.",
             f"**Operation:** {operation}",
             f"**Details:** `{safe_detail}`",
         ]

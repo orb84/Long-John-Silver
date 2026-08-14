@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from loguru import logger
 from src.core.models import CategoryItem, DownloadPriority, SearchResult, QualityProfile
 from src.core.library_objects import CanonicalLibraryObjectBuilder
+from src.core.search_rank_guard import SearchRankGuard
+from src.utils.async_boundary import AsyncBoundary
 
 if TYPE_CHECKING:
     from src.search.aggregator import SearchAggregator
@@ -50,6 +52,8 @@ def _inline_query(name: str, episode_label: str | None, language: str) -> str:
 
 class SearchPipeline:
     """Unified search pipeline for both automated and LLM-triggered flows."""
+
+    _LLM_RANK_TIMEOUT_SECONDS = 120.0
 
     def __init__(
         self,
@@ -94,7 +98,8 @@ class SearchPipeline:
 
     async def run_search(
         self, item: CategoryItem, episode_label: str | None = None,
-        mode: str = 'auto', language: str | None = None,
+        mode: str = 'auto', language: str | None = None, *,
+        rank_candidates: bool = True,
     ) -> SearchResult | list[SearchResult] | None:
         """Single entry point for all torrent searches.
 
@@ -108,6 +113,10 @@ class SearchPipeline:
         Returns:
             mode='fast'/'auto': SearchResult | None
             mode='llm': list[SearchResult] | None
+            rank_candidates: Whether this layer should invoke the legacy LLM
+                selector in llm mode. Interactive category/tool workspaces set
+                this false because they perform one bounded adjudication after
+                all category query ladders finish.
         """
         settings = self._settings_manager.settings
         category_id = item.item_type
@@ -166,7 +175,7 @@ class SearchPipeline:
             if mode == 'llm' and validated:
                 # Return validated candidates for LLM agent to review. If LLM
                 # selection service is available, use it to rank.
-                if self._torrent_selection:
+                if self._torrent_selection and rank_candidates:
                     ranked = await self._safe_llm_rank(validated, item, episode_label or '', target_lang)
                     return ranked or validated
                 return validated
@@ -240,7 +249,7 @@ class SearchPipeline:
                 return validated[0]
 
             if mode == 'llm' and alt_validated:
-                if self._torrent_selection:
+                if self._torrent_selection and rank_candidates:
                     ranked = await self._safe_llm_rank(alt_validated, item, episode_label or '', target_lang)
                     return ranked or alt_validated
                 return alt_validated
@@ -279,12 +288,6 @@ class SearchPipeline:
                 pass
         return getattr(item, 'quality', None)
 
-    def _build_alternative_queries(self, item, episode_label, language, category):
-        """Compatibility wrapper for category-owned alternative queries."""
-        if category and hasattr(category, 'build_alternative_search_queries'):
-            return category.build_alternative_search_queries(item, episode_label, language)
-        return []
-
     def _should_llm_rank_validated(
         self,
         category: object | None,
@@ -321,7 +324,10 @@ class SearchPipeline:
         checker = getattr(self._aggregator, "last_search_timed_out", None)
         if callable(checker):
             try:
-                return bool(checker())
+                verdict = checker()
+                if AsyncBoundary.close_if_awaitable(verdict):
+                    return False
+                return bool(verdict)
             except Exception:
                 return False
         diagnostics = getattr(self._aggregator, "provider_diagnostics", {})
@@ -397,14 +403,15 @@ class SearchPipeline:
         LLM ranking layer fails, the caller should still receive deterministic
         candidates instead of an empty assistant reply or a failed plan.
         """
-        try:
-            return await self._llm_rank(candidates, item, episode_label, language)
-        except RecursionError as exc:
-            logger.error(f"Torrent LLM ranker recursed for {item.key} {episode_label}: {exc}; using unranked candidates")
-            return None
-        except Exception as exc:
-            logger.warning(f"Torrent LLM ranker failed for {item.key} {episode_label}: {exc}; using unranked candidates")
-            return None
+        guard = getattr(self, "_rank_guard", None)
+        if guard is None or guard.timeout_seconds != self._LLM_RANK_TIMEOUT_SECONDS:
+            guard = SearchRankGuard(self._LLM_RANK_TIMEOUT_SECONDS)
+            self._rank_guard = guard
+        return await guard.run(
+            lambda: self._llm_rank(candidates, item, episode_label, language),
+            item_key=item.key,
+            unit_label=episode_label,
+        )
 
 
     def quality_reference_for_item(self, item: CategoryItem, episode_label: str | None = None) -> str:

@@ -18,19 +18,23 @@ class ProviderRegistry:
     def __init__(self, key_store: KeyStore):
         self._key_store = key_store
         self._presets: dict[str, ProviderPreset] = get_builtin_presets()
+        self._builtin_ids = frozenset(self._presets)
         self._active_provider_id: Optional[str] = None
         self._api_base_overrides: dict[str, str] = {}
 
     def register_custom(self, preset: ProviderPreset) -> None:
-        """Register a custom provider preset."""
+        """Register a custom provider without overwriting a bundled identity."""
+        if preset.id in self._builtin_ids:
+            raise ValueError(f"Cannot replace bundled provider preset: {preset.id}")
         preset.provider_type = ProviderType.CUSTOM
         self._presets[preset.id] = preset
         logger.info(f"Registered custom provider: {preset.id}")
 
     def remove_provider(self, provider_id: str) -> None:
-        """Remove a provider (only custom providers can be removed)."""
-        preset = self._presets.get(provider_id)
-        if preset and preset.provider_type == ProviderType.CUSTOM:
+        """Remove a user-defined provider while preserving bundled presets."""
+        if provider_id in self._builtin_ids:
+            return
+        if provider_id in self._presets:
             del self._presets[provider_id]
             logger.info(f"Removed custom provider: {provider_id}")
 
@@ -39,10 +43,16 @@ class ProviderRegistry:
         return self._presets.get(provider_id)
 
     def list_presets(self) -> list[ProviderPreset]:
-        """Return all provider presets ordered for display."""
+        """Return each bundled and user-defined provider exactly once."""
         from src.llm_providers.presets import get_ordered_presets
-        builtins = get_ordered_presets()
-        custom = [p for p in self._presets.values() if p.provider_type == ProviderType.CUSTOM]
+
+        ordered_builtin_ids = [preset.id for preset in get_ordered_presets()]
+        builtins = [self._presets[provider_id] for provider_id in ordered_builtin_ids if provider_id in self._presets]
+        custom = [
+            preset
+            for provider_id, preset in self._presets.items()
+            if provider_id not in self._builtin_ids
+        ]
         return builtins + custom
 
     def set_active_provider(self, provider_id: str) -> None:

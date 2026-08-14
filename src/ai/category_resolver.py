@@ -44,8 +44,11 @@ class CategoryResolver:
             if category:
                 return CategoryResolution(
                     category_id=category.category_id,
-                    confidence=0.9,
-                    reason="Matched tracked item, category keyword, or router brief.",
+                    confidence=0.65,
+                    reason=(
+                        "Matched a unique category vocabulary hint. This is prompt-scoping evidence only; "
+                        "unknown titles still require metadata/library identity verification before search."
+                    ),
                 )
 
         ambiguous = self._matching_briefs(user_message)

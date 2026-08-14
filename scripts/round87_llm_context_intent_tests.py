@@ -91,7 +91,7 @@ async def test_intent_is_llm_owned_with_pending_context() -> None:
     router = IntentRouter(llm_client=llm)
     routed = await router.route("faites-le", context=pending)
     assert routed == Intent.DOWNLOAD
-    prompt = llm.calls[0]["messages"][0]["content"]
+    prompt = "\n".join(str(row.get("content") or "") for row in llm.calls[0]["messages"])
     assert "rs123" in prompt and "candidate_id" in prompt, "pending action context must be passed to LLM router"
 
 
@@ -107,7 +107,7 @@ async def test_plan_language_binding_does_not_parse_user_language_words() -> Non
         steps=[PlanStep(id="s", tool_name="search_media_torrents", arguments={"name": "For All Mankind", "language": "Spanish"})],
     )
     normalized = coord._normalize_download_plan(plan, "arbitrary multilingual message", {"search_media_torrents", "queue_download"})
-    assert normalized.steps[0].arguments["language"] == "Spanish", "explicit planner language must not be overwritten by prompt word heuristics"
+    assert normalized.steps[0].arguments["language"] == "Italian", "configured tracked language must win unless the user explicitly overrides it"
 
     plan2 = AgentPlan(
         intent=Intent.DOWNLOAD,

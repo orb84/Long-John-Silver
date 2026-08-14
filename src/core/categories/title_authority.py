@@ -18,9 +18,33 @@ class CategoryTitleAuthority:
     """Build and apply provider-backed title aliases for one category item."""
 
     @classmethod
-    def query_titles_for_item(cls, item: Any, *, preferred_language: str | None = None, limit: int = 6) -> list[str]:
-        """Return bounded search titles, preferring provider/localized aliases."""
-        aliases = cls.aliases_for_item(item, preferred_language=preferred_language, include_user_key=True)
+    def query_titles_for_item(
+        cls,
+        item: Any,
+        *,
+        preferred_language: str | None = None,
+        limit: int = 6,
+        strict_preferred_language: bool = False,
+    ) -> list[str]:
+        """Return bounded provider-backed search titles.
+
+        When ``strict_preferred_language`` is true, arbitrary alternative-title
+        aliases and translations for unrelated locales are excluded.  This is
+        important for explicit-language acquisition: a request for an Italian
+        movie must not wander into a Swedish alias merely because TMDB happened
+        to publish it in the same alternative-title collection.
+        """
+        if strict_preferred_language and preferred_language:
+            values = cls._strict_query_title_values(
+                cls._metadata(item), preferred_language=preferred_language
+            )
+            values.append(getattr(item, "display_name", None))
+            values.append(getattr(item, "key", None))
+            aliases = cls._dedupe_titles(values)
+        else:
+            aliases = cls.aliases_for_item(
+                item, preferred_language=preferred_language, include_user_key=True
+            )
         return aliases[: max(1, int(limit or 1))]
 
     @classmethod
@@ -53,19 +77,92 @@ class CategoryTitleAuthority:
         return cls._dedupe_titles(values)
 
     @classmethod
-    def matches_any_alias(cls, candidate_title: str, aliases: list[str]) -> bool:
-        """Return true when a release title contains a known alias phrase."""
+    def matches_any_alias(
+        cls, candidate_title: str, aliases: list[str], *, disambiguating_year: int | None = None
+    ) -> bool:
+        """Return true when a release title names a known alias.
+
+        One-word titles need a stricter boundary than ordinary substring
+        containment.  A tracked title such as ``Beacon`` must match
+        ``Beacon S01E06`` after the caller has scoped the series prefix to
+        ``Beacon``, but it must not match a different series whose prefix is
+        ``Beacon Runner``.  A release year immediately after the one-word alias
+        is allowed as a common disambiguator.
+        """
         normalized_candidate = cls.normalized_phrase(candidate_title)
         if not normalized_candidate:
+            return False
+        candidate_tokens = normalized_candidate.split()
+        if not candidate_tokens:
             return False
         padded_candidate = f" {normalized_candidate} "
         for alias in aliases or []:
             normalized_alias = cls.normalized_phrase(alias)
             if not normalized_alias:
                 continue
+            alias_tokens = normalized_alias.split()
+            if len(alias_tokens) == 1:
+                if cls._one_word_alias_matches_candidate(
+                    candidate_tokens, alias_tokens[0], disambiguating_year=disambiguating_year
+                ):
+                    return True
+                continue
             if f" {normalized_alias} " in padded_candidate:
                 return True
         return False
+
+    @classmethod
+    def _one_word_alias_matches_candidate(
+        cls, candidate_tokens: list[str], alias_token: str, *, disambiguating_year: int | None = None
+    ) -> bool:
+        """Return true for a one-word alias using a provider-backed year when available.
+
+        Without an independently verified year, one-word titles keep the old
+        conservative suffix-only rule so ``Beacon`` cannot match ``Beacon
+        Runner``.  When the owning category has verified a movie year, an exact
+        ``<title> <year>`` prefix is strong identity evidence; ordinary release
+        metadata after that prefix must not be forced through a tiny token
+        whitelist.
+        """
+        if not candidate_tokens or not alias_token:
+            return False
+        if candidate_tokens[0] != alias_token:
+            return False
+        if len(candidate_tokens) == 1:
+            return True
+        if disambiguating_year is not None:
+            year_token = str(int(disambiguating_year))
+            if len(candidate_tokens) >= 2 and candidate_tokens[1] == year_token:
+                return True
+        return all(cls._is_release_suffix_token(token) for token in candidate_tokens[1:])
+
+    @classmethod
+    def _is_release_suffix_token(cls, token: str) -> bool:
+        """Return true for common non-title release/disambiguation tokens."""
+        text = str(token or "").strip().casefold()
+        if not text:
+            return False
+        if cls._is_release_year_token(text):
+            return True
+        if re.fullmatch(r"(?:480|576|720|1080|1440|2160)p|4k|8k", text):
+            return True
+        if re.fullmatch(r"s\d{1,2}(?:e\d{1,3})?|\d{1,2}x\d{1,3}", text):
+            return True
+        return text in {
+            "web", "webrip", "webdl", "dl", "web-dl", "hdtv", "bluray", "brrip", "dvdrip",
+            "amzn", "hmax", "nf", "dsnp", "atvp", "max", "hulu", "itunes",
+            "x264", "x265", "h264", "h265", "hevc", "avc", "aac", "ac3", "ddp", "ddp5",
+            "ita", "italian", "eng", "english", "multi", "dual", "subs", "sub", "dubbed",
+            "proper", "repack", "extended", "remastered", "unrated", "limited",
+        }
+
+    @staticmethod
+    def _is_release_year_token(token: str) -> bool:
+        try:
+            year = int(str(token or ""))
+        except (TypeError, ValueError):
+            return False
+        return 1900 <= year <= 2100
 
     @staticmethod
     def normalized_phrase(value: object) -> str:
@@ -116,6 +213,42 @@ class CategoryTitleAuthority:
                     values.append(nested.get(key))
                 values.extend(cls._flatten_title_values(nested.get("title_aliases")))
                 values.extend(cls._flatten_title_values(nested.get("localized_titles")))
+        return values
+
+
+    @classmethod
+    def _strict_query_title_values(
+        cls, metadata: dict[str, Any], *, preferred_language: str
+    ) -> list[Any]:
+        """Return canonical titles plus translations for the requested locale only."""
+        values: list[Any] = []
+        preferred = cls._language_token(preferred_language)
+        for key in ("display_name", "title", "name", "original_title", "original_name"):
+            values.append(metadata.get(key))
+
+        localized = metadata.get("localized_titles") or metadata.get("translations") or []
+        for row in localized if isinstance(localized, list) else []:
+            if not isinstance(row, dict):
+                continue
+            lang = cls._language_token(row.get("language") or row.get("iso_639_1"))
+            country = str(row.get("country") or row.get("iso_3166_1") or "").strip().lower()
+            if lang == preferred or cls._country_matches_language(country, preferred):
+                values.extend(cls._flatten_title_values(row))
+
+        for nested_key in ("tmdb", "tvmaze"):
+            nested = metadata.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in ("display_name", "title", "name", "original_title", "original_name"):
+                values.append(nested.get(key))
+            nested_localized = nested.get("localized_titles") or nested.get("translations") or []
+            for row in nested_localized if isinstance(nested_localized, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                lang = cls._language_token(row.get("language") or row.get("iso_639_1"))
+                country = str(row.get("country") or row.get("iso_3166_1") or "").strip().lower()
+                if lang == preferred or cls._country_matches_language(country, preferred):
+                    values.extend(cls._flatten_title_values(row))
         return values
 
     @classmethod

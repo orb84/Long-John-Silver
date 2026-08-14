@@ -18,7 +18,7 @@ class TestPromptBuilder:
     def test_download_intent(self):
         builder = PromptBuilder()
         prompt = builder.build_system_prompt(Intent.DOWNLOAD)
-        assert "search_torrents" in prompt
+        assert "search_media_torrents" in prompt
 
     def test_config_intent(self):
         builder = PromptBuilder()

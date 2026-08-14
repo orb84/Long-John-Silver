@@ -99,7 +99,8 @@ class PromptBuilder:
             parts.append("CATEGORY-SCOPED GUIDANCE:\n" + category_guidance)
         if platform_guidance:
             parts.append(platform_guidance)
-        if intent in {Intent.SEARCH, Intent.DOWNLOAD}:
+        # DOWNLOAD omits the web handbook because its compact tool surface cannot execute it.
+        if intent == Intent.SEARCH:
             parts.append(self._public_web_research_guidance(active_category_id=active_category_id))
 
         parts.append(self._task_guidance(intent, active_category_id=active_category_id))

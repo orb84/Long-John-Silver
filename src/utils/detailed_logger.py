@@ -13,8 +13,13 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Sequence
+
+from src.core.security.path_policy import SafePathResolver
+from src.core.operation_trace import OperationTraceContext
+from src.utils.log_sanitizer import redact_secrets
 
 
 class ThreadSafeFileWriter:
@@ -86,7 +91,9 @@ class ChatLogger:
         """
         self._writer = writer
 
-    async def log_message(self, sender: str, content: str, session_id: str = "default") -> None:
+    async def log_message(
+        self, sender: str, content: str, session_id: str = "default", turn_id: str | None = None
+    ) -> None:
         """Log a chat message to chat.log.
 
         Args:
@@ -95,9 +102,12 @@ class ChatLogger:
             session_id: Session identifier.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
+        trace = OperationTraceContext.fields()
+        effective_session = session_id or str(trace.get("session_id") or "default")
+        effective_turn = turn_id or trace.get("turn_id")
         log_entry = (
             "================================================================================\n"
-            f"Timestamp: {timestamp} | Session: {session_id}\n"
+            f"Timestamp: {timestamp} | Session: {effective_session} | Turn: {effective_turn or '-'} | Turn elapsed ms: {trace.get('turn_elapsed_ms')}\n"
             f"Sender: {sender}\n"
             "Message:\n"
             f"  {content!r}\n"
@@ -131,45 +141,46 @@ class LLMLogger:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> None:
-        """Log full message list and tool schema context to llm_context.log.
+        """Log the exact provider payload plus explicit size diagnostics.
 
-        Args:
-            task: Task classification tag.
-            messages: Prior conversation and prompt messages list.
-            tools: Optional dictionary tools list.
-            model: Target model name.
-            temperature: LLM temperature parameter.
-            max_tokens: LLM max tokens parameter.
+        Messages are serialized rather than reduced to role/content lines so
+        assistant tool calls and every function schema remain inspectable.  The
+        estimates are labelled as such; provider-reported usage is recorded by
+        the live activity monitor after completion.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
-        
-        # Build message history block
-        msg_lines = []
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
-            # Escape strings to preserve block readable alignment
-            msg_lines.append(f"  [{role.upper()}] {content.strip()}")
-        msg_block = "\n".join(msg_lines)
+        trace = OperationTraceContext.fields()
+        safe_messages = messages or []
+        safe_tools = tools or []
+        try:
+            messages_json = json.dumps(safe_messages, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            messages_json = repr(safe_messages)
+        try:
+            tools_json = json.dumps(safe_tools, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            tools_json = repr(safe_tools)
 
-        # Build tools block
-        tools_block = "None"
-        if tools:
-            tool_lines = []
-            for t in tools:
-                func = t.get("function", {})
-                name = func.get("name", "unknown")
-                tool_lines.append(f"  - Tool: '{name}'")
-            tools_block = "\n".join(tool_lines)
-
+        message_chars = len(messages_json)
+        tool_chars = len(tools_json)
+        # Match the conservative live monitor closely enough for a readable log
+        # audit while avoiding a dependency from utils back into the AI runtime.
+        message_tokens_est = int((message_chars / 3.4) * 1.15)
+        tool_tokens_est = int((tool_chars / 2.2) * 1.15) if safe_tools else 0
+        total_tokens_est = message_tokens_est + tool_tokens_est
         log_entry = (
             "================================================================================\n"
             f"Timestamp: {timestamp}\n"
+            f"Session: {trace.get('session_id') or '-'} | Turn: {trace.get('turn_id') or '-'} | Turn elapsed ms: {trace.get('turn_elapsed_ms')}\n"
             f"Task: {task} | Model: {model} | Temperature: {temperature} | Max Tokens: {max_tokens}\n"
-            "--- MESSAGES ---\n"
-            f"{msg_block}\n"
-            "--- TOOLS ---\n"
-            f"{tools_block}\n"
+            "--- PAYLOAD SIZE (ESTIMATED BEFORE PROVIDER TOKENIZATION) ---\n"
+            f"Messages: {len(safe_messages)} | Message chars: {message_chars} | Estimated message tokens: {message_tokens_est}\n"
+            f"Tools: {len(safe_tools)} | Tool-schema chars: {tool_chars} | Estimated tool tokens: {tool_tokens_est}\n"
+            f"Estimated total prompt tokens: {total_tokens_est}\n"
+            "--- EXACT MESSAGES JSON ---\n"
+            f"{messages_json}\n"
+            "--- EXACT TOOL SCHEMAS JSON ---\n"
+            f"{tools_json if safe_tools else '[]'}\n"
             "================================================================================\n\n"
         )
         await self._context_writer.write(log_entry)
@@ -183,9 +194,11 @@ class LLMLogger:
             model: Target model name.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
+        trace = OperationTraceContext.fields()
         log_entry = (
             "================================================================================\n"
             f"Timestamp: {timestamp}\n"
+            f"Session: {trace.get('session_id') or '-'} | Turn: {trace.get('turn_id') or '-'} | Turn elapsed ms: {trace.get('turn_elapsed_ms')}\n"
             f"Task: {task} | Model: {model}\n"
             "--- RAW RESPONSE ---\n"
             f"{raw_text}\n"
@@ -214,6 +227,100 @@ class SearchLogger:
         self._writer = writer
         self._json_writer = json_writer
 
+    async def begin_search(
+        self,
+        *,
+        query: str,
+        category: str,
+        active_providers: list[str],
+    ) -> str:
+        """Record the start of one provider search and return its stable ID.
+
+        Completion-only logs made cancelled searches disappear entirely, which
+        forced operators to infer duration from unrelated later timestamps.
+        Every search now has an explicit started/terminal lifecycle.
+        """
+        timestamp = datetime.now(timezone.utc).isoformat()
+        trace = OperationTraceContext.fields()
+        search_id = self._query_id(timestamp, query, category)
+        await self._write_lifecycle(
+            event="torrent_search_started",
+            search_id=search_id,
+            timestamp=timestamp,
+            query=query,
+            category=category,
+            active_providers=active_providers,
+            elapsed_ms=0,
+            detail=None,
+            trace=trace,
+        )
+        return search_id
+
+    async def log_search_event(
+        self,
+        *,
+        event: str,
+        search_id: str,
+        query: str,
+        category: str,
+        active_providers: list[str],
+        elapsed_ms: int,
+        detail: str | None = None,
+    ) -> None:
+        """Record a terminal/non-success search lifecycle event."""
+        await self._write_lifecycle(
+            event=event,
+            search_id=search_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            query=query,
+            category=category,
+            active_providers=active_providers,
+            elapsed_ms=max(0, int(elapsed_ms or 0)),
+            detail=detail,
+            trace=OperationTraceContext.fields(),
+        )
+
+    async def _write_lifecycle(
+        self,
+        *,
+        event: str,
+        search_id: str,
+        timestamp: str,
+        query: str,
+        category: str,
+        active_providers: list[str],
+        elapsed_ms: int,
+        detail: str | None,
+        trace: dict[str, object],
+    ) -> None:
+        """Write one compact lifecycle record to both search ledgers."""
+        safe_detail = redact_secrets(str(detail)) if detail else None
+        human = (
+            "--------------------------------------------------------------------------------\n"
+            f"Timestamp: {timestamp}\n"
+            f"Session: {trace.get('session_id') or '-'} | Turn: {trace.get('turn_id') or '-'} | Turn elapsed ms: {trace.get('turn_elapsed_ms')}\n"
+            f"Search ID: {search_id} | Event: {event} | Search elapsed ms: {elapsed_ms}\n"
+            f"Query: {query!r} | Category: {category} | Providers: {active_providers}\n"
+            f"Detail: {safe_detail or '-'}\n"
+            "--------------------------------------------------------------------------------\n\n"
+        )
+        await self._writer.write(human)
+        if self._json_writer:
+            record = {
+                "event": event,
+                "search_id": search_id,
+                "timestamp": timestamp,
+                "session_id": trace.get("session_id"),
+                "turn_id": trace.get("turn_id"),
+                "turn_elapsed_ms": trace.get("turn_elapsed_ms"),
+                "search_elapsed_ms": elapsed_ms,
+                "query": query,
+                "category": category,
+                "active_providers": active_providers,
+                "detail": safe_detail,
+            }
+            await self._json_writer.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
     async def log_search(
         self,
         query: str,
@@ -230,6 +337,8 @@ class SearchLogger:
         ranked_results: Sequence[Any] | None = None,
         fallback_used: bool | None = None,
         max_results_to_log: int = 200,
+        search_id: str | None = None,
+        search_elapsed_ms: int | None = None,
     ) -> None:
         """Log indexing queries, provider diagnostics, and visible candidates.
 
@@ -241,7 +350,8 @@ class SearchLogger:
         passkeys can appear in them.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
-        query_id = self._query_id(timestamp, query, category)
+        trace = OperationTraceContext.fields()
+        query_id = str(search_id or self._query_id(timestamp, query, category))
         diagnostics_lines = self._format_provider_diagnostics(provider_diagnostics or {})
         raw_lines = self._format_result_block("Raw Results", raw_results or [], max_results_to_log)
         deduped_lines = self._format_result_block("Deduped Results", deduped_results or [], max_results_to_log)
@@ -250,7 +360,8 @@ class SearchLogger:
         log_entry = (
             "================================================================================\n"
             f"Timestamp: {timestamp}\n"
-            f"Search ID: {query_id}\n"
+            f"Session: {trace.get('session_id') or '-'} | Turn: {trace.get('turn_id') or '-'} | Turn elapsed ms: {trace.get('turn_elapsed_ms')}\n"
+            f"Search ID: {query_id} | Event: torrent_search_completed | Search elapsed ms: {search_elapsed_ms}\n"
             f"Query: {query!r} | Category: {category}\n"
             f"Active Providers: {active_providers}\n"
             f"Fallback Used: {fallback_used}\n"
@@ -268,9 +379,18 @@ class SearchLogger:
         await self._writer.write(log_entry)
         if self._json_writer:
             record = {
+                # Preserve the historical event name for structured-log
+                # compatibility, but state terminal truth explicitly so
+                # operators do not need to infer completion from that legacy
+                # label.
                 "event": "torrent_search_query",
+                "terminal_state": "completed",
                 "search_id": query_id,
                 "timestamp": timestamp,
+                "session_id": trace.get("session_id"),
+                "turn_id": trace.get("turn_id"),
+                "turn_elapsed_ms": trace.get("turn_elapsed_ms"),
+                "search_elapsed_ms": search_elapsed_ms,
                 "query": query,
                 "category": category,
                 "active_providers": active_providers,
@@ -499,6 +619,7 @@ class StructuredReplyLogger:
             steps: List of generated AgentPlan steps with tool payloads.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
+        trace = OperationTraceContext.fields()
         
         # Build step execution layout
         step_lines = []
@@ -511,6 +632,7 @@ class StructuredReplyLogger:
         log_entry = (
             "================================================================================\n"
             f"Timestamp: {timestamp}\n"
+            f"Session: {trace.get('session_id') or '-'} | Turn: {trace.get('turn_id') or '-'} | Turn elapsed ms: {trace.get('turn_elapsed_ms')}\n"
             f"Structured Plan Generated for Intent '{intent}':\n"
             f"Goal: {user_goal}\n"
             "Steps:\n"
@@ -519,25 +641,96 @@ class StructuredReplyLogger:
         )
         await self._writer.write(log_entry)
 
-    async def log_intent(self, query: str, routed_intent: str, confidence: float = 1.0) -> None:
-        """Log query intent classification results.
-
-        Args:
-            query: The user query string.
-            routed_intent: Classified target intent.
-            confidence: LLM classification confidence score.
-        """
+    async def log_intent(
+        self,
+        query: str,
+        routed_intent: str,
+        confidence: float = 1.0,
+        status: str = "success",
+        error: str | None = None,
+    ) -> None:
+        """Log intent classification with honest confidence and failure state."""
         timestamp = datetime.now(timezone.utc).isoformat()
+        trace = OperationTraceContext.fields()
+        error_line = f"  Error: {error}\n" if error else ""
         log_entry = (
             "================================================================================\n"
             f"Timestamp: {timestamp}\n"
-            f"Intent Routed:\n"
+            f"Session: {trace.get('session_id') or '-'} | Turn: {trace.get('turn_id') or '-'} | Turn elapsed ms: {trace.get('turn_elapsed_ms')}\n"
+            "Intent Routed:\n"
             f"  Query: {query!r}\n"
             f"  Routed Intent: {routed_intent}\n"
             f"  Confidence: {confidence:.2f}\n"
+            f"  Status: {status}\n"
+            f"{error_line}"
             "================================================================================\n\n"
         )
         await self._writer.write(log_entry)
+
+
+class ChatTurnAuditLogger:
+    """Write an explicit lifecycle ledger for every user-visible chat turn.
+
+    The ledger exists so cancellation and duration are never inferred from gaps
+    between transcript messages.  Every event carries the same session/turn id
+    used by LLM and search telemetry.
+    """
+
+    def __init__(self, writer: ThreadSafeFileWriter, json_writer: ThreadSafeFileWriter) -> None:
+        self._writer = writer
+        self._json_writer = json_writer
+        self._started_monotonic: dict[tuple[str, str], float] = {}
+
+    async def log_event(
+        self,
+        event: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        transport: str,
+        detail: str | None = None,
+        message: str | None = None,
+        state: str | None = None,
+    ) -> None:
+        """Append one turn lifecycle event to human and structured ledgers."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        trace = OperationTraceContext.fields()
+        key = (str(session_id or "default"), str(turn_id or ""))
+        now_mono = time.monotonic()
+        if event in {"turn_received", "turn_started"} and key not in self._started_monotonic:
+            self._started_monotonic[key] = now_mono
+            # Keep enough recently finished starts for late cancellation
+            # acknowledgements to retain the same elapsed clock.  Different
+            # transports can observe turn_cancelled and cancel_settled in either
+            # order, so deleting on the first terminal event loses truth.
+            while len(self._started_monotonic) > 4096:
+                self._started_monotonic.pop(next(iter(self._started_monotonic)))
+        started = self._started_monotonic.get(key)
+        elapsed_ms = max(0, int((now_mono - started) * 1000)) if started is not None else None
+        if trace.get("turn_id") == turn_id and trace.get("turn_elapsed_ms") is not None:
+            elapsed_ms = trace.get("turn_elapsed_ms")
+        safe_detail = redact_secrets(str(detail)) if detail else None
+        record = {
+            "event": str(event or "turn_event"),
+            "timestamp": timestamp,
+            "session_id": str(session_id or "default"),
+            "turn_id": str(turn_id or ""),
+            "transport": str(transport or "unknown"),
+            "state": state,
+            "detail": safe_detail,
+            "message": message,
+            "turn_elapsed_ms": elapsed_ms,
+        }
+        human = (
+            "================================================================================\n"
+            f"Timestamp: {timestamp} | Session: {record['session_id']} | Turn: {record['turn_id']}\n"
+            f"Event: {record['event']} | Transport: {record['transport']} | State: {state or '-'} | Turn elapsed ms: {record['turn_elapsed_ms']}\n"
+            f"Detail: {safe_detail or '-'}\n"
+            f"Message: {message!r}\n"
+            "================================================================================\n\n"
+        )
+        await self._writer.write(human)
+        await self._json_writer.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
 class DetailedLoggingSubsystem:
@@ -559,6 +752,8 @@ class DetailedLoggingSubsystem:
         search_writer = ThreadSafeFileWriter(self._log_dir / "searches.log")
         search_json_writer = ThreadSafeFileWriter(self._log_dir / "searches.jsonl", max_bytes=25 * 1024 * 1024)
         torrent_writer = ThreadSafeFileWriter(self._log_dir / "torrents.log")
+        turn_writer = ThreadSafeFileWriter(self._log_dir / "chat_turns.log")
+        turn_json_writer = ThreadSafeFileWriter(self._log_dir / "chat_turns.jsonl", max_bytes=25 * 1024 * 1024)
 
         # Initialize individual loggers
         self._chat_logger = ChatLogger(chat_writer)
@@ -566,6 +761,7 @@ class DetailedLoggingSubsystem:
         self._structured_logger = StructuredReplyLogger(structured_writer)
         self._search_logger = SearchLogger(search_writer, search_json_writer)
         self._torrent_logger = TorrentLogger(torrent_writer)
+        self._turn_logger = ChatTurnAuditLogger(turn_writer, turn_json_writer)
 
     @property
     def chat_logger(self) -> ChatLogger:
@@ -591,3 +787,8 @@ class DetailedLoggingSubsystem:
     def torrent_logger(self) -> TorrentLogger:
         """Return the torrent candidate evaluation logger."""
         return self._torrent_logger
+
+    @property
+    def turn_logger(self) -> ChatTurnAuditLogger:
+        """Return the explicit chat-turn lifecycle ledger."""
+        return self._turn_logger

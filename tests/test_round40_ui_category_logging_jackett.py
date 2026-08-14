@@ -4,6 +4,8 @@ from pathlib import Path
 
 from src.search.jackett_indexer_config import JackettIndexerConfigurer, JackettIndexerInfo, JACKETT_INDEXER_PROFILES
 from src.utils.log_sanitizer import redact_secrets, redact_url
+from src.ai.prompt_builder import PromptBuilder
+from src.core.models import Intent
 
 
 def test_chat_input_is_multiline_textarea_with_shift_enter() -> None:
@@ -21,18 +23,18 @@ def test_chat_input_is_multiline_textarea_with_shift_enter() -> None:
 
 
 def test_category_creation_guidance_requires_researched_download_profiles() -> None:
-    prompt = Path("src/ai/prompt_builder.py").read_text()
+    prompt = PromptBuilder().build_system_prompt(Intent.CONFIG)
     guide = Path("skills/category_creation_guide.md").read_text()
     tools = Path("src/ai/tools/categories.py").read_text()
 
     assert "research_category_download_profile" in prompt
-    assert "CATEGORY-DESIGN SAFETY RULE" in prompt
+    assert "Keep category rules category-owned" in prompt
     assert "Category-Specific Download Profiles" in guide
     assert "Downloadability does not mean" in guide
     assert "download_profile" in Path("src/core/domain_models/categories.py").read_text()
     assert "download_profile_research" in Path("src/core/domain_models/categories.py").read_text()
     assert "Do not copy movie/TV release vocabulary" in tools
-    assert "creating/refining category types" in Path("src/ai/intent_router.py").read_text()
+    assert "Category design" in prompt
 
 
 def test_log_sanitizer_redacts_jackett_api_keys() -> None:

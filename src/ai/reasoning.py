@@ -41,6 +41,7 @@ class ReasoningPlanner:
         ),
         Intent.DOWNLOAD: (
             "For DOWNLOAD: use the small generic chain: category context/enquire_about_media, search_media_torrents, then queue_download only by stable candidate_id/result_set_id. "
+            "Treat lexical category words as hints only; use category-owned metadata identity, copy recommended_search_arguments from enquiry, and ask its clarification_question when identity is unresolved or ambiguous. "
             "For current/future release tracking, research first, track through track_category_item if requested, and create a web-information watch when repeated checks are needed. "
             "Do not pre-queue after fresh discovery; inspect/ask when candidate coverage, language, quality, size, or seeders are ambiguous.\n"
             + TaskPromptGuidance.planner_contract()
@@ -308,11 +309,14 @@ class ReasoningPlanner:
             "- TOOL PHILOSOPHY RULE: Prefer a small chain of generic tools. Category state and rules arrive through context/enquire_about_media/metadata_lookup; category-specific micro-tools must not be invented or called for ordinary download decisions.\n"
             "- DEPENDENCY OUTPUT RULE: Do not write prose placeholders like '<URL from the first search result>'. When one step needs data from a previous step, use ${step_id.path.to.field}; for example ${search_event.results.0.url} or ${lookup_show.latest_season}.\n"
             "- Do not call read_web_page/browser_open/browser_extract with a URL unless the argument is either a literal http(s) URL or a ${step_id.results.0.url}-style placeholder.\n"
-            "- For SEARCH plans involving current public information, include category_web_research or web_research when those tools are available; metadata-only plans are insufficient for rumours/news/future schedules.\n"
-            "- When using category_web_research or web_research, pass the user's concrete wording as query and set time_range/categories when exposed by the tool schema.\n"
-            f"{WebResearchPromptGuidance.planner_rules()}\n"
-            "JSON:"
         )
+        if intent == Intent.SEARCH:
+            prompt += (
+                "- For current public information, include category_web_research or web_research when available; metadata-only plans are insufficient for rumours/news/future schedules.\n"
+                "- Pass the user's concrete wording to category_web_research/web_research and set time_range/categories when exposed.\n"
+                f"{WebResearchPromptGuidance.planner_rules()}\n"
+            )
+        prompt += "JSON:"
         return prompt
 
     def _build_repair_prompt(self, previous_output: str,

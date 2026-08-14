@@ -20,6 +20,7 @@ from src.ai.reasoning import ReasoningPlanner
 from src.ai.tool_executor import ToolCallExecutor
 from src.core.models import Intent, AgentPlan, PlanStep
 from src.utils.item_matcher import ItemMatcher
+from src.ai.tracked_language_policy import TrackedLanguagePlanPolicy
 from src.ai.tools.metadata_lookup_support import MetadataLookupRequest
 from src.ai.public_web_requirements import PublicWebEvidencePolicy
 from src.core.categories.search_scope import SearchScopePolicy
@@ -687,7 +688,32 @@ class PlanCoordinator:
         if agent_plan.intent != Intent.DOWNLOAD:
             return agent_plan
 
-        # Keep explicit queue-by-selection plans intact.
+        # Bind a durable tracked-item language before any early return.  The
+        # planner may invent a language on an otherwise valid generic search
+        # step; only current-request evidence or explicit provenance may
+        # override the configured item preference.
+        matched_item = None
+        if self._settings:
+            for tracked_item in self._settings.tracked_items:
+                if ItemMatcher.is_item_mentioned(
+                    tracked_key=tracked_item.key,
+                    prompt=user_prompt,
+                    goal=agent_plan.user_goal or "",
+                    steps=agent_plan.steps,
+                ):
+                    matched_item = tracked_item
+                    configured_language = str(getattr(tracked_item, "language", "") or "").strip()
+                    if configured_language:
+                        TrackedLanguagePlanPolicy.apply(
+                            agent_plan,
+                            configured_language=configured_language,
+                            user_prompt=user_prompt,
+                            intent=agent_plan.intent,
+                        )
+                    break
+
+        # Keep explicit queue-by-selection plans intact after applying the
+        # tracked preference policy to their import/queue arguments.
         if agent_plan.steps and all(step.tool_name == "queue_download" for step in agent_plan.steps):
             return agent_plan
 
@@ -935,25 +961,17 @@ class PlanCoordinator:
                 if is_mentioned:
                     logger.info(
                         f"[Tracked Item Binding] Tracked item '{item.key}' detected in plan. "
-                        "Binding exact item key and filling configured language only when the plan omitted language."
+                        "Binding exact item key and enforcing configured language unless the request explicitly overrides it."
                     )
-                    language_relevant_tools = {"search_torrents", "search_media_torrents", "queue_download", "queue_media_download"}
-                    plan_has_language = bool(agent_plan.constraints.get("language"))
-                    for step in agent_plan.steps:
-                        if (
-                            isinstance(step.arguments, dict)
-                            and step.tool_name in language_relevant_tools
-                            and step.arguments.get("language")
-                        ):
-                            plan_has_language = True
-                            break
-                    if intent == Intent.DOWNLOAD and not plan_has_language:
-                        agent_plan.constraints["language"] = lang
+                    TrackedLanguagePlanPolicy.apply(
+                        agent_plan,
+                        configured_language=lang,
+                        user_prompt=user_prompt,
+                        intent=intent,
+                    )
                     for step in agent_plan.steps:
                         if not isinstance(step.arguments, dict):
                             continue
-                        if not plan_has_language and step.tool_name in ("search_torrents", "search_media_torrents"):
-                            step.arguments["language"] = lang
                         for arg_key in ("name", "title", "item_name"):
                             val = step.arguments.get(arg_key)
                             if val and isinstance(val, str) and ItemMatcher.fuzzy_match_names(item.key, val):

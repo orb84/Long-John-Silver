@@ -68,11 +68,14 @@ def test_tv_pack_queries_prioritize_episode_range_language() -> None:
     asyncio.run(run())
 
 
-def test_tv_default_scope_for_title_only_download_is_bundle_preferred() -> None:
+def test_tv_title_only_download_remains_unresolved_without_unit_scope() -> None:
     tv = TvShowCategory()
     item = tv.create_item("A Knight of the Seven Kingdoms", language="Italian")
     scope = tv.default_agent_search_scope(item, season=None, episode=None, search_scope="default", language="Italian", context=None)
-    assert scope == "bundle_preferred", scope
+    # Round 285 made bare-title TV downloads fail closed. A season, episode, or
+    # structured unit scope must authorize bundle search; the category must not
+    # silently guess "latest season" from a title alone.
+    assert scope == "default", scope
     explicit = tv.default_agent_search_scope(item, season=None, episode=None, search_scope="individual_units_only", language="Italian", context=None)
     assert explicit == "individual_units_only", explicit
 
@@ -99,7 +102,7 @@ def main() -> None:
     test_literal_title_repair()
     test_tv_exact_language_query_is_primary_and_preserved()
     test_tv_pack_queries_prioritize_episode_range_language()
-    test_tv_default_scope_for_title_only_download_is_bundle_preferred()
+    test_tv_title_only_download_remains_unresolved_without_unit_scope()
     test_broad_default_search_does_not_make_fake_batch()
     print("round233 TV download/search regression tests passed")
 

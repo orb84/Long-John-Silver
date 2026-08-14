@@ -105,6 +105,17 @@ class AgentGoalStateManager:
         goal.updated_at = datetime.now(timezone.utc).isoformat()
         await self._save(goal)
 
+    async def active_goal(self, session_id: str | None) -> AgentGoalState | None:
+        """Return the current structured goal for composition-layer routing.
+
+        This is deliberately a compact state read, not transcript inference.
+        Callers may use the persisted category/result-set ownership to keep a
+        short SEARCH/DOWNLOAD follow-up attached to the acquisition workflow.
+        """
+        if not session_id or not self._db:
+            return None
+        return await self._load(session_id)
+
     async def _load(self, session_id: str) -> AgentGoalState | None:
         try:
             raw = await self._db.system.get_preference(self._key(session_id))
@@ -221,7 +232,16 @@ class AgentGoalStateManager:
                 "do not invent internal JSON placeholders",
             ]
         if intent == Intent.SEARCH:
-            return ["use metadata_lookup for media facts", "use web/research tools only when metadata is insufficient"]
+            actions = [
+                "use metadata_lookup for media facts",
+                "use web/research tools only when metadata is insufficient",
+            ]
+            if has_results:
+                actions.insert(
+                    0,
+                    "refine the active acquisition with search_media_torrents; web evidence is not a queueable candidate set",
+                )
+            return actions
         return []
 
     @staticmethod

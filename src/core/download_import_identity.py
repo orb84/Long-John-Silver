@@ -91,9 +91,21 @@ async def _find_duplicate_import_context(
     context: DownloadImportContext | None,
     *,
     download_id: str,
+    ignore_completed: bool = False,
 ) -> DownloadItem | None:
-    """Return an existing download that already represents this media unit."""
+    """Return an existing download that already represents this media unit.
+
+    ``ignore_completed`` is used only after canonical category verification has
+    proven that the logical unit is absent. Active/non-terminal duplicates still
+    win; only stale terminal history is excluded from admission.
+    """
     if not context:
         return None
     duplicates = await downloads_repo.find_existing_by_import_context(context)
-    return next((download for download in duplicates if download.id != download_id), None)
+    eligible = [download for download in duplicates if download.id != download_id]
+    if ignore_completed:
+        eligible = [
+            download for download in eligible
+            if str(getattr(getattr(download, "status", None), "value", getattr(download, "status", ""))) != "complete"
+        ]
+    return eligible[0] if eligible else None

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.core.models import ActionReceipt, SecurityConfirmationRequest
@@ -43,7 +43,7 @@ class SecurityConfirmationService:
             affected_paths=affected_paths or [],
             blocked_paths=blocked_paths or [],
             payload_hash=self.payload_hash(payload),
-            expires_at=datetime.utcnow() + timedelta(minutes=ttl_minutes),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes),
             user_message=user_message,
         )
         self._requests[request.token] = request
@@ -54,7 +54,7 @@ class SecurityConfirmationService:
         request = self._requests.get(token)
         if not request:
             return False
-        if request.expires_at < datetime.utcnow():
+        if request.expires_at < datetime.now(timezone.utc):
             self._requests.pop(token, None)
             return False
         if request.action_name != action_name:

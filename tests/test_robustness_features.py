@@ -56,14 +56,15 @@ class TestEnquireAboutMedia:
             assert not mock_client_cls.called, "Should NOT call TMDB if cache is fresh"
 
     async def test_tv_show_enquire_stale_cache(self) -> None:
-        """TvShowCategory.enquire should refresh metadata from TMDB if cache is stale (>24 hours)."""
+        """TvShowCategory.enquire should refresh metadata from TMDB if cache is stale under the current seven-day provider snapshot policy."""
         settings = Settings(tmdb_api_key="fake_key")
+        object.__setattr__(settings, "category_service_value", MagicMock(return_value="fake_key"))
         settings.tracked_items = [
             TvShowItem(key="Firefly", language="Italian", enabled=True)
         ]
         
-        # Stale cache (25 hours old)
-        stale_time = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        # Stale cache (older than the seven-day snapshot window)
+        stale_time = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
         
         db = MagicMock()
         db.media = AsyncMock()
@@ -142,7 +143,7 @@ class TestLanguagePreferencePrimacy:
                 user_prompt="Download Firefly S01E01",
                 intent=Intent.DOWNLOAD,
                 system_prompt_content="Base system prompt",
-                allowed_tool_names=set()
+                allowed_tool_names={"search_media_torrents"}
             )
             
             assert res_plan is not None
@@ -182,7 +183,7 @@ class TestLanguagePreferencePrimacy:
                 user_prompt="Download Firefly S01E01 in French",
                 intent=Intent.DOWNLOAD,
                 system_prompt_content="Base system prompt",
-                allowed_tool_names=set()
+                allowed_tool_names={"search_media_torrents"}
             )
             
             assert res_plan is not None
@@ -196,7 +197,7 @@ class TestDownloadRetry:
     """Test that cancelled/failed downloads can be re-queued."""
 
     async def test_retry_on_cancelled_status(self) -> None:
-        """Downloader.add_magnet should allow cancelled or failed downloads to proceed (bypassing duplicate checks)."""
+        """Downloader.restart_download should explicitly revive cancelled or failed rows."""
         db = MagicMock()
         db.downloads = AsyncMock()
         
@@ -234,15 +235,12 @@ class TestDownloadRetry:
         # Mock session to ensure we don't try to add to actual libtorrent
         downloader._session = MagicMock()
         
-        res = await downloader.add_magnet(
-            item_name="Firefly",
-            magnet_link="magnet:?xt=urn:btih:1234",
-            season=1,
-            episode=1
-        )
-        
-        # Assert that it queued/started a new item instead of returning the cancelled one as a blocked duplicate
-        assert res.status in (DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING)
+        res = await downloader.restart_download("test_id")
+
+        # Explicit restart is the authoritative path for terminal rows; adding
+        # the same magnet remains duplicate-safe.
+        assert res is not None
+        assert res.status == DownloadStatus.QUEUED
         assert db.downloads.upsert_download.called
 
 

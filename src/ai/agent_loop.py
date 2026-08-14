@@ -26,6 +26,7 @@ from src.ai.error_presenter import AgentErrorPresenter
 from src.ai.download_context_policy import DownloadContextPolicy
 from src.ai.download_tool_recovery import DownloadToolRecovery
 from src.ai.bare_tool_call import BareToolCallDetector
+from src.ai.tool_outcome_guard import ToolOutcomeLedger
 
 
 class LLMCompletionFn(Protocol):
@@ -154,6 +155,11 @@ class AgentLoopExecutor:
         )
         final_response = fallback_message or self._error_presenter.iteration_limit()
         forced_download_search_attempted = False
+        forced_download_status_attempted = False
+        metadata_only_reprompted = False
+        required_queue_followthrough_reprompted = False
+        executed_tool_names: set[str] = set()
+        outcome_ledger = ToolOutcomeLedger()
 
         for i in range(max_iterations):
             try:
@@ -199,6 +205,8 @@ class AgentLoopExecutor:
                         )
                         loop_state.tool_results.append(result_summary)
                         messages.append(result_message)
+                        executed_tool_names.add(recovered.name)
+                        outcome_ledger.record(recovered.name, result_message)
                         continue
                     if DownloadContextPolicy.download_turn_requires_tool(task, allowed_tool_names) and not loop_state.tool_results:
                         if not forced_download_search_attempted and "search_media_torrents" in set(allowed_tool_names or set()):
@@ -233,7 +241,84 @@ class AgentLoopExecutor:
                                 )
                                 loop_state.tool_results.append(result_summary)
                                 messages.append(result_message)
+                                executed_tool_names.add("search_media_torrents")
+                                outcome_ledger.record("search_media_torrents", result_message)
                                 continue
+                    if (
+                        DownloadContextPolicy.download_turn_requires_tool(task, allowed_tool_names)
+                        and loop_state.tool_results
+                        and not DownloadContextPolicy.has_operational_download_evidence(executed_tool_names)
+                    ):
+                        if not forced_download_status_attempted and "list_downloads" in set(allowed_tool_names or set()):
+                            forced_download_status_attempted = True
+                            tool_call_id = f"forced_list_downloads_{uuid.uuid4().hex[:12]}"
+                            messages.append({
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {"name": "list_downloads", "arguments": "{}"},
+                                }],
+                            })
+                            result_message, result_summary = await self._tool_executor.execute_tool_call(
+                                name="list_downloads",
+                                arguments_raw="{}",
+                                tool_call_id=tool_call_id,
+                                allowed_tool_names=allowed_tool_names,
+                                tool_context=self._tool_context(
+                                    session_id,
+                                    active_category_id=active_category_id,
+                                    user_prompt=user_prompt,
+                                ),
+                            )
+                            loop_state.tool_results.append(result_summary)
+                            messages.append(result_message)
+                            executed_tool_names.add("list_downloads")
+                            outcome_ledger.record("list_downloads", result_message)
+                            continue
+                        if not metadata_only_reprompted:
+                            metadata_only_reprompted = True
+                            messages.append({
+                                "role": "system",
+                                "content": DownloadContextPolicy.reprompt_after_metadata_only_download_answer(user_prompt),
+                            })
+                            continue
+                        final_response = self._error_presenter.queue_failure(
+                            "No current queue or candidate evidence was obtained for this download request.",
+                            user_prompt=user_prompt,
+                        )
+                        break
+                    required_followthrough = outcome_ledger.required_queue_followthrough()
+                    if required_followthrough and not required_queue_followthrough_reprompted:
+                        required_queue_followthrough_reprompted = True
+                        messages.append({"role": "system", "content": required_followthrough})
+                        continue
+
+                    partial_queue_failure = outcome_ledger.partial_queue_failure()
+                    if partial_queue_failure:
+                        success_count, detail = partial_queue_failure
+                        final_response = self._error_presenter.queue_partial_failure(
+                            success_count,
+                            detail,
+                            user_prompt=user_prompt,
+                        )
+                        logger.warning(
+                            "Suppressing LLM final prose because queue_download returned a partial receipt: {} succeeded; {}",
+                            success_count,
+                            detail,
+                        )
+                        break
+                    queue_failure = outcome_ledger.unresolved_queue_failure()
+                    if queue_failure:
+                        final_response = self._error_presenter.queue_failure(
+                            queue_failure,
+                            user_prompt=user_prompt,
+                        )
+                        logger.warning(
+                            "Suppressing LLM final prose because the latest queue_download receipt is a failure: {}",
+                            queue_failure,
+                        )
+                        break
                     final_response = content_text
                     break
 
@@ -257,6 +342,8 @@ class AgentLoopExecutor:
                     )
                     loop_state.tool_results.append(result_summary)
                     messages.append(result_message)
+                    executed_tool_names.add(function_name)
+                    outcome_ledger.record(function_name, result_message)
 
                 # Reflect after tool results for eligible intents
                 if should_reflect and self._should_reflect_now(
@@ -299,8 +386,8 @@ class AgentLoopExecutor:
             source = session_id.split("_", 1)[0] or "web"
         return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id, user_prompt=user_prompt)
 
+    @staticmethod
     async def _execute_plan_steps(
-        self,
         plan: AgentPlan,
         plan_executor: PlanExecutor,
         messages: list,

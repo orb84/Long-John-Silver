@@ -21,6 +21,8 @@ from typing import Any
 
 from loguru import logger
 
+from src.core.security.command_policy import CommandPolicy
+
 
 class AutoStartManager:
     """Installs or removes a user-level launch-at-login entry."""
@@ -31,6 +33,7 @@ class AutoStartManager:
     def __init__(self, working_dir: str | Path | None = None, command: list[str] | None = None) -> None:
         self._working_dir = Path(working_dir).resolve() if working_dir else self._default_project_root()
         self._command = command or self._default_entry_command()
+        self._command_policy = CommandPolicy()
 
     def status(self) -> dict[str, Any]:
         """Return current platform auto-start state and generated target paths."""
@@ -291,16 +294,32 @@ exec {self._quote(run_sh)} "$LJS_PORT" >> {self._quote(log_path)} 2>&1
         path = self._entry_path()
         if not path:
             return
-        import subprocess
-
         uid = os.getuid()
-        subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        completed = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        self._command_policy.run_sync(
+            ["launchctl", "bootout", f"gui/{uid}", str(path)],
+            purpose="autostart.launchctl_bootout",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        completed = self._command_policy.run_sync(
+            ["launchctl", "bootstrap", f"gui/{uid}", str(path)],
+            purpose="autostart.launchctl_bootstrap",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         if completed.returncode == 0:
             # RunAtLoad fires at bootstrap.  The wrapper lock prevents duplicate
             # launches if LJS is already running because the user toggled this
             # from the UI.
-            subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/{self.APP_ID}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            self._command_policy.run_sync(
+                ["launchctl", "kickstart", "-k", f"gui/{uid}/{self.APP_ID}"],
+                purpose="autostart.launchctl_kickstart",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         else:
             logger.info("LaunchAgent written but not bootstrapped in current session; it will run at next GUI login.")
 
@@ -310,9 +329,13 @@ exec {self._quote(run_sh)} "$LJS_PORT" >> {self._quote(log_path)} 2>&1
         path = self._entry_path()
         if not path:
             return
-        import subprocess
-
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        self._command_policy.run_sync(
+            ["launchctl", "bootout", f"gui/{os.getuid()}", str(path)],
+            purpose="autostart.launchctl_bootout",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     def _desktop_exec_value(self) -> str:
         return " ".join(self._desktop_quote(part) for part in self._command)
@@ -376,22 +399,42 @@ Environment=LJS_ACCESS_LOGS=quiet
 WantedBy=default.target
 '''
         path.write_text(service, encoding="utf-8")
-        import subprocess
-
         if shutil_which("systemctl"):
-            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            completed = subprocess.run(["systemctl", "--user", "enable", "long-john-silver.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            self._command_policy.run_sync(
+                ["systemctl", "--user", "daemon-reload"],
+                purpose="autostart.systemd_reload",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            completed = self._command_policy.run_sync(
+                ["systemctl", "--user", "enable", "long-john-silver.service"],
+                purpose="autostart.systemd_enable",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             if completed.returncode != 0:
                 logger.info("systemd user service written but not enabled; XDG autostart entry remains installed.")
 
     def _disable_systemd_user_service(self) -> None:
         if self._platform_key() != "linux":
             return
-        import subprocess
-
         if shutil_which("systemctl"):
-            subprocess.run(["systemctl", "--user", "disable", "long-john-silver.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            self._command_policy.run_sync(
+                ["systemctl", "--user", "disable", "long-john-silver.service"],
+                purpose="autostart.systemd_disable",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self._command_policy.run_sync(
+                ["systemctl", "--user", "daemon-reload"],
+                purpose="autostart.systemd_reload",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
 
     def _write_windows_run_key(self) -> None:
         import winreg  # type: ignore

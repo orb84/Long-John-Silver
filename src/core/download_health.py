@@ -101,14 +101,27 @@ class DownloadHealthSupervisor:
             if item.status not in (DownloadStatus.DOWNLOADING, DownloadStatus.STALLED):
                 continue
             counters["observed"] += 1
-            state = self._states.setdefault(item.id, DownloadHealthState(download_id=item.id))
-            if state.last_bytes == 0 and item.downloaded_bytes:
-                state.last_bytes = item.downloaded_bytes
+            state = self._states.get(item.id)
+            if state is None:
+                state = DownloadHealthState(
+                    download_id=item.id,
+                    last_bytes=int(item.downloaded_bytes or 0),
+                    last_progress_at=self._durable_progress_time(item, now),
+                )
+                self._states[item.id] = state
+            elif state.last_bytes == 0 and item.downloaded_bytes:
+                state.last_bytes = int(item.downloaded_bytes or 0)
                 state.last_progress_at = now
 
             if item.status == DownloadStatus.DOWNLOADING:
                 if await self._handle_downloading(item, state, now):
                     counters["parked"] += 1
+                    alt_count = await self._maybe_find_alternatives(item, state, now)
+                    counters["alternatives"] += alt_count
+                    soulseek_count = await self._maybe_find_soulseek_candidates(
+                        item, state, now, had_torrent_alternatives=alt_count > 0,
+                    )
+                    counters["soulseek_hits"] += soulseek_count
                 continue
 
             if item.status == DownloadStatus.STALLED:
@@ -122,6 +135,20 @@ class DownloadHealthSupervisor:
         if any(counters.values()):
             logger.debug(f"Download health pass: {counters}")
         return counters
+
+    @staticmethod
+    def _durable_progress_time(item: DownloadItem, now: datetime) -> datetime:
+        """Seed stall timing from durable transfer timestamps after restarts."""
+        for value in (getattr(item, "updated_at", None), getattr(item, "created_at", None)):
+            if isinstance(value, datetime):
+                return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            if isinstance(value, str) and value.strip():
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+        return now
 
     async def _handle_downloading(self, item: DownloadItem, state: DownloadHealthState, now: datetime) -> bool:
         """Update rolling state; park when no real byte movement is observed."""

@@ -79,8 +79,8 @@ class TestAgentRunPreparer:
             intent_router=mock_intent_router,
             prompt_builder=prompt_builder,
             tool_names_by_intent={
-                Intent.SEARCH: {"movie.resolve_metadata", "search_torrents"},
-                Intent.DOWNLOAD: {"movie.resolve_metadata", "search_torrents", "get_library_status"},
+                Intent.SEARCH: {"movie.resolve_metadata", "search_media_torrents"},
+                Intent.DOWNLOAD: {"movie.resolve_metadata", "search_media_torrents", "get_library_status"},
                 Intent.CONFIG: {"category_item_add", "add_preference"},
             },
             **kwargs,
@@ -96,12 +96,13 @@ class TestAgentRunPreparer:
         assert Intent.SEARCH in result.allowed_tool_names or len(result.allowed_tool_names) > 0
 
     def test_download_request_includes_torrent_tool(self):
-        """DOWNLOAD intent should include search_torrents."""
+        """DOWNLOAD intent should include category-owned media discovery."""
         preparer = self._make_preparer(intent_result=Intent.DOWNLOAD)
         result = _run(
             preparer.prepare("Download Severance S02E01")
         )
-        assert "search_torrents" in result.allowed_tool_names
+        assert "search_media_torrents" in result.allowed_tool_names
+        assert "search_torrents" not in result.allowed_tool_names
         assert result.intent == Intent.DOWNLOAD
         assert result.task == "download"
 

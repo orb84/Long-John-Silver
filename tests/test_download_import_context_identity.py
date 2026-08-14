@@ -113,7 +113,8 @@ def test_download_import_context_does_not_use_candidate_id_as_provider_id():
 
     assert context.provider == "tmdb"
     assert context.provider_id == ""
-    assert context.stable_provider_key == ""
+    assert context.stable_provider_key == "category:tv:example"
+    assert "candidate-local-1" not in context.stable_provider_key
 
 
 @pytest.mark.asyncio

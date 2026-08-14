@@ -86,7 +86,7 @@ def test_download_control_public_schema_prefers_unit_descriptor_filters() -> Non
     assert '"unit_key"' in source
     assert '"unit_label"' in source
     assert '"next_unit"' in source
-    assert "next_episode/latest_episode remain accepted aliases" in source
+    assert "next_episode/latest_episode are legacy aliases" in source
 
 
 def test_torrent_selection_prompt_fallback_has_no_builtin_category_branch() -> None:

@@ -13,6 +13,9 @@ LJS treats every assistant request, user-provided path, downloaded filename, met
 - Risky/destructive actions can produce a two-phase confirmation receipt with exact affected paths.
 - Security-sensitive operations can be written to `./data/security_audit.jsonl`.
 - `scripts/check_security_architecture.py` fails CI if raw unsafe primitives are reintroduced outside `src/core/security/`.
+- Managed autostart, slskd, and SearXNG operations use the same capabilities; service managers do not receive exemptions for direct process execution, recursive deletion, copying, or rollback.
+- State-changing assistant/UI actions use durable command receipts. If mutation execution may have happened but its receipt cannot be persisted, callers receive an `uncertain` failure and must verify live state before retrying.
+- Durable operational payloads are sanitized and bounded so tracker URLs, passkeys, credentials, tokens, and URL query strings do not enter receipts or support bundles.
 
 ## Running LJS defensively
 

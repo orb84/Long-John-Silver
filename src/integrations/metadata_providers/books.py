@@ -16,6 +16,20 @@ from src.integrations.metadata_providers.base import (
 )
 
 
+class InternetArchiveMediaType:
+    """Recover category-owned IA media type when legacy config lost kwargs."""
+
+    @staticmethod
+    def resolve(category: Any, configured: str | None) -> str:
+        """Prefer explicit configuration, then infer audio versus text safely."""
+        explicit = compact(configured).lower()
+        identity = " ".join((
+            compact(getattr(category, "category_id", "")).lower(),
+            compact(getattr(category, "media_kind", "")).lower(),
+        ))
+        return explicit or ("audio" if "audio" in identity else "texts")
+
+
 class BookMetadataProviders:
     """Adapters for Open Library, Gutendex, IA, Google Books, Apple, LibriVox, Comic Vine."""
 
@@ -92,8 +106,11 @@ class BookMetadataProviders:
             ))
         return [item for item in items if item.title]
 
-    async def internet_archive(self, query: str, limit: int, *, mediatype: str) -> list[ProviderResult]:
-        """Search Internet Archive by media type and normalize catalog candidates."""
+    async def internet_archive(
+        self, query: str, limit: int, *, mediatype: str | None = None,
+    ) -> list[ProviderResult]:
+        """Search IA, recovering category-owned media type after legacy config drift."""
+        mediatype = InternetArchiveMediaType.resolve(self.context.category, mediatype)
         fragment = safe_query_fragment(query)
         if not fragment:
             return []
@@ -227,7 +244,7 @@ class BookMetadataProviders:
         """Search LibriVox audiobook metadata with reader/chapter evidence."""
         data = await self.context.json(
             "librivox",
-            "https://librivox.org/api/feed/audiobooks",
+            "https://librivox.org/api/feed/audiobooks/",
             params={"title": query, "format": "json", "extended": "1", "coverart": "1", "limit": limit},
         )
         items: list[ProviderResult] = []

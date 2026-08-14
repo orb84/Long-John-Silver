@@ -132,10 +132,13 @@ YAML `services` entry tells setup/LLM what a provider is for; a YAML
 needed. Real API clients, metadata ingestion, conversion execution, and rich
 canonical object builders still belong in category-owned Python code.
 
-When deterministic category routing uses router vocabulary, match tokens with
-category-router helpers rather than raw substring checks. Short tokens such as
-`EP` or `TV` must match only as bounded tokens; they must not match prose such
-as `please`.
+Router vocabulary is weak prompt-selection evidence, never final category
+identity. Unknown titles must be verified through exact tracked/canonical state
+or the category-owned metadata identity hook; competing or missing evidence must
+ask the user rather than falling back to abstract `media`. When vocabulary is
+used for hints, match tokens with category-router helpers rather than raw
+substring checks. Short tokens such as `EP` or `TV` must match only as bounded
+tokens; they must not match prose such as `please`.
 
 
 ### 0.6 Suggestion Actions Are Declared by Suggestions
@@ -728,3 +731,194 @@ When changing assistant execution, tool definitions, category search hooks, or b
 - Category code owns release schemas, latest/missing unit resolution, bundle semantics, fallback phases, and unit descriptors. Generic chat/planner code may pass category-neutral intent such as `season_pack_preferred`, but must not hardcode TV/movie/book/game behaviors.
 - CHAT turns should not create or mutate active download/search goals. Active goal state is for SEARCH/DOWNLOAD/CONFIG task continuity and should remain compact.
 - Verify with `scripts/round102_llm_led_contract_tests.py` after touching tool validation, search result shape, download execution, or candidate inspection.
+
+
+## Round 286 Agent Rule — LLM observability, bounded payloads, and cancellation
+
+When changing provider calls, context assembly, chat transport, or category
+identity, preserve these rules:
+
+- All chat/router/planner/ranker model calls must cross `TaskLLMClient` so the
+  activity monitor can attribute exact payload, latency, retries, result, and
+  cancellation to one session/turn. Do not add an unobserved provider path.
+- Context accounting includes function schemas and output reserve. Never report
+  the selected context ceiling as though it were the payload actually sent.
+  Refuse provider I/O when the measured irreducible payload cannot fit.
+- Automatic interactive context values are soft assembly targets. They compact
+  routine turns but never replace the endpoint/user-selected hard window. Apply
+  context safety headroom once, and allow irreducible payloads to spill above a
+  soft target while they remain below the usable hard ceiling.
+- Web chat owns at most one active turn per connection. New messages while busy
+  are rejected; Stop cancels the real server task and provider await. Do not
+  implement cosmetic-only cancellation.
+- LLM activity summary polling must remain cheap. Fetch exact message/tool-schema
+  details only for a selected or active call, keep history bounded, and require
+  normal dashboard authentication.
+- Semantic season/episode clues choose the TV verifier but do not authorize a
+  title. Strong exact TV metadata ends category probing; weak/empty TV metadata
+  may invoke only the bounded TV-owned web fallback before cross-category
+  comparison or clarification.
+- A structured unresolved/ambiguous category result is terminal for that agent
+  turn. Surface its question instead of retrying the same tool/model loop.
+- Optional definition-backed metadata probes must fail soft. Legacy private
+  config drift may not turn missing provider kwargs into exceptions, and provider
+  endpoint forms must match their documented contracts.
+- Keep the header's title/status region single-line and bounded at intermediate
+  widths; do not rely on the final mobile breakpoint to prevent vertical overflow.
+
+Verify with `pytest -q tests/test_round286_llm_observability_cancel_and_tv_identity.py`.
+
+
+## Round 287 Agent Rule — Context-window authority and graceful soft targets
+
+When changing context assembly, tool exposure, telemetry, retries, or post-turn
+learning, preserve these rules:
+
+- The provider/model maximum or explicit user cap is the hard context authority.
+  A null configured cap means follow the endpoint maximum; do not reinterpret it
+  as a task cap.
+- Task values such as 8k/24k/32k/48k are soft assembly targets only. Apply
+  `context_budget_percent` once to the hard window, not again to the soft target.
+- Compress optional history and bulky tool results toward the soft target. If
+  the primary system/current-turn/tool contract is irreducible, allow it to
+  exceed the target while it remains below the usable hard ceiling.
+- Reject before provider I/O only when measured messages + serialized function
+  schemas + output reserve exceed the usable hard ceiling. Record that rejection
+  in the normal LLM activity monitor.
+- Keep ordinary DOWNLOAD schemas compact and non-duplicative. Queue aliases,
+  configuration/watch tools, broad library helpers, and unrelated source admin
+  do not belong in every download call.
+- The activity UI must show selected/model window, usable hard ceiling, soft
+  target, measured prompt/total, and whether target overflow was allowed or the
+  hard ceiling rejected the call.
+- Routing calls must tolerate the selected model/provider latency (currently two
+  observable 90-second attempts), while the chat emits a progress state after
+  five seconds. Provider retries must be limited to concrete transient failures. Do not
+  retry invalid requests merely because an exception contains generic `API` or
+  `HTTP` wording.
+- Post-turn learning/taste work must not extend the user-visible WebSocket turn.
+  Dispatch it through the shared TaskSupervisor in production. A routine
+  DOWNLOAD is already engagement evidence through the behavior recorder; do not
+  launch a second taste-extraction LLM call unless explicit preference language
+  is present.
+
+Verify with `pytest -q tests/test_round287_context_budget_resilience.py` and
+`python scripts/round287_context_budget_resilience_tests.py`.
+
+
+## Round 288 Agent Rule — Reasoning-safe routing and live LLM diagnostics
+
+When changing intent routing, provider adapters, retry policy, or diagnostics,
+preserve these rules:
+
+- Never impose a tiny hard-coded output-token limit on intent routing. Reasoning
+  models and provider adapters differ in how reasoning and visible output consume
+  generation budget. The router inherits configured generation settings and uses
+  a narrow output contract instead of token starvation.
+- Do not force a router temperature or other generation value either. Prompt
+  format constraints are not permission to override user/task model settings.
+- Per-call generation overrides must cross every provider adapter consistently.
+  Provider-specific direct adapters may filter unsupported fields, but they may
+  not silently discard supported temperature, top-p, response-format, reasoning,
+  or user/task output settings.
+- Routing timeout is an observable transport envelope, not an output budget. The
+  current default is two 90-second attempts. A user-facing status appears after
+  five seconds; every timeout, retry, terminal failure, context rejection,
+  cancellation, rate limit, and authentication error emits a compact live event.
+- Never convert a routing-provider failure into fake semantic ambiguity or log it
+  with fabricated confidence. Report that routing failed before search/download
+  execution, preserve confidence zero, and link the user to diagnostics.
+- Compact LLM problem cards and the dedicated diagnostics workspace must consume
+  the same activity-monitor records. A timeout attempt must appear as its own
+  event/card, and clicking it must open the exact related call. Reconcile bounded
+  activity snapshots so a transient browser-event WebSocket gap cannot silently
+  lose a timeout; use stable deduplication so recovery does not duplicate live cards.
+- The diagnostics workspace must expose bounded activity history, attempt timing,
+  exact selected-call messages/tool schemas, context budgets, generation settings,
+  provider usage, the secret-redacted context log, raw-response log, structured
+  routing log, and filtered LLM application logs. Exact large payloads remain
+  lazy-loaded and authenticated. Errors exposed in snapshots/cards must be
+  secret-redacted.
+- Streaming calls remain running in telemetry until the stream is consumed, fails,
+  or is cancelled. Do not mark a provider stream complete merely because its
+  iterator was created.
+
+Verify with `pytest -q tests/test_round288_reasoning_router_live_diagnostics.py`,
+`python scripts/round288_reasoning_router_live_diagnostics_tests.py`, and the AI
+intent/context/architecture gates.
+
+
+## Round 289 Agent Rule — Effective routes and browser/runtime coherence
+
+When changing LLM settings, provider routing, chat state, telemetry delivery, or
+frontend assets, preserve these rules:
+
+- Resolve task configuration field by field: per-task → capability tier → global.
+  A task-specific generation/context value may not erase a tier provider/model.
+- Settings must show the effective task routes and their winning source. A model
+  selector that only changes a displayed base value while a hidden tier continues
+  to own routing is a release-blocking bug.
+- Save base and tier routes atomically. Applying the base route to every chat task
+  clears only provider/model endpoint identity; preserve task generation/context
+  tuning and the explicit embedding route.
+- Version runtime route configuration. Active provider calls or stream consumers
+  captured under an old revision must be cancelled with a truthful
+  `route_configuration_changed` event; retries may not continue on the old model.
+- LLM problem events are durable before browser delivery and must be present in
+  the first bounded activity snapshot. Live WebSocket delivery plus snapshot
+  reconciliation must produce exactly one card per call/event/attempt.
+- Enter chat busy state synchronously before network I/O, then reconcile it from
+  session/turn-scoped server state. Input must disable, Send must become a real
+  Stop action, concurrent sends must be rejected, and terminal states must restore
+  the controls.
+- Version all local browser assets from their content and serve HTML with no-store
+  semantics. Browser-origin chat/settings traffic using an obsolete bundle must
+  receive an explicit reload instruction before any LLM work starts.
+- Do not copy exact large prompts/tool schemas for status checks. Telemetry cleanup
+  uses constant-size activity status access; exact context remains lazy-loaded.
+
+Verify with `pytest -q tests/test_round289_effective_routing_live_ui.py`,
+`node scripts/round289_frontend_contract_harness.js .`, and
+`python scripts/round289_effective_model_routes_live_ui_tests.py`.
+
+
+## Round 290 Agent Rule — Complete readiness and deployed-build truth
+
+When changing startup, liveness, browser versioning, or deployment diagnostics,
+preserve these rules:
+
+- TCP reads are not HTTP messages. Never validate `/api/live` by searching one
+  arbitrary `reader.read()` fragment. Parse through the header terminator, bound
+  and read the complete response body, then decode JSON.
+- Readiness must prove the exact process/package just launched, not merely that
+  some LJS-like service owns the port. Require both runtime build ID and browser
+  asset fingerprint to match the current app instance.
+- Keep `/api/live` dependency-free. It may read immutable app-state identity but
+  must not call databases, providers, browsers, storage, scanners, or metadata.
+- Log the accepted build and asset IDs and expose the build ID in authenticated
+  UI diagnostics. Support must be able to distinguish “new package never
+  started” from “new code ran but behaved incorrectly.”
+- If another process owns the port, fail with an explicit stale/different-build
+  diagnostic. Do not silently accept it and do not automatically kill an
+  unidentified process.
+
+Verify with `pytest -q tests/test_round290_startup_build_identity.py` and
+`python scripts/round290_complete_readiness_build_identity_tests.py`.
+
+## Round 293 Agent Rule — Search truth, result-set confirmation, and cancellation ownership
+
+When changing interactive media search, cached candidate queueing, or chat Stop behavior, preserve these rules:
+
+- Categorized media SEARCH/DOWNLOAD turns use the normal registered tool loop directly. Do not insert an advisory LLM planner before a simple category-owned acquisition search. Generic/non-media SEARCH may retain planning when it genuinely adds execution value.
+- Fresh acquisition goal ownership is intent-neutral across SEARCH/DOWNLOAD: a concrete new acquisition request starts a new structured goal and does not inherit stale result sets, while terse refinements/selections continue the current goal. Reuse the existing context-freshness boundary; do not add category-specific phrase parsers.
+- Optional tool arguments represented as JSON `null` are equivalent to omission after required-field validation. Do not waste an agent iteration because a model serialized an unset optional number/string as null.
+- Explicit media-language search remains category-owned. Once a provider/year-backed candidate explicitly advertises the requested language, that is useful search evidence; do not continue alias fan-out merely to reach an arbitrary candidate-count target. Unrelated-locale provider aliases must not enter the explicit-language query ladder.
+- When explicit requested-language candidates exist, unknown/wrong-language rows are fallback evidence, not peers that can outrank or distract from the verified candidates merely because they have more seeders.
+- A later user selection of a stable cached `candidate_id`/`result_set_id` confirms soft warnings for that exact candidate (for example very low seeders). Hard request constraints remain non-overridable. Confirmation never transfers to a different fallback candidate.
+- Policy/confirmation failures are not operational failures and must not trigger fallback-candidate spraying. Automated first-turn/batch queueing may attempt an alternate only after an explicitly fallback-eligible operational failure, and every alternate must satisfy its own policy. A later explicit user selection of one exact cached candidate is terminal for that candidate: if that exact queue attempt fails operationally, report the failure and do not silently substitute another release.
+- Browser Stop is server-authoritative on both WebSocket and REST transports. REST must explicitly cancel the shared `ChatTurnRegistry` task; aborting only the browser fetch is forbidden. Keep the UI in `stopping` until the server task actually settles.
+- Provider/search child tasks belong to the owning chat turn. On cancellation, cancel and await those children before returning. No Jackett/indexer/search operation may continue invisibly after its parent user turn is stopped.
+- Turn/search logs must carry stable session/turn lineage so a wall-clock gap cannot be mistaken for request runtime. Preserve bounded authenticated diagnostics views for turn lifecycle and search events.
+- Deterministic user-facing errors and queue receipts must use plain human language. Do not add theatrical/persona error metaphors that obscure what succeeded or failed.
+
+Verify with `python scripts/round293_ella_search_selection_cancel_tests.py`, the Round 290–292 incident harnesses, and the standard AI/category/security/architecture gates.

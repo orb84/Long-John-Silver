@@ -10,63 +10,26 @@ from src.ai.intent_router import route_intent_fast, IntentRouter, Intent
 
 
 class TestFastRouting:
-    """Tests the fast regex keyword-matching path."""
+    """The compatibility seam must never classify free-form text by keywords."""
 
-    def test_download_intent(self):
-        """Verify singular forms match DOWNLOAD intent."""
-        intent, confidence = route_intent_fast("download the latest episode")
-        assert intent == Intent.DOWNLOAD
-        intent, confidence = route_intent_fast("find and download stranger things")
-        assert intent == Intent.DOWNLOAD
-        intent, confidence = route_intent_fast("get me a torrent for house of the dragon")
-        assert intent == Intent.DOWNLOAD
-
-    def test_download_intent_plurals(self):
-        """Verify plural forms (episodes, seasons) match DOWNLOAD intent."""
-        intent, confidence = route_intent_fast("download the missing episodes")
-        assert intent == Intent.DOWNLOAD
-        intent, confidence = route_intent_fast("get the remaining episodes")
-        assert intent == Intent.DOWNLOAD
-        intent, confidence = route_intent_fast("fill the remaining seasons")
-        assert intent == Intent.DOWNLOAD
-
-    def test_search_intent(self):
-        """Verify SEARCH intent keyword matches."""
-        intent, confidence = route_intent_fast("search for the last of us ratings")
-        assert intent == Intent.SEARCH
-        intent, confidence = route_intent_fast("when does the new episode air?")
-        assert intent == Intent.SEARCH
-        intent, confidence = route_intent_fast("what's the IMDB rating of breaking bad")
-        assert intent == Intent.SEARCH
-
-    def test_search_intent_plurals(self):
-        """Verify plural forms match SEARCH intent."""
-        intent, confidence = route_intent_fast("info about the new shows")
-        assert intent == Intent.SEARCH
-        intent, confidence = route_intent_fast("are there new episodes of severance?")
-        assert intent == Intent.SEARCH
-
-    def test_config_intent(self):
-        """Verify CONFIG intent keyword matches."""
-        intent, confidence = route_intent_fast("change the model to gpt-4")
-        assert intent == Intent.CONFIG
-
-    def test_config_intent_plurals(self):
-        """Verify CONFIG intent matches plural forms."""
-        intent, confidence = route_intent_fast("add the shows to tracked list")
-        assert intent == Intent.CONFIG
-        intent, confidence = route_intent_fast("remove shows")
-        assert intent == Intent.CONFIG
-
-    def test_ambiguous_prefers_download(self):
-        """Verify download intent priority when matching multiple keywords."""
-        intent, confidence = route_intent_fast("find and download the show")
-        assert intent == Intent.DOWNLOAD
-
-    def test_unknown_returns_none(self):
-        """Verify unmatched strings return None for fast routing, triggering LLM fallback."""
-        intent, confidence = route_intent_fast("hello there")
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "download the latest episode",
+            "get the remaining episodes",
+            "search for ratings",
+            "when does the new episode air?",
+            "change the model to gpt-4",
+            "remove shows",
+            "hello there",
+            "scarica il prossimo episodio",
+        ],
+    )
+    def test_fast_routing_is_disabled(self, message):
+        """All natural-language requests must flow through contextual LLM routing."""
+        intent, confidence = route_intent_fast(message)
         assert intent is None
+        assert confidence == 0.0
 
 
 @pytest.mark.asyncio

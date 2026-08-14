@@ -121,6 +121,10 @@ class LLMConfig(BaseModel):
     research: TaskModelConfig = Field(default_factory=TaskModelConfig)
     taste_extraction: TaskModelConfig = Field(default_factory=TaskModelConfig)
 
+    def tier_for_task(self, task: str) -> str | None:
+        """Return the public capability tier for a task, when one exists."""
+        return self._tier_for_task(task)
+
     def _tier_for_task(self, task: str) -> str | None:
         """Look up which tier a task belongs to.
 
@@ -151,34 +155,64 @@ class LLMConfig(BaseModel):
         return self._resolve_config(task)
 
     def _resolve_config(self, task: str) -> TaskModelConfig:
-        """Resolve the effective config for a task through the priority chain.
+        """Resolve task/tier values field by field.
 
-        Priority: per-task override -> tier default -> global default.
+        A per-task object that sets only ``max_tokens`` must not erase the
+        tier's model/provider. The previous all-or-nothing selection made the
+        documented fallback contract untrue and hid which model actually won.
 
-        A per-task config is considered "set" if it has any field filled in.
-        The caller then checks specific fields and falls back to the next
-        priority level for fields that are None.
-
-        Args:
-            task: Task name to resolve.
-
-        Returns:
-            The TaskModelConfig with the highest priority that has values set.
+        Global values remain the final fallback in ``TaskLLMClient`` because
+        their field names are not identical (for example ``active_provider``).
         """
-        # 1. Per-task override (explicit setting for this specific task)
-        per_task = getattr(self, task, None)
-        if per_task and per_task.has_values():
-            return per_task
-
-        # 2. Tier default (setting for all tasks of this capability level)
         tier_name = self._tier_for_task(task)
-        if tier_name:
-            tier_config = getattr(self, tier_name, None)
-            if tier_config and tier_config.has_values():
-                return tier_config
+        tier_config = getattr(self, tier_name, None) if tier_name else None
+        per_task = getattr(self, task, None)
+        values: dict[str, Any] = {}
+        for field_name in TaskModelConfig.model_fields:
+            task_value = getattr(per_task, field_name, None) if per_task else None
+            tier_value = getattr(tier_config, field_name, None) if tier_config else None
+            values[field_name] = task_value if task_value is not None else tier_value
+        return TaskModelConfig(**values)
 
-        # 3. Global default (a dummy config — callers use self.model/self.api_base/self.api_key)
-        return TaskModelConfig()
+    def route_source(self, task: str, field_name: str) -> str:
+        """Return the configuration layer that owns one effective route field."""
+        if field_name not in TaskModelConfig.model_fields:
+            raise ValueError(f"Unknown LLM route field: {field_name}")
+        per_task = getattr(self, task, None)
+        if per_task and getattr(per_task, field_name, None) is not None:
+            return f"task:{task}"
+        tier_name = self._tier_for_task(task)
+        tier_config = getattr(self, tier_name, None) if tier_name else None
+        if tier_config and getattr(tier_config, field_name, None) is not None:
+            return f"tier:{tier_name}"
+        return "global"
+
+    def routing_tasks(self) -> list[str]:
+        """Return every configured task route in stable UI order."""
+        tasks: list[str] = []
+        for tier in ("lightweight", "standard", "heavy"):
+            for task in LLMTaskTier[tier]["tasks"]:
+                if task not in tasks:
+                    tasks.append(task)
+        if "embedding" not in tasks:
+            tasks.append("embedding")
+        return tasks
+
+    def clear_route_overrides(self) -> None:
+        """Make the visible base provider/model authoritative for all tasks.
+
+        Generation and context tuning remain intact. Only endpoint identity
+        fields are cleared, so applying a base route does not destroy a user's
+        task-specific temperature, token, or context preferences.
+        """
+        route_fields = ("model", "provider", "api_base", "api_key")
+        chat_tasks = [task for task in self.routing_tasks() if task != "embedding"]
+        for config_name in ("lightweight", "standard", "heavy", *chat_tasks):
+            route_config = getattr(self, config_name, None)
+            if not isinstance(route_config, TaskModelConfig):
+                continue
+            for field_name in route_fields:
+                setattr(route_config, field_name, None)
 
     def get_model_for_task(self, task: str) -> str:
         """Get the model name for a specific task.

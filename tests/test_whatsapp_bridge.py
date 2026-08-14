@@ -108,17 +108,24 @@ class TestWhatsAppHandleIncoming:
             whatsapp_token="test_token",
             whatsapp_phone_number_id="123456",
         )
-        assistant = AsyncMock()
-        assistant.run = AsyncMock(return_value="Here is your show")
+        class StreamingAssistant:
+            def __init__(self):
+                self.calls = []
+
+            async def run_stream(self, prompt, *, session_id, user_id):
+                self.calls.append((prompt, session_id, user_id))
+                yield "Here is your show"
+
+        assistant = StreamingAssistant()
         bridge = WhatsAppBridge(settings, assistant, AsyncMock())
 
         response = await bridge.handle_incoming("15551234567", "find me Severance")
 
-        assistant.run.assert_called_once_with(
+        assert assistant.calls == [(
             "find me Severance",
-            session_id="whatsapp_15551234567",
-            user_id="whatsapp_15551234567",
-        )
+            "whatsapp_15551234567",
+            "whatsapp_15551234567",
+        )]
         assert response == "Here is your show"
 
     @pytest.mark.asyncio
@@ -128,13 +135,22 @@ class TestWhatsAppHandleIncoming:
             whatsapp_token="test_token",
             whatsapp_phone_number_id="123456",
         )
-        assistant = AsyncMock()
-        assistant.run = AsyncMock(side_effect=Exception("LLM down"))
-        bridge = WhatsAppBridge(settings, assistant, AsyncMock())
+        class FailingAssistant:
+            async def run_stream(self, prompt, *, session_id, user_id):
+                if False:
+                    yield ""
+                raise Exception("LLM down")
+
+            @staticmethod
+            def format_chat_error(operation, exc):
+                return f"Error during {operation}: {exc}"
+
+        bridge = WhatsAppBridge(settings, FailingAssistant(), AsyncMock())
 
         response = await bridge.handle_incoming("15551234567", "hello")
 
-        assert "error" in response.lower() or "Captain" in response
+        assert "error" in response.lower()
+        assert "LLM down" in response
 
 
 class TestWhatsAppSendMessage:

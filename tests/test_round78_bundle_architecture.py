@@ -55,7 +55,8 @@ def test_bundle_handler_uses_category_context_for_tv_size_estimates() -> None:
     """Per-unit estimates come from category hooks, not generic season math."""
     handler = BundleDownloadHandler()
     context = handler.describe_candidate("Example.Show.S01.Complete.1080p.WEB-DL", category_id="tv")
-    assert context and context["bundle_type"] == "tv_bundle"
+    assert context and context["bundle_kind"] == "tv_season_pack"
+    assert context["bundle_type"] == "complete"
     estimate = handler.compute_per_unit_limit_mb(
         24 * 1024 * 1024 * 1024,
         "Example.Show.S01.Complete.1080p.WEB-DL",
@@ -69,7 +70,14 @@ def test_movie_category_can_select_requested_file_from_collection() -> None:
     """Flat categories can still select one useful payload from a collection."""
     movie = MovieCategory()
     item = SimpleNamespace(key="The Matrix", display_name="The Matrix", year=1999)
-    result = SearchResult(title="The.Matrix.Collection.1999.2003.1080p.BluRay", magnet="m:1")
+    result = {
+        "title": "The.Matrix.Collection.1999.2003.1080p.BluRay",
+        "magnet": "m:1",
+        "files": [
+            {"path": "The.Matrix.1999.1080p.BluRay.mkv"},
+            {"path": "The.Matrix.Reloaded.2003.1080p.BluRay.mkv"},
+        ],
+    }
     target = movie.unit_descriptor_from_search_result(result, item, None)
     parsed = movie.parse_name("The.Matrix.1999.1080p.BluRay.mkv")
     file_descriptor = movie.unit_descriptor_from_file("The.Matrix.1999.1080p.BluRay.mkv", parsed)

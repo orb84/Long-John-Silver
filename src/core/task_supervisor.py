@@ -63,13 +63,17 @@ class TaskSupervisor:
         self._specs[name] = {"criticality": criticality, "coro_factory": coro_factory}
         self._restart_counts.setdefault(name, 0)
 
-        coro = coro_factory()
-        task = asyncio.create_task(self._run_supervised(name, coro, criticality))
+        task = asyncio.create_task(self._run_supervised(name, coro_factory, criticality))
         self._tasks[name] = task
         logger.debug(f"Supervised task spawned: {name} ({criticality.value})")
         return task
 
-    def spawn_one_shot(self, name: str, coro: object) -> asyncio.Task:
+    def spawn_one_shot(
+        self,
+        name: str,
+        coro_or_factory: object,
+        criticality: TaskCriticality = TaskCriticality.BEST_EFFORT,
+    ) -> asyncio.Task:
         """Spawn a best-effort one-shot task (no restart on crash).
 
         For fire-and-forget operations that should still be logged on
@@ -79,28 +83,34 @@ class TaskSupervisor:
 
         Args:
             name: Unique identifier for this task.
-            coro: The coroutine to run.
+            coro_or_factory: Coroutine to run or a zero-argument factory that
+                creates it only after the supervising task starts.
+            criticality: Compatibility argument. One-shot tasks are always
+                treated as best-effort and are never restarted.
 
         Returns:
             The asyncio.Task object.
         """
-        task_name = f"{name}_{id(coro)}" if name in self._tasks else name
+        _ = criticality
+        task_name = f"{name}_{id(coro_or_factory)}" if name in self._tasks else name
+        factory = coro_or_factory if callable(coro_or_factory) else lambda: coro_or_factory
+        owned_coroutine = None if callable(coro_or_factory) else coro_or_factory
 
         self._specs[task_name] = {"criticality": TaskCriticality.BEST_EFFORT}
-        task = asyncio.create_task(self._run_supervised(task_name, coro, TaskCriticality.BEST_EFFORT))
+        task = asyncio.create_task(
+            self._run_supervised(task_name, factory, TaskCriticality.BEST_EFFORT)
+        )
         self._tasks[task_name] = task
 
-        def _cleanup(_task):
+        def _cleanup(_task: asyncio.Task) -> None:
             self._tasks.pop(task_name, None)
             self._specs.pop(task_name, None)
+            close = getattr(owned_coroutine, "close", None)
+            if callable(close):
+                close()
 
         task.add_done_callback(_cleanup)
         return task
-
-    def is_alive(self, name: str) -> bool:
-        """Return True if the task exists and is not done."""
-        task = self._tasks.get(name)
-        return task is not None and not task.done()
 
     def cancel(self, name: str) -> None:
         """Cancel a specific supervised task by name."""
@@ -171,9 +181,21 @@ class TaskSupervisor:
         """Number of currently running supervised tasks."""
         return sum(1 for t in self._tasks.values() if not t.done())
 
-    async def _run_supervised(self, name: str, coro, criticality: TaskCriticality) -> None:
-        """Run a coroutine with supervision: catch crashes and handle restarts."""
+    async def _run_supervised(
+        self,
+        name: str,
+        coro_factory: Callable[[], object],
+        criticality: TaskCriticality,
+    ) -> None:
+        """Create and run a coroutine inside its supervising task.
+
+        Delaying coroutine creation until this task starts prevents an immediate
+        shutdown from leaving a factory-created coroutine unawaited.
+        """
         try:
+            if self._shutting_down:
+                return
+            coro = coro_factory()
             await coro
         except asyncio.CancelledError:
             if not self._shutting_down:
@@ -235,9 +257,8 @@ class TaskSupervisor:
             await asyncio.sleep(backoff)
             if not self._shutting_down:
                 try:
-                    new_coro = coro_factory()
                     task = asyncio.create_task(
-                        self._run_supervised(name, new_coro, criticality)
+                        self._run_supervised(name, coro_factory, criticality)
                     )
                     self._tasks[name] = task
                 except Exception as e:

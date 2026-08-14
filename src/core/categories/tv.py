@@ -9,6 +9,7 @@ TVMaze integration, and TV-specific file organization.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from loguru import logger
 from src.core.categories.base import CategoryMedia
 from src.core.categories.tv_agent import TvAgentSearchMixin
 from src.core.categories.tv_context import TvContextMixin
+from src.core.categories.tv_cleanup import TvCleanupMixin
 from src.core.categories.tv_metadata_info import TvMetadataInfoMixin
 from src.core.categories.tv_workflows import TvWorkflowMixin
 from src.core.categories.tv_web_research import TvWebResearchMixin
@@ -85,7 +87,7 @@ class TvSearchPatterns(SearchPatterns):
         return None
 
 
-class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, TvWorkflowMixin, TvWebResearchMixin, CategoryMedia):
+class TvShowCategory(TvCleanupMixin, TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, TvWorkflowMixin, TvWebResearchMixin, CategoryMedia):
     """Television shows with seasons and episodes."""
 
     category_id = "tv"
@@ -129,7 +131,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             language=str(kwargs.get("language") or "English"),
             enabled=bool(kwargs.get("enabled", True)),
             check_interval_days=int(kwargs.get("check_interval_days") or 7),
-            auto_download=kwargs.get("auto_download") if kwargs.get("auto_download") is not None else False,
+            auto_download=kwargs.get("auto_download"),
             last_season=kwargs.get("last_season"),
             last_episode=kwargs.get("last_episode"),
             tvmaze_id=kwargs.get("tvmaze_id"),
@@ -181,29 +183,11 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         tvmaze = (getattr(context, "metadata_clients", {}) or {}).get("tvmaze") if enrich_metadata else None
         if tvmaze and title:
             try:
-                tvmaze_id = getattr(item, "tvmaze_id", None)
-                if not tvmaze_id:
-                    hits = await tvmaze.search(title)
-                    if hits:
-                        # Prefer exact normalized title matches, otherwise take TVMaze's top score.
-                        wanted = self._canonical_title(title)
-                        best = next((hit for hit in hits if self._canonical_title(hit.get("name") or "") == wanted), hits[0])
-                        tvmaze_id = best.get("id")
-                        if tvmaze_id and hasattr(item, "tvmaze_id"):
-                            item.tvmaze_id = int(tvmaze_id)
+                tvmaze_id = await self._resolve_tvmaze_id(item, title, metadata, tvmaze)
                 if tvmaze_id:
                     details = await tvmaze.get_show_details(int(tvmaze_id))
                     if details:
-                        metadata["tvmaze"] = details
-                        metadata["tvmaze_id"] = tvmaze_id
-                        aliases = list(metadata.get("title_aliases") or [])
-                        for value in (details.get("name"), title):
-                            if value and value not in aliases:
-                                aliases.append(str(value))
-                        if aliases:
-                            metadata["title_aliases"] = aliases
-                        if details.get("status") and not metadata.get("lifecycle_status"):
-                            metadata["lifecycle_status"] = details.get("status")
+                        self._apply_tvmaze_details(item, metadata, title, int(tvmaze_id), details)
                         if db and getattr(db, "media", None):
                             await db.media.upsert_category_metadata(
                                 self.category_id, title, "tvmaze", details, external_id=str(tvmaze_id)
@@ -213,6 +197,38 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
 
         item.metadata = metadata
         return item
+
+    async def _resolve_tvmaze_id(self, item: Any, title: str, metadata: dict[str, Any], tvmaze: Any) -> int | None:
+        """Resolve one exact TVMaze show id without leaking title semantics to core."""
+        known = self._watch_tvmaze_id(item, metadata)
+        if known:
+            return int(known)
+        hits = await tvmaze.search(title)
+        wanted = self._canonical_title(title)
+        exact = next(
+            (row for row in (hits or []) if self._canonical_title(row.get("name") or "") == wanted),
+            None,
+        )
+        resolved = self._safe_positive_int(exact.get("id")) if exact else None
+        if resolved and hasattr(item, "tvmaze_id"):
+            item.tvmaze_id = int(resolved)
+        return resolved
+
+    @staticmethod
+    def _apply_tvmaze_details(item: Any, metadata: dict[str, Any], title: str, tvmaze_id: int, details: dict[str, Any]) -> None:
+        """Merge one verified TVMaze record into category-owned item metadata."""
+        metadata["tvmaze"] = details
+        metadata["tvmaze_id"] = tvmaze_id
+        aliases = list(metadata.get("title_aliases") or [])
+        for value in (details.get("name"), title):
+            if value and value not in aliases:
+                aliases.append(str(value))
+        if aliases:
+            metadata["title_aliases"] = aliases
+        if details.get("status") and not metadata.get("lifecycle_status"):
+            metadata["lifecycle_status"] = details.get("status")
+        if hasattr(item, "tvmaze_id") and not getattr(item, "tvmaze_id", None):
+            item.tvmaze_id = tvmaze_id
 
     async def build_watch_plan(self, item: Any, context: Any) -> Any:
         """Build a TV-owned watch plan.
@@ -237,7 +253,27 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         rss_feeds: list[CategoryRssFeedSpec] = []
         reasons: list[str] = []
         seen_units: set[str] = set()
-        release_search_enabled = self.release_watch_search_allowed(item, self._release_watch_requirements(item, context), settings)
+        item_updates: dict[str, Any] = {}
+
+        effective_item = item
+        if getattr(item, "auto_download", None) is None:
+            default_auto = self._initial_auto_download_default(metadata, lifecycle=lifecycle)
+            if default_auto is not None:
+                try:
+                    effective_item = item.model_copy(deep=False) if hasattr(item, "model_copy") else copy.copy(item)
+                except Exception:
+                    effective_item = copy.copy(item)
+                setattr(effective_item, "auto_download", default_auto)
+                item_updates["auto_download"] = default_auto
+                item_updates["tracking_default_source"] = "tv_provider_lifecycle"
+                reasons.append(
+                    "new-show episode automation defaulted on from active TV lifecycle"
+                    if default_auto else "episode automation defaulted off because TV lifecycle is not active"
+                )
+
+        release_search_enabled = self.release_watch_search_allowed(
+            effective_item, self._release_watch_requirements(effective_item, context), settings
+        )
 
         def add_episode_watch(
             episode_row: dict[str, Any],
@@ -259,7 +295,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             interval_hours = self._release_watch_interval_hours(metadata, cadence_profile=cadence, default=2.0)
             watch_start_at = self._watch_start_for_air_datetime(expected_air_at)
             expires_at = self._watch_expiry_for_air_datetime(expected_air_at, cadence)
-            requirements = self._release_watch_requirements(item, context)
+            requirements = self._release_watch_requirements(effective_item, context)
             payload = {
                 "expected_air_at": expected_air_at,
                 "expected_air_date": episode_row.get("air_date") or episode_row.get("airdate") or "",
@@ -321,6 +357,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 reason="; ".join(reasons[:8]) or "TV release watches active",
                 rss_feeds=self._dedupe_rss_feeds(rss_feeds),
                 release_watches=release_watches,
+                item_updates=item_updates,
             )
 
         if lifecycle in {"returning series", "in production", "running", "to be determined", "active_airing"}:
@@ -329,6 +366,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 title,
                 mode="periodic_metadata",
                 reason=f"TV lifecycle is active but no concrete episode watch is known ({lifecycle or 'unknown active'}); refresh metadata instead of broad RSS",
+                item_updates=item_updates,
             )
 
         return CategoryWatchPlan(
@@ -336,7 +374,26 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             title,
             mode="periodic_metadata",
             reason=f"TV lifecycle is not actively airing ({lifecycle or 'unknown'}); use scheduled lifecycle checks, not RSS",
+            item_updates=item_updates,
         )
+
+    def _initial_auto_download_default(self, metadata: dict[str, Any], *, lifecycle: str = "") -> bool | None:
+        """Choose the initial per-show episode automation value from TV lifecycle evidence.
+
+        This applies only while the user's per-show setting is still ``None``.
+        Once the checkbox has a literal boolean value, that user-visible choice
+        remains authoritative. Active/returning shows default to tracking new
+        releases; ended/inactive shows default off. Unknown provider state stays
+        unset rather than being silently converted to off.
+        """
+        status = str(lifecycle or self._tv_lifecycle_status(metadata) or "").strip().lower()
+        if self._next_episode_from_metadata(metadata):
+            return True
+        if status in {"returning series", "in production", "running", "to be determined", "active_airing"}:
+            return True
+        if status in {"ended", "cancelled", "finished"}:
+            return False
+        return None
 
     async def _missing_frontier_episodes_for_watch(self, item: Any, context: Any, metadata: dict[str, Any]) -> list[dict[str, Any]]:
         """Return aired, missing frontier episodes that deserve release watches.
@@ -575,6 +632,32 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                     metadata.setdefault("tvmaze", payload)
                 elif provider == "tmdb_tv":
                     metadata.update({k: v for k, v in payload.items() if k not in metadata})
+        # Library discovery intentionally avoids live metadata provider storms.
+        # The watch-policy boundary is where TV actually needs lifecycle truth
+        # (active/returning vs ended) to choose the initial tracking default.
+        # Fetch TVMaze only when that truth is still absent, and persist the
+        # result so later startup/watch-policy syncs remain local reads.
+        if not self._tv_lifecycle_status(metadata) and not self._next_episode_from_metadata(metadata):
+            tvmaze = (getattr(context, "metadata_clients", {}) or {}).get("tvmaze")
+            title = str(getattr(item, "key", "") or "").strip()
+            if tvmaze is not None and title:
+                try:
+                    tvmaze_id = await self._resolve_tvmaze_id(item, title, metadata, tvmaze)
+                    if tvmaze_id:
+                        details = await tvmaze.get_show_details(int(tvmaze_id))
+                        if isinstance(details, dict) and details:
+                            self._apply_tvmaze_details(item, metadata, title, int(tvmaze_id), details)
+                            item.metadata = metadata
+                            if db and getattr(db, "media", None):
+                                await db.media.upsert_category_metadata(
+                                    self.category_id,
+                                    title,
+                                    "tvmaze",
+                                    details,
+                                    external_id=str(tvmaze_id),
+                                )
+                except Exception as exc:
+                    logger.debug("TV watch lifecycle lookup failed for %s: %s", title, exc)
         return metadata
 
     @staticmethod
@@ -862,28 +945,32 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         return signals
 
     def reconcile_settings_item_with_persisted_state(self, item: Any, persisted_payload: dict[str, Any] | None, settings: Any | None = None) -> bool:
-        """Make the visible TV checkbox a hard stop before unattended work.
+        """Reconcile repository mirrors without overriding the visible per-show setting.
 
-        Older builds could leave ``settings.tracked_items`` and the category item
-        repository disagreeing.  For TV, background automation is explicit opt-in:
-        literal ``True`` must exist on the runtime item and be confirmed by the
-        persisted category row.  False, null, strings, legacy integers, missing
-        persisted values, and nested visible-off values all collapse to disabled.
+        ``settings.tracked_items`` owns the user-visible checkbox. Repository
+        rows mirror that choice for inspectors/background workers; they must not
+        silently force an unset or enabled setting to ``False``. Old repository
+        rows can seed an unset runtime value during migration, after which both
+        stores are rewritten consistently.
         """
-        settings_auto = getattr(item, "auto_download", None)
-        persisted_signals = self._persisted_auto_download_signals(persisted_payload)
-        persisted_confirms_true = bool(persisted_signals) and all(value is True for value in persisted_signals)
-        runtime_confirms_true = settings_auto is True
-        if runtime_confirms_true and persisted_confirms_true:
-            return False
-        needs_persisted_rewrite = bool(persisted_signals and any(value is True for value in persisted_signals))
-        if settings_auto is not False:
-            setattr(item, "auto_download", False)
+        _ = settings
+        runtime = getattr(item, "auto_download", None)
+        signals = self._persisted_auto_download_signals(persisted_payload)
+        persisted: bool | None = None
+        if signals and all(value is True for value in signals):
+            persisted = True
+        elif signals and all(value is False for value in signals):
+            persisted = False
+
+        if runtime is None and persisted is not None:
+            setattr(item, "auto_download", persisted)
             return True
-        return needs_persisted_rewrite
+        if runtime is None:
+            return False
+        return persisted is not runtime
 
     def release_watch_auto_download_allowed(self, item: Any, requirements: dict[str, Any], settings: Any | None = None) -> bool:
-        """Allow TV release-watch auto-queueing only after explicit per-show opt-in.
+        """Allow TV release-watch auto-queueing only when the resolved per-show setting is on.
 
         Stored watch rows can be older than the current inspector checkbox.  A
         stale ``requirements.auto_download=true`` snapshot must not resurrect
@@ -893,26 +980,41 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
         return self._tv_auto_download_enabled(item)
 
     def queued_background_start_allowed(self, item: Any, settings: Any | None = None) -> bool | None:
-        """Use TV's safe default for already-queued background rows.
-
-        TV automation is opt-in.  ``None``/missing values are therefore a hard
-        false for matched TV items, not an invitation to inherit the global
-        Captain-mode switch.
-        """
+        """Use the resolved TV per-show value for already-queued background rows."""
         return self._tv_auto_download_enabled(item)
 
     def background_discovery_allowed(self, item: Any, settings: Any | None = None) -> bool:
-        """Allow unattended TV search/queue only after explicit per-show opt-in."""
+        """Allow unattended TV search/queue when the resolved per-show value is on."""
         return self._tv_auto_download_enabled(item)
 
     def release_watch_search_allowed(self, item: Any, requirements: dict[str, Any], settings: Any | None = None) -> bool:
-        """Allow TV release-watch searches only for explicitly opted-in shows.
+        """Allow TV release-watch searches only when per-show automation is resolved on.
 
         Notification-only searches are still background work and can produce
-        noisy false positives. TV therefore treats null/off per-show automation
-        as a hard stop for search, not only for queueing.
+        noisy false positives. An unresolved null and an explicit off both stop
+        search until the category lifecycle/default or user choice resolves it.
         """
         return self._tv_auto_download_enabled(item)
+
+    def canonical_download_satisfaction(
+        self,
+        canonical: Any,
+        unit_descriptor: dict[str, Any],
+    ) -> bool | None:
+        """Return whether the canonical TV object contains the descriptor unit."""
+        descriptor = unit_descriptor if isinstance(unit_descriptor, dict) else {}
+        coordinates = descriptor.get("coordinates") if isinstance(descriptor.get("coordinates"), dict) else {}
+        season = self._safe_positive_int(coordinates.get("season"))
+        episode = self._safe_positive_int(coordinates.get("episode"))
+        if not season:
+            season, episode = self._unit_coordinates(
+                str(descriptor.get("label") or descriptor.get("stable_key") or "")
+            )
+        if not season:
+            return None
+        if episode:
+            return self._canonical_payload_has_downloaded_unit(canonical, season, episode)
+        return self._canonical_payload_has_complete_season(canonical, season)
 
     async def discovery_already_satisfied(self, item: Any, unit_label: str | None, context: Any | None = None) -> bool:
         """Skip TV auto-discovery when the canonical library already owns the unit.
@@ -975,6 +1077,31 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             if self._coordinates_match(row_season, row_episode, season, episode):
                 return True
         return False
+
+    def _canonical_payload_has_complete_season(self, canonical: Any, season: int) -> bool | None:
+        """Return whether every provider-known aired episode in a season is local.
+
+        A season-level request must not be considered satisfied merely because
+        one episode exists.  The decision is definitive only when the canonical
+        object includes the provider episode frontier used to define the full
+        aired season; otherwise duplicate admission remains conservative.
+        """
+        if not isinstance(canonical, dict):
+            return None
+        computed = canonical.get("computed") if isinstance(canonical.get("computed"), dict) else {}
+        local: set[tuple[int, int]] = set()
+        expected: set[tuple[int, int]] = set()
+        for raw in list(computed.get("local_episode_keys") or []):
+            row_season, row_episode = self._unit_coordinates(str(raw or ""))
+            if row_season == season and row_episode:
+                local.add((row_season, row_episode))
+        for raw in list(computed.get("provider_aired_episode_keys") or []):
+            row_season, row_episode = self._unit_coordinates(str(raw or ""))
+            if row_season == season and row_episode:
+                expected.add((row_season, row_episode))
+        if not expected:
+            return None
+        return expected.issubset(local)
 
     def _downloaded_payload_matches(self, payload: Any, season: int | None, episode: int | None) -> bool:
         """Return whether a canonical row represents the requested downloaded TV unit."""
@@ -1286,6 +1413,10 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             context["requested_episode"] = requested_episode
             context["contains_requested_unit"] = self._bundle_contains_episode(title, requested_season, requested_episode)
             context["selective_download_required"] = True
+            context["selective_queue_policy"] = self._selective_queue_policy(
+                contains_requested_unit=bool(context.get("contains_requested_unit")),
+                target_scope="requested_unit_only",
+            )
         elif requested_season:
             pack_type = str(pack.get("pack_type") or "")
             start = self._safe_positive_int(pack.get("season_start")) or self._safe_positive_int(pack.get("season"))
@@ -1295,10 +1426,37 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 context["selective_download_required"] = True
                 context["selection_scope"] = "requested_season_only"
                 context["selected_unit_episode_count_hint"] = 10
+                context["selective_queue_policy"] = self._selective_queue_policy(
+                    contains_requested_unit=True,
+                    target_scope="requested_season_only",
+                )
         count = self._bundle_episode_count_hint(pack, title)
         if count:
             context["unit_count"] = count
         return {key: value for key, value in context.items() if value not in (None, "", [], {})}
+
+
+    @staticmethod
+    def _selective_queue_policy(*, contains_requested_unit: bool, target_scope: str) -> dict[str, Any]:
+        """Describe whether TV can select requested files after torrent metadata.
+
+        The downloader already waits for metadata and asks TV to match files to
+        the persisted unit descriptor.  Search/assistant code consumes this
+        structured capability verdict instead of inventing a blanket
+        pre-inspection requirement for every bundle.
+        """
+        if not contains_requested_unit:
+            return {
+                "status": "requires_inspection",
+                "mode": "metadata_file_priority",
+                "reason": "the release name does not prove that the requested TV unit is inside this bundle",
+            }
+        return {
+            "status": "supported",
+            "mode": "metadata_file_priority",
+            "target_scope": target_scope,
+            "reason": "TV can prioritize only the requested unit after torrent metadata arrives",
+        }
 
     def estimate_bundle_unit_size_mb(
         self,
@@ -1352,7 +1510,11 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             return False
         for target in target_descriptors or []:
             target_coords = target.get("coordinates") if isinstance(target.get("coordinates"), dict) else {}
-            if self._safe_positive_int(target_coords.get("season")) == file_season and self._safe_positive_int(target_coords.get("episode")) == file_episode:
+            target_season = self._safe_positive_int(target_coords.get("season"))
+            target_episode = self._safe_positive_int(target_coords.get("episode"))
+            if target_season != file_season:
+                continue
+            if target_episode is None or target_episode == file_episode:
                 return True
         return False
 
@@ -1709,6 +1871,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
             },
             "computed_fields": [
                 "season_count", "episode_count", "downloaded_episode_count", "provider_aired_episode_count",
+                "provider_aired_episode_keys",
                 "missing_episodes", "quality_gaps", "language_gaps", "total_size_bytes", "has_local_files",
             ],
             "source_of_truth_rule": (
@@ -1906,6 +2069,10 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 if lang and lang not in local_subtitle_languages:
                     local_subtitle_languages.append(lang)
         local_episode_keys = [f"S{s:02d}E{e:02d}" for s, e in sorted(local_keys)]
+        provider_aired_episode_keys = [
+            f"S{int(row['season']):02d}E{int(row['episode']):02d}"
+            for row in provider_episodes
+        ]
         return {
             "schema_version": self.library_object_spec()["schema_version"],
             "category_id": self.category_id,
@@ -1926,6 +2093,7 @@ class TvShowCategory(TvMetadataInfoMixin, TvContextMixin, TvAgentSearchMixin, Tv
                 "downloaded_file_count": len(downloaded_files),
                 "local_episode_keys": local_episode_keys,
                 "provider_aired_episode_count": len(provider_episodes),
+                "provider_aired_episode_keys": provider_aired_episode_keys,
                 "missing_episodes": missing,
                 "missing_episode_count": len(missing),
                 "quality_gaps": quality_gaps,

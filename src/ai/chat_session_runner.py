@@ -16,6 +16,7 @@ from typing import Any, AsyncIterator, Literal
 from src.core.models import Intent
 
 from src.ai.assistant import AIAssistant
+from src.llm_providers.activity import LLMActivityContext
 
 ChatEventType = Literal["status", "token", "done"]
 
@@ -27,6 +28,7 @@ class ChatTurnRequest:
     prompt: str
     session_id: str
     user_id: str | None = None
+    turn_id: str | None = None
     first_progress_seconds: float = 5.0
     later_progress_seconds: float = 75.0
     max_status_updates: int = 3
@@ -55,17 +57,48 @@ class ChatSessionRunner:
 
     async def run_events(self, request: ChatTurnRequest) -> AsyncIterator[ChatTurnEvent]:
         """Yield status/token/done events for a single assistant turn."""
-        status_intent = await self._status_intent(request)
-        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-        task = asyncio.create_task(
-            self._consume_assistant_stream(request, queue),
-            name=f"assistant-chat-{request.session_id}",
-        )
-        try:
-            async for event in self._drain_events(request, queue, status_intent=status_intent):
-                yield event
-        finally:
-            await self._cancel_if_pending(task)
+        # Bind before the preflight router so every nested model call—including
+        # intent classification—appears under the same user-visible turn.
+        with LLMActivityContext.bind(session_id=request.session_id, turn_id=request.turn_id):
+            status_task = asyncio.create_task(
+                self._status_intent(request),
+                name=f"assistant-route-{request.session_id}",
+            )
+            routing_status_sent = False
+            try:
+                status_intent = await asyncio.wait_for(
+                    asyncio.shield(status_task),
+                    timeout=max(0.1, request.first_progress_seconds),
+                )
+            except asyncio.TimeoutError:
+                routing_status_sent = True
+                yield ChatTurnEvent(
+                    "status",
+                    "The LLM is still classifying this request. Any timeout or retry will appear as a notification and in LLM Diagnostics.",
+                )
+                status_intent = await status_task
+            except asyncio.CancelledError:
+                await self._cancel_if_pending(status_task)
+                raise
+            except Exception:
+                status_intent = None
+
+            queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            task = asyncio.create_task(
+                self._consume_assistant_stream(request, queue),
+                name=f"assistant-chat-{request.session_id}",
+            )
+            try:
+                async for event in self._drain_events(
+                    request,
+                    queue,
+                    status_intent=status_intent,
+                    initial_tick=1 if routing_status_sent else 0,
+                ):
+                    yield event
+            finally:
+                await self._cancel_if_pending(task)
+                await self._cancel_if_pending(status_task)
 
     async def collect_response(self, request: ChatTurnRequest) -> str:
         """Run a turn through the shared event pipeline and return final text."""
@@ -83,15 +116,17 @@ class ChatSessionRunner:
         return f"⚠️ Error during {operation}: {exc}"
 
     async def _progress_message(self, prompt: str, tick: int, intent: Intent | None = None) -> str:
-        generator = getattr(self._assistant, "generate_progress_message", None)
-        if callable(generator):
-            return await generator(prompt, tick, intent=intent)
+        """Return useful progress without spending another model invocation."""
+        if intent == Intent.SEARCH:
+            return "Searching the configured sources and checking the useful matches…"
+        if intent == Intent.DOWNLOAD:
+            return "Checking the selected release and queue state…"
+        if intent == Intent.CONFIG:
+            return "Checking and applying the requested configuration…"
         formatter = getattr(self._assistant, "format_progress_message", None)
         if callable(formatter):
             return formatter(prompt, tick)
-        if tick == 0:
-            return "Aye Captain — I’m checking the right charts before I answer."
-        return "Still on it, Captain. I’m verifying the useful details."
+        return "Still working on this request…"
 
     async def _status_intent(self, request: ChatTurnRequest) -> Intent | None:
         """Return preflight intent used only to decide status visibility.
@@ -133,8 +168,9 @@ class ChatSessionRunner:
         queue: asyncio.Queue[tuple[str, Any]],
         *,
         status_intent: Intent | None = None,
+        initial_tick: int = 0,
     ) -> AsyncIterator[ChatTurnEvent]:
-        tick = 0
+        tick = max(0, int(initial_tick))
         saw_answer_text = False
         should_send_status = status_intent in {Intent.SEARCH, Intent.DOWNLOAD, Intent.CONFIG}
         delay = request.first_progress_seconds

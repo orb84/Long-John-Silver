@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.ai.plan_executor import PlanExecutor
+from src.ai.tool_registry import ToolDefinition
 from src.ai.reasoning import ReasoningPlanner
 from src.core.models import AgentPlan, PlanStep, PlanExecutionStep, PlanExecutionResult, Intent, AgentLoopState
 from src.utils.circuit_breaker import CircuitBreaker
@@ -143,7 +144,18 @@ class FakeToolRegistry:
     def get_definition(self, name):
         return {"name": name}
 
-    async def execute(self, name, arguments):
+    def get_tool_definition(self, name):
+        handler = self._tools.get(name)
+        if handler is None:
+            return None
+        return ToolDefinition(
+            name=name,
+            description="test tool",
+            parameters={"type": "object", "additionalProperties": True},
+            handler=handler,
+        )
+
+    async def execute(self, name, arguments, context=None):
         handler = self._tools.get(name)
         if handler is None:
             raise ValueError(f"Unknown tool: {name}")
@@ -334,26 +346,28 @@ class TestPlanExecutor:
         assert result.steps[0].success is False
 
     @pytest.mark.asyncio
-    async def test_resolves_selected_magnet_placeholder(self):
-        """Step with a SELECTED_MAGNET placeholder resolves it using preceding search results."""
+    async def test_resolves_selected_candidate_handles(self):
+        """Queue steps resolve stable result-set and candidate handles, never raw magnets."""
         from src.ai.tool_executor import ToolCallExecutor
         registry = FakeToolRegistry()
 
         async def search_handler(args):
             return {
                 "query": "Severance S02E01",
+                "result_set_id": "results-1",
                 "candidates": [
                     {
+                        "candidate_id": "candidate-1",
                         "title": "Severance S02E01 1080p",
-                        "magnet": "magnet:?xt=urn:btih:testmagnet12345",
                     }
                 ]
             }
 
         async def download_handler(args):
-            # Assert that the placeholder was resolved to the actual magnet link
-            assert args["magnet"] == "magnet:?xt=urn:btih:testmagnet12345"
-            return {"status": "queued"}
+            assert args["result_set_id"] == "results-1"
+            assert args["candidate_id"] == "candidate-1"
+            assert "magnet" not in args
+            return {"status": "queued", "download_id": "download-1"}
 
         registry.register("search_media_torrents", search_handler)
         registry.register("queue_download", download_handler)
@@ -371,7 +385,7 @@ class TestPlanExecutor:
                 PlanStep(id="search", tool_name="search_media_torrents",
                          arguments={"name": "Severance", "season": 2, "episode": 1}),
                 PlanStep(id="download", tool_name="queue_download",
-                         arguments={"name": "Severance", "magnet": "<SELECTED_MAGNET>"},
+                         arguments={"name": "Severance", "result_set_id": "${search.result_set_id}", "candidate_id": "${search.candidates.0.candidate_id}"},
                          depends_on=["search"]),
             ],
         )

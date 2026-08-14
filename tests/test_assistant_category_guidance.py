@@ -38,10 +38,11 @@ class TestAssistantCategoryGuidance:
         # Mock conversation binding to not hit DB
         assistant._conversation_binding = MagicMock()
         assistant._conversation_binding.build_context_messages = AsyncMock(return_value=[])
+        assistant._conversation_binding.build_intent_routing_context = AsyncMock(return_value="")
         assistant._conversation_binding.record_turn = AsyncMock()
 
         ctx = await assistant._prepare_execution_context(
-            user_prompt="Hello assistant, can you search for some movies or shows?",
+            user_prompt="Hello assistant, can you research something for me?",
             session_id="session1",
             user_id="user1"
         )
@@ -77,6 +78,7 @@ class TestAssistantCategoryGuidance:
         # Mock conversation binding to not hit DB
         assistant._conversation_binding = MagicMock()
         assistant._conversation_binding.build_context_messages = AsyncMock(return_value=[])
+        assistant._conversation_binding.build_intent_routing_context = AsyncMock(return_value="")
         assistant._conversation_binding.record_turn = AsyncMock()
 
         ctx = await assistant._prepare_execution_context(

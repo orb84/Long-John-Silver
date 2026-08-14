@@ -32,6 +32,8 @@ class WebDependencies:
     notifications: Any = None
     auth_service: Any = None
     llm_manager: Any = None
+    llm_activity_monitor: Any = None
+    turn_logger: Any = None
     scanner: Any = None
     conversation_manager: Any = None
     vector_store: Any = None
@@ -151,7 +153,7 @@ class DownloadStatsBroadcaster:
         if self._supervisor:
             self._supervisor.spawn_one_shot(
                 f"dl_stats_{download_id}",
-                self._ws_manager.broadcast(msg),
+                lambda: self._ws_manager.broadcast(msg),
             )
         else:
             asyncio.create_task(self._ws_manager.broadcast(msg))

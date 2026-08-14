@@ -22,6 +22,7 @@ class SettingsPanel extends Component {
         this._personas = [];
         this._activePersona = null;
         this._llmModelCache = {};
+        this._llmRouting = { config_revision: 0, routes: [] };
 
         if (this.container) {
             this.render();
@@ -111,6 +112,12 @@ class SettingsPanel extends Component {
         this._setVal('pref-llm-raw-recent-percent', llm.raw_recent_context_percent === null || llm.raw_recent_context_percent === undefined ? 30 : llm.raw_recent_context_percent);
         this._setVal('pref-llm-reserved-output', llm.reserved_output_tokens === null || llm.reserved_output_tokens === undefined ? '' : llm.reserved_output_tokens);
         this._syncLlmContextWindowControl(false);
+        const hasModelOverrides = ['lightweight', 'standard', 'heavy'].some(name => {
+            const route = llm[name] || {};
+            return !!(route.model || route.provider || route.api_base);
+        });
+        this._setCheck('pref-llm-apply-base-all', !hasModelOverrides);
+        this._renderEffectiveLlmRoutes();
 
         const embeddings = this._settings.embeddings || {};
         this._setCheck('pref-embeddings-enabled', embeddings.enabled !== false);
@@ -373,7 +380,8 @@ class SettingsPanel extends Component {
      */
     async saveLLM() {
         try {
-            await APIClient.post('/api/settings/llm', {
+            const applyAll = !!(document.getElementById('pref-llm-apply-base-all') || {}).checked;
+            const result = await APIClient.post('/api/settings/llm', {
                 provider: this._valueById('pref-llm-provider', 'openrouter'),
                 model: this._valueById('pref-llm-model', ''),
                 api_base: this._nullableValueById('pref-llm-api-base'),
@@ -381,23 +389,33 @@ class SettingsPanel extends Component {
                 max_context_tokens: this._llmContextCapPayload(),
                 context_budget_percent: this._intById('pref-llm-context-budget-percent', 85),
                 raw_recent_context_percent: this._intById('pref-llm-raw-recent-percent', 30),
-                reserved_output_tokens: this._nonNegativeIntOrNullById('pref-llm-reserved-output')
-            });
-            await APIClient.post('/api/settings/tiers', {
-                lightweight: {
-                    model: this._nullableValueById('pref-llm-lw-model'),
-                    provider: this._nullableValueById('pref-llm-lw-provider')
-                },
-                standard: {
-                    model: this._nullableValueById('pref-llm-std-model'),
-                    provider: this._nullableValueById('pref-llm-std-provider')
-                },
-                heavy: {
-                    model: this._nullableValueById('pref-llm-hv-model'),
-                    provider: this._nullableValueById('pref-llm-hv-provider')
+                reserved_output_tokens: this._nonNegativeIntOrNullById('pref-llm-reserved-output'),
+                apply_base_to_all: applyAll,
+                tiers: {
+                    lightweight: {
+                        model: this._nullableValueById('pref-llm-lw-model'),
+                        provider: this._nullableValueById('pref-llm-lw-provider')
+                    },
+                    standard: {
+                        model: this._nullableValueById('pref-llm-std-model'),
+                        provider: this._nullableValueById('pref-llm-std-provider')
+                    },
+                    heavy: {
+                        model: this._nullableValueById('pref-llm-hv-model'),
+                        provider: this._nullableValueById('pref-llm-hv-provider')
+                    }
                 }
             });
-            toast.show('AI Gateway configuration saved.');
+            this._llmRouting = {
+                config_revision: result.config_revision || 0,
+                routes: result.routes || []
+            };
+            this._renderEffectiveLlmRoutes();
+            this._eventBus?.publish('settings:llm_saved', this._llmRouting);
+            window.helmPanel?.updateModelBadge();
+            toast.show(applyAll
+                ? 'AI Gateway saved. The selected base model now owns every LLM task.'
+                : 'AI Gateway and tier routes saved atomically.');
         } catch (err) {
             toast.error(err.message);
         }
@@ -866,6 +884,7 @@ class SettingsPanel extends Component {
             const data = await APIClient.get('/api/settings');
             const personaData = await APIClient.get('/api/personas');
             this._settings = data.settings || {};
+            this._llmRouting = data.llm_routing || { config_revision: 0, routes: [] };
             this._categories = (data.categories || []).map(cat => ({ ...cat, id: cat.id || cat.category_id }));
             this._personas = personaData.personas || [];
             this._activePersona = personaData.active || null;
@@ -1670,10 +1689,14 @@ class SettingsPanel extends Component {
             this._createSettingItem('Base model', 'Main model used when a task has no tier override. This list is loaded from the selected provider endpoint; the current custom value is preserved when the endpoint is unavailable.', this._modelSelectControl('pref-llm-model', 'pref-llm-provider', 'base')),
             this._createSettingItem('API base URL', 'Optional provider endpoint override.', DOM.el('input', { type: 'text', id: 'pref-llm-api-base', placeholder: 'Defaults if blank' })),
             this._createSettingItem('API key', 'Optional active provider key.', DOM.el('input', { type: 'text', className: 'ljs-secret-input', autocomplete: 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true', id: 'pref-llm-api-key', placeholder: '••••••••' })),
-            DOM.el('p', { className: 'empty-msg' }, ['Model menus use the provider /models endpoint. If a key or custom API base changed, save the gateway first, then refresh the model list.']),
+            DOM.el('p', { className: 'empty-msg' }, ['Model menus use the provider /models endpoint. The effective route table below is authoritative: it shows the model each task will actually call.']),
+            this._createSettingItem('Use base route for every task', 'Checked by default when no tier route is active. Saving clears only model/provider endpoint overrides; task-specific temperature, token, and context tuning remain intact.', this._toggle('pref-llm-apply-base-all')),
+            DOM.el('div', { id: 'pref-llm-effective-routes', className: 'llm-effective-routes' }, [
+                DOM.el('p', { className: 'empty-msg' }, ['Effective task routes will appear after settings load.'])
+            ]),
             this._sectionTitle('Context budget'),
-            this._createSettingItem('Context window cap', 'Maximum prompt context the app may assemble for the selected model. Defaults to the endpoint-reported maximum. Minimum is 10k tokens unless the endpoint itself is smaller.', this._contextWindowControl()),
-            this._createSettingItem('Context budget percent', 'Safety headroom applied inside the cap before reserving output tokens.', DOM.el('input', { type: 'number', id: 'pref-llm-context-budget-percent', min: '20', max: '100', step: '1', placeholder: '85' })),
+            this._createSettingItem('Context window cap', 'Hard maximum context available to the app for the selected model. Defaults to the endpoint-reported maximum. Routine tasks use a smaller soft assembly target, but that target never replaces this cap and may be exceeded safely when the irreducible prompt needs room.', this._contextWindowControl()),
+            this._createSettingItem('Context budget percent', 'Safety headroom applied to the hard cap before reserving output tokens. It does not shrink the routine soft target a second time.', DOM.el('input', { type: 'number', id: 'pref-llm-context-budget-percent', min: '20', max: '100', step: '1', placeholder: '85' })),
             this._createSettingItem('Raw recent history reserve', 'Percent of conversation-history budget kept uncompressed for the latest turns. Older conversation is compressed into the remaining history budget.', DOM.el('input', { type: 'number', id: 'pref-llm-raw-recent-percent', min: '0', max: '100', step: '1', placeholder: '30' })),
             this._createSettingItem('Reserved output tokens', 'Optional explicit response-token reserve. Leave blank to use task defaults. The model context window includes these output tokens.', DOM.el('input', { type: 'number', id: 'pref-llm-reserved-output', min: '0', step: '1', placeholder: 'auto' })),
             this._sectionTitle('Tier overrides'),
@@ -1875,7 +1898,12 @@ class SettingsPanel extends Component {
                 'data-provider-input': providerId,
                 'data-tier-name': tierName || '',
                 onchange: () => {
-                    if (modelId === 'pref-llm-model') this._syncLlmContextWindowControl(false);
+                    if (modelId === 'pref-llm-model') {
+                        this._markBaseRouteAuthoritative();
+                        this._syncLlmContextWindowControl(false);
+                    } else {
+                        this._markTierOverridesActive();
+                    }
                 }
             }, [DOM.el('option', { value: '' }, ['Refresh models to choose…'])]),
             DOM.el('button', {
@@ -1891,6 +1919,7 @@ class SettingsPanel extends Component {
      * @private
      */
     _onPrimaryLlmProviderChanged() {
+        this._markBaseRouteAuthoritative();
         this._refreshLlmModelSelect('pref-llm-model', 'pref-llm-provider', false);
         this._syncLlmContextWindowControl(false);
     }
@@ -2059,6 +2088,38 @@ class SettingsPanel extends Component {
         return `${n} tokens`;
     }
 
+    _markBaseRouteAuthoritative() {
+        const checkbox = document.getElementById('pref-llm-apply-base-all');
+        if (checkbox) checkbox.checked = true;
+    }
+
+    _markTierOverridesActive() {
+        const checkbox = document.getElementById('pref-llm-apply-base-all');
+        if (checkbox) checkbox.checked = false;
+    }
+
+    _renderEffectiveLlmRoutes() {
+        const root = document.getElementById('pref-llm-effective-routes');
+        if (!root) return;
+        const routes = Array.isArray(this._llmRouting?.routes) ? this._llmRouting.routes : [];
+        root.replaceChildren();
+        if (!routes.length) {
+            root.appendChild(DOM.el('p', { className: 'empty-msg' }, ['No effective routes are available.']));
+            return;
+        }
+        root.appendChild(DOM.el('div', { className: 'llm-route-summary-heading' }, [
+            DOM.el('strong', {}, ['Effective routing']),
+            DOM.el('span', {}, [`revision ${this._llmRouting.config_revision || 0}`])
+        ]));
+        routes.filter(route => route.model).forEach(route => {
+            root.appendChild(DOM.el('div', { className: 'llm-route-row' }, [
+                DOM.el('span', { className: 'llm-route-task' }, [String(route.task || 'task').replaceAll('_', ' ')]),
+                DOM.el('span', { className: 'llm-route-model', title: route.model || '' }, [route.model || 'disabled']),
+                DOM.el('span', { className: 'llm-route-source' }, [route.source || 'global'])
+            ]));
+        });
+    }
+
     /**
      * Create the pair of model/provider controls for a tier.
      * @private
@@ -2067,7 +2128,10 @@ class SettingsPanel extends Component {
         const providerId = `pref-llm-${prefix}-provider`;
         const modelId = `pref-llm-${prefix}-model`;
         return DOM.el('div', { className: 'tier-control llm-tier-control' }, [
-            DOM.el('select', { id: providerId, onchange: () => this._refreshLlmModelSelect(modelId, providerId, true) }, [
+            DOM.el('select', { id: providerId, onchange: () => {
+                this._markTierOverridesActive();
+                this._refreshLlmModelSelect(modelId, providerId, true);
+            } }, [
                 DOM.el('option', { value: '' }, ['Use active provider']),
                 ...this._llmProviderOptions()
             ]),

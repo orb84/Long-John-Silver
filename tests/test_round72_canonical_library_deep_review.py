@@ -1,4 +1,7 @@
 from pathlib import Path
+import inspect
+
+from src.core.categories.base_contract import CategoryContractMixin
 
 
 def project_root() -> Path:
@@ -34,11 +37,11 @@ def test_generic_path_planner_does_not_invent_category_aliases() -> None:
 
 
 def test_base_setup_requirements_are_provider_neutral() -> None:
-    contract = (project_root() / "src/core/categories/base_contract.py").read_text()
-    base_requirements = contract.split("def provider_setup_requirements", 1)[0] + contract.split("def provider_setup_requirements", 1)[1].split("def setup_requirements", 1)[1].split("def declare_workflows", 1)[0]
-    assert "TVMaze" not in base_requirements
-    assert "TMDB" not in base_requirements
-    assert "provider_setup_requirements" in contract
+    provider_source = inspect.getsource(CategoryContractMixin.provider_setup_requirements)
+    setup_source = inspect.getsource(CategoryContractMixin.setup_requirements)
+    assert "TVMaze" not in provider_source
+    assert "TMDB" not in provider_source
+    assert "self.provider_setup_requirements(settings)" in setup_source
 
 
 def test_tv_units_are_physical_files_not_episode_rows() -> None:

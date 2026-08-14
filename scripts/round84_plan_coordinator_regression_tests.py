@@ -148,7 +148,7 @@ async def assert_prepare_plan_websocket_path_does_not_raise_attribute_error() ->
         context=None,
     )
     assert plan is not None
-    assert executor is not None
+    assert executor is None  # structured plans are advisory; the agent loop owns execution
     assert plan.steps[0].tool_name == "search_media_torrents", plan.steps
     assert "season" not in plan.steps[0].arguments, plan.steps[0].arguments
     assert "Goal:" in updated_prompt

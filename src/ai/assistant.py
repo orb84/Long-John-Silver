@@ -23,7 +23,12 @@ if TYPE_CHECKING:
     from src.core.downloader import DownloadManager
     from src.core.categories.registry import CategoryRegistry
 
-from src.ai.intent_router import IntentRouter, route_intent, ClarificationBuilder
+from src.ai.intent_router import (
+    ClarificationBuilder,
+    IntentRouter,
+    IntentRoutingDecision,
+    route_intent,
+)
 from src.ai.language import detect_user_language_label
 from src.ai.agent_loop_state import INTENTS_ELIGIBLE_FOR_REFLECTION
 from src.ai.agent_loop import AgentLoopExecutor
@@ -85,6 +90,7 @@ class AgentDependencies:
     storage_monitor: Any | None = None
     taste_profiler: Any | None = None
     taste_signal_ingestor: TasteSignalIngestionService | None = None
+    task_supervisor: Any | None = None
 
 
 @dataclass
@@ -174,6 +180,7 @@ class AIAssistant:
             settings=dependencies.settings,
         )
         self._tool_policy = AgentToolPolicy(settings=dependencies.settings)
+        self._task_supervisor = dependencies.task_supervisor
         self._taste_signal_ingestor = dependencies.taste_signal_ingestor or (
             TasteSignalIngestionService(
                 llm_client=dependencies.llm_client,
@@ -182,7 +189,7 @@ class AIAssistant:
                 category_registry=dependencies.category_registry,
             ) if dependencies.taste_profiler else None
         )
-        self._preflight_intent_cache: dict[tuple[str, str, str], tuple[Intent, str | None]] = {}
+        self._preflight_intent_cache: dict[tuple[str, str, str], tuple[IntentRoutingDecision, str | None]] = {}
 
     @property
     def tool_registry(self) -> ToolRegistry:
@@ -203,11 +210,11 @@ class AIAssistant:
             session_id,
             pending_action_context=pending_action_context,
         )
-        intent = await self._route_intent(user_prompt, routing_context)
+        decision = await self._route_intent_decision(user_prompt, routing_context)
         self._preflight_intent_cache[(session_id or "default", user_id or "", user_prompt)] = (
-            intent, pending_action_context
+            decision, pending_action_context
         )
-        return intent
+        return decision.intent
 
     async def generate_progress_message(
         self, user_prompt: str, tick: int = 0, intent: Intent | None = None
@@ -263,18 +270,43 @@ class AIAssistant:
         )
         return any(fragment in lowered for fragment in bad_fragments)
 
-    async def _route_intent(self, user_prompt: str, pending_action_context: str | None) -> Intent:
-        """Route user intent through the configured router/client."""
+    async def _route_intent_decision(
+        self, user_prompt: str, pending_action_context: str | None,
+    ) -> IntentRoutingDecision:
+        """Route user intent while preserving confidence and operational failures."""
         if self._intent_router:
-            return await self._intent_router.route(user_prompt, context=pending_action_context)
+            detailed = getattr(self._intent_router, "route_with_details", None)
+            if callable(detailed):
+                candidate = await detailed(user_prompt, context=pending_action_context)
+                if isinstance(candidate, IntentRoutingDecision):
+                    return candidate
+                if isinstance(candidate, Intent):
+                    return IntentRoutingDecision(candidate, 0.75, "success")
+            intent = await self._intent_router.route(
+                user_prompt, context=pending_action_context
+            )
+            if not isinstance(intent, Intent):
+                raise TypeError(
+                    f"Intent router returned unsupported value: {type(intent).__name__}"
+                )
+            return IntentRoutingDecision(intent, 0.75, "success")
         routing_config = self._llm_runtime.get_llm_config("intent_routing")
-        return await route_intent(
+        intent = await route_intent(
             user_prompt,
             model=routing_config["model"],
             api_base=routing_config["api_base"],
             api_key=routing_config["api_key"],
             context=pending_action_context,
         )
+        return IntentRoutingDecision(
+            intent,
+            0.75 if intent != Intent.CLARIFY else 0.0,
+            "success" if intent != Intent.CLARIFY else "provider_error",
+        )
+
+    async def _route_intent(self, user_prompt: str, pending_action_context: str | None) -> Intent:
+        """Compatibility wrapper returning only the routed intent."""
+        return (await self._route_intent_decision(user_prompt, pending_action_context)).intent
 
     def format_progress_message(self, user_prompt: str, tick: int = 0) -> str:
         """Format a deterministic in-chat progress update in the active persona.
@@ -323,6 +355,16 @@ class AIAssistant:
             settings=self._settings,
         )
 
+    def llm_route_summary(self) -> dict[str, Any]:
+        """Return the current effective task routes without exposing credentials."""
+        if not self._llm_client:
+            return {"config_revision": 0, "routes": []}
+        return {
+            "config_revision": self._llm_client.config_revision,
+            "routes": self._llm_client.effective_routes(),
+            "cancelled_old_route_calls": self._llm_client.last_reload_cancelled_calls,
+        }
+
     def update_settings(self, settings: Settings) -> None:
         """Hot-reload settings without restarting the assistant."""
         self._settings = settings
@@ -356,19 +398,26 @@ class AIAssistant:
         cache_key = (session_id or "default", user_id or "", user_prompt)
         cached = self._preflight_intent_cache.pop(cache_key, None)
         if cached is not None:
-            intent, cached_context = cached
+            routing_decision, cached_context = cached
             pending_action_context = cached_context
         else:
             routing_context = await self._conversation_binding.build_intent_routing_context(
                 session_id,
                 pending_action_context=pending_action_context,
             )
-            intent = await self._route_intent(user_prompt, routing_context)
+            routing_decision = await self._route_intent_decision(
+                user_prompt, routing_context
+            )
+        intent = routing_decision.intent
 
         if self._structured_logger:
             try:
                 await self._structured_logger.log_intent(
-                    query=user_prompt, routed_intent=intent.value, confidence=1.0
+                    query=user_prompt,
+                    routed_intent=intent.value,
+                    confidence=routing_decision.confidence,
+                    status=routing_decision.status,
+                    error=routing_decision.error,
                 )
             except Exception as le:
                 logger.warning(f"Failed to log intent routing: {le}")
@@ -377,7 +426,11 @@ class AIAssistant:
             intent_hint = None
             if self._intent_router:
                 intent_hint = getattr(self._intent_router, "_last_clarify_hint", None)
-            clarification = ClarificationBuilder.build(user_prompt, intent_hint=intent_hint)
+            clarification = ClarificationBuilder.build(
+                user_prompt,
+                intent_hint=intent_hint,
+                decision=routing_decision,
+            )
             await self._conversation_binding.record_turn(session_id, "user", user_prompt)
             await self._conversation_binding.record_turn(session_id, "assistant", clarification)
             return ExecutionContext(
@@ -403,6 +456,7 @@ class AIAssistant:
         )
 
         goal_context = ""
+        acquisition_continuation = False
         if intent in {Intent.SEARCH, Intent.DOWNLOAD, Intent.CONFIG}:
             goal_context = await self._goal_state.build_context_and_update(
                 session_id=session_id,
@@ -410,6 +464,27 @@ class AIAssistant:
                 intent=intent,
                 category_id=active_category.category_id if active_category else None,
             )
+            if intent in {Intent.SEARCH, Intent.DOWNLOAD}:
+                structured_goal = await self._goal_state.active_goal(session_id)
+                acquisition_continuation = bool(
+                    intent == Intent.SEARCH
+                    and structured_goal is not None
+                    and getattr(structured_goal, "result_sets", None)
+                )
+            else:
+                structured_goal = None
+            if active_category is None and structured_goal is not None:
+                goal_category_id = str(getattr(structured_goal, "category_id", "") or "")
+                if goal_category_id and getattr(structured_goal, "result_sets", None) and self._category_registry:
+                    continued_category = self._category_registry.get(goal_category_id)
+                    if continued_category is not None:
+                        active_category = continued_category
+                        agent_context.category_id = goal_category_id
+                        logger.debug(
+                            "Continued acquisition category from structured goal state: session={} category={}",
+                            session_id,
+                            goal_category_id,
+                        )
 
         category_guidance = ""
         category_context_text = ""
@@ -524,10 +599,17 @@ class AIAssistant:
             active_category_id=active_category.category_id if active_category else None,
         )
 
-        allowed_tool_names = self._tool_policy.allowed_tool_names(intent, category=active_category)
+        allowed_tool_names = self._tool_policy.allowed_tool_names(
+            intent,
+            category=active_category,
+            acquisition_continuation=acquisition_continuation,
+        )
         agent_context.allowed_tool_names = sorted(allowed_tool_names)
         tool_definitions = self._tool_policy.definitions_for_intent(
-            self._tool_registry, intent, category=active_category,
+            self._tool_registry,
+            intent,
+            category=active_category,
+            acquisition_continuation=acquisition_continuation,
         )
         system_prompt = self._append_live_tool_contract(system_prompt, allowed_tool_names, tool_definitions)
         logger.debug(
@@ -650,11 +732,16 @@ class AIAssistant:
         if history_str:
             planning_context = f"{planning_context}\n{history_str}"
 
-        if ctx.intent == Intent.DOWNLOAD:
+        if self._uses_live_media_acquisition_loop(ctx):
             agent_plan, plan_exec = None, None
-            ctx.messages[0]["content"] = self._download_tool_loop_contract(
-                ctx.messages[0]["content"]
-            )
+            if ctx.intent == Intent.DOWNLOAD:
+                ctx.messages[0]["content"] = self._download_tool_loop_contract(
+                    ctx.messages[0]["content"]
+                )
+            else:
+                ctx.messages[0]["content"] = self._search_tool_loop_contract(
+                    ctx.messages[0]["content"]
+                )
         else:
             agent_plan, plan_exec, ctx.messages[0]["content"] = (
                 await self._plan_coordinator.prepare_plan(
@@ -727,7 +814,7 @@ class AIAssistant:
                 user_id, item_name=user_prompt[:100],
             )
 
-        await self._ingest_taste_from_turn(
+        await self._dispatch_taste_ingestion(
             user_prompt=user_prompt,
             assistant_response=final_response,
             user_id=user_id,
@@ -778,11 +865,16 @@ class AIAssistant:
         if history_str:
             planning_context = f"{planning_context}\n{history_str}"
 
-        if ctx.intent == Intent.DOWNLOAD:
+        if self._uses_live_media_acquisition_loop(ctx):
             agent_plan, plan_exec = None, None
-            ctx.messages[0]["content"] = self._download_tool_loop_contract(
-                ctx.messages[0]["content"]
-            )
+            if ctx.intent == Intent.DOWNLOAD:
+                ctx.messages[0]["content"] = self._download_tool_loop_contract(
+                    ctx.messages[0]["content"]
+                )
+            else:
+                ctx.messages[0]["content"] = self._search_tool_loop_contract(
+                    ctx.messages[0]["content"]
+                )
         else:
             agent_plan, plan_exec, ctx.messages[0]["content"] = (
                 await self._plan_coordinator.prepare_plan(
@@ -853,7 +945,7 @@ class AIAssistant:
                 user_id, item_name=user_prompt[:100],
             )
 
-        await self._ingest_taste_from_turn(
+        await self._dispatch_taste_ingestion(
             user_prompt=user_prompt,
             assistant_response=stream_executor.last_content,
             user_id=user_id,
@@ -861,6 +953,37 @@ class AIAssistant:
             ctx=ctx,
         )
 
+
+    @staticmethod
+    def _uses_live_media_acquisition_loop(ctx: ExecutionContext) -> bool:
+        """Return whether media acquisition should skip the advisory pre-planner.
+
+        The ordinary agent loop already has the registered search/research tools
+        and task guidance. Running a second LLM planner before SEARCH/DOWNLOAD
+        adds latency and another failure surface without adding execution
+        authority; the live loop can choose the appropriate tool directly.
+        """
+        if ctx.intent == Intent.DOWNLOAD:
+            return True
+        return bool(
+            ctx.intent == Intent.SEARCH
+            and ctx.category_id
+            and "search_media_torrents" in (ctx.allowed_tool_names or set())
+        )
+
+
+    @staticmethod
+    def _search_tool_loop_contract(system_prompt: str) -> str:
+        """Append the compact contract for media-search turns without a pre-planner."""
+        return (
+            system_prompt
+            + "\n\nMEDIA SEARCH AGENT CONTRACT:\n"
+            + "- Use the registered search and metadata tools directly; do not invent tool names or placeholder arguments.\n"
+            + "- Preserve the user's literal title and explicit constraints such as language, year, season, episode, quality, and search scope.\n"
+            + "- search_media_torrents owns category-specific query expansion and candidate identity. Do not replace its structured result with a generic web-search conclusion.\n"
+            + "- If useful candidates are returned, summarize those candidates plainly with stable candidate IDs and the evidence that matters to the user's constraints.\n"
+            + "- Do not claim that nothing was found when the tool returned candidates. Do not claim a download was queued unless a queue tool actually returned a verified queue receipt.\n"
+        )
 
     @staticmethod
     def _download_tool_loop_contract(system_prompt: str) -> str:
@@ -883,11 +1006,47 @@ class AIAssistant:
             + "- Apply configured media language as a constraint when the category context/tool result provides it. Use category guidance for language-tag semantics and do not invent cross-category language priorities.\n"
             + "- If storage context is WARNING/CRITICAL and a candidate size is known, call check_storage_capacity before claiming it cannot fit; deterministic storage math belongs to that tool/queue preflight, not prose guesses.\n"
             + "- Queue only when the chosen candidate or batch is clear and queue_download confirms status=queued or returns download IDs.\n"
+            + "- If the current message selects a stable candidate you previously showed, call queue_download with that candidate_id/result_set_id. The queue boundary treats that later selection as confirmation for soft warnings on that exact candidate; hard blockers remain non-overridable. Do not transfer that confirmation to a substitute candidate or ask the same soft confirmation again.\n"
             + "- If any state-changing download tool runs (queue, cancel, remove, pause, resume, restart, priority), the final answer must explicitly report each action result with any download_id/status returned by the tool. Do not bury or omit a cancellation because you then searched again.\n"
             + "- Do not cancel/remove an already queued or active download merely because the user asks for a better match or corrects constraints. Treat that as a search/refinement first; cancel/remove only after explicit user instruction or confirmation from a manage_downloads confirmation_required result.\n"
             + "- Never say a download was queued, started, cancelled, paused, resumed, or removed unless the latest tool result explicitly reports that state change.\n"
             + "- If a tool returns ok=false with recoverable=true, adjust the next tool call using its next_actions instead of ending with a crash.\n"
         )
+
+    async def _dispatch_taste_ingestion(
+        self,
+        *,
+        user_prompt: str,
+        assistant_response: str,
+        user_id: str | None,
+        session_id: str | None,
+        ctx: ExecutionContext,
+    ) -> None:
+        """Run post-turn taste work without extending a production chat turn.
+
+        The WebSocket remains busy until ``run_stream`` finishes. Awaiting a
+        separate model-based taste extraction here previously kept Send/Stop
+        locked for more than a minute after the visible response. Production
+        injects the shared ``TaskSupervisor`` and owns this as a best-effort
+        one-shot task. Dependency-light tests keep deterministic awaited
+        behavior when no supervisor is supplied.
+        """
+        if not self._taste_signal_ingestor:
+            return
+        kwargs = {
+            "user_prompt": user_prompt,
+            "assistant_response": assistant_response,
+            "user_id": user_id,
+            "session_id": session_id,
+            "ctx": ctx,
+        }
+        if self._task_supervisor is not None and hasattr(self._task_supervisor, "spawn_one_shot"):
+            self._task_supervisor.spawn_one_shot(
+                "assistant_taste_ingestion",
+                lambda: self._ingest_taste_from_turn(**kwargs),
+            )
+            return
+        await self._ingest_taste_from_turn(**kwargs)
 
     async def _ingest_taste_from_turn(
         self,
