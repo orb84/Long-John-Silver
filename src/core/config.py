@@ -30,6 +30,7 @@ from src.core.models import (
     SecurityConfig,
     Settings,
     SharingSettings,
+    MCPSettings,
     SoulseekSettings,
     StorageConfig,
     WebSearchConfig,
@@ -236,6 +237,8 @@ class SettingsManager:
             settings.soulseek = SoulseekSettings(**{**settings.soulseek.model_dump(), **data['soulseek']})
         if 'embeddings' in data and isinstance(data['embeddings'], dict):
             settings.embeddings = EmbeddingSettings(**{**settings.embeddings.model_dump(), **data['embeddings']})
+        if 'mcp' in data and isinstance(data['mcp'], dict):
+            settings.mcp = MCPSettings(**{**settings.mcp.model_dump(), **data['mcp']})
         if 'tracked_items' in data:
             settings.tracked_items = self._deserialize_tracked_items(data['tracked_items'])
         if 'bandwidth_schedules' in data and isinstance(data['bandwidth_schedules'], list):
@@ -245,7 +248,7 @@ class SettingsManager:
                 if isinstance(item, (dict, BandwidthSchedule))
             ]
         for key, value in data.items():
-            if key in {'llm', 'web_search', 'storage', 'security', 'sharing', 'soulseek', 'embeddings', 'tracked_items', 'bandwidth_schedules', 'category_settings', 'library_paths'}:
+            if key in {'llm', 'web_search', 'storage', 'security', 'sharing', 'soulseek', 'embeddings', 'mcp', 'tracked_items', 'bandwidth_schedules', 'category_settings', 'library_paths'}:
                 continue
             if hasattr(settings, key) and value is not None:
                 if key == 'default_quality' and isinstance(value, dict):

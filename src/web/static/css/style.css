@@ -3840,3 +3840,68 @@ body.llm-diagnostics-open { overflow: hidden; }
   .llm-route-source,
   .llm-route-summary-heading span { grid-column: 1 / -1; text-align: left; }
 }
+
+/* ─── Round 296: MCP connection/settings panel ─────────────────── */
+.setting-status {
+  padding: 10px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: rgba(255,255,255,.035);
+  color: var(--text-dim);
+  font-size: .86rem;
+  line-height: 1.45;
+}
+.setting-status.success {
+  border-color: rgba(42,157,143,.38);
+  background: rgba(42,157,143,.10);
+  color: var(--accent-teal);
+}
+.setting-status.danger {
+  border-color: rgba(231,111,81,.34);
+  background: rgba(231,111,81,.09);
+  color: var(--accent-red);
+}
+.mcp-copy-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  width: 100%;
+  align-items: center;
+}
+.mcp-copy-row input {
+  min-width: 0;
+}
+.mcp-instructions {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 12px 14px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: rgba(0,0,0,.14);
+}
+.mcp-instructions p {
+  margin: 0;
+  line-height: 1.5;
+}
+.mcp-client-config {
+  margin: 6px 0 0;
+  padding: 12px;
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 10px;
+  background: rgba(0,0,0,.30);
+  color: var(--text-main);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+@media (max-width: 780px) {
+  .mcp-copy-row {
+    grid-template-columns: 1fr auto;
+  }
+  .mcp-copy-row button:last-child:nth-child(3) {
+    grid-column: 1 / -1;
+  }
+}

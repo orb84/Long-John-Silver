@@ -1,16 +1,16 @@
-"""Configuration for LJS's local MCP transport adapter."""
+"""Validated configuration for LJS's local MCP transport adapter."""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+from typing import Iterable
 
-from src.core.models import InvocationCapability
+from src.core.models import InvocationCapability, MCPSettings
 
 
 @dataclass(frozen=True, slots=True)
 class MCPIntegrationSettings:
-    """Environment-backed settings for the opt-in local MCP endpoint."""
+    """Immutable runtime settings derived from persisted application settings."""
 
     enabled: bool
     bearer_token: str
@@ -20,7 +20,7 @@ class MCPIntegrationSettings:
     capabilities: frozenset[InvocationCapability]
     mount_path: str = "/mcp"
 
-    _DEFAULT_CAPABILITIES = frozenset(
+    DEFAULT_CAPABILITIES = frozenset(
         {
             InvocationCapability.AGENT_DELEGATE,
             InvocationCapability.AGENT_READ,
@@ -33,47 +33,31 @@ class MCPIntegrationSettings:
     )
 
     @classmethod
-    def from_environment(cls) -> "MCPIntegrationSettings":
-        """Load a fail-closed local MCP configuration from environment variables."""
-        enabled = cls._truthy(os.getenv("LJS_MCP_ENABLED", "0"))
-        token = str(os.getenv("LJS_MCP_TOKEN", "") or "").strip()
-        principal_id = str(os.getenv("LJS_MCP_PRINCIPAL_ID", "mcp-local") or "mcp-local").strip()
-        user_id = str(os.getenv("LJS_MCP_USER_ID", "local") or "local").strip() or "local"
-        client_id = str(os.getenv("LJS_MCP_CLIENT_ID", principal_id) or principal_id).strip() or principal_id
-        configured = str(os.getenv("LJS_MCP_CAPABILITIES", "") or "").strip()
-        if not enabled:
-            return cls(
-                enabled=False,
-                bearer_token=token,
-                principal_id=principal_id,
-                user_id=user_id,
-                client_id=client_id,
-                capabilities=cls._DEFAULT_CAPABILITIES,
-            )
-        capabilities = cls._parse_capabilities(configured) if configured else cls._DEFAULT_CAPABILITIES
-        if not token:
-            raise ValueError("LJS_MCP_TOKEN is required when LJS_MCP_ENABLED=1")
-        if len(token) < 32:
-            raise ValueError("LJS_MCP_TOKEN must be at least 32 characters when configured")
+    def from_application(cls, settings: MCPSettings) -> "MCPIntegrationSettings":
+        """Build fail-closed runtime settings from the canonical Settings model."""
+        configured = cls._parse_capabilities(settings.capabilities)
+        capabilities = configured or cls.DEFAULT_CAPABILITIES
+        token = str(settings.bearer_token or "").strip()
+        if settings.enabled:
+            if not token:
+                raise ValueError("MCP bearer token is required when MCP is enabled")
+            if len(token) < 32:
+                raise ValueError("MCP bearer token must be at least 32 characters")
         return cls(
-            enabled=enabled,
+            enabled=bool(settings.enabled),
             bearer_token=token,
-            principal_id=principal_id,
-            user_id=user_id,
-            client_id=client_id,
+            principal_id=str(settings.principal_id or "mcp-local").strip() or "mcp-local",
+            user_id=str(settings.user_id or "local").strip() or "local",
+            client_id=str(settings.client_id or settings.principal_id or "mcp-local").strip() or "mcp-local",
             capabilities=capabilities,
         )
 
-    @staticmethod
-    def _truthy(value: str) -> bool:
-        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-    @staticmethod
-    def _parse_capabilities(value: str) -> frozenset[InvocationCapability]:
+    @classmethod
+    def _parse_capabilities(cls, values: Iterable[str]) -> frozenset[InvocationCapability]:
         resolved: set[InvocationCapability] = set()
         invalid: list[str] = []
-        for raw in value.split(","):
-            name = raw.strip()
+        for raw in values or []:
+            name = str(raw or "").strip()
             if not name:
                 continue
             try:
@@ -81,5 +65,5 @@ class MCPIntegrationSettings:
             except ValueError:
                 invalid.append(name)
         if invalid:
-            raise ValueError(f"Unknown LJS_MCP_CAPABILITIES values: {', '.join(sorted(invalid))}")
+            raise ValueError(f"Unknown MCP capability values: {', '.join(sorted(invalid))}")
         return frozenset(resolved)

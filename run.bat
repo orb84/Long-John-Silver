@@ -133,11 +133,12 @@ if not exist "requirements.txt" (
 )
 
 set "NEEDS_INSTALL=0"
-if not exist "%VENV_DIR%\.deps_installed" set "NEEDS_INSTALL=1"
-if exist "%VENV_DIR%\.deps_installed" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "if ((Get-Item 'requirements.txt').LastWriteTimeUtc -gt (Get-Item '%VENV_DIR%\.deps_installed').LastWriteTimeUtc) { exit 0 } else { exit 1 }" >nul 2>nul
-    if not errorlevel 1 set "NEEDS_INSTALL=1"
-)
+set "REQUIREMENTS_HASH="
+for /f "usebackq delims=" %%H in (`"%VENV_PYTHON%" -c "import hashlib; print(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest())"`) do set "REQUIREMENTS_HASH=%%H"
+set "INSTALLED_REQUIREMENTS_HASH="
+if exist "%VENV_DIR%\.deps_installed" set /p INSTALLED_REQUIREMENTS_HASH=<"%VENV_DIR%\.deps_installed"
+if not defined INSTALLED_REQUIREMENTS_HASH set "NEEDS_INSTALL=1"
+if /I not "!INSTALLED_REQUIREMENTS_HASH!"=="!REQUIREMENTS_HASH!" set "NEEDS_INSTALL=1"
 if /I "%ACTION%"=="update" set "NEEDS_INSTALL=1"
 if /I "%ACTION%"=="install" set "NEEDS_INSTALL=1"
 
@@ -153,7 +154,7 @@ if "%NEEDS_INSTALL%"=="1" (
     echo [LJS] Optional bridges:
     echo     %VENV_PYTHON% -m pip install discord.py           [Discord bot]
     echo     %VENV_PYTHON% -m pip install python-telegram-bot  [Telegram bot]
-    type nul > "%VENV_DIR%\.deps_installed"
+    > "%VENV_DIR%\.deps_installed" echo !REQUIREMENTS_HASH!
     echo [LJS] Dependencies installed.
 )
 

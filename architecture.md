@@ -3235,32 +3235,53 @@ overrides are honored for routing but are **not** credential-owned, so provider
 secrets do not silently follow them. Explicit task/tier custom endpoints also do
 not inherit the global provider secret.
 
-### MCP transport and authentication
+### MCP transport, Settings ownership, and live lifecycle
 
-The first MCP implementation is opt-in Streamable HTTP mounted at `/mcp` in the
-**already-running LJS FastAPI process**. The top-level FastAPI lifespan owns the
-MCP SDK session manager. Starting MCP must never initialize another LJS
-scheduler, downloader, database runtime, sidecar manager, or assistant.
+Local MCP is opt-in Streamable HTTP mounted at `/mcp` in the **already-running
+LJS FastAPI process**. MCP configuration is canonical application Settings
+(`Settings.mcp`), persisted in ignored `config/settings.local.yaml`; environment
+variables no longer decide whether the server exists.
 
-The transport is intentionally local-only. `LocalMCPNetworkBoundary` rejects
-non-loopback clients and missing/unknown ASGI client origins, even when the rest
-of LJS is bound to `0.0.0.0`. `MCPAuthenticationBoundary` authenticates once at
-the outer ASGI boundary and propagates the immutable validated principal through
+`/mcp` itself is mounted once through `MCPDynamicMount`. The top-level FastAPI
+lifespan starts one `MCPRuntimeController` worker. This worker owns every
+`session_manager.run()` enter/exit for the lifetime of the process. A Compass
+Settings mutation sends an apply/disable command to that worker and awaits the
+actual transition. This avoids crossing AnyIO/SDK context ownership between
+unrelated HTTP request tasks while still making the switch live without a
+process restart.
+
+Runtime replacement is sequential rather than nested: the owner worker detaches
+and closes the current SDK context before entering a replacement context. The
+controller owns the transaction around that worker transition: if replacement,
+persistence, or the initiating Settings request fails, it best-effort restores
+the previous persisted configuration and previous runtime. The worker still
+finishes any already-queued SDK transition before cancellation propagates, so
+live runtime and persisted Settings do not split-brain.
+
+The Settings surface is `Compass → MCP — External LLM Control`. It exposes live
+status, exact loopback endpoint based on the actual `LJS_PORT`, dedicated token,
+user binding, bounded capability controls and generic Streamable-HTTP client
+instructions. First enable generates a strong token automatically. Generic
+`/api/settings` redacts that secret; `/api/settings/mcp` is the dedicated
+Settings UI contract.
+
+The transport remains local-only. `LocalMCPNetworkBoundary` rejects non-loopback
+clients and missing/unknown ASGI client origins even when the rest of LJS is
+bound to `0.0.0.0`. `MCPAuthenticationBoundary` authenticates once at the outer
+ASGI boundary and propagates the immutable validated principal through
 `MCPRequestPrincipalContext`.
 
-Local MCP v1 accepts only the dedicated `LJS_MCP_TOKEN` (minimum 32 characters).
-Generic LJS Web JWTs are not MCP credentials and are never widened into `admin`.
-`LJS_MCP_USER_ID` selects the canonical LJS user whose preferences/history are
-used by delegated turns. `local` may be created by normal local-session bootstrap;
-any other configured user id must already exist. `LJS_MCP_CLIENT_ID` participates
-in handle ownership.
-One token/principal/client tuple should represent one local external agent.
+Local MCP v1 accepts only the dedicated persisted bearer token. Generic LJS Web
+JWTs are not MCP credentials. The configured `user_id` selects the canonical LJS
+user whose preferences/history are used by delegated turns; any non-`local` id
+must already exist before activation. One token/principal/client tuple represents
+one local external agent.
 
 Remote MCP is a separate future feature and requires a real TLS/OAuth resource
 server design. LJS must not publish fake discovery metadata or weaken the local
 boundary to simulate it.
 
-Current public MCP tools are deliberately small:
+Current public MCP tools remain deliberately small:
 
 - `ljs.agent_message`, `ljs.agent_cancel`, `ljs.agent_close`;
 - `ljs.status`, `ljs.capabilities`;
@@ -3270,14 +3291,24 @@ Current public MCP tools are deliberately small:
 - `ljs.diagnostics_recent`.
 
 Bounded JSON resources expose status, capabilities, a first library summary
-page, active downloads, and LLM configuration. No stdio runtime owner, remote
-MCP, public raw acquisition tools, arbitrary action executor, or MCP Tasks clone
-is part of this slice.
+page, active downloads, and LLM configuration. These are **static MCP resources**:
+their registered handlers are zero-argument methods and must not request SDK
+`Context` injection. Authentication still happens at the outer ASGI boundary;
+the already-validated principal is read from `MCPRequestPrincipalContext` inside
+the resource handler. This keeps per-request authorization without violating the
+MCP Python SDK contract that reserves injected `Context` for tools/prompts and
+resource templates with URI variables. `check_mcp_architecture.py` and the
+dependency-light MCP acceptance registrar both fail if a static resource handler
+acquires parameters again.
+
+No stdio runtime owner, remote MCP, public raw acquisition tools, arbitrary
+action executor, or MCP Tasks clone is part of this slice.
 
 Verify this boundary with:
 
 ```bash
 python -m compileall -q src scripts main.py
+node --check src/web/static/js/components/settingsPanel.js
 PYTHONPATH=. python scripts/mcp_control_plane_tests.py
 PYTHONPATH=. python scripts/check_mcp_architecture.py
 PYTHONPATH=. python scripts/round293_ella_search_selection_cancel_tests.py
@@ -3291,7 +3322,3 @@ PYTHONPATH=. python scripts/check_compatibility_shims.py
 PYTHONPATH=. python scripts/check_architecture.py
 PYTHONPATH=. pytest -q
 ```
-
-The real SDK/HTTP acceptance protocol is documented in
-`MCP_LIVE_ACCEPTANCE_LOCAL_AGENT_2026-08-15.md` and must run against the same
-normally started LJS process; it must not bootstrap a second runtime.

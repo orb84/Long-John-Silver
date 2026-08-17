@@ -23,6 +23,7 @@ class SettingsPanel extends Component {
         this._activePersona = null;
         this._llmModelCache = {};
         this._llmRouting = { config_revision: 0, routes: [] };
+        this._mcp = null;
 
         if (this.container) {
             this.render();
@@ -43,6 +44,7 @@ class SettingsPanel extends Component {
 
         const grid = DOM.el('div', { className: 'settings-grid compass-settings-grid' }, [
             this._buildAppPanel(),
+            this._buildMcpPanel(),
             this._buildPersonaPanel(),
             this._buildDownloadsPanel(),
             this._buildSharingPanel(),
@@ -75,6 +77,7 @@ class SettingsPanel extends Component {
         this._setVal('pref-max-dl-speed', defaultQuality.max_download_speed_kbps || '');
         this._setVal('pref-max-ul-speed', defaultQuality.max_upload_speed_kbps || '');
         this._setCheck('pref-auto-start', !!this._settings.auto_start_at_login);
+        this._populateMCP();
         this._setCheck('pref-auto-download', !!this._settings.auto_download);
         this._setCheck('pref-auto-discover', !!this._settings.auto_discover);
         this._setVal('pref-stall-interval', this._settings.stall_check_interval_minutes || '30');
@@ -209,6 +212,86 @@ class SettingsPanel extends Component {
             this._setCheck('pref-auto-start', !!result.auto_start_at_login);
         } catch (err) {
             toast.error(err.message);
+        }
+    }
+
+    /**
+     * Apply MCP enablement, user binding, action grants, and optional token rotation.
+     *
+     * @param {Object} options - Optional mutation flags.
+     * @param {boolean} [options.regenerateToken=false] - Rotate the dedicated MCP token.
+     */
+    async saveMCP(options = {}) {
+        const currentCaps = Array.isArray((this._mcp || {}).capabilities) ? [...this._mcp.capabilities] : [];
+        const capabilitySet = new Set(currentCaps);
+        ['downloads.write', 'tracking.write'].forEach(capability => capabilitySet.delete(capability));
+        if (!!(document.getElementById('pref-mcp-agent-actions') || {}).checked) {
+            capabilitySet.add('downloads.write');
+            capabilitySet.add('tracking.write');
+        }
+        try {
+            this._mcp = await APIClient.post('/api/settings/mcp', {
+                enabled: !!(document.getElementById('pref-mcp-enabled') || {}).checked,
+                user_id: this._valueById('pref-mcp-user-id', 'local').trim() || 'local',
+                capabilities: Array.from(capabilitySet),
+                regenerate_token: !!options.regenerateToken
+            });
+            this._populateMCP();
+            if (this._mcp.running) toast.show('MCP is enabled and running.');
+            else if (!this._mcp.enabled) toast.show('MCP is disabled.');
+            else toast.error(this._mcp.last_error || 'MCP is enabled but did not start.');
+        } catch (err) {
+            toast.error(err.message);
+            await this._refreshMCP();
+        }
+    }
+
+    async _refreshMCP() {
+        try {
+            this._mcp = await APIClient.get('/api/settings/mcp');
+            this._populateMCP();
+        } catch (err) {
+            console.error('[SettingsPanel] Failed to load MCP status:', err);
+        }
+    }
+
+    async _copyMCPValue(field) {
+        const value = field === 'token' ? String((this._mcp || {}).bearer_token || '') : String((this._mcp || {}).endpoint || '');
+        if (!value) {
+            toast.error(`No MCP ${field} is available yet.`);
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(value);
+            toast.show(`MCP ${field === 'token' ? 'token' : 'address'} copied.`);
+        } catch (err) {
+            toast.error(`Could not copy MCP ${field}: ${err.message}`);
+        }
+    }
+
+    _populateMCP() {
+        const mcp = this._mcp || {};
+        this._setCheck('pref-mcp-enabled', !!mcp.enabled);
+        this._setCheck('pref-mcp-agent-actions', (mcp.capabilities || []).includes('downloads.write') && (mcp.capabilities || []).includes('tracking.write'));
+        this._setVal('pref-mcp-user-id', mcp.user_id || 'local');
+        this._setVal('pref-mcp-address', mcp.endpoint || 'http://127.0.0.1:8088/mcp');
+        this._setVal('pref-mcp-token', mcp.bearer_token || '');
+        const status = document.getElementById('pref-mcp-status');
+        if (status) {
+            const state = mcp.running ? 'Running' : (mcp.enabled ? 'Enabled, not running' : 'Disabled');
+            const detail = mcp.last_error ? ` — ${mcp.last_error}` : (mcp.running ? ' — ready for Streamable HTTP MCP clients on this machine.' : '');
+            status.textContent = `${state}${detail}`;
+            status.className = `setting-status ${mcp.running ? 'success' : (mcp.enabled ? 'danger' : 'neutral')}`;
+        }
+        const config = document.getElementById('pref-mcp-client-config');
+        if (config) {
+            const endpoint = mcp.endpoint || 'http://127.0.0.1:8088/mcp';
+            const token = mcp.bearer_token || '<token generated when enabled>';
+            config.textContent = JSON.stringify({
+                transport: 'streamable-http',
+                url: endpoint,
+                headers: { Authorization: `Bearer ${token}` }
+            }, null, 2);
         }
     }
 
@@ -876,14 +959,25 @@ class SettingsPanel extends Component {
     }
 
     /**
+     * Public refresh hook used when another view changes persisted settings.
+     */
+    async loadSettings() {
+        return this._init();
+    }
+
+    /**
      * Load settings from the backend and hydrate all panels.
      * @private
      */
     async _init() {
         try {
-            const data = await APIClient.get('/api/settings');
-            const personaData = await APIClient.get('/api/personas');
+            const [data, personaData, mcpData] = await Promise.all([
+                APIClient.get('/api/settings'),
+                APIClient.get('/api/personas'),
+                APIClient.get('/api/settings/mcp')
+            ]);
             this._settings = data.settings || {};
+            this._mcp = mcpData || null;
             this._llmRouting = data.llm_routing || { config_revision: 0, routes: [] };
             this._categories = (data.categories || []).map(cat => ({ ...cat, id: cat.id || cat.category_id }));
             this._personas = personaData.personas || [];
@@ -912,6 +1006,44 @@ class SettingsPanel extends Component {
             ),
             this._saveButton('Save Startup Option', 'fa-solid fa-circle-check', () => this.saveStartup())
         ], 'settings-startup-panel');
+    }
+
+    _buildMcpPanel() {
+        return this._panel('fa-solid fa-plug-circle-bolt', 'MCP — External LLM Control', 'Connect a local MCP-capable LLM client to the same LJS domain agent and bounded control plane.', [
+            this._createSettingItem(
+                'Enable MCP server',
+                'Starts or stops the MCP session manager immediately inside this same LJS process. No second LJS runtime is created.',
+                this._toggle('pref-mcp-enabled', () => this.saveMCP())
+            ),
+            DOM.el('div', { id: 'pref-mcp-status', className: 'setting-status neutral' }, ['Loading MCP status...']),
+            this._sectionTitle('Connection'),
+            this._createSettingItem('MCP address', 'Use this exact Streamable HTTP URL in an MCP client running on the same computer as LJS.', DOM.el('div', { className: 'mcp-copy-row' }, [
+                DOM.el('input', { type: 'text', id: 'pref-mcp-address', readonly: 'readonly' }),
+                DOM.el('button', { type: 'button', className: 'btn btn-sm btn-secondary', onclick: () => this._copyMCPValue('address') }, ['Copy'])
+            ])),
+            this._createSettingItem('Bearer token', 'Send this dedicated token in the Authorization header. Regenerating it immediately invalidates the old MCP credential.', DOM.el('div', { className: 'mcp-copy-row' }, [
+                DOM.el('input', { type: 'password', id: 'pref-mcp-token', readonly: 'readonly', className: 'ljs-secret-input' }),
+                DOM.el('button', { type: 'button', className: 'btn btn-sm btn-secondary', onclick: () => this._copyMCPValue('token') }, ['Copy']),
+                DOM.el('button', { type: 'button', className: 'btn btn-sm btn-secondary', onclick: () => this.saveMCP({ regenerateToken: true }) }, ['Regenerate'])
+            ])),
+            this._createSettingItem('LJS user binding', 'Usually keep this as local. A different ID must already exist in LJS; delegated conversations use that user’s preferences and history.', DOM.el('input', { type: 'text', id: 'pref-mcp-user-id', placeholder: 'local' })),
+            this._createSettingItem('Allow download / tracking actions', 'Optional. When enabled, the delegated agent may queue downloads and change tracking only when the MCP caller explicitly uses agent_message with allow_actions=true. Library deletion remains unavailable.', this._toggle('pref-mcp-agent-actions')),
+            this._sectionTitle('How to configure your LLM / MCP client'),
+            DOM.el('div', { className: 'mcp-instructions' }, [
+                DOM.el('p', {}, ['Configure this in the MCP / Tools / Integrations area of your LLM application or agent host — not in the model provider base-URL field.']),
+                DOM.el('p', {}, ['1. Add a new MCP server using the Streamable HTTP transport.']),
+                DOM.el('p', {}, ['2. Paste the MCP address shown above as the server URL.']),
+                DOM.el('p', {}, ['3. Add an HTTP header named Authorization with value Bearer <the token shown above>.']),
+                DOM.el('p', {}, ['4. Connect/refresh the MCP server. The client should discover LJS tools such as ljs.agent_message, ljs.library_list, and ljs.downloads_list.']),
+                DOM.el('p', { className: 'empty-msg' }, ['Client configuration schemas differ slightly; if your app does not accept the JSON shape below, use its equivalent Streamable HTTP URL and Authorization-header fields.']),
+                DOM.el('p', { className: 'empty-msg' }, ['Important: this release is loopback-only. The MCP client must run on the same machine as LJS; a cloud-hosted LLM service cannot reach 127.0.0.1.']),
+                DOM.el('pre', { id: 'pref-mcp-client-config', className: 'mcp-client-config' }, ['Loading connection example...'])
+            ]),
+            DOM.el('div', { className: 'settings-button-row' }, [
+                this._saveButton('Apply MCP Settings', 'fa-solid fa-circle-check', () => this.saveMCP()),
+                this._saveButton('Refresh MCP Status', 'fa-solid fa-rotate', () => this._refreshMCP(), 'quick-btn btn-secondary')
+            ])
+        ], 'settings-mcp-panel');
     }
 
     /**
@@ -1811,9 +1943,11 @@ class SettingsPanel extends Component {
      * Create a toggle switch control.
      * @private
      */
-    _toggle(id) {
+    _toggle(id, onChange = null) {
+        const attrs = { type: 'checkbox', id };
+        if (onChange) attrs.onchange = onChange;
         return DOM.el('label', { className: 'toggle-switch' }, [
-            DOM.el('input', { type: 'checkbox', id }),
+            DOM.el('input', attrs),
             DOM.el('span', { className: 'slider' })
         ]);
     }

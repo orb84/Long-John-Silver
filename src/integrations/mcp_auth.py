@@ -63,7 +63,7 @@ class MCPPrincipalResolver:
         self._settings = settings
 
     async def resolve(self, headers: Mapping[str, str] | None) -> InvocationPrincipal:
-        """Authenticate one HTTP MCP request using only ``LJS_MCP_TOKEN``."""
+        """Authenticate one HTTP MCP request using the dedicated persisted MCP token."""
         token = self._bearer_token(headers)
         configured = self._settings.bearer_token
         if not token or not configured or not secrets.compare_digest(token, configured):

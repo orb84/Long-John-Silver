@@ -60,10 +60,7 @@ from src.core.public_control_plane import (
     PublicStatusService,
 )
 from src.core.public_control_plane_facade import PublicControlPlane
-from src.integrations.mcp_auth import MCPPrincipalResolver
-from src.integrations.mcp_configuration import MCPIntegrationSettings
-from src.integrations.mcp_runtime import MCPHostRuntime
-from src.integrations.mcp_server import MCPServerAdapter
+from src.integrations.mcp_runtime import MCPHostRuntime, MCPRuntimeController
 from src.utils.async_boundary import AsyncBoundary
 
 
@@ -155,44 +152,42 @@ def create_app(*, runtime_build_id: str | None = None, **kwargs: Any) -> FastAPI
     deps.action_gateway = action_gateway
     deps.tool_registry = tool_registry
 
-    ActionRegistrationService(action_gateway, deps).register_all()
+    control_plane = PublicControlPlane(
+        agent=AgentDelegationService(
+            ChatSessionRunner(deps.assistant),
+            chat_turns,
+            ConversationHandleService(deps.db),
+        ),
+        status=PublicStatusService(deps.storage_monitor),
+        library=PublicLibraryService(
+            settings_manager=deps.settings_manager,
+            database=deps.db,
+            downloader=deps.downloader,
+            category_registry=deps.category_registry,
+        ),
+        downloads=PublicDownloadService(deps.downloader),
+        llm=PublicLLMConfigurationService(
+            settings_manager=deps.settings_manager,
+            assistant=deps.assistant,
+            llm_manager=deps.llm_manager,
+            action_gateway=action_gateway,
+        ),
+        diagnostics=PublicDiagnosticsService(deps.llm_activity_monitor),
+    )
+    mcp_controller = MCPRuntimeController(
+        settings_manager=deps.settings_manager,
+        control_plane=control_plane,
+        database=deps.db,
+        auth_service=deps.auth_service,
+    )
+    deps.mcp_controller = mcp_controller
+    app.state.mcp_controller = mcp_controller
+    mcp_runtime.configure(mcp_controller)
+    app.mount("/mcp", mcp_controller.asgi_app, name="mcp")
 
-    mcp_settings = MCPIntegrationSettings.from_environment()
-    app.state.mcp_adapter = None
-    if mcp_settings.enabled:
-        control_plane = PublicControlPlane(
-            agent=AgentDelegationService(
-                ChatSessionRunner(deps.assistant),
-                chat_turns,
-                ConversationHandleService(deps.db),
-            ),
-            status=PublicStatusService(deps.storage_monitor),
-            library=PublicLibraryService(
-                settings_manager=deps.settings_manager,
-                database=deps.db,
-                downloader=deps.downloader,
-                category_registry=deps.category_registry,
-            ),
-            downloads=PublicDownloadService(deps.downloader),
-            llm=PublicLLMConfigurationService(
-                settings_manager=deps.settings_manager,
-                assistant=deps.assistant,
-                llm_manager=deps.llm_manager,
-                action_gateway=action_gateway,
-            ),
-            diagnostics=PublicDiagnosticsService(deps.llm_activity_monitor),
-        )
-        mcp_adapter = MCPServerAdapter(
-            control_plane=control_plane,
-            principal_resolver=MCPPrincipalResolver(
-                settings=mcp_settings,
-                auth_service=deps.auth_service,
-                database=deps.db,
-            ),
-        )
-        mcp_runtime.configure(mcp_adapter)
-        app.mount(mcp_settings.mount_path, mcp_adapter.asgi_app, name="mcp")
-        app.state.mcp_adapter = mcp_adapter
+    # Register mutations only after the runtime controller exists so the
+    # Settings action can start/stop MCP through the same audited gateway.
+    ActionRegistrationService(action_gateway, deps).register_all()
 
     downloader = deps.downloader
     stats_callback_result = downloader.set_stats_callback(

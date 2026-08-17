@@ -1,5 +1,74 @@
 # LJS Progress
 
+## 2026-08-17 — Round 297 MCP static-resource registration fix
+
+Round 296 could fail while enabling the MCP runtime before the server ever
+became live. The MCP Python SDK v2 rejects injected `Context` parameters on
+**static** resources (fixed URIs such as `ljs://status`); LJS registered all five
+static resources with `ctx: Context`, so adapter construction raised during the
+Settings transition.
+
+Fixed:
+
+- all five fixed MCP resource handlers are now zero-argument handlers;
+- per-request authorization remains enforced by the outer ASGI authentication
+  boundary and `MCPRequestPrincipalContext`, so removing SDK `Context` does not
+  bypass principal/capability checks;
+- the dependency-light fake SDK registrar now rejects parameters on static
+  resource handlers, reproducing the real SDK registration rule;
+- `check_mcp_architecture.py` independently audits registered fixed-resource
+  handler signatures so this startup failure cannot silently return;
+- the real-machine MCP probe now **reads every static resource**, not only lists
+  the resource catalog, proving authenticated principal propagation through the
+  actual SDK/runtime;
+- architecture documentation records the static-resource/Context boundary.
+
+Final feasible validation: MCP control-plane and MCP architecture guards PASS;
+Round-293 cancellation/search incident PASS; AI intent/context, security,
+category, public-doc and model-facade guards PASS; JavaScript and launcher
+syntax PASS; full architecture review reports **0 HARD findings**. The sandbox
+still cannot install/import the real MCP SDK, so the dependency-complete live
+probe remains a real-machine gate rather than a claimed local result.
+
+## 2026-08-17 — Round 296 MCP Settings and live runtime control
+
+MCP is now a normal application-owned integration instead of a hidden
+environment-variable feature. Compass contains a dedicated MCP panel with live
+enable/disable, exact loopback address, generated bearer token, canonical user
+binding, bounded action capability toggle, runtime status/error display, and a
+pasteable Streamable-HTTP client configuration example.
+
+The backend now persists `Settings.mcp` in ignored local settings and always
+mounts a small `/mcp` dispatcher. A lifespan-owned `MCPRuntimeController` worker
+is the only task that enters/exits MCP SDK session-manager contexts; Settings
+requests command that worker and wait for the observed transition. This makes
+the switch genuinely live without bootstrapping another LJS runtime or crossing
+AnyIO context ownership between HTTP request tasks. Runtime replacements are
+sequential (never nested), cancelled Settings requests restore prior runtime
+state, and non-local user bindings are validated before activation.
+
+The old `LJS_MCP_*` server environment configuration has been removed from the
+operator contract. First enable generates the dedicated token automatically. If
+the installed virtualenv predates the MCP dependency, the app remains healthy
+and Compass reports the exact dependency/startup error with launcher update
+instructions instead of silently appearing dead.
+
+The launchers now track the SHA-256 content of `requirements.txt` rather than
+comparing archive/file modification times. A project update that adds the MCP
+SDK therefore forces dependency installation even when a ZIP preserved an older
+`requirements.txt` timestamp.
+
+Validation for this round includes dependency-light fake-SDK runtime tests that
+prove live enable/disable/regeneration, same-task/LIFO SDK context ownership,
+rollback after a cancelled Settings update, rollback after a failed live runtime
+replacement, and rollback after a persistence failure that occurred after the
+candidate state was written. Final provider-free/static gates pass, including
+the Round-293 cancellation/search incident test and the architecture audit with
+0 HARD findings. Real SDK/network acceptance remains explicitly documented in
+`MCP_LIVE_ACCEPTANCE_LOCAL_AGENT_2026-08-17.md`; this sandbox cannot execute it
+because `aiosqlite`, `mcp`, `httpx2`, and `litellm` are not installed and package
+index access is unavailable.
+
 ## 2026-08-15 — Round 295 MCP security/truth repair
 
 Deep adversarial review of the first MCP slice found release-blocking authority

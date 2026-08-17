@@ -70,6 +70,7 @@ class MCPLiveAcceptance:
             transport = streamable_http_client(self._url, http_client=http_client)
             async with Client(transport) as client:
                 await self._check_catalog(client)
+                await self._check_static_resources(client)
                 await self._check_reads(client)
                 await self._check_read_only_write_denial(client)
                 await self._check_read_only_probe_denial(client)
@@ -125,6 +126,16 @@ class MCPLiveAcceptance:
             "tools": sorted(tool_names),
             "resources": sorted(resource_uris),
         }
+
+    async def _check_static_resources(self, client: Client) -> None:
+        """Read every fixed resource so registration and request-principal propagation are proven live."""
+        read: dict[str, int] = {}
+        for uri in sorted(self.EXPECTED_RESOURCES):
+            result = await client.read_resource(uri)
+            if not result.contents:
+                raise AssertionError(f"Static MCP resource {uri} returned no content")
+            read[uri] = len(result.contents)
+        self._evidence["checks"]["static_resources"] = read
 
     async def _check_reads(self, client: Client) -> None:
         status = self._structured(await client.call_tool("ljs.status", {}))
@@ -314,11 +325,11 @@ class MCPLiveAcceptanceCLI:
     def run() -> int:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--url", default=os.getenv("LJS_MCP_URL", "http://127.0.0.1:8088/mcp"))
-        parser.add_argument("--token", default=os.getenv("LJS_MCP_TOKEN", ""))
+        parser.add_argument("--token", default=os.getenv("LJS_MCP_ACCEPTANCE_TOKEN", ""))
         parser.add_argument("--evidence", default="mcp_live_acceptance_evidence.json")
         args = parser.parse_args()
         if not args.token:
-            parser.error("Provide --token or set LJS_MCP_TOKEN")
+            parser.error("Provide --token or set LJS_MCP_ACCEPTANCE_TOKEN")
         evidence = asyncio.run(MCPLiveAcceptance(url=args.url, token=args.token).run())
         evidence_path = Path(args.evidence)
         evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True, ensure_ascii=False) + "\n")

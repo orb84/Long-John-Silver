@@ -56,6 +56,8 @@ class SettingsRouter:
         router.add_api_route("/api/settings/whatsapp", self._update_whatsapp, methods=["POST"])
         router.add_api_route("/api/settings/sharing", self._update_sharing, methods=["POST"])
         router.add_api_route("/api/settings/startup", self._update_startup, methods=["POST"])
+        router.add_api_route("/api/settings/mcp", self._get_mcp, methods=["GET"])
+        router.add_api_route("/api/settings/mcp", self._update_mcp, methods=["POST"])
         router.add_api_route("/api/settings/taste-signals", self._list_taste_signals, methods=["GET"])
         router.add_api_route("/api/settings/taste-signals/{signal_id}", self._update_taste_signal, methods=["POST"])
         router.add_api_route("/api/settings/taste-signals/{signal_id}", self._delete_taste_signal, methods=["DELETE"])
@@ -92,8 +94,11 @@ class SettingsRouter:
             candidate_summary = route_summary_method()
             if isinstance(candidate_summary, dict):
                 route_summary = candidate_summary
+        settings_payload = self._deps.settings_manager.settings.model_dump()
+        if isinstance(settings_payload.get("mcp"), dict):
+            settings_payload["mcp"].pop("bearer_token", None)
         return {
-            "settings": self._deps.settings_manager.settings.model_dump(),
+            "settings": settings_payload,
             "llm_routing": route_summary,
             "categories": categories,
             "config_files": {
@@ -535,6 +540,43 @@ class SettingsRouter:
         """Update launch-at-login preference and OS entry."""
         body = await request.json()
         return await self._execute_action('settings_update_startup', {'enabled': bool(body.get('enabled'))})
+
+    async def _get_mcp(self, request: Request, _auth: bool = Depends(verify_auth)) -> dict:
+        """Return local MCP configuration, live runtime state, and client setup data."""
+        controller = self._deps.mcp_controller
+        if controller is None:
+            raise HTTPException(status_code=503, detail="MCP runtime controller is unavailable")
+        payload = controller.snapshot(include_token=True)
+        endpoint = self._mcp_endpoint(request)
+        token = str(payload.get("bearer_token") or "")
+        payload["endpoint"] = endpoint
+        payload["client_config"] = {
+            "transport": "streamable-http",
+            "url": endpoint,
+            "headers": {"Authorization": f"Bearer {token}" if token else "Bearer <token>"},
+        }
+        return payload
+
+    async def _update_mcp(self, request: Request, _auth: bool = Depends(verify_auth)) -> dict:
+        """Apply local MCP settings through the audited runtime action."""
+        body = await request.json()
+        allowed = {"enabled", "principal_id", "user_id", "client_id", "capabilities", "regenerate_token"}
+        args = {key: body[key] for key in allowed if key in body}
+        result = await self._execute_action("settings_update_mcp", args)
+        endpoint = self._mcp_endpoint(request)
+        token = str(result.get("bearer_token") or "")
+        result["endpoint"] = endpoint
+        result["client_config"] = {
+            "transport": "streamable-http",
+            "url": endpoint,
+            "headers": {"Authorization": f"Bearer {token}" if token else "Bearer <token>"},
+        }
+        return result
+
+    def _mcp_endpoint(self, request: Request) -> str:
+        """Return the loopback-only MCP endpoint using the actual web-server port."""
+        port = getattr(request.app.state, "web_port", None) or self._deps.settings_manager.settings.web_port
+        return f"http://127.0.0.1:{int(port)}/mcp"
 
     async def _update_sharing(self, request: Request, _auth: bool = Depends(verify_auth)):
         """Update seed-in-place library sharing preferences."""

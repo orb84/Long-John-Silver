@@ -29,7 +29,7 @@ class MCPServerAdapter:
 
     def __init__(self, *, control_plane: PublicControlPlane, principal_resolver: MCPPrincipalResolver) -> None:
         if MCPServer is None:
-            raise RuntimeError("MCP is enabled but the 'mcp>=2,<3' package is not installed")
+            raise RuntimeError("MCP runtime dependency is missing. Run ./run.sh update (macOS/Linux) or run.bat update (Windows), then restart LJS.")
         self._control = control_plane
         self._principal_resolver = principal_resolver
         self._server = MCPServer("LJS")
@@ -152,25 +152,30 @@ class MCPServerAdapter:
         principal = await self._principal(ctx)
         return self._control.diagnostics.recent(principal, limit=limit)
 
-    async def status_resource(self, ctx: Context) -> str:
+    async def status_resource(self) -> str:
         """Render the bounded status resource as JSON."""
-        return self._json(await self.status(ctx))
+        principal = MCPRequestPrincipalContext.require()
+        return self._json(self._control.status.get(principal))
 
-    async def capabilities_resource(self, ctx: Context) -> str:
+    async def capabilities_resource(self) -> str:
         """Render validated caller capabilities as JSON."""
-        return self._json(await self.capabilities(ctx))
+        principal = MCPRequestPrincipalContext.require()
+        return self._json(self._capability_payload(principal))
 
-    async def library_summary_resource(self, ctx: Context) -> str:
+    async def library_summary_resource(self) -> str:
         """Render a deliberately bounded first page of library summaries."""
-        return self._json(await self.library_list(ctx, offset=0, limit=25))
+        principal = MCPRequestPrincipalContext.require()
+        return self._json(await self._control.library.list_items(principal, offset=0, limit=25))
 
-    async def downloads_resource(self, ctx: Context) -> str:
+    async def downloads_resource(self) -> str:
         """Render bounded active-download state as JSON."""
-        return self._json(await self.downloads_list(ctx, limit=100))
+        principal = MCPRequestPrincipalContext.require()
+        return self._json(await self._control.downloads.list_active(principal, limit=100))
 
-    async def llm_resource(self, ctx: Context) -> str:
+    async def llm_resource(self) -> str:
         """Render configured/effective LLM routing as JSON."""
-        return self._json(await self.llm_get(ctx))
+        principal = MCPRequestPrincipalContext.require()
+        return self._json(self._control.llm.get(principal))
 
     async def _principal(self, ctx: Context) -> InvocationPrincipal:
         """Return the principal authenticated once at the outer ASGI boundary."""

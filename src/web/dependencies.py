@@ -61,6 +61,7 @@ class WebDependencies:
     category_registry: Any = None
     tool_registry: Any = None
     behavior_recorder: Any = None
+    mcp_controller: Any = None
     templates: Any = None
     librarian: Any = None
     chat_ws_manager: Any = None

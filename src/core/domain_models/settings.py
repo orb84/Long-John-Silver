@@ -87,6 +87,46 @@ class WebSearchConfig(BaseModel):
 
 
 
+class MCPSettings(BaseModel):
+    """Persisted configuration for LJS's local MCP control-plane endpoint.
+
+    The transport remains loopback-only in this release.  The bearer token is
+    stored in the ignored local settings file, never in the tracked template.
+    """
+
+    enabled: bool = False
+    bearer_token: str = ""
+    principal_id: str = "mcp-local"
+    user_id: str = "local"
+    client_id: str = "mcp-local"
+    capabilities: list[str] = Field(default_factory=lambda: [
+        "agent.delegate",
+        "agent.read",
+        "status.read",
+        "library.read",
+        "downloads.read",
+        "config.llm.read",
+        "diagnostics.read",
+    ])
+
+    @model_validator(mode="after")
+    def _normalize_mcp_settings(self) -> "MCPSettings":
+        """Normalize identifiers/capabilities without weakening validation later."""
+        self.principal_id = str(self.principal_id or "mcp-local").strip() or "mcp-local"
+        self.user_id = str(self.user_id or "local").strip() or "local"
+        self.client_id = str(self.client_id or self.principal_id).strip() or self.principal_id
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for raw in self.capabilities or []:
+            value = str(raw or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                normalized.append(value)
+        self.capabilities = normalized
+        self.bearer_token = str(self.bearer_token or "").strip()
+        return self
+
+
 class EmbeddingSettings(BaseModel):
     """Local semantic-memory embedding runtime settings.
 
@@ -338,6 +378,7 @@ class Settings(BaseModel):
     """Main application settings."""
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    mcp: MCPSettings = Field(default_factory=MCPSettings)
     web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)

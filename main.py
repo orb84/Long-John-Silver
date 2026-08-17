@@ -893,6 +893,7 @@ async def main():
         # can answer health checks.  Otherwise the browser may see the machine as
         # unreachable even though the main process is alive.
         port = int(os.environ.get("LJS_PORT", settings.web_port))
+        app.state.web_port = port
         web_host = os.environ.get("LJS_HOST", "0.0.0.0")
         access_log_mode = os.environ.get("LJS_ACCESS_LOGS", "quiet").strip().lower()
         access_logs_enabled = access_log_mode not in {"0", "false", "off", "none"}

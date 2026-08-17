@@ -23,6 +23,7 @@ from src.web.action_handlers.setup import SetupActionHandler
 from src.web.action_handlers.upgrades import UpgradesActionHandler
 from src.web.action_handlers.suggestions import SuggestionsActionHandler
 from src.web.action_handlers.downloads import DownloadsActionHandler
+from src.web.action_handlers.mcp import MCPSettingsActionHandler
 
 
 class ActionRegistrationService:
@@ -117,6 +118,8 @@ class ActionRegistrationService:
             ("settings_update_startup", handler.update_startup),
         ):
             gw.register(action_name, method)
+        if deps.mcp_controller is not None:
+            gw.register("settings_update_mcp", MCPSettingsActionHandler(deps.mcp_controller).update)
 
     # ── Library actions ──
 

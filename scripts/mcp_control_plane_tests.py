@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import os
+import inspect
 import sqlite3
+import tempfile
 import sys
 import types
 from pathlib import Path
@@ -23,15 +24,18 @@ from src.ai.tool_context import ToolExecutionContextFactory
 from src.ai.tool_registry import ToolRegistry
 from src.ai.category_tool_factory import CategoryToolFactory
 from src.core.conversation_handle import ConversationHandleAccessError, ConversationHandleLimitError, ConversationHandleService
+from src.core.config import SettingsManager
 from src.core.categories.tv import TvShowCategory
 from src.core.categories.movie import MovieCategory
 from src.core.categories.registry import CategoryRegistry
 from src.core.categories.base import CategoryWorkflowContext
 from src.core.public_control_plane import PublicLLMConfigurationService, PublicLibraryRedactor, PublicStatusService
-from src.core.models import AgentDelegationStatus, InvocationCapability, InvocationContext, InvocationEvidence, InvocationPrincipal, Settings
+from src.core.models import AgentDelegationStatus, InvocationCapability, InvocationContext, InvocationEvidence, InvocationPrincipal, MCPSettings, Settings
 from src.integrations.mcp_auth import MCPAuthenticationBoundary, MCPAuthenticationError, MCPPrincipalResolver, MCPRequestPrincipalContext
 from src.integrations.mcp_configuration import MCPIntegrationSettings
 from src.integrations.mcp_network import LocalMCPNetworkBoundary
+import src.integrations.mcp_runtime_worker as mcp_runtime_worker_module
+from src.integrations.mcp_runtime import MCPRuntimeController
 from src.web.action_handlers.settings import SettingsActionHandler
 from src.web.action_handlers.providers import ProvidersActionHandler
 from src.web.action_handlers.setup import SetupActionHandler
@@ -154,6 +158,12 @@ class _MCPControlPlaneAcceptance:
     async def run(cls) -> None:
         cls._migration_syntax()
         cls._settings_contract()
+        cls._settings_persistence_contract()
+        cls._launcher_dependency_contract()
+        await cls._runtime_controller_contract()
+        await cls._runtime_cancelled_update_contract()
+        await cls._runtime_transition_failure_rollback_contract()
+        await cls._runtime_persistence_failure_rollback_contract()
         await cls._llm_configuration_contract()
         await cls._llm_route_ownership_and_atomicity_contract()
         await cls._tool_capability_contract()
@@ -189,49 +199,336 @@ class _MCPControlPlaneAcceptance:
 
     @staticmethod
     def _settings_contract() -> None:
-        old = dict(os.environ)
-        try:
-            os.environ["LJS_MCP_ENABLED"] = "1"
-            os.environ.pop("LJS_MCP_CAPABILITIES", None)
-            os.environ["LJS_MCP_TOKEN"] = "x" * 32
-            settings = MCPIntegrationSettings.from_environment()
-            assert settings.enabled is True
-            assert InvocationCapability.AGENT_DELEGATE in settings.capabilities
-            assert InvocationCapability.CONFIG_LLM_WRITE not in settings.capabilities
-            assert InvocationCapability.CONFIG_LLM_ENDPOINT_WRITE not in settings.capabilities
-            assert settings.user_id == "local"
-            os.environ.pop("LJS_MCP_TOKEN", None)
-            try:
-                MCPIntegrationSettings.from_environment()
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Enabled MCP without a dedicated token must fail closed")
-            os.environ["LJS_MCP_TOKEN"] = "x" * 32
-            os.environ["LJS_MCP_CAPABILITIES"] = "not.a.capability"
-            try:
-                MCPIntegrationSettings.from_environment()
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Unknown MCP capability must fail closed")
-            os.environ.pop("LJS_MCP_CAPABILITIES", None)
-            os.environ["LJS_MCP_TOKEN"] = "too-short"
-            try:
-                MCPIntegrationSettings.from_environment()
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Weak dedicated MCP tokens must fail closed")
+        settings = MCPIntegrationSettings.from_application(
+            MCPSettings(enabled=True, bearer_token="x" * 32)
+        )
+        assert settings.enabled is True
+        assert InvocationCapability.AGENT_DELEGATE in settings.capabilities
+        assert InvocationCapability.CONFIG_LLM_WRITE not in settings.capabilities
+        assert InvocationCapability.CONFIG_LLM_ENDPOINT_WRITE not in settings.capabilities
+        assert settings.user_id == "local"
 
-            # Disabled MCP must remain inert even if stale MCP-only configuration is invalid.
-            os.environ["LJS_MCP_ENABLED"] = "0"
-            os.environ["LJS_MCP_CAPABILITIES"] = "stale.invalid.capability"
-            disabled = MCPIntegrationSettings.from_environment()
-            assert disabled.enabled is False
+        for invalid in (
+            MCPSettings(enabled=True, bearer_token=""),
+            MCPSettings(enabled=True, bearer_token="too-short"),
+            MCPSettings(enabled=True, bearer_token="x" * 32, capabilities=["not.a.capability"]),
+        ):
+            try:
+                MCPIntegrationSettings.from_application(invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Invalid enabled MCP configuration must fail closed")
+
+        disabled = MCPIntegrationSettings.from_application(MCPSettings(enabled=False))
+        assert disabled.enabled is False
+
+    @staticmethod
+    def _settings_persistence_contract() -> None:
+        """MCP enable/token state must survive a normal SettingsManager reload."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kwargs = {
+                "yaml_path": str(root / "settings.local.yaml"),
+                "template_path": str(root / "missing.template.yaml"),
+                "category_config_dir": str(root / "categories"),
+                "category_template_dir": str(root / "category-templates"),
+                "category_definition_dir": str(root / "category-definitions"),
+            }
+            manager = SettingsManager(**kwargs)
+            settings = manager.settings
+            settings.mcp.enabled = True
+            settings.mcp.bearer_token = "p" * 48
+            settings.mcp.user_id = "local"
+            manager.save(settings)
+
+            reloaded = SettingsManager(**kwargs).settings
+            assert reloaded.mcp.enabled is True
+            assert reloaded.mcp.bearer_token == "p" * 48
+            assert reloaded.mcp.user_id == "local"
+
+    @staticmethod
+    def _launcher_dependency_contract() -> None:
+        """Project updates must reinstall changed requirements by content, not archive mtime."""
+        run_sh = Path("run.sh").read_text()
+        run_bat = Path("run.bat").read_text()
+        assert "sha256" in run_sh and "REQUIREMENTS_HASH" in run_sh
+        assert "sha256" in run_bat and "REQUIREMENTS_HASH" in run_bat
+        assert 'requirements.txt" -nt' not in run_sh
+        assert "LastWriteTimeUtc" not in run_bat
+
+    @staticmethod
+    async def _runtime_controller_contract() -> None:
+        """Prove live start/stop keeps SDK context ownership in one host worker task."""
+        original_adapter = mcp_runtime_worker_module.MCPServerAdapter
+        entered_tasks: list[asyncio.Task[object] | None] = []
+        exited_tasks: list[asyncio.Task[object] | None] = []
+        context_stack: list[object] = []
+
+        class _OwnedContext:
+            def __init__(self) -> None:
+                self._owner: asyncio.Task[object] | None = None
+
+            async def __aenter__(self) -> object:
+                self._owner = asyncio.current_task()
+                entered_tasks.append(self._owner)
+                context_stack.append(self)
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                exited_tasks.append(asyncio.current_task())
+                assert asyncio.current_task() is self._owner, "MCP SDK context crossed task ownership"
+                assert context_stack and context_stack[-1] is self, "MCP SDK contexts were not closed LIFO"
+                context_stack.pop()
+
+        class _SessionManager:
+            def run(self) -> _OwnedContext:
+                return _OwnedContext()
+
+        class _Adapter:
+            def __init__(self, **_kwargs: object) -> None:
+                self.session_manager = _SessionManager()
+                self.asgi_app = object()
+
+        class _SettingsManager:
+            def __init__(self) -> None:
+                self.settings = Settings()
+                self.saved = 0
+
+            def save(self, _settings: Settings) -> None:
+                self.saved += 1
+
+        try:
+            mcp_runtime_worker_module.MCPServerAdapter = _Adapter  # type: ignore[assignment]
+            manager = _SettingsManager()
+            controller = MCPRuntimeController(
+                settings_manager=manager,
+                control_plane=object(),
+                database=_Database(),
+            )
+            await controller.start()
+            assert controller.running is False
+            enabled = await controller.apply({"enabled": True})
+            assert enabled["running"] is True
+            first_token = str(enabled["bearer_token"])
+            assert len(first_token) >= 32
+            regenerated = await controller.apply({"enabled": True, "regenerate_token": True})
+            assert regenerated["running"] is True
+            assert str(regenerated["bearer_token"]) != first_token
+            disabled = await controller.apply({"enabled": False})
+            assert disabled["running"] is False
+            await controller.shutdown()
+            assert entered_tasks and exited_tasks
+            assert all(task is entered_tasks[0] for task in entered_tasks + exited_tasks)
+            assert not context_stack
         finally:
-            os.environ.clear()
-            os.environ.update(old)
+            mcp_runtime_worker_module.MCPServerAdapter = original_adapter
+
+    @staticmethod
+    async def _runtime_cancelled_update_contract() -> None:
+        """Cancelled Settings requests must not leave runtime/config split-brain."""
+        original_adapter = mcp_runtime_worker_module.MCPServerAdapter
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class _DelayedContext:
+            async def __aenter__(self) -> object:
+                entered.set()
+                await release.wait()
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        class _SessionManager:
+            def run(self) -> _DelayedContext:
+                return _DelayedContext()
+
+        class _Adapter:
+            def __init__(self, **_kwargs: object) -> None:
+                self.session_manager = _SessionManager()
+                self.asgi_app = object()
+
+        class _SettingsManager:
+            def __init__(self) -> None:
+                self.settings = Settings()
+
+            def save(self, _settings: Settings) -> None:
+                return None
+
+        try:
+            mcp_runtime_worker_module.MCPServerAdapter = _Adapter  # type: ignore[assignment]
+            manager = _SettingsManager()
+            controller = MCPRuntimeController(
+                settings_manager=manager,
+                control_plane=object(),
+                database=_Database(),
+            )
+            await controller.start()
+            update = asyncio.create_task(controller.apply({"enabled": True}))
+            await entered.wait()
+            update.cancel()
+            release.set()
+            try:
+                await update
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("Cancelled MCP settings request must remain cancelled")
+            assert manager.settings.mcp.enabled is False
+            assert controller.running is False
+            await controller.shutdown()
+        finally:
+            mcp_runtime_worker_module.MCPServerAdapter = original_adapter
+
+    @staticmethod
+    async def _runtime_transition_failure_rollback_contract() -> None:
+        """A failed runtime replacement must restore the previous live MCP runtime."""
+        original_adapter = mcp_runtime_worker_module.MCPServerAdapter
+        adapter_count = 0
+        active_tokens: list[str] = []
+
+        class _Context:
+            def __init__(self, token: str, *, fail: bool) -> None:
+                self._token = token
+                self._fail = fail
+
+            async def __aenter__(self) -> object:
+                if self._fail:
+                    raise RuntimeError("synthetic runtime replacement failure")
+                active_tokens.append(self._token)
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                if self._token in active_tokens:
+                    active_tokens.remove(self._token)
+
+        class _SessionManager:
+            def __init__(self, token: str, *, fail: bool) -> None:
+                self._token = token
+                self._fail = fail
+
+            def run(self) -> _Context:
+                return _Context(self._token, fail=self._fail)
+
+        class _Adapter:
+            def __init__(self, **kwargs: object) -> None:
+                nonlocal adapter_count
+                adapter_count += 1
+                resolver = kwargs["principal_resolver"]
+                token = str(getattr(resolver, "_settings").bearer_token)
+                # First activation succeeds, candidate replacement fails, rollback succeeds.
+                self.session_manager = _SessionManager(token, fail=adapter_count == 2)
+                self.asgi_app = object()
+
+        class _SettingsManager:
+            def __init__(self) -> None:
+                self.settings = Settings()
+                self.saved_tokens: list[str] = []
+
+            def save(self, settings: Settings) -> None:
+                self.saved_tokens.append(settings.mcp.bearer_token)
+
+        try:
+            mcp_runtime_worker_module.MCPServerAdapter = _Adapter  # type: ignore[assignment]
+            manager = _SettingsManager()
+            controller = MCPRuntimeController(
+                settings_manager=manager,
+                control_plane=object(),
+                database=_Database(),
+            )
+            await controller.start()
+            first = await controller.apply({"enabled": True})
+            first_token = str(first["bearer_token"])
+            assert controller.running is True
+            try:
+                await controller.apply({"enabled": True, "regenerate_token": True})
+            except RuntimeError as exc:
+                assert "synthetic runtime replacement failure" in str(exc)
+            else:
+                raise AssertionError("Failed MCP runtime replacement must fail the Settings mutation")
+            assert manager.settings.mcp.enabled is True
+            assert manager.settings.mcp.bearer_token == first_token
+            assert controller.running is True
+            assert active_tokens == [first_token]
+            await controller.shutdown()
+            assert not active_tokens
+        finally:
+            mcp_runtime_worker_module.MCPServerAdapter = original_adapter
+
+    @staticmethod
+    async def _runtime_persistence_failure_rollback_contract() -> None:
+        """A failed Settings save must restore both disk truth and the previous runtime."""
+        original_adapter = mcp_runtime_worker_module.MCPServerAdapter
+        active_tokens: list[str] = []
+
+        class _Context:
+            def __init__(self, token: str) -> None:
+                self._token = token
+
+            async def __aenter__(self) -> object:
+                active_tokens.append(self._token)
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                if self._token in active_tokens:
+                    active_tokens.remove(self._token)
+
+        class _SessionManager:
+            def __init__(self, token: str) -> None:
+                self._token = token
+
+            def run(self) -> _Context:
+                return _Context(self._token)
+
+        class _Adapter:
+            def __init__(self, **kwargs: object) -> None:
+                resolver = kwargs["principal_resolver"]
+                token = str(getattr(resolver, "_settings").bearer_token)
+                self.session_manager = _SessionManager(token)
+                self.asgi_app = object()
+
+        class _SettingsManager:
+            def __init__(self) -> None:
+                self.settings = Settings()
+                self.persisted = self.settings.mcp.model_copy(deep=True)
+                self.fail_next = False
+
+            def save(self, settings: Settings) -> None:
+                # Simulate a storage layer that wrote candidate state and then errored.
+                self.persisted = settings.mcp.model_copy(deep=True)
+                if self.fail_next:
+                    self.fail_next = False
+                    raise RuntimeError("synthetic settings persistence failure")
+
+        try:
+            mcp_runtime_worker_module.MCPServerAdapter = _Adapter  # type: ignore[assignment]
+            manager = _SettingsManager()
+            controller = MCPRuntimeController(
+                settings_manager=manager,
+                control_plane=object(),
+                database=_Database(),
+            )
+            await controller.start()
+            first = await controller.apply({"enabled": True})
+            first_token = str(first["bearer_token"])
+            manager.fail_next = True
+            try:
+                await controller.apply({"enabled": True, "regenerate_token": True})
+            except RuntimeError as exc:
+                assert "synthetic settings persistence failure" in str(exc)
+            else:
+                raise AssertionError("Failed MCP Settings persistence must fail the mutation")
+            assert manager.settings.mcp.enabled is True
+            assert manager.settings.mcp.bearer_token == first_token
+            assert manager.persisted.enabled is True
+            assert manager.persisted.bearer_token == first_token
+            assert controller.running is True
+            assert active_tokens == [first_token]
+            await controller.shutdown()
+            assert not active_tokens
+        finally:
+            mcp_runtime_worker_module.MCPServerAdapter = original_adapter
 
     @staticmethod
     async def _llm_configuration_contract() -> None:
@@ -1124,6 +1421,12 @@ class _MCPControlPlaneAcceptance:
 
             def resource(self, uri: str, **_: object):
                 def decorator(fn: object) -> object:
+                    if "{" not in uri:
+                        parameters = inspect.signature(fn).parameters
+                        assert not parameters, (
+                            f"Static MCP resource {uri} must not declare handler parameters: "
+                            f"{list(parameters)}"
+                        )
                     self.resources.append(uri)
                     return fn
                 return decorator

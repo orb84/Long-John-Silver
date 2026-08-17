@@ -523,91 +523,61 @@ See [LICENSE](LICENSE), [NOTICE](NOTICE), and [AUTHORS.md](AUTHORS.md).
 
 ## Local MCP integration (opt-in)
 
-LJS can expose its existing domain agent and a small deterministic control plane
-to a **local** MCP host without exporting the assistant's private tool registry.
-The MCP server runs inside the same LJS FastAPI process as the Web UI,
-downloader, scheduler and `AIAssistant`; it never bootstraps a second LJS
-runtime.
+LJS can expose its existing domain agent and a deliberately small deterministic
+control plane to a **local MCP-capable LLM client**. MCP runs inside the same LJS
+FastAPI process as the Web UI, downloader, scheduler and `AIAssistant`; it does
+not start a second LJS runtime.
 
-The integration is disabled by default. Install the normal project requirements,
-then generate a dedicated MCP credential:
+Configure it from **Compass → MCP — External LLM Control**. The panel shows:
+
+- an **Enable MCP server** switch that starts/stops MCP live;
+- the exact loopback **MCP address** for the port LJS is actually using;
+- the dedicated bearer token, with copy/regenerate controls;
+- the canonical LJS user used by delegated conversations;
+- an optional download/tracking action grant;
+- live `Running` / `Enabled, not running` / `Disabled` status and startup errors;
+- a pasteable Streamable-HTTP client configuration example.
+
+The first enable automatically creates a strong dedicated token in the ignored
+`config/settings.local.yaml`. The public template contains no secret. Ordinary
+LJS Web JWTs are not MCP credentials.
+
+For a normal local client, add an MCP server using **Streamable HTTP** and use
+the values shown in Compass. With LJS on the default port the shape is:
+
+```json
+{
+  "transport": "streamable-http",
+  "url": "http://127.0.0.1:8088/mcp",
+  "headers": {
+    "Authorization": "Bearer <token shown in Compass>"
+  }
+}
+```
+
+Then reconnect/refresh the MCP integration in the LLM application. It should
+discover tools including `ljs.agent_message`, `ljs.library_list`, and
+`ljs.downloads_list`. `ljs.agent_message` returns an opaque `conversation_id`;
+pass it back to continue the same real LJS conversation.
+
+**Local means local.** This transport deliberately accepts only loopback
+connections. The MCP host/client must therefore run on the same computer as LJS;
+a cloud-hosted model service cannot directly call `127.0.0.1`. Remote MCP is a
+separate future TLS/OAuth design, not something to expose with a reverse proxy.
+
+If Compass reports that the MCP runtime dependency is missing, update the normal
+LJS environment and restart once:
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+./run.sh update       # macOS / Linux
+# or
+run.bat update        # Windows
 ```
 
-Configure, for example:
+The launchers already reinstall `requirements.txt` when it changes, so a normal
+fresh install/update includes the MCP SDK.
 
-```dotenv
-LJS_MCP_ENABLED=1
-LJS_MCP_TOKEN=<generated token>
-LJS_MCP_PRINCIPAL_ID=my-local-agent
-LJS_MCP_USER_ID=local
-LJS_MCP_CLIENT_ID=my-local-agent
-LJS_MCP_CAPABILITIES=agent.delegate,agent.read,status.read,library.read,downloads.read,config.llm.read,diagnostics.read
-```
-
-After starting LJS normally, the Streamable-HTTP endpoint is available only to
-loopback clients at `http://127.0.0.1:8088/mcp` (adjust the port if `LJS_PORT`
-differs). Send `Authorization: Bearer <token>`. **Ordinary LJS Web JWTs are not
-MCP credentials.** Local MCP v1 intentionally accepts only the dedicated token.
-
-`LJS_MCP_USER_ID` binds delegated conversations to the canonical LJS user whose
-preferences/history should be visible to the domain agent. `local` may be created
-by the normal local-session authority; any other configured user id must already
-exist, so a typo cannot silently create a preference-less shadow user. `LJS_MCP_CLIENT_ID`
-provides the configured client identity used with the principal when binding
-opaque conversation handles. Local MCP v1 configures one dedicated
-token/principal/client tuple at a time; do not share that credential across
-unrelated external clients.
-
-The primary semantic tool is `ljs.agent_message`. It returns a server-minted
-`conversation_id`; pass that opaque handle on later requests to continue the
-same real LJS conversation and pending-result state. Handles expire after
-inactivity (30-day default), are quota-bounded per principal/client (100 active
-default), and can be explicitly revoked with `ljs.agent_close`. Revocation/expiry
-also cleans the private external session and its conversation history rather than
-leaving unreachable external-session storage behind.
-
-Delegated calls default to `allow_actions=false`. To let the LJS agent mutate
-state, both conditions must hold: the credential already has the exact
-application capability for that action, and that particular call sets
-`allow_actions=true`. Category `risk_level`/confirmation metadata is **not** an
-authorization domain. Download, library-write, file-delete, tracking and
-configuration authorities are explicit capabilities; an unannotated future
-mutation fails closed for constrained external principals. Destructive category
-actions remain hidden from ordinary delegated assistant turns in this slice: the
-underlying explicit category workflow owns exact token-bound confirmation, but
-the assistant does not yet expose a generic pending destructive-confirmation
-state. This avoids advertising an action the chat loop cannot safely complete.
-
-The current public tool surface is:
-
-- `ljs.agent_message`, `ljs.agent_cancel`, `ljs.agent_close`;
-- `ljs.status`, `ljs.capabilities`;
-- `ljs.library_list`, `ljs.library_get`;
-- `ljs.downloads_list`;
-- `ljs.llm_get`, `ljs.llm_test`, `ljs.llm_set`;
-- `ljs.diagnostics_recent`.
-
-`ljs.agent_cancel` reports observed lifecycle truth: `not_running` when no live
-turn matched, `cancelling` while a cancelled child is still unwinding, and
-`cancelled` only after the owned turn is settled. Delegated failures return a
-bounded `failed` result and direct detailed diagnostics to the diagnostics
-surface rather than leaking private exception text.
-
-LLM control is deliberately split by authority. `config.llm.read` reads routing;
-`config.llm.probe` is required for the outbound provider/model probe performed
-by `ljs.llm_test`; `config.llm.write` changes ordinary model/provider routing;
-and `config.llm.endpoint.write` is additionally required for any `api_base`
-change. API-key fields are not accepted through MCP. Canonical LLM mutation is
-failure-atomic: provider/endpoint transitions cannot inherit another route's
-secret, custom/operator endpoints never automatically receive a provider
-KeyStore secret, and persistence/runtime reload failures roll the prior route
-back before a successful receipt can be reported.
-
-This release does not provide stdio MCP, public raw search/download tools, an
-arbitrary action executor, remote-network MCP, or an MCP Tasks clone.
-Non-loopback (and unknown-origin) MCP HTTP requests fail closed even when the
-normal LJS Web UI is LAN-visible. Remote MCP requires a separately designed
-TLS/OAuth deployment and is intentionally deferred.
+Credential capabilities default to read/delegate only. Even when download or
+tracking capabilities are enabled in Compass, delegated calls independently
+default to `allow_actions=false`; the external caller must deliberately request
+action-enabled delegation.
