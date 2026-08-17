@@ -35,11 +35,16 @@ class CategoryScopedTool:
         self.intents = self._resolve_intents(declaration, is_workflow)
         self.allow_direct = True
         self.requires_confirmation = getattr(declaration, "requires_confirmation", False)
+        self.risk_level = str(getattr(declaration, "risk_level", "read") or "read")
         self.destructive = bool(
             getattr(declaration, "destructive", False)
-            or getattr(declaration, "risk_level", "") == "destructive"
+            or self.risk_level == "destructive"
         )
         self.required_dependencies = ["category_registry"]
+        declared_capabilities = getattr(declaration, "invocation_capabilities_required", None)
+        self.required_capabilities = (
+            frozenset(declared_capabilities) if declared_capabilities else None
+        )
 
     def parameters(self) -> dict[str, Any]:
         """Return the JSON schema declared by the category."""

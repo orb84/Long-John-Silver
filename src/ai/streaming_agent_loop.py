@@ -82,6 +82,7 @@ class StreamingAgentLoopExecutor:
         session_id: str | None = None,
         active_category_id: str | None = None,
         user_prompt: str | None = None,
+        tool_context: ToolExecutionContext | None = None,
     ) -> AsyncIterator[str]:
         """Execute the streaming agent tool loop, yielding tokens.
 
@@ -216,7 +217,7 @@ class StreamingAgentLoopExecutor:
                         arguments_raw=recovered.arguments,
                         tool_call_id=recovered.call_id,
                         allowed_tool_names=allowed_tool_names,
-                        tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                        tool_context=tool_context,
                     )
                     messages.append(result_message)
                     executed_tool_count += 1
@@ -255,7 +256,7 @@ class StreamingAgentLoopExecutor:
                                     arguments_raw=json.dumps(recovery_args, ensure_ascii=False),
                                     tool_call_id=tool_call_id,
                                     allowed_tool_names=allowed_tool_names,
-                                    tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                                    tool_context=tool_context,
                                 )
                                 messages.append(result_message)
                                 executed_tool_count += 1
@@ -303,7 +304,7 @@ class StreamingAgentLoopExecutor:
                                     arguments_raw=json.dumps(recovery_args, ensure_ascii=False),
                                     tool_call_id=tool_call_id,
                                     allowed_tool_names=allowed_tool_names,
-                                    tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                                    tool_context=tool_context,
                                 )
                                 messages.append(result_message)
                                 executed_tool_count += 1
@@ -341,11 +342,7 @@ class StreamingAgentLoopExecutor:
                                 arguments_raw="{}",
                                 tool_call_id=tool_call_id,
                                 allowed_tool_names=allowed_tool_names,
-                                tool_context=self._tool_context(
-                                    session_id,
-                                    active_category_id=active_category_id,
-                                    user_prompt=user_prompt,
-                                ),
+                                tool_context=tool_context,
                             )
                             messages.append(result_message)
                             executed_tool_count += 1
@@ -445,7 +442,7 @@ class StreamingAgentLoopExecutor:
                         arguments_raw=tc.arguments,
                         tool_call_id=tc.id,
                         allowed_tool_names=allowed_tool_names,
-                        tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                        tool_context=tool_context,
                     )
                     messages.append(result_message)
                     executed_tool_count += 1
@@ -505,15 +502,6 @@ class StreamingAgentLoopExecutor:
         return None
 
 
-    @staticmethod
-    def _tool_context(session_id: str | None, *, active_category_id: str | None = None, user_prompt: str | None = None) -> ToolExecutionContext:
-        """Build lightweight invocation context for declarative tools."""
-        source = "web"
-        if session_id and ":" in session_id:
-            source = session_id.split(":", 1)[0] or "web"
-        elif session_id and "_" in session_id:
-            source = session_id.split("_", 1)[0] or "web"
-        return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id, user_prompt=user_prompt)
 
     @staticmethod
     def _terminal_clarification(result_message: dict[str, Any]) -> str | None:

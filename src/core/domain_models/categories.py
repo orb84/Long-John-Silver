@@ -10,6 +10,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 from src.core.domain_models.enums import Intent
+from src.core.domain_models.invocation import InvocationCapability
 
 # --- Category Contract Models ---
 
@@ -153,6 +154,7 @@ class CategoryActionDeclaration(BaseModel):
     risk_level: Literal["read", "write", "destructive"] = "read"
     operation: str = ""
     capabilities_required: list[str] = Field(default_factory=list)
+    invocation_capabilities_required: set[InvocationCapability] = Field(default_factory=set)
     confirmation_prompt: str | None = None
     result_component: str | None = None
 
@@ -172,6 +174,7 @@ class CategoryWorkflowDeclaration(BaseModel):
     risk_level: Literal["read", "write", "destructive"] = "read"
     requires_confirmation: bool = False
     tool_name: str | None = None
+    invocation_capabilities_required: set[InvocationCapability] = Field(default_factory=set)
 
 
 class ChangedEntity(BaseModel):

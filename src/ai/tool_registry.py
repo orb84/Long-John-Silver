@@ -13,7 +13,8 @@ from typing import Callable, Any
 
 from src.core.models import Intent, SearchResult
 from src.ai.tools.base import AgentTool
-from src.core.models import ToolExecutionContext
+from src.core.models import InvocationCapability, ToolExecutionContext
+from src.ai.tool_capabilities import AgentToolCapabilityResolver
 
 
 class ToolDefinition:
@@ -30,7 +31,9 @@ class ToolDefinition:
                  intents: set[Intent] | None = None,
                  allow_direct: bool = False,
                  requires_confirmation: bool = False,
-                 destructive: bool = False):
+                 destructive: bool = False,
+                 required_capabilities: frozenset[InvocationCapability] | None = None,
+                 mutating: bool | None = None):
         self.name = name
         self.description = description
         self.parameters = parameters
@@ -39,6 +42,9 @@ class ToolDefinition:
         self.allow_direct = allow_direct
         self.requires_confirmation = requires_confirmation
         self.destructive = destructive
+        metadata = AgentToolCapabilityResolver.for_name(name)
+        self.required_capabilities = required_capabilities or metadata.required
+        self.mutating = metadata.mutating if mutating is None else bool(mutating)
 
     def to_openai_format(self) -> dict:
         """Convert to OpenAI function-calling format."""
@@ -68,7 +74,9 @@ class ToolRegistry:
                  intents: set[Intent] | None = None,
                  allow_direct: bool = False,
                  requires_confirmation: bool = False,
-                 destructive: bool = False) -> None:
+                 destructive: bool = False,
+                 required_capabilities: frozenset[InvocationCapability] | None = None,
+                 mutating: bool | None = None) -> None:
         """Register a tool with its OpenAI-format definition and handler.
 
         Args:
@@ -90,6 +98,8 @@ class ToolRegistry:
             allow_direct=allow_direct,
             requires_confirmation=requires_confirmation,
             destructive=destructive,
+            required_capabilities=required_capabilities,
+            mutating=mutating,
         )
         logger.trace(f"Registered tool: {name}")
 
@@ -113,6 +123,7 @@ class ToolRegistry:
                 ctx = ToolExecutionContext()
             return await tool.execute(kwargs, ctx)
 
+        capability_metadata = AgentToolCapabilityResolver.for_tool(tool)
         self._tools[tool.name] = ToolDefinition(
             name=tool.name,
             description=tool.description,
@@ -122,6 +133,8 @@ class ToolRegistry:
             allow_direct=tool.allow_direct,
             requires_confirmation=tool.requires_confirmation,
             destructive=tool.destructive,
+            required_capabilities=capability_metadata.required,
+            mutating=capability_metadata.mutating,
         )
         logger.trace(f"Registered declarative tool: {tool.name}")
 
@@ -196,11 +209,46 @@ class ToolRegistry:
         """Return whether a tool name is registered."""
         return name in self._tools
 
+    def filter_names_for_context(
+        self, names: set[str], context: ToolExecutionContext | None
+    ) -> set[str]:
+        """Return only tool names authorized for a constrained invocation."""
+        if context is None or context.trusted:
+            return set(names)
+        granted = set(context.capabilities or set())
+        filtered: set[str] = set()
+        for name in names:
+            tool = self._tools.get(name)
+            if tool is None:
+                continue
+            required = {capability.value for capability in tool.required_capabilities}
+            if required.issubset(granted) and (context.allow_actions or not tool.mutating):
+                filtered.add(name)
+        return filtered
+
     async def execute(self, name: str, arguments: dict, context: ToolExecutionContext | None = None) -> Any:
-        """Execute a tool by name with the given arguments."""
+        """Execute a tool by name with capability enforcement at the boundary."""
         tool = self._tools.get(name)
         if not tool:
             return {"error": f"Tool '{name}' not found."}
+
+        if context is not None and not context.trusted:
+            granted = set(context.capabilities or set())
+            required = {capability.value for capability in tool.required_capabilities}
+            if not required.issubset(granted):
+                return {
+                    "ok": False,
+                    "error_code": "CAPABILITY_DENIED",
+                    "recoverable": False,
+                    "error": "This invocation is not authorized to use that capability.",
+                }
+            if tool.mutating and not context.allow_actions:
+                return {
+                    "ok": False,
+                    "error_code": "ACTIONS_DISABLED",
+                    "recoverable": False,
+                    "error": "This delegated invocation is read-only.",
+                }
 
         try:
             payload = dict(arguments or {})

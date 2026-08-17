@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_serializer, model_
 
 from src.core.domain_models.enums import Intent
 from src.core.domain_models.categories import AgentRunContext
+from src.core.domain_models.invocation import InvocationCapability, InvocationEvidence
 
 # --- Agent / Planning Models ---
 
@@ -91,10 +92,23 @@ class ToolExecutionContext(BaseModel):
     session_id: str | None = None
     source: str = "chat"
     actor: str = "user"
+    principal_id: str | None = None
+    client_id: str | None = None
+    capabilities: set[str] = Field(default_factory=set)
+    trusted: bool = True
+    allow_actions: bool = True
+    invocation_evidence: InvocationEvidence | None = None
     category_id: str | None = None
     user_prompt: str | None = None
     operation_id: str | None = None
     correlation_id: str | None = None
+
+    def allows_capability(self, capability: InvocationCapability | str) -> bool:
+        """Return whether this already-resolved tool context grants a capability."""
+        if self.trusted or InvocationCapability.ADMIN.value in self.capabilities:
+            return True
+        value = str(getattr(capability, "value", capability))
+        return value in self.capabilities
 
 
 class AgentStreamEvent(BaseModel):

@@ -232,14 +232,32 @@ class LLMConfig(BaseModel):
         return config.model if config.model else self.model
 
     def get_api_base_for_task(self, task: str) -> Optional[str]:
-        """Get the API base URL for a specific task, falling back to the default."""
+        """Get a task endpoint without crossing provider ownership boundaries.
+
+        A tier/task that selects another provider must not inherit the global
+        provider endpoint. Provider presets are resolved later by the provider
+        manager/runtime when no explicit endpoint is returned here.
+        """
         config = self._resolve_config(task)
-        return config.api_base if config.api_base else self.api_base
+        if config.api_base:
+            return config.api_base
+        provider = config.provider or self.active_provider
+        return self.api_base if provider == self.active_provider else None
 
     def get_api_key_for_task(self, task: str) -> Optional[str]:
-        """Get the API key for a specific task, falling back to the default."""
+        """Get an explicitly compatible task/global secret.
+
+        Global secrets are owned by the global provider+endpoint route. They are
+        never inherited by a task/tier that overrides either provider or API
+        base. Provider-key-store fallback is resolved later by TaskLLMClient.
+        """
         config = self._resolve_config(task)
-        return config.api_key if config.api_key else self.api_key
+        if config.api_key:
+            return config.api_key
+        provider = config.provider or self.active_provider
+        if provider != self.active_provider or config.api_base is not None:
+            return None
+        return self.api_key
 
     def get_max_tokens_for_task(self, task: str) -> Optional[int]:
         """Get the max_tokens for a specific task, if configured at any level."""

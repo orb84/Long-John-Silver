@@ -265,6 +265,8 @@ class QueueDownloadTool:
             return ActionSource.SCHEDULER
         if normalized in {"system", "repair"}:
             return ActionSource.SYSTEM
+        if normalized in {"mcp", "external", "external_agent"}:
+            return ActionSource.EXTERNAL
         return ActionSource.CHAT
 
     @classmethod

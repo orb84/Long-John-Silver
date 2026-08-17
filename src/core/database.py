@@ -17,6 +17,7 @@ from src.core.repositories.system import SystemRepository
 from src.core.repositories.notifications import NotificationRepository
 from src.core.repositories.release_watch import ReleaseWatchRepository
 from src.core.repositories.web_research import WebResearchRepository
+from src.core.repositories.conversation_handle import ConversationHandleRepository
 from src.core.repositories.base import BaseRepository
 
 
@@ -363,6 +364,7 @@ class Database:
         "category_fact_provenance": ("id", "category_id", "item_id", "fact_type", "value_json"),
         "web_information_watch": ("id", "title", "objective", "intent", "enabled", "next_run_at"),
         "web_information_watch_event": ("id", "watch_id", "event_type", "created_at"),
+        "external_conversation_handles": ("handle_id", "internal_session_id", "principal_id", "client_id", "revoked_at"),
     }
 
     def __init__(self, db_path: str = "data/ljs.db"):
@@ -378,6 +380,7 @@ class Database:
         self.notifications: Optional[NotificationRepository] = None
         self.release_watches: Optional[ReleaseWatchRepository] = None
         self.web_research: Optional[WebResearchRepository] = None
+        self.conversation_handles: Optional[ConversationHandleRepository] = None
 
     async def initialize(self) -> None:
         """Create the base schema and run any pending migrations.
@@ -403,6 +406,7 @@ class Database:
         self.notifications = NotificationRepository(self._db)
         self.release_watches = ReleaseWatchRepository(self._db)
         self.web_research = WebResearchRepository(self._db)
+        self.conversation_handles = ConversationHandleRepository(self._db)
 
         logger.info(
             f"Database initialized at {self._db_path} "

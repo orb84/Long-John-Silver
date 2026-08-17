@@ -78,6 +78,7 @@ class CategoryWorkflowContext:
     category_registry: object | None = None
     search_constraints: dict[str, Any] = field(default_factory=dict)
     agent_search_facts: dict[str, Any] = field(default_factory=dict)
+    tool_execution_context: object | None = None
 
 
 class MediaCategory(CategoryContractMixin, ABC):

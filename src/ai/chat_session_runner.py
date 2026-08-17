@@ -11,14 +11,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Literal
 
-from src.core.models import Intent
+from src.core.models import Intent, InvocationContext
+from src.core.invocation import InvocationContextResolver
 
-from src.ai.assistant import AIAssistant
+if TYPE_CHECKING:
+    from src.ai.assistant import AIAssistant
+
 from src.llm_providers.activity import LLMActivityContext
 
 ChatEventType = Literal["status", "token", "done"]
+ChatOutcomeStatus = Literal["complete", "needs_input"]
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,7 @@ class ChatTurnRequest:
     session_id: str
     user_id: str | None = None
     turn_id: str | None = None
+    invocation_context: InvocationContext | None = None
     first_progress_seconds: float = 5.0
     later_progress_seconds: float = 75.0
     max_status_updates: int = 3
@@ -40,6 +45,20 @@ class ChatTurnEvent:
 
     type: ChatEventType
     content: str = ""
+    outcome_status: ChatOutcomeStatus | None = None
+    turn_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ChatTurnOutcome:
+    """Typed terminal result for adapters that need more than rendered text."""
+
+    status: ChatOutcomeStatus
+    message: str
+    turn_id: str | None = None
+    result_set_ids: tuple[str, ...] = ()
+    candidate_ids: tuple[str, ...] = ()
+    action_receipt_ids: tuple[str, ...] = ()
 
 
 class ChatSessionRunner:
@@ -51,7 +70,7 @@ class ChatSessionRunner:
     policy.  Bridge code may only translate these events into platform sends.
     """
 
-    def __init__(self, assistant: AIAssistant) -> None:
+    def __init__(self, assistant: "AIAssistant") -> None:
         """Create a runner for the injected assistant instance."""
         self._assistant = assistant
 
@@ -102,11 +121,28 @@ class ChatSessionRunner:
 
     async def collect_response(self, request: ChatTurnRequest) -> str:
         """Run a turn through the shared event pipeline and return final text."""
+        return (await self.collect_outcome(request)).message
+
+    async def collect_outcome(self, request: ChatTurnRequest) -> ChatTurnOutcome:
+        """Run a turn once and preserve its typed terminal state for adapters."""
         parts: list[str] = []
+        status: ChatOutcomeStatus = "complete"
         async for event in self.run_events(request):
             if event.type == "token":
                 parts.append(event.content)
-        return "".join(parts).strip()
+            elif event.type == "done" and event.outcome_status is not None:
+                status = event.outcome_status
+        evidence = request.invocation_context.evidence if request.invocation_context is not None else None
+        if evidence is not None and evidence.needs_input:
+            status = "needs_input"
+        return ChatTurnOutcome(
+            status=status,
+            message="".join(parts).strip(),
+            turn_id=request.turn_id,
+            result_set_ids=tuple(evidence.result_set_ids[:20]) if evidence is not None else (),
+            candidate_ids=tuple(evidence.candidate_ids[:100]) if evidence is not None else (),
+            action_receipt_ids=tuple(evidence.action_receipt_ids[:50]) if evidence is not None else (),
+        )
 
     def format_error(self, operation: str, exc: BaseException | str) -> str:
         """Return the assistant/persona error for a failed transport turn."""
@@ -149,10 +185,16 @@ class ChatSessionRunner:
         queue: asyncio.Queue[tuple[str, Any]],
     ) -> None:
         try:
+            invocation_context = request.invocation_context or InvocationContextResolver.trusted_for_session(
+                request.session_id,
+                user_id=request.user_id,
+                turn_id=request.turn_id,
+            )
             async for chunk in self._assistant.run_stream(
                 request.prompt,
                 session_id=request.session_id,
                 user_id=request.user_id,
+                invocation_context=invocation_context,
             ):
                 await queue.put(("token", chunk))
         except asyncio.CancelledError:
@@ -191,7 +233,14 @@ class ChatSessionRunner:
             elif kind == "error":
                 raise payload
             elif kind == "done":
-                yield ChatTurnEvent("done")
+                outcome_status: ChatOutcomeStatus = (
+                    "needs_input" if status_intent == Intent.CLARIFY else "complete"
+                )
+                yield ChatTurnEvent(
+                    "done",
+                    outcome_status=outcome_status,
+                    turn_id=request.turn_id,
+                )
                 return
 
     @staticmethod

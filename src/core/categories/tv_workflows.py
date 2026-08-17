@@ -8,6 +8,7 @@ from typing import Any
 from loguru import logger
 
 from src.core.models import (
+    InvocationCapability,
     ActionReceipt,
     NotificationMessage,
     CategoryActionDeclaration,
@@ -552,6 +553,7 @@ class TvWorkflowMixin:
                 operation="download_next_missing_episode",
                 capabilities_required=["episodic", "downloadable"],
                 result_component="action_receipt",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_next_missing_episode",
             ),
             CategoryActionDeclaration(
@@ -572,6 +574,7 @@ class TvWorkflowMixin:
                 operation="download_specific_episode",
                 capabilities_required=["episodic", "downloadable"],
                 result_component="action_receipt",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_specific_episode",
             ),
             CategoryActionDeclaration(
@@ -588,6 +591,7 @@ class TvWorkflowMixin:
                 operation="download_season_pack",
                 capabilities_required=["episodic", "downloadable"],
                 result_component="action_receipt",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_season_pack",
             ),
             CategoryActionDeclaration(
@@ -608,6 +612,7 @@ class TvWorkflowMixin:
                 capabilities_required=["episodic", "downloadable"],
                 confirmation_prompt="Queue all selected aired missing episodes for this show?",
                 result_component="action_receipt",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_missing_batch",
             ),
             CategoryActionDeclaration(
@@ -616,9 +621,11 @@ class TvWorkflowMixin:
                 description="Scan the configured TV library and reconcile discovered shows and episodes.",
                 parameters={"type": "object", "properties": {}, "required": []},
                 risk_level="write",
+                llm_visible=False,
                 operation="scan_library",
                 capabilities_required=["file_organization"],
                 result_component="season_episode_grid",
+                invocation_capabilities_required={InvocationCapability.LIBRARY_WRITE},
                 tool_name="tv.scan_library",
             ),
             CategoryActionDeclaration(
@@ -637,6 +644,7 @@ class TvWorkflowMixin:
                 capabilities_required=["file_organization"],
                 confirmation_prompt="Delete this TV item? This may remove files if delete_files is true.",
                 result_component="action_receipt",
+                invocation_capabilities_required={InvocationCapability.LIBRARY_WRITE},
                 tool_name="tv.delete_item",
             ),
         ])
@@ -683,6 +691,7 @@ class TvWorkflowMixin:
                 },
                 intent=Intent.DOWNLOAD,
                 risk_level="write",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_next_missing_episode",
             ),
             CategoryWorkflowDeclaration(
@@ -699,6 +708,7 @@ class TvWorkflowMixin:
                 },
                 intent=Intent.DOWNLOAD,
                 risk_level="write",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_specific_episode",
             ),
             CategoryWorkflowDeclaration(
@@ -707,6 +717,7 @@ class TvWorkflowMixin:
                 parameters={"type": "object", "properties": {"item_id": {"type": "string"}}, "required": ["item_id"]},
                 intent=Intent.DOWNLOAD,
                 risk_level="write",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.scheduled_check",
             ),
             CategoryWorkflowDeclaration(
@@ -719,6 +730,7 @@ class TvWorkflowMixin:
                 },
                 intent=Intent.DOWNLOAD,
                 risk_level="write",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_season_pack",
             ),
             CategoryWorkflowDeclaration(
@@ -731,7 +743,27 @@ class TvWorkflowMixin:
                 },
                 intent=Intent.DOWNLOAD,
                 risk_level="write",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="tv.download_missing_batch",
+            ),
+            CategoryWorkflowDeclaration(
+                name="delete_item",
+                description="Delete/untrack one TV item; deleting local files requires separate file-delete authority and exact confirmation.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "delete_files": {"type": "boolean"},
+                        "confirmed": {"type": "boolean"},
+                        "confirmation_token": {"type": "string"},
+                    },
+                    "required": ["item_id"],
+                },
+                intent=Intent.CONFIG,
+                risk_level="destructive",
+                requires_confirmation=True,
+                invocation_capabilities_required={InvocationCapability.LIBRARY_WRITE},
+                tool_name="tv.delete_item",
             ),
         ]
 
@@ -1059,6 +1091,19 @@ class TvWorkflowMixin:
             )
 
         if workflow_name in {"delete_item", "delete_show"}:
+            tool_context = getattr(context, "tool_execution_context", None)
+            if (
+                arguments.get("delete_files")
+                and tool_context is not None
+                and not tool_context.allows_capability(InvocationCapability.LIBRARY_FILES_DELETE)
+            ):
+                return ActionReceipt(
+                    category_id=self.category_id,
+                    action_name=workflow_name,
+                    status="failed",
+                    user_message="This invocation may untrack the TV item but is not authorized to delete library files.",
+                    technical_message="Missing library.files.delete capability.",
+                )
             payload = {k: v for k, v in arguments.items() if k not in {"confirmed", "confirmation_token"}}
             affected_paths = self._candidate_delete_paths(title, context.settings) if arguments.get("delete_files") else []
             if not arguments.get("confirmed"):

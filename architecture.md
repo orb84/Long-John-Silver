@@ -3080,3 +3080,218 @@ The dependency-light executable harness exists specifically for packaging hosts
 that do not have the complete declared LJS runtime installed. The in-project
 pytest file remains the normal authoritative regression when that environment is
 available.
+
+## External control plane and MCP agent delegation (2026-08-15, security/truth repair)
+
+LJS exposes external automation through an **application-owned public control
+plane**. MCP is only a transport adapter over that control plane; it does not
+own domain reasoning, category semantics, conversation state, mutation truth,
+downloader state, or scheduler/runtime lifecycle.
+
+### Authority and lifecycle boundaries
+
+The external-control architecture keeps distinct identities/lifecycles separate:
+
+- `conversation_id` is a high-entropy server-minted public handle. It maps
+  privately to an existing LJS session, is bound to principal/client/user,
+  expires after inactivity (30-day default), is quota-bounded (100 active per
+  principal/client by default), and is explicitly revocable with
+  `ljs.agent_close`. Expiry/revocation cleans the private external session and its
+  conversation history. External callers never choose internal `session_id` values.
+- `turn_id` is the foreground assistant-execution identity owned by
+  `src/ai/chat_turn_registry.py`. Web/REST/MCP delegation share that same
+  process-local cancellation authority. Public cancellation truth distinguishes
+  `not_running`, `cancelling`, and settled `cancelled`.
+- `command_id` / `correlation_id` remain durable mutation/receipt identities
+  owned by `ActionGateway` and command-producing tools.
+- A detached long-running `work_id` still does **not** exist. It should be added
+  only if real interoperability proves request-scoped execution insufficient;
+  it must not replace conversation/turn/command identities.
+
+`ChatSessionRunner` remains the semantic entry point for interactive assistant
+turns. `AgentDelegationService` adapts an external principal and opaque handle
+into that existing runner. `AgentTurnControlService` owns cancellation/close
+truth, and `AgentDelegationAdmissionGate` bounds external provider-backed
+parallelism (4 active turns per principal/client by default). Delegated messages
+are bounded to 65,536 characters. These controls do not create a second agent
+loop.
+
+`ChatTurnRegistry` is intentionally process-local because LJS is currently a
+single-process runtime. Any future multi-worker deployment must introduce a
+shared turn-ownership/lease authority before claiming cross-worker cancellation.
+Transport-session affinity must not be used as a substitute.
+
+### Invocation identity and application capabilities
+
+`InvocationPrincipal` and `InvocationContext` are protocol-neutral application
+models. Trusted first-party surfaces retain their historical tool surface.
+Constrained external principals carry explicit capabilities.
+
+Authorization domain and operational risk are separate concepts. Category
+`risk_level`, destructive labels and confirmation policy answer how an action is
+handled; they **do not grant authority**. `CategoryActionDeclaration` and
+`CategoryWorkflowDeclaration` carry explicit `invocation_capabilities_required`
+for concrete application domains such as:
+
+- `library.read` / `library.write`;
+- `library.files.delete`;
+- `downloads.read` / `downloads.write`;
+- `tracking.write`;
+- `config.write`;
+- `config.llm.read` / `config.llm.probe` / `config.llm.write` /
+  `config.llm.endpoint.write`.
+
+Current TV/movie/base/definition-backed mutations declare the authority they
+actually require. The generic cross-domain category dispatcher and any future
+mutable tool lacking explicit authorization metadata fail closed to `admin` for
+constrained principals rather than being guessed from English tool names or
+`risk_level`.
+
+Definition-backed workflows receive the originating `ToolExecutionContext`.
+This closes hidden-mutation paths where a normally read-only workflow can
+persist when scheduler/internal-only arguments (for example `item_id`) are
+present: constrained external callers need the write capability for the hidden
+persistence path as well.
+
+Agent-visible category contracts must also be executable truth. Generic
+`scan_library` / `consolidate_library` declarations that do not own a concrete
+category executor are not advertised as LLM tools. TV/movie delete workflows
+are concrete two-phase, token-bound workflows: untracking requires
+`library.write`, while `delete_files=true` additionally requires
+`library.files.delete` before local path evidence is computed. Ordinary
+delegated assistant turns still hide destructive category tools because the
+assistant has no canonical policy-level `confirmed` continuation state yet; an
+explicit category caller can use the workflow confirmation contract directly.
+Do not invent a tool-name or prose-based confirmation bypass to expose them.
+
+Capability enforcement is defense in depth:
+
+1. `AIAssistant` intersects intent/category tool policy with invocation
+   capabilities **before** tool definitions are shown to the LLM.
+2. `ToolRegistry.execute()` rechecks capabilities at execution.
+3. Delegated calls default to `allow_actions=false`, which removes write
+   capabilities even from a more privileged credential for that turn.
+4. Unknown/unannotated mutable private tools fail closed for constrained
+   principals.
+
+The private `ToolRegistry` is not the MCP catalog. MCP must not export it, a
+`execute_action(name,args)` escape hatch, or raw search/download micro-tools.
+
+### Structured delegated outcomes
+
+A delegated turn returns `ChatTurnOutcome` / `AgentDelegationResult` with public
+conversation handle, `turn_id`, status/text, stable result-set/candidate IDs in
+observation order, and IDs of **persisted** action receipts. The structural
+evidence collector does not parse assistant prose or media vocabulary.
+
+Confirmation-required tool results (`requires_confirmation`,
+`confirmation_required`, `needs_confirmation`) keep the delegated turn in
+`needs_input`; they are not mistaken for completion. Unhandled runner failures
+become a bounded `failed` result whose public message directs callers to the
+separately authorized diagnostics surface rather than exposing private
+exception text.
+
+### Public control plane
+
+`src/core/public_control_plane.py` contains bounded query/control services for:
+
+- application/storage status with private exception redaction;
+- tracked canonical library summaries and exact item lookup, recursively
+  redacting host-local path fields;
+- active-download summaries;
+- configured/effective LLM routing;
+- an explicit outbound provider/model probe;
+- curated LLM routing changes through `ActionGateway`;
+- redacted recent LLM diagnostics.
+
+The facade in `src/core/public_control_plane_facade.py` is protocol-neutral and
+has no MCP request dependency or arbitrary gateway-registration escape hatch.
+
+### LLM route and credential ownership
+
+Provider/model configuration, endpoint authority and credentials are distinct.
+The public capabilities intentionally separate them:
+
+- `config.llm.read` reads configured/effective routing;
+- `config.llm.probe` allows the outbound authenticated provider/model catalog
+  request performed by `ljs.llm_test`;
+- `config.llm.write` changes ordinary provider/model/tier routing;
+- `config.llm.endpoint.write` is additionally required whenever an MCP update
+  contains an `api_base` change.
+
+The MCP surface never accepts API-key fields. Canonical mutation is implemented
+by `LLMSettingsMutationService` using a detached candidate configuration. A
+provider transition resets the route to the selected provider's configured
+endpoint and clears an incompatible global/tier secret; a custom endpoint change
+also clears inherited route secrets. Persistence and runtime reload are treated
+as one mutation: failures trigger best-effort restoration of the previous
+persisted and runtime configuration before the command can be reported as
+successful.
+
+`ProviderCredentialPolicy` controls automatic KeyStore secret attachment. A
+stored provider credential may be auto-attached only when the resolved endpoint
+is that provider preset's canonical endpoint. Operator/registry endpoint
+overrides are honored for routing but are **not** credential-owned, so provider
+secrets do not silently follow them. Explicit task/tier custom endpoints also do
+not inherit the global provider secret.
+
+### MCP transport and authentication
+
+The first MCP implementation is opt-in Streamable HTTP mounted at `/mcp` in the
+**already-running LJS FastAPI process**. The top-level FastAPI lifespan owns the
+MCP SDK session manager. Starting MCP must never initialize another LJS
+scheduler, downloader, database runtime, sidecar manager, or assistant.
+
+The transport is intentionally local-only. `LocalMCPNetworkBoundary` rejects
+non-loopback clients and missing/unknown ASGI client origins, even when the rest
+of LJS is bound to `0.0.0.0`. `MCPAuthenticationBoundary` authenticates once at
+the outer ASGI boundary and propagates the immutable validated principal through
+`MCPRequestPrincipalContext`.
+
+Local MCP v1 accepts only the dedicated `LJS_MCP_TOKEN` (minimum 32 characters).
+Generic LJS Web JWTs are not MCP credentials and are never widened into `admin`.
+`LJS_MCP_USER_ID` selects the canonical LJS user whose preferences/history are
+used by delegated turns. `local` may be created by normal local-session bootstrap;
+any other configured user id must already exist. `LJS_MCP_CLIENT_ID` participates
+in handle ownership.
+One token/principal/client tuple should represent one local external agent.
+
+Remote MCP is a separate future feature and requires a real TLS/OAuth resource
+server design. LJS must not publish fake discovery metadata or weaken the local
+boundary to simulate it.
+
+Current public MCP tools are deliberately small:
+
+- `ljs.agent_message`, `ljs.agent_cancel`, `ljs.agent_close`;
+- `ljs.status`, `ljs.capabilities`;
+- `ljs.library_list`, `ljs.library_get`;
+- `ljs.downloads_list`;
+- `ljs.llm_get`, `ljs.llm_test`, `ljs.llm_set`;
+- `ljs.diagnostics_recent`.
+
+Bounded JSON resources expose status, capabilities, a first library summary
+page, active downloads, and LLM configuration. No stdio runtime owner, remote
+MCP, public raw acquisition tools, arbitrary action executor, or MCP Tasks clone
+is part of this slice.
+
+Verify this boundary with:
+
+```bash
+python -m compileall -q src scripts main.py
+PYTHONPATH=. python scripts/mcp_control_plane_tests.py
+PYTHONPATH=. python scripts/check_mcp_architecture.py
+PYTHONPATH=. python scripts/round293_ella_search_selection_cancel_tests.py
+PYTHONPATH=. python scripts/check_ai_intent_architecture.py
+PYTHONPATH=. python scripts/check_ai_context_architecture.py
+PYTHONPATH=. python scripts/check_security_architecture.py
+PYTHONPATH=. python scripts/check_category_architecture.py
+PYTHONPATH=. python scripts/check_public_docs.py
+PYTHONPATH=. python scripts/check_model_facade_imports.py
+PYTHONPATH=. python scripts/check_compatibility_shims.py
+PYTHONPATH=. python scripts/check_architecture.py
+PYTHONPATH=. pytest -q
+```
+
+The real SDK/HTTP acceptance protocol is documented in
+`MCP_LIVE_ACCEPTANCE_LOCAL_AGENT_2026-08-15.md` and must run against the same
+normally started LJS process; it must not bootstrap a second runtime.

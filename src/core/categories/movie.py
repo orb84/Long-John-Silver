@@ -24,6 +24,7 @@ from src.core.categories.media_probe import probe_media_files_serial, resolution
 from src.core.categories.video_sidecars import plan_video_sidecar_imports
 from src.core.security.path_policy import SafePathResolver, SecurityPolicyError
 from src.core.models import (
+    InvocationCapability,
     CategoryActionDeclaration,
     CategoryLlmProfile,
     CategoryPromptExample,
@@ -562,9 +563,11 @@ class MovieCategory(CategoryMedia):
                 description="Scan the configured movie library path and reconcile discovered movie items.",
                 parameters={"type": "object", "properties": {}, "required": []},
                 risk_level="write",
+                llm_visible=False,
                 operation="scan_library",
                 capabilities_required=["file_organization"],
                 result_component="file_list",
+                invocation_capabilities_required={InvocationCapability.LIBRARY_WRITE},
                 tool_name="movie.scan_library",
             ),
             CategoryActionDeclaration(
@@ -583,6 +586,7 @@ class MovieCategory(CategoryMedia):
                 capabilities_required=["file_organization"],
                 confirmation_prompt="Delete this movie item? This may remove files if delete_files is true.",
                 result_component="action_receipt",
+                invocation_capabilities_required={InvocationCapability.LIBRARY_WRITE},
                 tool_name="movie.delete_item",
             ),
         ])
@@ -621,6 +625,7 @@ class MovieCategory(CategoryMedia):
                 parameters={"type": "object", "properties": {"item_id": {"type": "string"}}, "required": ["item_id"]},
                 intent=Intent.DOWNLOAD,
                 risk_level="write",
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="movie.scheduled_check",
             ),
             CategoryWorkflowDeclaration(
@@ -634,7 +639,28 @@ class MovieCategory(CategoryMedia):
                 intent=Intent.DOWNLOAD,
                 risk_level="write",
                 requires_confirmation=False,
+                invocation_capabilities_required={InvocationCapability.DOWNLOADS_WRITE},
                 tool_name="movie.download_movie",
+            ),
+            CategoryWorkflowDeclaration(
+                name="delete_item",
+                description="Delete/untrack one movie; deleting local files requires separate file-delete authority and exact confirmation.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "year": {"type": "integer"},
+                        "delete_files": {"type": "boolean"},
+                        "confirmed": {"type": "boolean"},
+                        "confirmation_token": {"type": "string"},
+                    },
+                    "required": ["item_id"],
+                },
+                intent=Intent.CONFIG,
+                risk_level="destructive",
+                requires_confirmation=True,
+                invocation_capabilities_required={InvocationCapability.LIBRARY_WRITE},
+                tool_name="movie.delete_item",
             ),
         ]
 
@@ -729,6 +755,19 @@ class MovieCategory(CategoryMedia):
             )
 
         if workflow_name == "delete_item":
+            tool_context = getattr(context, "tool_execution_context", None)
+            if (
+                arguments.get("delete_files")
+                and tool_context is not None
+                and not tool_context.allows_capability(InvocationCapability.LIBRARY_FILES_DELETE)
+            ):
+                return ActionReceipt(
+                    category_id=self.category_id,
+                    action_name=workflow_name,
+                    status="failed",
+                    user_message="This invocation may untrack the movie but is not authorized to delete library files.",
+                    technical_message="Missing library.files.delete capability.",
+                )
             payload = {k: v for k, v in arguments.items() if k not in {"confirmed", "confirmation_token"}}
             affected_paths = self._candidate_delete_paths(title, context.settings) if arguments.get("delete_files") else []
             if not arguments.get("confirmed"):

@@ -106,6 +106,14 @@ class UserRepository(BaseRepository):
             "channel_user_id": channel_user_id,
         }
 
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete one session and its conversation history as one lifecycle cleanup."""
+        normalized = str(session_id or "")
+        await self._db.execute("DELETE FROM conversation_history WHERE session_id = ?", (normalized,))
+        cursor = await self._db.execute("DELETE FROM sessions WHERE id = ?", (normalized,))
+        await self._db.commit()
+        return bool(cursor.rowcount)
+
     async def get_user_sessions(self, user_id: str) -> list[dict]:
         """Get all sessions for a user."""
         cursor = await self._db.execute(

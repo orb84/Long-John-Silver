@@ -1099,4 +1099,5 @@ class CategoryToolProvider:
             artwork_manager=self._artwork_manager,
             user_id=context.user_id,
             session_id=context.session_id,
+            tool_execution_context=context,
         )

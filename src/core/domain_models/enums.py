@@ -122,6 +122,7 @@ class ActionSource(str, Enum):
 
     CHAT = "chat"
     UI = "ui"
+    EXTERNAL = "external"
     SCHEDULER = "scheduler"
     SYSTEM = "system"
 

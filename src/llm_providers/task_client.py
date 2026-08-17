@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from src.core.models import LLMConfig, TaskModelConfig
 from src.llm_providers.manager import LLMProviderManager
+from src.llm_providers.credential_policy import ProviderCredentialPolicy
 from src.llm_providers.context_limits import (
     FALLBACK_CONTEXT_LIMIT,
     MIN_USER_CONTEXT_LIMIT,
@@ -791,15 +792,9 @@ class TaskLLMClient:
             )
             return None
 
-        api_base = resolved_task.api_base if resolved_task.api_base else config.api_base
-        api_key = resolved_task.api_key if resolved_task.api_key else config.api_key
-
-        # Try resolving key from provider manager if still missing
-        if not api_key:
-            provider_id = resolved_task.provider if resolved_task.provider else config.active_provider
-            if provider_id:
-                api_key = self._manager.keys.get_active_key(provider_id)
-                api_key = api_key.key if api_key else None
+        provider_id = self._resolve_provider(task, resolved_task)
+        api_base = self._resolve_api_base(task, resolved_task, provider_id)
+        api_key = self._resolve_api_key(task, resolved_task, provider_id)
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -958,18 +953,17 @@ class TaskLLMClient:
 
         if resolved_task.api_base:
             return resolved_task.api_base
-        if config.api_base:
+        if provider_id == config.active_provider and config.api_base:
             return config.api_base
 
-        # Provider preset API base
+        # Provider registry resolves an operator override first and otherwise
+        # falls back to the provider preset.  Credential attachment is decided
+        # separately by ProviderCredentialPolicy, so honoring a custom endpoint
+        # here cannot make a stored provider key follow it.
         if provider_id:
-            preset = self._manager.registry.get_preset(provider_id)
-            if preset and preset.api_base:
-                return preset.api_base
-            # Check for API base override
-            override = self._manager.registry.get_resolved_api_base(provider_id)
-            if override:
-                return override
+            resolved = self._manager.registry.get_resolved_api_base(provider_id)
+            if resolved:
+                return resolved
 
         return None
 
@@ -985,11 +979,20 @@ class TaskLLMClient:
 
         if resolved_task.api_key:
             return resolved_task.api_key
-        if config.api_key:
+
+        # The global secret is coupled to the global provider+endpoint route.
+        # Never send it to a task/tier that overrides provider or API base.
+        if (
+            config.api_key
+            and provider_id == config.active_provider
+            and resolved_task.api_base is None
+        ):
             return config.api_key
 
-        # Active key from KeyStore
-        if provider_id:
+        # Provider key-store secrets may only be auto-attached to a provider-owned
+        # endpoint (the provider preset), never to an operator override or arbitrary custom URL.
+        api_base = self._resolve_api_base(task, resolved_task, provider_id)
+        if provider_id and ProviderCredentialPolicy.is_provider_owned_endpoint(self._manager.registry, provider_id, api_base):
             active_key = self._manager.keys.get_active_key(provider_id)
             if active_key:
                 return active_key.key

@@ -33,11 +33,12 @@ from src.ai.language import detect_user_language_label
 from src.ai.agent_loop_state import INTENTS_ELIGIBLE_FOR_REFLECTION
 from src.ai.agent_loop import AgentLoopExecutor
 from src.ai.streaming_agent_loop import StreamingAgentLoopExecutor
-from src.core.models import AgentRunContext, AgentStreamEvent
+from src.core.models import AgentRunContext, AgentStreamEvent, InvocationContext, ToolExecutionContext
 from src.ai.tool_executor import ToolCallExecutor
 from src.ai.torrent_selection import TorrentSelectionService
 from src.ai.prompt_builder import PromptBuilder
 from src.ai.tool_registry import ToolRegistry
+from src.ai.tool_context import ToolExecutionContextFactory
 from src.ai.category_resolver import CategoryResolver
 from src.ai.tool_policy import AgentToolPolicy
 from src.ai.memory_composer import PromptMemoryComposer
@@ -111,6 +112,7 @@ class ExecutionContext:
     pref_summary: str | None = None
     agent_context: AgentRunContext | None = None
     category_id: str | None = None
+    tool_execution_context: ToolExecutionContext | None = None
 
 
 
@@ -380,6 +382,7 @@ class AIAssistant:
     async def _prepare_execution_context(
         self, user_prompt: str, session_id: str | None = None,
         user_id: str | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> ExecutionContext:
         """Build shared execution context for run() and run_stream().
 
@@ -604,13 +607,18 @@ class AIAssistant:
             category=active_category,
             acquisition_continuation=acquisition_continuation,
         )
-        agent_context.allowed_tool_names = sorted(allowed_tool_names)
-        tool_definitions = self._tool_policy.definitions_for_intent(
-            self._tool_registry,
-            intent,
-            category=active_category,
-            acquisition_continuation=acquisition_continuation,
+        tool_execution_context = ToolExecutionContextFactory.create(
+            invocation=invocation_context,
+            session_id=session_id,
+            user_id=user_id,
+            category_id=active_category.category_id if active_category else None,
+            user_prompt=user_prompt,
         )
+        allowed_tool_names = self._tool_registry.filter_names_for_context(
+            allowed_tool_names, tool_execution_context,
+        )
+        agent_context.allowed_tool_names = sorted(allowed_tool_names)
+        tool_definitions = self._tool_registry.get_definitions(allowed_tool_names) or None
         system_prompt = self._append_live_tool_contract(system_prompt, allowed_tool_names, tool_definitions)
         logger.debug(
             "Prepared agent context: intent={} category={} tools={} messages_context_chars={}",
@@ -671,6 +679,7 @@ class AIAssistant:
             pref_summary=planning_pref_context,
             agent_context=agent_context,
             category_id=agent_context.category_id,
+            tool_execution_context=tool_execution_context,
         )
 
 
@@ -691,7 +700,8 @@ class AIAssistant:
         )
 
     async def run(self, user_prompt: str, session_id: str | None = None,
-                  user_id: str | None = None) -> str:
+                  user_id: str | None = None,
+                  invocation_context: InvocationContext | None = None) -> str:
         """Execute the agentic loop with intent routing and tool calling.
 
         Args:
@@ -710,7 +720,7 @@ class AIAssistant:
             except Exception as le:
                 logger.warning(f"Failed to log user message: {le}")
 
-        ctx = await self._prepare_execution_context(user_prompt, session_id, user_id)
+        ctx = await self._prepare_execution_context(user_prompt, session_id, user_id, invocation_context)
         if ctx.clarification:
             if self._chat_logger:
                 try:
@@ -790,6 +800,7 @@ class AIAssistant:
             plan_trace_store=plan_trace_store,
             session_id=session_id,
             active_category_id=ctx.category_id,
+            tool_context=ctx.tool_execution_context,
         )
         final_response = loop_result.response
 
@@ -825,7 +836,8 @@ class AIAssistant:
         return final_response
 
     async def run_stream(self, user_prompt: str, session_id: str | None = None,
-                         user_id: str | None = None) -> AsyncIterator[str]:
+                         user_id: str | None = None,
+                         invocation_context: InvocationContext | None = None) -> AsyncIterator[str]:
         """Stream the agentic loop, yielding tokens as they arrive from the LLM.
 
         Tool calls are handled sequentially; the final text response
@@ -842,7 +854,7 @@ class AIAssistant:
             except Exception as le:
                 logger.warning(f"Failed to log user message: {le}")
 
-        ctx = await self._prepare_execution_context(user_prompt, session_id, user_id)
+        ctx = await self._prepare_execution_context(user_prompt, session_id, user_id, invocation_context)
         if ctx.clarification:
             if self._chat_logger:
                 try:
@@ -921,6 +933,7 @@ class AIAssistant:
             session_id=session_id,
             active_category_id=ctx.category_id,
             user_prompt=user_prompt,
+            tool_context=ctx.tool_execution_context,
         ):
             yield token
 

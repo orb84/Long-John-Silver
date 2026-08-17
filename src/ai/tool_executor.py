@@ -18,6 +18,7 @@ from loguru import logger
 from src.ai.tool_registry import ToolRegistry
 from src.ai.tool_result_compactor import ToolResultCompactor
 from src.ai.tool_contracts import ToolContractValidator
+from src.ai.tool_result_evidence import ToolResultEvidenceCollector
 from src.core.models import ToolExecutionContext
 
 
@@ -213,6 +214,10 @@ class ToolCallExecutor:
                 execution_context = execution_context.model_copy(update={"operation_id": tool_call_id})
                 result = await self._execute_with_bounded_retry(
                     executable_name, validation.arguments, tool_context=execution_context,
+                )
+                ToolResultEvidenceCollector.record(
+                    result,
+                    execution_context.invocation_evidence,
                 )
 
         if isinstance(result, dict) and (result.get("ok") is False or result.get("error")):

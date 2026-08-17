@@ -20,3 +20,5 @@ from src.core.domain_models.auth import *
 
 # Private compatibility helpers intentionally re-exported for legacy callers.
 from src.core.domain_models.media import _deserialize_item
+
+from src.core.domain_models.invocation import *

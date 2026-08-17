@@ -105,6 +105,7 @@ class AgentLoopExecutor:
         plan_trace_store: Optional[Any] = None,
         session_id: str | None = None,
         active_category_id: str | None = None,
+        tool_context: ToolExecutionContext | None = None,
     ) -> AgentLoopResult:
         """Execute the agentic tool loop.
 
@@ -201,7 +202,7 @@ class AgentLoopExecutor:
                             arguments_raw=recovered.arguments,
                             tool_call_id=recovered.call_id,
                             allowed_tool_names=allowed_tool_names,
-                            tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                            tool_context=tool_context,
                         )
                         loop_state.tool_results.append(result_summary)
                         messages.append(result_message)
@@ -237,7 +238,7 @@ class AgentLoopExecutor:
                                     arguments_raw=json.dumps(recovery_args, ensure_ascii=False),
                                     tool_call_id=tool_call_id,
                                     allowed_tool_names=allowed_tool_names,
-                                    tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                                    tool_context=tool_context,
                                 )
                                 loop_state.tool_results.append(result_summary)
                                 messages.append(result_message)
@@ -265,11 +266,7 @@ class AgentLoopExecutor:
                                 arguments_raw="{}",
                                 tool_call_id=tool_call_id,
                                 allowed_tool_names=allowed_tool_names,
-                                tool_context=self._tool_context(
-                                    session_id,
-                                    active_category_id=active_category_id,
-                                    user_prompt=user_prompt,
-                                ),
+                                tool_context=tool_context,
                             )
                             loop_state.tool_results.append(result_summary)
                             messages.append(result_message)
@@ -337,7 +334,7 @@ class AgentLoopExecutor:
                             arguments_raw=function_args,
                             tool_call_id=tool_call_id,
                             allowed_tool_names=allowed_tool_names,
-                            tool_context=self._tool_context(session_id, active_category_id=active_category_id, user_prompt=user_prompt),
+                            tool_context=tool_context,
                         )
                     )
                     loop_state.tool_results.append(result_summary)
@@ -376,15 +373,6 @@ class AgentLoopExecutor:
             tool_results_count=len(loop_state.tool_results),
         )
 
-    @staticmethod
-    def _tool_context(session_id: str | None, *, active_category_id: str | None = None, user_prompt: str | None = None) -> ToolExecutionContext:
-        """Build lightweight invocation context for declarative tools."""
-        source = "web"
-        if session_id and ":" in session_id:
-            source = session_id.split(":", 1)[0] or "web"
-        elif session_id and "_" in session_id:
-            source = session_id.split("_", 1)[0] or "web"
-        return ToolExecutionContext(session_id=session_id, source=source, category_id=active_category_id, user_prompt=user_prompt)
 
     @staticmethod
     async def _execute_plan_steps(

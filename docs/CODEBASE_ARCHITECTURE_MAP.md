@@ -1090,3 +1090,56 @@ provider for one domain.
 - `src/core/categories/tv_agent.py` owns TV release-title identity checks and publishes `title_identity` on annotated search candidates. TV payload filters must reject a row when that verdict says the candidate names a different series, even if the row has a matching `unit_descriptor` such as `S01E06`.
 - `src/ai/tools/scheduling.py` may preserve and pass through `title_identity`, but it must not regain TV title parsing or decide that an episode coordinate makes a candidate title safe.
 - `scripts/round281_tv_title_identity_guard_tests.py` covers the Rooster/Rooster Fighter class of regression with neutral fixture names so active tests do not encode one-off show titles.
+
+### External control plane / MCP delegation (2026-08-15)
+
+- `src/core/domain_models/invocation.py` — authenticated invocation principals,
+  application capabilities, per-call action mode, and structured stable evidence.
+- `src/core/invocation.py` — trusted-first-party compatibility resolver and
+  capability guard.
+- `src/ai/tool_capabilities.py` — explicit capability metadata for private agent
+  tools; unknown tools fail closed for constrained external principals.
+- `src/ai/tool_context.py` — one shared `ToolExecutionContext` factory for both
+  agent loops.
+- `src/ai/tool_result_evidence.py` — structural collection of stable result-set,
+  candidate, and persisted command-receipt IDs.
+- `src/ai/chat_turn_registry.py` — canonical transport-neutral foreground-turn
+  owner. `src/web/chat_turn_registry.py` is only a compatibility re-export.
+- `src/core/repositories/conversation_handle.py` +
+  `src/core/conversation_handle.py` — durable server-minted external conversation
+  handles bound to principal/client and private LJS sessions.
+- `src/ai/agent_delegation.py` — external-agent delegation over the existing
+  `ChatSessionRunner`; no second LLM/tool loop.
+- `src/core/public_control_plane.py` — bounded status/library/download/LLM/
+  diagnostics services; curated LLM writes use `ActionGateway`.
+- `src/core/public_control_plane_facade.py` — protocol-neutral aggregate exposed
+  to adapters.
+- `src/integrations/mcp_configuration.py` — opt-in environment configuration and
+  explicit default capabilities.
+- `src/integrations/mcp_auth.py` — bearer credential validation to an
+  `InvocationPrincipal`.
+- `src/integrations/mcp_network.py` — loopback-only ASGI boundary for the first
+  MCP transport.
+- `src/integrations/mcp_server.py` — thin official-SDK MCP tools/resources
+  adapter. It must not import the private ToolRegistry or bootstrap LJS runtime.
+- `src/integrations/mcp_runtime.py` — lets the top-level FastAPI lifespan own the
+  mounted MCP session manager.
+- `migrations/114_external_conversation_handles.sql` — persistent external
+  conversation-handle binding.
+- `scripts/mcp_control_plane_tests.py` — dependency-light behavioral acceptance
+  for auth, handles, delegation, cancellation, evidence, transport surface and
+  loopback enforcement.
+- `scripts/check_mcp_architecture.py` — drift guard preventing public raw
+  search/download/generic-action exposure and runtime ownership in the adapter.
+
+Flow:
+
+```text
+MCP host
+  -> local-only Streamable HTTP adapter
+  -> validated InvocationPrincipal
+  -> PublicControlPlane
+       -> AgentDelegationService -> ChatSessionRunner -> AIAssistant -> private ToolRegistry
+       -> bounded canonical reads
+       -> curated command -> ActionGateway
+```

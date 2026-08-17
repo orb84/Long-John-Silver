@@ -24,6 +24,7 @@ from src.core.categories.identity import clean_display_title, clean_path_fragmen
 from src.core.categories.local_object_reconstruction import LocalObjectReconstructor
 from src.core.categories.types import ParsedMedia, ScannedFileObservation, ScannedItem
 from src.core.models import (
+    InvocationCapability,
     ActionReceipt,
     CategoryLlmProfile,
     CategoryPromptExample,
@@ -813,8 +814,9 @@ class DefinitionBackedCategory(CategoryMedia):
                 tool_name=tool_name,
                 description=self._workflow_description(workflow_name),
                 intent=self._workflow_intent(workflow_name),
-                risk_level="write" if self._workflow_is_write(workflow_name) else "read",
-                requires_confirmation=self._workflow_is_write(workflow_name),
+                risk_level="write" if self._workflow_invocation_capabilities(workflow_name) else "read",
+                requires_confirmation=bool(self._workflow_invocation_capabilities(workflow_name)),
+                invocation_capabilities_required=self._workflow_invocation_capabilities(workflow_name),
                 parameters=self._workflow_parameters(workflow_name),
             ))
         return workflows
@@ -848,15 +850,22 @@ class DefinitionBackedCategory(CategoryMedia):
 
     @staticmethod
     def _workflow_intent(workflow_name: str) -> Intent:
-        """Infer a safe tool intent scope from a workflow name."""
-        if any(token in workflow_name for token in ("download", "convert", "queue")):
+        """Return the explicit intent contract for definition-backed workflows."""
+        if workflow_name in {"search_download_candidates", "convert_audio_for_apple"}:
             return Intent.DOWNLOAD
         return Intent.SEARCH
 
     @staticmethod
-    def _workflow_is_write(workflow_name: str) -> bool:
-        """Return whether a workflow mutates files/download state."""
-        return any(token in workflow_name for token in ("download", "convert", "queue", "delete", "repair"))
+    def _workflow_invocation_capabilities(workflow_name: str) -> set[InvocationCapability]:
+        """Return application authorization for the implemented mutating workflows.
+
+        Definition identifiers are contracts, not natural-language evidence. A workflow
+        remains read-only until its concrete executor is explicitly classified here;
+        adding a future mutating executor therefore requires an authorization decision.
+        """
+        if workflow_name == "convert_audio_for_apple":
+            return {InvocationCapability.LIBRARY_WRITE}
+        return set()
 
     @staticmethod
     def _workflow_parameters(workflow_name: str) -> dict[str, Any]:
@@ -919,6 +928,9 @@ class DefinitionBackedCategory(CategoryMedia):
         provider snapshot so the UI and future refresh scheduling have durable
         evidence instead of repeatedly re-querying providers.
         """
+        tool_context = getattr(context, "tool_execution_context", None)
+        if tool_context is not None and not tool_context.allows_capability(InvocationCapability.LIBRARY_WRITE):
+            return None
         db = getattr(context, "db", None)
         media_repo = getattr(db, "media", None) if db is not None else None
         if media_repo is None or not hasattr(media_repo, "upsert_category_metadata"):

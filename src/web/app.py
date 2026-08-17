@@ -48,8 +48,22 @@ from src.web.llm_diagnostics import LLMActivityBroadcaster
 from src.web.static_assets import BrowserBundleCoherenceMiddleware, StaticAssetVersionResolver
 from src.web.runtime_identity import RuntimeBuildIdentityResolver
 from src.web.chat_state import ChatTurnStateBroadcaster
-from src.web.chat_turn_registry import ActiveChatTurn, ChatTurnRegistry
+from src.ai.chat_turn_registry import ActiveChatTurn, ChatTurnRegistry
 from src.ai.chat_session_runner import ChatSessionRunner, ChatTurnRequest
+from src.ai.agent_delegation import AgentDelegationService
+from src.core.conversation_handle import ConversationHandleService
+from src.core.public_control_plane import (
+    PublicDiagnosticsService,
+    PublicDownloadService,
+    PublicLibraryService,
+    PublicLLMConfigurationService,
+    PublicStatusService,
+)
+from src.core.public_control_plane_facade import PublicControlPlane
+from src.integrations.mcp_auth import MCPPrincipalResolver
+from src.integrations.mcp_configuration import MCPIntegrationSettings
+from src.integrations.mcp_runtime import MCPHostRuntime
+from src.integrations.mcp_server import MCPServerAdapter
 from src.utils.async_boundary import AsyncBoundary
 
 
@@ -78,7 +92,8 @@ async def _stream_chat_with_progress(
 def create_app(*, runtime_build_id: str | None = None, **kwargs: Any) -> FastAPI:
     """Create and configure the FastAPI application."""
     deps = WebDependencies(**kwargs)
-    app = FastAPI(title="LJS Quartermaster's Deck")
+    mcp_runtime = MCPHostRuntime()
+    app = FastAPI(title="LJS Quartermaster's Deck", lifespan=mcp_runtime.lifespan)
     deps.templates = Jinja2Templates(directory="src/web/templates")
     asset_versions = StaticAssetVersionResolver(Path("src/web/static"))
     deps.templates.env.globals["static_asset"] = asset_versions.url
@@ -142,6 +157,43 @@ def create_app(*, runtime_build_id: str | None = None, **kwargs: Any) -> FastAPI
 
     ActionRegistrationService(action_gateway, deps).register_all()
 
+    mcp_settings = MCPIntegrationSettings.from_environment()
+    app.state.mcp_adapter = None
+    if mcp_settings.enabled:
+        control_plane = PublicControlPlane(
+            agent=AgentDelegationService(
+                ChatSessionRunner(deps.assistant),
+                chat_turns,
+                ConversationHandleService(deps.db),
+            ),
+            status=PublicStatusService(deps.storage_monitor),
+            library=PublicLibraryService(
+                settings_manager=deps.settings_manager,
+                database=deps.db,
+                downloader=deps.downloader,
+                category_registry=deps.category_registry,
+            ),
+            downloads=PublicDownloadService(deps.downloader),
+            llm=PublicLLMConfigurationService(
+                settings_manager=deps.settings_manager,
+                assistant=deps.assistant,
+                llm_manager=deps.llm_manager,
+                action_gateway=action_gateway,
+            ),
+            diagnostics=PublicDiagnosticsService(deps.llm_activity_monitor),
+        )
+        mcp_adapter = MCPServerAdapter(
+            control_plane=control_plane,
+            principal_resolver=MCPPrincipalResolver(
+                settings=mcp_settings,
+                auth_service=deps.auth_service,
+                database=deps.db,
+            ),
+        )
+        mcp_runtime.configure(mcp_adapter)
+        app.mount(mcp_settings.mount_path, mcp_adapter.asgi_app, name="mcp")
+        app.state.mcp_adapter = mcp_adapter
+
     downloader = deps.downloader
     stats_callback_result = downloader.set_stats_callback(
         DownloadStatsBroadcaster(dl_ws_manager, deps.supervisor, event_bus),
@@ -178,7 +230,7 @@ def create_app(*, runtime_build_id: str | None = None, **kwargs: Any) -> FastAPI
             return await call_next(request)
         allowed = ("/setup", "/api/setup", "/static", "/ws", "/api/providers",
                    "/api/comms", "/api/health", "/api/live", "/api/browser", "/api/jackett", "/api/soulseek", "/api/searxng", "/api/storage",
-                   "/api/settings", "/api/web-search", "/api/web-research", "/api/personas", "/api/setup/language", "/api/trakt", "/category-data")
+                   "/api/settings", "/api/web-search", "/api/web-research", "/api/personas", "/api/setup/language", "/api/trakt", "/category-data", "/mcp")
         if any(request.url.path == p or request.url.path.startswith(p + "/") for p in allowed):
             return await call_next(request)
         return RedirectResponse(url="/setup", status_code=302)

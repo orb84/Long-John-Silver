@@ -5,18 +5,22 @@ Provides SettingsActionHandler: the single place for settings mutation
 logic invoked via ActionGateway from UI endpoints.
 """
 
-from pathlib import Path
-from typing import Any
+from __future__ import annotations
 
-from src.ai.assistant import AIAssistant
-from src.core.config import SettingsManager
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
 from src.core.autostart import AutoStartManager
-from src.core.downloader import DownloadManager
 from src.core.models import WebSearchConfig, SizeLimitMode, BandwidthSchedule, SharingSettings, EmbeddingSettings, SoulseekSettings
-from src.llm_providers.manager import LLMProviderManager
-from src.llm_providers.context_limits import MIN_USER_CONTEXT_LIMIT
-from src.utils.auth import AuthService
-from src.integrations.slskd_manager import SlskdManager
+from src.llm_providers.settings_mutation import LLMSettingsMutationService
+
+if TYPE_CHECKING:
+    from src.ai.assistant import AIAssistant
+    from src.core.config import SettingsManager
+    from src.core.downloader import DownloadManager
+    from src.llm_providers.manager import LLMProviderManager
+    from src.utils.auth import AuthService
+    from src.integrations.slskd_manager import SlskdManager
 
 
 class SettingsActionHandler:
@@ -38,81 +42,12 @@ class SettingsActionHandler:
         self._assistant = assistant
         self._downloader = downloader
         self._auth = auth_service
-        self._llm = llm_manager
+        self._llm_settings = LLMSettingsMutationService(settings_manager, assistant, llm_manager)
         self._slskd = slskd_manager
 
     async def update_llm(self, **kwargs: Any) -> dict:
-        """Atomically update the base route, tier routes, and runtime config."""
-        settings = self._sm.settings
-        llm = settings.llm
-        self._apply_llm_route_fields(llm, kwargs)
-        self._apply_llm_budget_fields(llm, kwargs)
-        tiers = kwargs.get("tiers") if isinstance(kwargs.get("tiers"), dict) else {}
-        self._apply_llm_tiers(llm, tiers)
-        if bool(kwargs.get("apply_base_to_all")):
-            llm.clear_route_overrides()
-
-        self._sm.save(settings)
-        self._assistant.update_settings(settings)
-        summary = self._assistant.llm_route_summary()
-        return {
-            "status": "ok",
-            "apply_base_to_all": bool(kwargs.get("apply_base_to_all")),
-            **summary,
-        }
-
-    def _apply_llm_route_fields(self, llm: Any, values: dict[str, Any]) -> None:
-        """Apply the visible base route and provider-owned defaults."""
-        if values.get("model"):
-            llm.model = values["model"]
-        if "api_base" in values:
-            llm.api_base = values["api_base"] or None
-        if "api_key" in values:
-            llm.api_key = values["api_key"] or None
-        provider_id = values.get("provider")
-        if not provider_id:
-            return
-        llm.active_provider = provider_id
-        if not llm.api_base:
-            preset = self._llm.registry.get_preset(provider_id)
-            if preset:
-                llm.api_base = preset.api_base
-        if "api_key" not in values or not values["api_key"]:
-            active_key = self._llm.keys.get_active_key(provider_id)
-            if active_key:
-                llm.api_key = active_key.key
-
-    def _apply_llm_budget_fields(self, llm: Any, values: dict[str, Any]) -> None:
-        """Apply context-budget values while preserving their validated bounds."""
-        if "max_context_tokens" in values:
-            value = values["max_context_tokens"]
-            llm.max_context_tokens = None if value is None else max(MIN_USER_CONTEXT_LIMIT, int(value))
-        if "context_budget_percent" in values and values["context_budget_percent"] is not None:
-            llm.context_budget_percent = max(20, min(100, int(values["context_budget_percent"])))
-        if "reserved_output_tokens" in values:
-            value = values["reserved_output_tokens"]
-            llm.reserved_output_tokens = None if value is None else max(0, int(value))
-        if "raw_recent_context_percent" in values and values["raw_recent_context_percent"] is not None:
-            llm.raw_recent_context_percent = max(0, min(100, int(values["raw_recent_context_percent"])))
-        if "max_recent_conversation_turns" in values and values["max_recent_conversation_turns"] is not None:
-            llm.max_recent_conversation_turns = max(0, int(values["max_recent_conversation_turns"]))
-        if "auto_compress_context" in values:
-            llm.auto_compress_context = bool(values["auto_compress_context"])
-        if "conversation_summary_max_tokens" in values and values["conversation_summary_max_tokens"] is not None:
-            llm.conversation_summary_max_tokens = max(0, int(values["conversation_summary_max_tokens"]))
-
-    def _apply_llm_tiers(self, llm: Any, tiers: dict[str, Any]) -> None:
-        """Apply all tier route fields as part of the same persisted mutation."""
-        route_fields = ("model", "api_base", "api_key", "max_tokens", "temperature", "provider", "max_context_tokens")
-        for tier_key in ("lightweight", "standard", "heavy"):
-            tier_data = tiers.get(tier_key)
-            if not isinstance(tier_data, dict):
-                continue
-            existing = getattr(llm, tier_key)
-            for field_name in route_fields:
-                if field_name in tier_data:
-                    value = tier_data[field_name]
-                    setattr(existing, field_name, value if value != "" else None)
+        """Update canonical LLM routing through the focused mutation service."""
+        return await self._llm_settings.update(**kwargs)
 
     async def update_quality(self, **kwargs: Any) -> dict:
         """Update default quality settings and apply speed limits."""

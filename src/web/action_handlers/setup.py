@@ -5,17 +5,23 @@ Provides SetupActionHandler: the single place for setup wizard
 mutation logic invoked via ActionGateway from UI endpoints.
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from src.ai.assistant import AIAssistant
-from src.core.config import SettingsManager
 from src.core.autostart import AutoStartManager
 from src.core.models import EmbeddingSettings, WebSearchConfig, SharingSettings
-from src.llm_providers.manager import LLMProviderManager
-from src.utils.auth import AuthService
+from src.llm_providers.credential_policy import ProviderCredentialPolicy
+from src.llm_providers.settings_mutation import LLMSettingsMutationService
+
+if TYPE_CHECKING:
+    from src.ai.assistant import AIAssistant
+    from src.core.config import SettingsManager
+    from src.llm_providers.manager import LLMProviderManager
+    from src.utils.auth import AuthService
 
 
 class SetupActionHandler:
@@ -35,7 +41,7 @@ class SetupActionHandler:
         self._sm = settings_manager
         self._auth = auth_service
         self._llm = llm_manager
-        self._assistant = assistant
+        self._llm_settings = LLMSettingsMutationService(settings_manager, assistant, llm_manager)
 
     async def setup_password(self, password: str = "", confirm: str = "") -> dict:
         """Set or clear the web password hash."""
@@ -116,35 +122,41 @@ class SetupActionHandler:
                 logger.warning(f"Could not create library directory {root}: {exc}")
 
     async def setup_llm(self, **kwargs: Any) -> dict:
-        """Configure LLM provider, model, API base, API key, and web search."""
+        """Configure first-run LLM routing without crossing credential ownership."""
+        route_values: dict[str, Any] = {"apply_base_to_all": True}
+        for field_name in ("provider", "model", "api_base", "api_key"):
+            value = kwargs.get(field_name)
+            if value:
+                route_values[field_name] = value
+
+        result = await self._llm_settings.update(**route_values)
         settings = self._sm.settings
-        if kwargs.get("provider"):
-            settings.llm.active_provider = kwargs["provider"]
-            preset = self._llm.registry.get_preset(kwargs["provider"])
-            if preset:
-                settings.llm.api_base = preset.api_base
-        if kwargs.get("model"):
-            settings.llm.model = kwargs["model"]
-        if kwargs.get("api_base"):
-            settings.llm.api_base = kwargs["api_base"]
-        if kwargs.get("api_key"):
-            settings.llm.api_key = kwargs["api_key"]
-            provider = settings.llm.active_provider
-            self._llm.keys.add_key(provider, kwargs["api_key"], label="setup", set_active=True)
-        # First-run setup presents one provider/model as the app's AI brain.
-        # It must not leave shipped/stale tier or per-task route identities able
-        # to override that visible selection before the first chat request.
-        clear_routes = getattr(settings.llm, "clear_route_overrides", None)
-        if callable(clear_routes):
-            clear_routes()
+
+        supplied_key = str(kwargs.get("api_key") or "").strip()
+        if supplied_key:
+            provider = str(settings.llm.active_provider or "")
+            if ProviderCredentialPolicy.is_provider_owned_endpoint(
+                self._llm.registry, provider, settings.llm.api_base
+            ):
+                try:
+                    self._llm.keys.add_key(provider, supplied_key, label="setup", set_active=True)
+                except Exception as exc:
+                    # The route itself is already valid because its explicit key
+                    # is persisted with that route. KeyStore duplication is only
+                    # a convenience for future canonical-provider activation.
+                    logger.warning(f"Could not copy setup credential into provider KeyStore: {exc}")
+            else:
+                logger.info(
+                    "Setup credential belongs to a custom/operator LLM endpoint; "
+                    "not copying it into the canonical provider KeyStore."
+                )
+
         web_payload = kwargs.get("web_search")
         if isinstance(web_payload, dict):
             settings.web_search = WebSearchConfig(**{**settings.web_search.model_dump(), **web_payload})
-        self._sm.save(settings)
-        self._assistant.update_settings(settings)
-        summary_method = getattr(self._assistant, "llm_route_summary", None)
-        route_summary = summary_method() if callable(summary_method) else {}
-        return {"status": "ok", **route_summary}
+            self._sm.save(settings)
+
+        return result
 
 
     async def setup_embeddings(self, **kwargs: Any) -> dict:

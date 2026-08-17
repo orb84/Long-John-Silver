@@ -10,10 +10,12 @@ jinja2
 python-multipart
 aiosqlite
 httpx
+httpx2>=2.5.0
 bcrypt
 sqlite-vec
 fastembed>=0.4.0
 apscheduler
+mcp>=2,<3
 
 # ─── Media and search ──────────────────────────────────────────
 

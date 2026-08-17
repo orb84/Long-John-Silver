@@ -5,9 +5,16 @@ Provides ProvidersActionHandler: the single place for LLM provider
 management mutation logic invoked via ActionGateway from UI endpoints.
 """
 
-from src.ai.assistant import AIAssistant
-from src.core.config import SettingsManager
-from src.llm_providers.manager import LLMProviderManager
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from src.llm_providers.settings_mutation import LLMSettingsMutationService
+
+if TYPE_CHECKING:
+    from src.ai.assistant import AIAssistant
+    from src.core.config import SettingsManager
+    from src.llm_providers.manager import LLMProviderManager
 
 
 class ProvidersActionHandler:
@@ -24,8 +31,7 @@ class ProvidersActionHandler:
 
     def __init__(self, llm_manager: LLMProviderManager, settings_manager: SettingsManager, assistant: AIAssistant) -> None:
         self._llm = llm_manager
-        self._sm = settings_manager
-        self._assistant = assistant
+        self._llm_settings = LLMSettingsMutationService(settings_manager, assistant, llm_manager)
 
     async def add_key(self, provider_id: str, key: str, label: str = "default", set_active: bool = True) -> dict:
         """Add a new API key for a provider."""
@@ -45,16 +51,6 @@ class ProvidersActionHandler:
         return {"status": "activated"}
 
     async def activate(self, provider_id: str) -> dict:
-        """Activate a provider, persist to settings, and reload the assistant."""
-        self._llm.registry.set_active_provider(provider_id)
-        settings = self._sm.settings
-        settings.llm.active_provider = provider_id
-        preset = self._llm.registry.get_preset(provider_id)
-        if preset:
-            settings.llm.api_base = preset.api_base
-            active_key = self._llm.keys.get_active_key(provider_id)
-            if active_key:
-                settings.llm.api_key = active_key.key
-        self._sm.save(settings)
-        self._assistant.update_settings(settings)
+        """Activate one provider through the canonical rollback-safe route mutation."""
+        await self._llm_settings.update(provider=provider_id)
         return {"status": "activated", "provider_id": provider_id}

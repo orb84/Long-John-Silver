@@ -18,6 +18,7 @@ from loguru import logger
 from src.core.categories.base_context import CategoryContextMixin
 from src.core.categories.identity import basename_from_pathish
 from src.core.models import (
+    InvocationCapability,
     ActionReceipt,
     CategoryActionDeclaration,
     CategoryLlmProfile,
@@ -513,6 +514,7 @@ class CategoryContractMixin(CategoryContextMixin):
                 requires_confirmation=False,
                 destructive=False,
                 risk_level="read",
+                llm_visible=False,
                 tool_name=f"{self.category_id}.scan_library",
             ),
             CategoryActionDeclaration(
@@ -529,6 +531,8 @@ class CategoryContractMixin(CategoryContextMixin):
                 requires_confirmation=True,
                 destructive=False,
                 risk_level="write",
+                llm_visible=False,
+                invocation_capabilities_required={InvocationCapability.LIBRARY_WRITE},
                 tool_name=f"{self.category_id}.consolidate_library",
             ),
         ]
@@ -552,7 +556,17 @@ class CategoryContractMixin(CategoryContextMixin):
             )
 
         action = declared[action_name]
-        if action.requires_confirmation and not arguments.get("confirmed"):
+        workflow_name = action.operation or action.name
+        workflows = {workflow.name: workflow for workflow in self.declare_workflows()}
+        workflow = workflows.get(workflow_name)
+
+        # Most action confirmations are owned generically here. A workflow may
+        # explicitly declare ``requires_confirmation`` when it implements its own
+        # token-bound two-phase confirmation contract (for example conditional
+        # filesystem deletion). In that case dispatch must reach the workflow so
+        # it can mint/verify the canonical confirmation token.
+        workflow_owns_confirmation = bool(workflow and workflow.requires_confirmation)
+        if action.requires_confirmation and not workflow_owns_confirmation and not arguments.get("confirmed"):
             return ActionReceipt(
                 category_id=self.category_id,
                 action_name=action_name,
@@ -563,12 +577,9 @@ class CategoryContractMixin(CategoryContextMixin):
 
         # Category actions and category workflows share the same architecture:
         # actions are the UI/permission contract, workflows are the concrete
-        # domain implementation.  Route declared actions with an operation to
-        # the category-owned workflow executor instead of forcing every
-        # subclass to duplicate the dispatch boilerplate.
-        workflow_name = action.operation or action.name
-        workflows = {workflow.name for workflow in self.declare_workflows()}
-        if workflow_name in workflows:
+        # domain implementation. Route declared actions with an operation to the
+        # category-owned workflow executor instead of duplicating dispatch.
+        if workflow is not None:
             return await self.execute_workflow(workflow_name, arguments, context)
 
         return ActionReceipt(
